@@ -1,43 +1,14 @@
 {
   "name": "wyre",
-  "version": "0.3.0",
-  "description": "A practical PC, network, and mouse control panel for Windows and Linux.",
-  "main": "src/main.cjs",
-  "author": "bxane",
-  "license": "MIT",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Wyre Windows and Linux desktop application, based on MangoDisk.",
+  "license": "GPL-3.0-only",
   "scripts": {
-    "start": "electron .",
-    "prestart": "npm run build:mangodisk",
-    "build:mangodisk": "node scripts/build-mangodisk.mjs",
-    "dist:win": "npm run build:mangodisk && electron-builder --win nsis",
-    "dist:linux": "npm run build:mangodisk && electron-builder --linux AppImage deb"
+    "start": "pnpm --dir app tauri:dev",
+    "build": "pnpm --dir app tauri:build",
+    "dist:win": "pnpm --dir app tauri:build",
+    "dist:linux": "pnpm --dir app tauri:build"
   },
-  "devDependencies": {
-    "electron": "^43.0.0",
-    "electron-builder": "^26.0.12"
-  },
-  "build": {
-    "appId": "dev.bxane.wyre",
-    "productName": "Wyre",
-    "asar": true,
-    "directories": { "output": "dist" },
-    "files": ["src/**/*", "assets/**/*", "package.json"],
-    "extraResources": [
-      { "from": "build/sidecars", "to": "sidecars" },
-      { "from": "vendor/upstream/MangoDisk/LICENSE", "to": "licenses/MangoDisk-LICENSE" }
-    ],
-    "win": { "icon": "assets/wyre.ico", "target": ["nsis"] },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "artifactName": "Wyre-Setup-${version}-${arch}.${ext}"
-    },
-    "linux": {
-      "icon": "assets/icons",
-      "category": "Utility",
-      "target": ["AppImage", "deb"],
-      "artifactName": "Wyre-${version}-${arch}.${ext}",
-      "maintainer": "bxane"
-    }
-  }
+  "packageManager": "pnpm@11.13.1"
 }

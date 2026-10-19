@@ -1,54 +1,32 @@
 # Wyre
 
-Wyre is a small desktop control panel for Windows and Linux. It brings together live CPU and memory readings, an on-demand network speed check, pointer settings, and a reversible power profile switch.
+Wyre is the complete MangoDisk Tauri desktop application, rebranded for bxane and extended with on-demand network measurement plus reviewed Windows and GNOME mouse controls. The full Vue frontend and Rust application source lives in [`app/`](app/); the unmodified MangoDisk snapshot remains in [`vendor/upstream/MangoDisk/`](vendor/upstream/MangoDisk/) for attribution and comparison.
 
-## Features
+## Included tools
 
-- Live CPU load and RAM use, sampled locally.
-- Reviewable power profile changes with a one-step undo.
-- An on-demand MangoDisk cleanup preview with recommended and total estimated space; Wyre does not delete files or show matched local paths.
-- On-demand storage analysis of a folder you choose, including its 25 largest files. It is read-only and bounded to 25,000 files, 5,000 directories, and 10 folder levels.
-- Active local IPv4 interface addresses, plus an on-demand internet connection check.
-- On-demand latency, jitter, download, upload, and failed HTTP timing probe measurements using Cloudflare's public speed test endpoint. Each check transfers about 16 MB; no test runs in the background. Failed HTTP probes are not ICMP packet loss or packet capture.
-- Local IPv4 addresses for active network interfaces.
-- Pointer speed and acceleration controls for Windows and GNOME Linux. Other Linux desktops can run Wyre, but their pointer settings are not yet supported.
-- Windows and Linux power profile controls with a review step and one-step undo.
-- Pointer changes have a review step and one-step undo.
-- No accounts, telemetry, or background services.
-- The complete source snapshots requested from five upstream projects are preserved under `vendor/upstream/`. MangoDisk's CLI is built as a separate installer sidecar; the other projects remain source-only. Each keeps its own license; see [UPSTREAMS.md](UPSTREAMS.md).
-- Review of the earlier local source archives is documented in `SOURCE_REVIEW.md`.
+- MangoDisk's full storage analysis, cleanup, privacy, startup, application management, system optimization, maintenance, and history workflows.
+- An on-demand latency, jitter, download, and upload check through Cloudflare. Each run transfers about 16 MB; Cloudflare can see your public IP address. Nothing runs in the background.
+- Windows pointer speed and acceleration controls, plus GNOME Linux controls. Changes require review and can be undone once.
+- Windows NSIS and Linux AppImage and Debian installers from the GitHub Release workflow.
 
-## Run from source
+## Run and build
 
-Requires Node.js 22 or newer and Rust stable with Cargo to build the MangoDisk scanner.
+Use Node.js 22+, pnpm 11.13.1, Rust stable, and the native Tauri prerequisites for your OS.
 
 ```sh
-npm ci
-npm start
+cd app
+corepack pnpm install --frozen-lockfile
+corepack pnpm tauri:dev
 ```
 
-Build a local installer:
+Build the installer on its target OS:
 
 ```sh
-npm run dist:win
-npm run dist:linux
+corepack pnpm tauri:build
 ```
 
-The Windows build creates an NSIS installer. Linux builds create an AppImage and a Debian package. Each build compiles MangoDisk's native scanner for that platform. AppImage packaging must run on Linux; use the `linux` GitHub Actions runner or Linux/WSL to build it.
+Tag a version such as `v0.4.0` to build and publish signed Windows and Linux installers with `CHANGELOG.md` as the release notes. The workflow always creates SHA-256 checksums. Configure `WYRE_WINDOWS_PFX` (base64-encoded PFX) and `WYRE_WINDOWS_PFX_PASSWORD` Actions secrets for bxane Authenticode signing, and `WYRE_GPG_PRIVATE_KEY` (ASCII-armored private key), `WYRE_GPG_PASSPHRASE`, and `WYRE_GPG_KEY_ID` for bxane GPG signatures on Linux packages. Publishing stops if a platform signing key is missing.
 
-## Signing releases
+## Source and license
 
-Tag a version such as `v0.3.0` to start `.github/workflows/release.yml`. The workflow refuses to publish unless its signing secrets are present.
-
-- `WYRE_WINDOWS_PFX`: base64 encoded Authenticode PFX whose subject identifies `bxane`.
-- `WYRE_WINDOWS_PFX_PASSWORD`: PFX password.
-
-Wyre's release workflow signs Windows installers with Authenticode and Linux packages with detached CMS signatures, then publishes SHA-256 checksums, the public signing certificate, and the changelog. Keep signing secrets in GitHub Actions secrets; never commit a private key or certificate. The current local `CN=bxane` certificate is self-signed, so Windows may show an unknown publisher warning. Its signature protects the installer from undetected changes but does not carry a public certificate authority's trust. For a hosted release, add the PFX to the repository's Actions secrets as `WYRE_WINDOWS_PFX` (base64) and `WYRE_WINDOWS_PFX_PASSWORD`; those secrets let GitHub Actions sign both platform builds.
-
-## Mouse support
-
-Windows uses the current user's Windows pointer settings. Linux currently supports GNOME's `gsettings` mouse controls. Hardware-specific mouse firmware, DPI, and polling-rate writes are not implemented.
-
-## License
-
-Wyre is provided under the MIT License. See [LICENSE](LICENSE).
+Wyre is a GPL-3.0-only derivative of MangoDisk 1.1.9, pinned at commit `f7d8bc73b68ec2170ac4ba451c6723b11329380c`. MangoDisk copyright and license notices remain in the copied app and the upstream snapshot. Other preserved upstream snapshots retain their own licenses; see [`UPSTREAMS.md`](UPSTREAMS.md).
