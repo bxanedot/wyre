@@ -1,5 +1,6 @@
 node_modules/
 dist/
+build/
 *.pfx
 *.p12
 .env

@@ -7,6 +7,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'">
   <title>Wyre</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="optimize.css">
 </head>
 <body>
   <div class="shell">
@@ -21,11 +22,12 @@
         <button class="nav-item active" data-page="overview"><span class="nav-icon">◫</span>Overview</button>
         <button class="nav-item" data-page="network"><span class="nav-icon">⌁</span>Network<span class="nav-live"><i></i>LIVE</span></button>
         <button class="nav-item" data-page="storage"><span class="nav-icon">▤</span>Storage</button>
+        <button class="nav-item" data-page="optimize"><span class="nav-icon">✳</span>Optimize</button>
         <button class="nav-item" data-page="mouse"><span class="nav-icon">⌖</span>Mouse</button>
       </nav>
       <div class="sidebar-foot">
         <div class="device-indicator"><i></i><span>LOCAL DEVICE</span><b>CONNECTED</b></div>
-        <div class="version">WYRE DESKTOP <span>0.2.0</span></div>
+        <div class="version">WYRE DESKTOP <span>0.3.0</span></div>
       </div>
     </aside>
 
@@ -74,7 +76,7 @@
             <div class="quick-copy"><div class="eyebrow">CONTROL WITHOUT CLUTTER</div><h2>Small adjustments.<br><em>Smoother sessions.</em></h2><span>Pick one setting. See what changes.</span></div>
           </article>
         </div>
-        <footer class="page-foot"><span>WYRE / SYSTEM OVERVIEW</span><span>BUILT FOR FOCUS <i>·</i> VERSION 0.2.0</span></footer>
+        <footer class="page-foot"><span>WYRE / SYSTEM OVERVIEW</span><span>BUILT FOR FOCUS <i>·</i> VERSION 0.3.0</span></footer>
       </section>
 
       <section class="page" id="page-network">
@@ -107,8 +109,17 @@
         <footer class="page-foot"><span>WYRE / STORAGE</span><span>READ ONLY <i>·</i> NO DELETES OR BACKGROUND SCANS</span></footer>
       </section>
 
+      <section class="page" id="page-optimize">
+        <div class="intro-row compact-intro"><div><div class="eyebrow"><span class="eyebrow-line"></span>PC / 04</div><h1>Make room to <em>move.</em></h1><p class="intro-copy">Preview cleanup opportunities for this device before you decide what to do.</p></div><div class="local-badge"><span class="local-glyph">✳</span><span><b>PREVIEW ONLY</b><small>No files are changed</small></span></div></div>
+        <div class="optimize-layout">
+          <article class="card optimize-card"><div class="card-head"><div><div class="eyebrow">MANGODISK CLEANUP ENGINE</div><h2>See what could be cleared.</h2></div><span class="card-index">READ ONLY</span></div><p class="storage-copy">MangoDisk checks supported caches and temporary files. Wyre shows its recommendation and estimated size; it does not apply cleanup, and local paths stay hidden.</p><button class="button" id="cleanup-scan">SCAN FOR OPPORTUNITIES <span>↗</span></button><div class="notice" id="cleanup-status" aria-live="polite">No scan has been run.</div><div class="cleanup-metrics" id="cleanup-metrics" hidden><div><span>RECOMMENDED</span><b id="cleanup-recommended">—</b></div><div><span>ALL CANDIDATES</span><b id="cleanup-total">—</b></div></div><p class="cleanup-note">Preview only · no cleanup is applied, so your files remain unchanged.</p></article>
+          <article class="card cleanup-results"><div class="card-head"><div><div class="eyebrow">CANDIDATES</div><h2>Review the categories.</h2></div></div><ol id="cleanup-list" class="cleanup-list"><li class="empty-result">Run a scan to see available cleanup candidates.</li></ol></article>
+        </div>
+        <footer class="page-foot"><span>WYRE / OPTIMIZE</span><span>MANGODISK ENGINE <i>·</i> GPL-3.0 SOURCE INCLUDED</span></footer>
+      </section>
+
       <section class="page" id="page-mouse">
-        <div class="intro-row compact-intro"><div><div class="eyebrow"><span class="eyebrow-line"></span>INPUT / 04</div><h1>Find your <em>feel.</em></h1><p class="intro-copy">Set pointer speed and acceleration for this device.</p></div><div class="local-badge"><span class="local-glyph">⌖</span><span><b>OS SETTINGS</b><small>Applied to this device</small></span></div></div>
+        <div class="intro-row compact-intro"><div><div class="eyebrow"><span class="eyebrow-line"></span>INPUT / 05</div><h1>Find your <em>feel.</em></h1><p class="intro-copy">Set pointer speed and acceleration for this device.</p></div><div class="local-badge"><span class="local-glyph">⌖</span><span><b>OS SETTINGS</b><small>Applied to this device</small></span></div></div>
         <div class="mouse-layout">
           <article class="card mouse-control-card">
             <div class="card-head"><div><div class="eyebrow">POINTER CONTROL</div><h2>Make it yours.</h2></div><span class="card-index">01—02</span></div>

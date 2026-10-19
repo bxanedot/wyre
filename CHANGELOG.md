@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 — 2026-10-19
+
+- Integrated MangoDisk's native scan engine as an on-demand cleanup preview; Wyre does not apply cleanup or expose local file paths.
+- Added native MangoDisk CLI builds to Windows/Linux installer and signed release workflows.
+- Added the upstream MangoDisk license to packaged resources and documented its GPL-3.0 source.
+
 ## 0.2.0 — 2026-10-19
 
 - Added an opt-in local storage scan that lists the largest files in a chosen folder without deleting anything.

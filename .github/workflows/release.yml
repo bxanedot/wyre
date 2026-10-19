@@ -16,6 +16,8 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Require the bxane signing certificate
         env:
           WYRE_WINDOWS_PFX: ${{ secrets.WYRE_WINDOWS_PFX }}
@@ -24,7 +26,11 @@ jobs:
         run: |
           if (-not $env:WYRE_WINDOWS_PFX -or -not $env:WYRE_WINDOWS_PFX_PASSWORD) { throw 'Set WYRE_WINDOWS_PFX and WYRE_WINDOWS_PFX_PASSWORD in repository Actions secrets.' }
       - run: npm ci
-      - run: npm run dist:win
+      - name: Build signed Windows installer
+        env:
+          WIN_CSC_LINK: ${{ secrets.WYRE_WINDOWS_PFX }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WYRE_WINDOWS_PFX_PASSWORD }}
+        run: npm run dist:win
       - name: Sign and verify installer files
         env:
           WIN_CSC_LINK: ${{ secrets.WYRE_WINDOWS_PFX }}
@@ -40,12 +46,9 @@ jobs:
           Import-Certificate -FilePath $certPath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
           Copy-Item $certPath dist/Wyre-signing-cert.cer
           if ($certificate.Subject -notmatch 'CN=bxane') { throw 'The configured signing certificate subject must identify bxane.' }
-          $signtool = (Get-Command signtool.exe -ErrorAction Stop).Source
           $files = Get-ChildItem dist -Filter '*.exe' -Recurse
           if (-not $files) { throw 'No Windows executables were produced.' }
           foreach ($file in $files) {
-            & $signtool sign /f $pfxPath /p $env:WIN_CSC_KEY_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $file.FullName
-            if ($LASTEXITCODE -ne 0) { throw "Signing failed: $($file.Name)" }
             $signature = Get-AuthenticodeSignature $file.FullName
             if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) { throw "Signature verification failed: $($file.Name)" }
           }
@@ -66,6 +69,8 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Require the bxane signing certificate
         env:
           WYRE_WINDOWS_PFX: ${{ secrets.WYRE_WINDOWS_PFX }}
@@ -85,7 +90,7 @@ jobs:
           openssl x509 -in "$RUNNER_TEMP/wyre-cert.pem" -out dist/Wyre-signing-cert.pem
           openssl x509 -in "$RUNNER_TEMP/wyre-cert.pem" -noout -subject -fingerprint -sha256
           cd dist
-          sha256sum * > SHA256SUMS-Linux.txt
+          sha256sum *.AppImage *.deb Wyre-signing-cert.pem > SHA256SUMS-Linux.txt
           for file in *.AppImage *.deb SHA256SUMS-Linux.txt; do
             if [ -f "$file" ]; then
               openssl cms -sign -binary -in "$file" -signer "$RUNNER_TEMP/wyre-cert.pem" -inkey "$RUNNER_TEMP/wyre-key.pem" -outform DER -out "$file.p7s" -nosmimecap -md sha256

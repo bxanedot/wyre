@@ -4,7 +4,7 @@ The requested upstream source repositories are copied as independent snapshots u
 
 | Project | Relevant idea | How Wyre uses the reference |
 | --- | --- | --- |
-| [MangoDisk](https://github.com/harry0703/MangoDisk) | Disk analysis, cleanup, app/startup management | Full GPL-3.0 source snapshot is included separately. Wyre's existing folder scan remains read-only and is not MangoDisk code. |
+| [MangoDisk](https://github.com/harry0703/MangoDisk) | Disk analysis, cleanup, app/startup management | Its GPL-3.0 CLI is built as a separate sidecar for Wyre's read-only cleanup preview; see [UPSTREAMS.md](UPSTREAMS.md). |
 | [Network Optimizer for UniFi](https://github.com/Ozark-Connect/NetworkOptimizer) | UniFi network monitoring and optimization | Full BSL-1.1 source snapshot is included separately. It manages UniFi infrastructure rather than local Windows/Linux PC adapters. |
 | [SSH.NET](https://github.com/sshnet/SSH.NET) | SSH/SFTP for .NET applications | Full MIT source snapshot is included separately; Wyre currently has no remote-host controls. |
 | [PowerModels.jl](https://github.com/lanl-ansi/PowerModels.jl) | Mathematical optimization of electrical power networks | Full LANL-licensed Julia source snapshot is included separately; it models power grids rather than PC network settings. |

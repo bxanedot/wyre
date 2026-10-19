@@ -1,14 +1,16 @@
 {
   "name": "wyre",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A practical PC, network, and mouse control panel for Windows and Linux.",
   "main": "src/main.cjs",
   "author": "bxane",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "dist:win": "electron-builder --win nsis",
-    "dist:linux": "electron-builder --linux AppImage deb"
+    "prestart": "npm run build:mangodisk",
+    "build:mangodisk": "node scripts/build-mangodisk.mjs",
+    "dist:win": "npm run build:mangodisk && electron-builder --win nsis",
+    "dist:linux": "npm run build:mangodisk && electron-builder --linux AppImage deb"
   },
   "devDependencies": {
     "electron": "^43.0.0",
@@ -20,6 +22,10 @@
     "asar": true,
     "directories": { "output": "dist" },
     "files": ["src/**/*", "assets/**/*", "package.json"],
+    "extraResources": [
+      { "from": "build/sidecars", "to": "sidecars" },
+      { "from": "vendor/upstream/MangoDisk/LICENSE", "to": "licenses/MangoDisk-LICENSE" }
+    ],
     "win": { "icon": "assets/wyre.ico", "target": ["nsis"] },
     "nsis": {
       "oneClick": false,

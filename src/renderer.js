@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const pages = ['overview', 'network', 'storage', 'mouse'];
+const pages = ['overview', 'network', 'storage', 'optimize', 'mouse'];
 let state;
 let acceleration = true;
 let pendingChange = null;
@@ -228,6 +228,46 @@ $('storage-scan').addEventListener('click', async () => {
     }
   } catch (error) {
     $('storage-status').textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$('cleanup-scan').addEventListener('click', async () => {
+  const button = $('cleanup-scan');
+  button.disabled = true;
+  $('cleanup-status').textContent = 'Scanning supported cleanup locations…';
+  $('cleanup-metrics').hidden = true;
+  try {
+    const result = await window.wyre.scanCleanup();
+    $('cleanup-recommended').textContent = formatBytes(result.recommendedBytes);
+    $('cleanup-total').textContent = formatBytes(result.reclaimableBytes);
+    $('cleanup-metrics').hidden = false;
+    $('cleanup-status').textContent = `${result.rules.length.toLocaleString()} cleanup categories found. No files changed.`;
+    const list = $('cleanup-list');
+    list.replaceChildren();
+    const candidates = [...result.rules].sort((a, b) => b.bytes - a.bytes).slice(0, 12);
+    if (!candidates.length) {
+      const empty = document.createElement('li');
+      empty.className = 'empty-result';
+      empty.textContent = 'No cleanup candidates were found.';
+      list.append(empty);
+    }
+    for (const candidate of candidates) {
+      const row = document.createElement('li');
+      const label = document.createElement('div');
+      const group = document.createElement('b');
+      const detail = document.createElement('small');
+      const size = document.createElement('span');
+      group.textContent = String(candidate.group).replace(/([A-Z])/g, ' $1').replaceAll('_', ' ').trim();
+      detail.textContent = `${candidate.recommendedSelected ? 'Recommended' : 'Optional'} · ${candidate.risk}${candidate.requiresAppClose ? ' · close app first' : ''}`;
+      size.textContent = formatBytes(candidate.bytes);
+      label.append(group, detail);
+      row.append(label, size);
+      list.append(row);
+    }
+  } catch (error) {
+    $('cleanup-status').textContent = error.message;
   } finally {
     button.disabled = false;
   }

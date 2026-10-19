@@ -5,5 +5,6 @@ contextBridge.exposeInMainWorld('wyre', {
   applyMouse: settings => ipcRenderer.invoke('mouse:apply', settings),
   setPowerProfile: profile => ipcRenderer.invoke('power:set', profile),
   testNetwork: () => ipcRenderer.invoke('network:test'),
-  scanStorage: () => ipcRenderer.invoke('storage:scan')
+  scanStorage: () => ipcRenderer.invoke('storage:scan'),
+  scanCleanup: () => ipcRenderer.invoke('cleanup:scan')
 });

@@ -160,6 +160,40 @@ async function scanStorage() {
   return { canceled: false, root, scannedDirectories, scannedFiles, scannedBytes, skipped, limited: hitLimit || pending.length > 0 || scannedDirectories >= 5000, largest };
 }
 
+function scanCleanup() {
+  const binary = isWindows ? 'MangoDisk.exe' : 'MangoDisk';
+  const executable = app.isPackaged
+    ? path.join(process.resourcesPath, 'sidecars', binary)
+    : path.join(__dirname, '..', 'build', 'sidecars', binary);
+  return new Promise((resolve, reject) => execFile(executable, ['clean', '--format', 'json', '--no-progress'], {
+    timeout: 300000, maxBuffer: 16 * 1024 * 1024, windowsHide: true
+  }, (error, stdout) => {
+    let result;
+    try { result = JSON.parse(stdout); }
+    catch {
+      return reject(new Error(error?.code === 'ENOENT'
+        ? 'MangoDisk is missing. Rebuild or reinstall Wyre.'
+        : 'MangoDisk returned invalid scan data.'));
+    }
+    if (!result || typeof result !== 'object') return reject(new Error('MangoDisk returned invalid scan data.'));
+    if (result.error || error) return reject(new Error(error?.killed ? 'MangoDisk scan timed out.' : 'MangoDisk cleanup scan failed.'));
+    if (result.schemaVersion !== '1.0' || result.command !== 'clean.scan' || !Array.isArray(result.data?.rules)) {
+      return reject(new Error('MangoDisk returned an unsupported scan result.'));
+    }
+    if (!Number.isSafeInteger(result.data.reclaimableBytes) || result.data.reclaimableBytes < 0) {
+      return reject(new Error('MangoDisk returned invalid space estimates.'));
+    }
+    const rules = result.data.rules.filter(rule => rule && rule.selectable === true && typeof rule.group === 'string' && typeof rule.risk === 'string' && Number.isSafeInteger(rule.bytes) && rule.bytes > 0);
+    resolve({
+      reclaimableBytes: result.data.reclaimableBytes,
+      recommendedBytes: rules.filter(rule => rule.recommendedSelected).reduce((sum, rule) => sum + rule.bytes, 0),
+      rules: rules.map(({ group, risk, bytes, recommendedSelected, requiresAppClose }) => ({
+        group, risk, bytes, recommendedSelected: recommendedSelected === true, requiresAppClose: requiresAppClose === true
+      }))
+    });
+  }));
+}
+
 function requestBytes(url, method = 'GET', body) {
   return new Promise((resolve, reject) => {
     const started = performance.now();
@@ -204,6 +238,7 @@ ipcMain.handle('mouse:apply', (_event, settings) => applyMouse(settings));
 ipcMain.handle('power:set', (_event, profile) => setPowerProfile(profile));
 ipcMain.handle('network:test', networkTest);
 ipcMain.handle('storage:scan', scanStorage);
+ipcMain.handle('cleanup:scan', scanCleanup);
 
 function createWindow() {
   const win = new BrowserWindow({
