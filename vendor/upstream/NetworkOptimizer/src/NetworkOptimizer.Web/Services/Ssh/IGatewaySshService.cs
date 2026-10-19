@@ -1,0 +1,102 @@
+using NetworkOptimizer.Storage.Models;
+
+namespace NetworkOptimizer.Web.Services.Ssh;
+
+/// <summary>
+/// Service for SSH operations on the UniFi gateway/UDM.
+/// The gateway typically has different SSH credentials than other UniFi devices.
+/// Used by GatewaySpeedTestService and SqmDeploymentService.
+/// </summary>
+public interface IGatewaySshService
+{
+    /// <summary>
+    /// Get the gateway SSH settings (creates default if none exist)
+    /// </summary>
+    /// <param name="forceRefresh">If true, bypasses cache and loads fresh from database</param>
+    Task<GatewaySshSettings> GetSettingsAsync(bool forceRefresh = false);
+
+    /// <summary>
+    /// Save gateway SSH settings
+    /// </summary>
+    Task<GatewaySshSettings> SaveSettingsAsync(GatewaySshSettings settings);
+
+    /// <summary>
+    /// Test SSH connection to the gateway using saved settings
+    /// </summary>
+    Task<(bool success, string message)> TestConnectionAsync();
+
+    /// <summary>
+    /// True when this site's gateway is reached through its on-site agent but no
+    /// agent is currently online, so an SSH attempt would just hit the refusing
+    /// tunnel proxy. Callers use this to show a "waiting for the agent" state
+    /// instead of a connection error. Always false for a directly-reached site.
+    /// </summary>
+    Task<bool> IsAwaitingAgentTunnelAsync();
+
+    /// <summary>
+    /// Test SSH connection to the gateway using provided settings (for testing form values before save).
+    /// With no password and no key path, the stored credential is used against the given host, port
+    /// and username - the saved password never reaches the browser, so a page editing the host has
+    /// nothing else to send.
+    /// </summary>
+    /// <param name="host">Gateway hostname or IP</param>
+    /// <param name="port">SSH port</param>
+    /// <param name="username">SSH username</param>
+    /// <param name="password">Plain text password (not encrypted), or null to use the stored credential</param>
+    /// <param name="privateKeyPath">Path to private key file, or null to use the stored credential</param>
+    Task<(bool success, string message)> TestConnectionAsync(
+        string host,
+        int port,
+        string username,
+        string? password,
+        string? privateKeyPath);
+
+    /// <summary>
+    /// Run an SSH command on the gateway
+    /// </summary>
+    /// <param name="command">Command to execute</param>
+    /// <param name="timeout">Optional command timeout (default 30 seconds)</param>
+    /// <param name="cancellationToken">Cancellation token</param>
+    Task<(bool success, string output)> RunCommandAsync(
+        string command,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Run an SSH command on the gateway, streaming its stdout/stderr to
+    /// <paramref name="onOutput"/> as it arrives. For long-running commands whose progress
+    /// the UI shows live (the gateway agent installer). The result carries the exit code but
+    /// no output; a precondition failure (SSH disabled, unconfigured, agent tunnel down)
+    /// comes back as a failed result whose Error says why.
+    /// </summary>
+    /// <param name="command">Command to execute</param>
+    /// <param name="onOutput">Receives output chunks; may be called on any thread</param>
+    /// <param name="timeout">Overall command timeout</param>
+    /// <param name="cancellationToken">Cancels the run (kills the channel)</param>
+    Task<SshCommandResult> RunCommandStreamingAsync(
+        string command,
+        Action<string> onOutput,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Write a text file to the gateway over SFTP, with line endings normalized to LF.
+    /// For content too large for an exec request: SSH.NET caps a packet at 68,536 bytes, so an
+    /// "echo '&lt;base64&gt;' | base64 -d" write fails once a script grows past about 50 KB.
+    /// </summary>
+    /// <param name="content">File content</param>
+    /// <param name="remotePath">Destination path on the gateway; an existing file is overwritten</param>
+    /// <param name="cancellationToken">Cancellation token</param>
+    /// <returns>Success, and the error when it failed</returns>
+    Task<(bool success, string? error)> UploadTextFileAsync(
+        string content,
+        string remotePath,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Ready-to-use connection info for direct SSH.NET operations (SFTP uploads),
+    /// with decrypted credentials and any agent-tunnel routing applied.
+    /// Null when gateway SSH is disabled or not configured.
+    /// </summary>
+    Task<SshConnectionInfo?> GetConnectionInfoAsync();
+}

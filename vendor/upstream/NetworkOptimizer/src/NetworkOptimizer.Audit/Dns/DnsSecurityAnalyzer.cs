@@ -1,0 +1,3721 @@
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using NetworkOptimizer.Audit.Analyzers;
+using NetworkOptimizer.Audit.Models;
+using NetworkOptimizer.Core.Helpers;
+using NetworkOptimizer.UniFi.Models;
+using static NetworkOptimizer.Core.Enums.DeviceTypeExtensions;
+
+namespace NetworkOptimizer.Audit.Dns;
+
+/// <summary>
+/// Analyzes DNS security configuration for DoH, firewall rules, and DNS leak prevention
+/// </summary>
+public class DnsSecurityAnalyzer
+{
+    private readonly ILogger<DnsSecurityAnalyzer> _logger;
+
+    // UniFi settings keys
+    private const string SettingsKeyDoh = "doh";
+    private const string SettingsKeyDns = "dns";
+    private const string SettingsKeyWanDns = "wan_dns";
+
+    // WEB and IP-based DoH detection requires coverage of all 4 major providers
+    private static readonly HashSet<string> RequiredDohProviders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Cloudflare", "Google", "Quad9", "OpenDNS"
+    };
+
+    // IP-based DoH detection still requires a minimum IP count to avoid false positives
+    // from rules that incidentally block one or two DoH IPs for unrelated reasons.
+    private const int MinDohIpMatches = 3;
+
+    private readonly ThirdPartyDnsDetector _thirdPartyDetector;
+
+    public DnsSecurityAnalyzer(ILogger<DnsSecurityAnalyzer> logger, ThirdPartyDnsDetector thirdPartyDetector)
+    {
+        _logger = logger;
+        _thirdPartyDetector = thirdPartyDetector;
+    }
+
+    /// <summary>
+    /// Analyze DNS security from settings and firewall rules
+    /// </summary>
+    public Task<DnsSecurityResult> AnalyzeAsync(JsonElement? settingsData, List<FirewallRule>? firewallRules)
+        => AnalyzeAsync(settingsData, firewallRules, switches: null, networks: null);
+
+    /// <summary>
+    /// Analyze DNS security from settings, firewall rules, and device configuration
+    /// </summary>
+    public Task<DnsSecurityResult> AnalyzeAsync(JsonElement? settingsData, List<FirewallRule>? firewallRules, List<SwitchInfo>? switches, List<NetworkInfo>? networks)
+        => AnalyzeAsync(settingsData, firewallRules, switches, networks, deviceData: null);
+
+    /// <summary>
+    /// Analyze DNS security from settings, firewall rules, device configuration, and raw device data
+    /// </summary>
+    public Task<DnsSecurityResult> AnalyzeAsync(JsonElement? settingsData, List<FirewallRule>? firewallRules, List<SwitchInfo>? switches, List<NetworkInfo>? networks, JsonElement? deviceData)
+        => AnalyzeAsync(settingsData, firewallRules, switches, networks, deviceData, customDnsManagementPort: null);
+
+    /// <summary>
+    /// Analyze DNS security from settings, firewall rules, device configuration, and raw device data
+    /// </summary>
+    /// <param name="customDnsManagementPort">Optional custom port for third-party DNS management interface (Pi-hole, AdGuard Home, etc.)</param>
+    public Task<DnsSecurityResult> AnalyzeAsync(JsonElement? settingsData, List<FirewallRule>? firewallRules, List<SwitchInfo>? switches, List<NetworkInfo>? networks, JsonElement? deviceData, int? customDnsManagementPort)
+        => AnalyzeAsync(settingsData, firewallRules, switches, networks, deviceData, customDnsManagementPort, natRulesData: null);
+
+    /// <summary>
+    /// Analyze DNS security from settings, firewall rules, device configuration, raw device data, and NAT rules
+    /// </summary>
+    /// <param name="customDnsManagementPort">Optional custom port for third-party DNS management interface (Pi-hole, AdGuard Home, etc.)</param>
+    /// <param name="natRulesData">Optional NAT rules data for DNAT DNS detection</param>
+    /// <param name="dnatExcludedVlanIds">Optional VLAN IDs to exclude from DNAT coverage checks</param>
+    /// <param name="externalZoneId">Optional External/WAN zone ID for validating firewall rule destinations</param>
+    /// <param name="zoneLookup">Optional firewall zone lookup for DMZ/Hotspot network identification</param>
+    /// <param name="trustedDnsRedirectTargets">Optional additional IPs to accept as valid DNAT redirect targets (e.g., keepalived VIPs)</param>
+    public async Task<DnsSecurityResult> AnalyzeAsync(JsonElement? settingsData, List<FirewallRule>? firewallRules, List<SwitchInfo>? switches, List<NetworkInfo>? networks, JsonElement? deviceData, int? customDnsManagementPort, JsonElement? natRulesData, List<int>? dnatExcludedVlanIds = null, string? externalZoneId = null, Services.FirewallZoneLookup? zoneLookup = null, Dictionary<string, UniFiFirewallGroup>? firewallGroups = null, string? customDnsManagementUrl = null, List<UniFiNetworkConfig>? networkConfigs = null, List<string>? trustedDnsRedirectTargets = null)
+    {
+        var result = new DnsSecurityResult();
+
+        // Analyze DoH configuration from settings
+        if (settingsData.HasValue)
+        {
+            AnalyzeDohConfiguration(settingsData.Value, result);
+        }
+        else
+        {
+            _logger.LogWarning("No settings data available for DNS security analysis");
+        }
+
+        // Extract WAN DNS from device port_table (where network_name is "wan")
+        if (deviceData.HasValue)
+        {
+            ExtractWanDnsFromDevices(deviceData.Value, result);
+        }
+        else
+        {
+            _logger.LogDebug("No device data available for WAN DNS extraction");
+        }
+
+        // Fallback: enrich WAN interfaces that have no DNS in port_table with
+        // wan_dns1/wan_dns2 from network configs (networkconf API).
+        // Some firmware versions don't populate the dns array in port_table even
+        // when static DNS is configured in the WAN network settings.
+        if (networkConfigs != null)
+        {
+            EnrichWanDnsFromNetworkConfigs(networkConfigs, result);
+            EnrichWanIpv6DnsFromNetworkConfigs(networkConfigs, result);
+        }
+
+        // Analyze firewall rules
+        if (firewallRules != null && firewallRules.Count > 0)
+        {
+            AnalyzeFirewallRules(firewallRules, networks, result, externalZoneId);
+        }
+        else
+        {
+            _logger.LogWarning("No firewall rules available for DNS security analysis");
+        }
+
+        // Analyze device DNS configuration - using raw device data to include APs
+        if (deviceData.HasValue && networks != null)
+        {
+            AnalyzeAllDeviceDnsConfiguration(deviceData.Value, networks, result);
+        }
+        else if (switches != null && networks != null)
+        {
+            // Fallback to switches-only if no raw device data
+            AnalyzeDeviceDnsConfiguration(switches, networks, result);
+        }
+
+        // Set gateway name for issue reporting
+        if (switches != null)
+        {
+            result.GatewayName = switches.FirstOrDefault(s => s.IsGateway)?.Name;
+        }
+
+        // Detect third-party LAN DNS (Pi-hole, AdGuard Home, etc.)
+        if (networks?.Any() == true)
+        {
+            await AnalyzeThirdPartyDnsAsync(networks, result, customDnsManagementPort, zoneLookup, customDnsManagementUrl);
+        }
+
+        // Capture networks the user excluded from coverage checks up front, independent of NAT data, so the
+        // carve-out applies to every DNS coverage finding even when no NAT rules are supplied.
+        if (dnatExcludedVlanIds != null && dnatExcludedVlanIds.Count > 0 && networks != null)
+        {
+            var excludedVlanSet = dnatExcludedVlanIds.ToHashSet();
+            result.ExcludedFromCoverageNetworks.AddRange(
+                networks.Where(n => excludedVlanSet.Contains(n.VlanId) && !string.IsNullOrEmpty(n.Name)).Select(n => n.Name));
+        }
+
+        // Analyze DNAT DNS rules (alternative to firewall blocking)
+        if (natRulesData.HasValue && networks?.Any() == true)
+        {
+            AnalyzeDnatDnsRules(natRulesData.Value, networks, result, dnatExcludedVlanIds, firewallGroups, trustedDnsRedirectTargets);
+        }
+
+        // Everything above describes IPv4 traffic. Where a network carries IPv6, find the
+        // protection that holds over IPv4 but not over IPv6.
+        if (networks?.Any(n => n.HasIpv6) == true)
+        {
+            AnalyzeIpv6Coverage(firewallRules, natRulesData, networks, result, externalZoneId, dnatExcludedVlanIds, firewallGroups, trustedDnsRedirectTargets);
+        }
+
+        // Generate issues based on findings (includes async WAN DNS validation)
+        await GenerateAuditIssuesAsync(result, networks, zoneLookup);
+
+        _logger.LogDebug("DNS security analysis complete: DoH={DoHState}, Firewall rules found: DNS53={Dns53}, DoT={DoT}, DoH={DoHBlock}, DoQ={DoQBlock}, DoH3={DoH3Block}, DeviceDns={DeviceDnsOk}, WanDns={WanDnsCount}",
+            result.DohState, result.HasDns53BlockRule, result.HasDotBlockRule, result.HasDohBlockRule, result.HasDoqBlockRule, result.HasDoh3BlockRule, result.DeviceDnsPointsToGateway, result.WanDnsServers.Count);
+
+        return result;
+    }
+
+    private void AnalyzeDohConfiguration(JsonElement settings, DnsSecurityResult result)
+    {
+        // Look for DoH configuration in settings array
+        var settingsArray = settings.UnwrapDataArray().ToList();
+        var keys = settingsArray
+            .Where(s => s.TryGetProperty("key", out _))
+            .Select(s => s.GetProperty("key").GetString())
+            .ToList();
+        _logger.LogDebug("Found {Count} settings with keys: {Keys}", keys.Count, string.Join(", ", keys.Take(20)));
+
+        foreach (var setting in settingsArray)
+        {
+            if (!setting.TryGetProperty("key", out var keyProp))
+                continue;
+
+            var key = keyProp.GetString();
+
+            if (key == SettingsKeyDoh)
+            {
+                ParseDohSettings(setting, result);
+            }
+            else if (key == SettingsKeyDns || key == SettingsKeyWanDns)
+            {
+                _logger.LogDebug("Found WAN DNS settings with key '{Key}'", key);
+                ParseWanDnsSettings(setting, result);
+            }
+        }
+    }
+
+    private void ParseDohSettings(JsonElement dohSettings, DnsSecurityResult result)
+    {
+        // Get DoH state
+        if (dohSettings.TryGetProperty("state", out var stateProp))
+        {
+            result.DohState = stateProp.GetString() ?? "disabled";
+        }
+
+        // Parse custom servers (SDNS stamps)
+        if (dohSettings.TryGetProperty("custom_servers", out var customServers) && customServers.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var server in customServers.EnumerateArray())
+            {
+                var serverName = server.GetStringOrNull("server_name");
+                var sdnsStamp = server.GetStringOrNull("sdns_stamp");
+                var enabled = server.GetBoolOrDefault("enabled", true);
+
+                if (!string.IsNullOrEmpty(sdnsStamp))
+                {
+                    var decoded = DnsStampDecoder.Decode(sdnsStamp);
+                    if (decoded != null)
+                    {
+                        result.ConfiguredServers.Add(new DnsServerConfig
+                        {
+                            ServerName = serverName ?? decoded.Hostname ?? "Unknown",
+                            StampInfo = decoded,
+                            Enabled = enabled,
+                            IsCustom = true
+                        });
+                        _logger.LogDebug("DoH custom server: name={Name}, protocol={Protocol}, hostname={Hostname}, provider={Provider}",
+                            serverName, decoded.ProtocolName, decoded.Hostname, decoded.ProviderInfo?.Name ?? "not identified");
+                    }
+                    else
+                    {
+                        // sdnsStamp is known non-null here due to the enclosing if check
+                        var truncatedStamp = sdnsStamp.Length > 50 ? sdnsStamp[..50] + "..." : sdnsStamp;
+                        _logger.LogWarning("Failed to decode SDNS stamp for server {Name}: {Stamp}", serverName, truncatedStamp);
+                    }
+                }
+            }
+        }
+
+        // Parse built-in server names
+        // When state is "custom", only custom_servers are active; built-in server_names are stale config
+        var isCustomState = result.DohState == "custom";
+        if (dohSettings.TryGetProperty("server_names", out var serverNames) && serverNames.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var name in serverNames.EnumerateArray())
+            {
+                var serverName = name.GetString();
+                if (!string.IsNullOrEmpty(serverName))
+                {
+                    var provider = DohProviderRegistry.IdentifyProviderFromName(serverName);
+                    result.ConfiguredServers.Add(new DnsServerConfig
+                    {
+                        ServerName = serverName,
+                        Provider = provider,
+                        Enabled = !isCustomState,
+                        IsCustom = false
+                    });
+                    _logger.LogDebug("DoH built-in server: name={Name}, provider={Provider}, enabled={Enabled} (state={State})",
+                        serverName, provider?.Name ?? "not identified", !isCustomState, result.DohState);
+                }
+            }
+        }
+
+        // DoH is configured only if state is not off/disabled AND there are enabled servers
+        // UniFi API uses both "disabled" and "off" for the disabled state
+        var isDisabledState = result.DohState == "disabled" || result.DohState == "off";
+        result.DohConfigured = !isDisabledState && result.ConfiguredServers.Any(s => s.Enabled);
+    }
+
+    private void ParseWanDnsSettings(JsonElement dnsSettings, DnsSecurityResult result)
+    {
+        // WAN DNS servers (fallback or primary)
+        if (dnsSettings.TryGetProperty("dns_servers", out var servers) && servers.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var server in servers.EnumerateArray())
+            {
+                var ip = server.GetString();
+                if (!string.IsNullOrEmpty(ip))
+                {
+                    result.WanDnsServers.Add(ip);
+                }
+            }
+        }
+
+        // Check for ISP DNS (auto mode)
+        if (dnsSettings.TryGetProperty("mode", out var modeProp))
+        {
+            var mode = modeProp.GetString();
+            result.UsingIspDns = mode == "auto" || mode == "dhcp";
+        }
+    }
+
+    /// <summary>
+    /// Extract WAN DNS servers from device port_table.
+    /// UniFi stores WAN DNS in port_table entries where network_name starts with "wan" (wan, wan2, etc.).
+    /// </summary>
+    private void ExtractWanDnsFromDevices(JsonElement deviceData, DnsSecurityResult result)
+    {
+        var wanInterfacesChecked = new List<string>();
+        var wanInterfacesWithoutDns = new List<string>();
+
+        foreach (var device in deviceData.UnwrapDataArray())
+        {
+            // Only check gateways/routers for WAN DNS
+            var deviceType = device.GetStringOrNull("type");
+            if (deviceType == null || !FromUniFiApiType(deviceType).IsGateway())
+                continue;
+
+            // Look in port_table for WAN ports (wan, wan2, etc.)
+            if (!device.TryGetProperty("port_table", out var portTable) || portTable.ValueKind != JsonValueKind.Array)
+                continue;
+
+            // Collect cellular WAN network names from device-level wan1/wan2 properties.
+            // Device keys "wan1","wan2" map to port_table network_name "wan","wan2".
+            var cellularWanNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var prop in device.EnumerateObject())
+            {
+                if (!prop.Name.StartsWith("wan", StringComparison.OrdinalIgnoreCase)
+                    || (prop.Name.Length > 3 && !prop.Name[3..].All(char.IsDigit)))
+                    continue;
+                if (prop.Value.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var wanType = prop.Value.GetStringOrNull("type");
+                if (wanType is "wireless_5g" or "lte" or "wireless_lte")
+                {
+                    cellularWanNames.Add(prop.Name);
+                    if (prop.Name == "wan1")
+                        cellularWanNames.Add("wan");
+                }
+            }
+
+            foreach (var port in portTable.EnumerateArray())
+            {
+                var networkName = port.GetStringOrNull("network_name");
+                if (string.IsNullOrEmpty(networkName) || !networkName.StartsWith("wan", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Get additional port info for logging
+                var portName = port.GetStringOrNull("name") ?? "unnamed";
+                var portMedia = port.GetStringOrNull("media") ?? "unknown";
+                var portUp = port.GetBoolOrDefault("up");
+                var portIp = port.GetStringOrNull("ip");
+                var portIfname = port.GetStringOrNull("ifname");
+
+                // Cellular WANs (U5G, LTE modems) don't allow DNS configuration
+                var isCellular = cellularWanNames.Contains(networkName)
+                    || (portIfname?.StartsWith("gre", StringComparison.OrdinalIgnoreCase) == true);
+
+                wanInterfacesChecked.Add(networkName);
+
+                _logger.LogInformation("WAN interface detected: {Interface} (name={Name}, media={Media}, up={Up}, ip={Ip}, ifname={Ifname}, cellular={Cellular})",
+                    networkName, portName, portMedia, portUp, portIp ?? "none", portIfname ?? "unknown", isCellular);
+
+                if (isCellular)
+                {
+                    _logger.LogDebug("Skipping DNS check for cellular WAN interface {Interface}", networkName);
+                    result.WanInterfaces.Add(new WanInterfaceDns
+                    {
+                        InterfaceName = networkName,
+                        PortName = portName,
+                        IpAddress = portIp,
+                        IsUp = portUp,
+                        IsCellular = true,
+                        DnsServers = new List<string>()
+                    });
+                    continue;
+                }
+
+                // Check for DNS servers on this WAN port
+                var hasDnsProperty = port.TryGetProperty("dns", out var dnsArray);
+                var dnsCount = hasDnsProperty && dnsArray.ValueKind == JsonValueKind.Array ? dnsArray.GetArrayLength() : 0;
+
+                _logger.LogInformation("  DNS config: hasDnsProperty={HasDns}, arrayLength={Count}",
+                    hasDnsProperty, dnsCount);
+
+                // Create per-interface DNS record
+                var interfaceDns = new WanInterfaceDns
+                {
+                    InterfaceName = networkName,
+                    PortName = portName,
+                    IpAddress = portIp,
+                    IsUp = portUp,
+                    DnsServers = new List<string>()
+                };
+
+                if (hasDnsProperty && dnsArray.ValueKind == JsonValueKind.Array && dnsCount > 0)
+                {
+                    foreach (var dns in dnsArray.EnumerateArray())
+                    {
+                        var dnsIp = dns.GetString();
+                        if (!string.IsNullOrEmpty(dnsIp))
+                        {
+                            interfaceDns.DnsServers.Add(dnsIp);
+                            if (!result.WanDnsServers.Contains(dnsIp))
+                            {
+                                result.WanDnsServers.Add(dnsIp);
+                            }
+                            _logger.LogInformation("  Found DNS server: {DnsIp}", dnsIp);
+                        }
+                    }
+                }
+                else
+                {
+                    // This WAN interface has no static DNS configured
+                    wanInterfacesWithoutDns.Add(networkName);
+                    _logger.LogInformation("  No static DNS configured on {Interface} - may use ISP DNS or DHCP", networkName);
+                }
+
+                result.WanInterfaces.Add(interfaceDns);
+            }
+
+            // Found gateway, stop checking other devices
+            break;
+        }
+
+        if (result.WanDnsServers.Any())
+        {
+            _logger.LogDebug("Extracted {Count} WAN DNS servers from {InterfaceCount} interface(s): {Servers}",
+                result.WanDnsServers.Count, wanInterfacesChecked.Count, string.Join(", ", result.WanDnsServers));
+        }
+
+        // Track interfaces without DNS for potential issue reporting
+        if (wanInterfacesWithoutDns.Any())
+        {
+            result.UsingIspDns = true;
+            _logger.LogDebug("WAN interfaces without static DNS: {Interfaces}", string.Join(", ", wanInterfacesWithoutDns));
+        }
+
+        if (!wanInterfacesChecked.Any())
+        {
+            _logger.LogDebug("No WAN interfaces found in device port_table");
+        }
+    }
+
+    /// <summary>
+    /// Enrich WAN interfaces that have no DNS in port_table with wan_dns1/wan_dns2
+    /// from network configs. Correlates by matching port_table network_name (e.g., "wan", "wan2")
+    /// to networkconf wan_networkgroup (e.g., "WAN", "WAN2") case-insensitively.
+    /// </summary>
+    private void EnrichWanDnsFromNetworkConfigs(List<UniFiNetworkConfig> networkConfigs, DnsSecurityResult result)
+    {
+        var wanConfigs = networkConfigs
+            .Where(n => string.Equals(n.Purpose, "wan", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrEmpty(n.WanNetworkgroup))
+            .ToList();
+
+        if (!wanConfigs.Any())
+            return;
+
+        foreach (var wanInterface in result.WanInterfaces)
+        {
+            if (wanInterface.HasStaticDns)
+                continue;
+
+            // Match port_table network_name ("wan", "wan2") to networkconf wan_networkgroup ("WAN", "WAN2")
+            var matchingConfig = wanConfigs.FirstOrDefault(c =>
+                string.Equals(c.WanNetworkgroup, wanInterface.InterfaceName, StringComparison.OrdinalIgnoreCase));
+
+            if (matchingConfig == null)
+                continue;
+
+            var dnsServers = new List<string>();
+            if (!string.IsNullOrEmpty(matchingConfig.WanDns1))
+                dnsServers.Add(matchingConfig.WanDns1);
+            if (!string.IsNullOrEmpty(matchingConfig.WanDns2))
+                dnsServers.Add(matchingConfig.WanDns2);
+
+            if (dnsServers.Count == 0)
+                continue;
+
+            _logger.LogInformation("Enriched {Interface} DNS from network config (wan_dns1/wan_dns2): {Servers}",
+                wanInterface.InterfaceName, string.Join(", ", dnsServers));
+
+            foreach (var dns in dnsServers)
+            {
+                wanInterface.DnsServers.Add(dns);
+                if (!result.WanDnsServers.Contains(dns))
+                {
+                    result.WanDnsServers.Add(dns);
+                }
+            }
+
+            // Clear the UsingIspDns flag if all interfaces now have DNS
+            if (result.UsingIspDns && result.WanInterfaces.All(w => w.HasStaticDns))
+            {
+                result.UsingIspDns = false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Record each WAN's IPv6 state and static IPv6 DNS from network configs (wan_type_v6,
+    /// wan_ipv6_dns_preference, wan_ipv6_dns1/2). The device port_table carries no IPv6 DNS, so
+    /// networkconf is the only source. Writes only the IPv6 fields, so the IPv4 checks are unaffected.
+    /// </summary>
+    private void EnrichWanIpv6DnsFromNetworkConfigs(List<UniFiNetworkConfig> networkConfigs, DnsSecurityResult result)
+    {
+        foreach (var wanInterface in result.WanInterfaces)
+        {
+            var config = networkConfigs.FirstOrDefault(c =>
+                string.Equals(c.Purpose, "wan", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(c.WanNetworkgroup, wanInterface.InterfaceName, StringComparison.OrdinalIgnoreCase));
+            if (config == null)
+                continue;
+
+            wanInterface.HasIpv6 = !string.IsNullOrEmpty(config.WanTypeV6) &&
+                !string.Equals(config.WanTypeV6, "disabled", StringComparison.OrdinalIgnoreCase);
+            if (!wanInterface.HasIpv6 ||
+                !string.Equals(config.WanIpv6DnsPreference, "manual", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            foreach (var dns in new[] { config.WanIpv6Dns1, config.WanIpv6Dns2 })
+            {
+                if (System.Net.IPAddress.TryParse(dns?.Trim(), out var ip) &&
+                    ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+                    wanInterface.Ipv6DnsServers.Add(dns!.Trim());
+            }
+
+            if (wanInterface.Ipv6DnsServers.Count > 0)
+                _logger.LogInformation("{Interface} static IPv6 DNS from network config: {Servers}",
+                    wanInterface.InterfaceName, string.Join(", ", wanInterface.Ipv6DnsServers));
+        }
+    }
+
+    private void AnalyzeFirewallRules(List<FirewallRule> firewallRules, List<NetworkInfo>? networks, DnsSecurityResult result, string? externalZoneId, IpFamily family = IpFamily.IPv4)
+    {
+        // Analyze parsed firewall rules to find DNS-related rules. Only rules that match the
+        // family count: an IPv6-only block leaves IPv4 DNS open, and the reverse.
+        foreach (var rule in firewallRules)
+        {
+            var name = rule.Name ?? "";
+            if (!rule.Enabled || !rule.MatchesIpFamily(family))
+                continue;
+
+            var protocol = rule.Protocol?.ToLowerInvariant() ?? "all";
+            var matchOppositeProtocol = rule.MatchOppositeProtocol;
+
+            // Get source info for coverage tracking
+            var sourceMatchingTarget = rule.SourceMatchingTarget;
+            var sourceNetworkIds = rule.SourceNetworkIds;
+            var sourceMatchOppositeNetworks = rule.SourceMatchOppositeNetworks;
+
+            // Get destination info (port group resolution already done during parsing)
+            var destZoneId = rule.DestinationZoneId;
+            var matchingTarget = rule.DestinationMatchingTarget;
+            var webDomains = rule.WebDomains;
+
+            // DNS leak prevention rules must target the External zone.
+            // If we have an External zone ID, validate the destination zone matches.
+            // Rules targeting other zones (e.g., LAN) don't prevent DNS leaks to the internet.
+            // Rules without a destination zone are assumed to target all zones (including external).
+            var targetsExternalZone = string.IsNullOrEmpty(externalZoneId) ||
+                                      string.IsNullOrEmpty(destZoneId) ||
+                                      string.Equals(destZoneId, externalZoneId, StringComparison.OrdinalIgnoreCase);
+
+            // For legacy systems, LAN_IN rules can also block external traffic (traffic passes through
+            // LAN_IN before reaching WAN_OUT). However, LAN_IN is only acceptable for DoT/DoH blocking,
+            // NOT for UDP 53 - because the gateway's own DNS queries would be blocked by LAN_IN.
+            var ruleset = rule.Ruleset?.ToUpperInvariant();
+            var isLegacyLanIn = ruleset == "LAN_IN";
+
+            var isBlockAction = rule.ActionType.IsBlockAction();
+
+            // Debug logging for zone matching (helps diagnose DNS detection issues)
+            _logger.LogDebug("Rule '{Name}': action={Action}, isBlock={IsBlock}, destZone={DestZone}, externalZone={ExternalZone}, targetsExternal={TargetsExternal}, matchingTarget={MatchingTarget}",
+                name, rule.Action, isBlockAction, destZoneId ?? "(null)", externalZoneId ?? "(null)", targetsExternalZone, matchingTarget ?? "(null)");
+
+            // === Port-based DNS blocking detection ===
+            // RuleBlocksPortAndProtocol handles port matching (null port = all ports),
+            // DestinationMatchOppositePorts, and protocol matching in one call.
+            // Rules must block NEW connections to prevent DNS leaks - rules that only
+            // block INVALID connections (e.g., "Block Invalid Traffic") don't prevent DNS queries.
+            if (!isBlockAction || !rule.BlocksNewConnections())
+                continue;
+
+            // Rules with unresolved port groups can't be reliably evaluated - skip
+            if (rule.HasUnresolvedDestinationPortGroup)
+                continue;
+
+            // Port-based detection: rule must target ALL destinations in the zone.
+            // Rules with specific destination IPs/networks/domains/apps don't block all DNS.
+            // WEB and APP rules are evaluated in their own sections below.
+            if (rule.IsAnyDestination())
+            {
+                // Check for DNS port 53 blocking (UDP) - must target External zone
+                if (targetsExternalZone && FirewallGroupHelper.RuleBlocksPortAndProtocol(rule, "53", "udp"))
+                {
+                    result.HasDns53BlockRule = true;
+                    // A rule that specifically targets port 53 (a normal-mode port list, not a blanket
+                    // all-ports block and not an inverted "all except" match) signals an intentional
+                    // DNS-53 blocking strategy. A blanket "block all internet" rule still counts as block
+                    // coverage above, but must not be read as a DNS-53 strategy.
+                    if (!string.IsNullOrEmpty(rule.DestinationPort) && !rule.DestinationMatchOppositePorts)
+                        result.HasDns53BlockStrategy = true;
+                    result.Dns53RuleName = name;
+                    _logger.LogDebug("Found DNS53 block rule: {Name} (protocol={Protocol}, opposite={Opposite}, zone={Zone}, dedicatedPort={Dedicated})",
+                        name, protocol, matchOppositeProtocol, destZoneId ?? "any", !string.IsNullOrEmpty(rule.DestinationPort) && !rule.DestinationMatchOppositePorts);
+
+                    // Track network coverage for this rule
+                    if (networks != null)
+                    {
+                        AddCoveredNetworks(networks, rule, family, result.Dns53CoveredNetworkIds, result.Dns53RuleCoverage, name);
+                    }
+                }
+
+                // Check for DNS over TLS (port 853 TCP) blocking
+                // For legacy systems, LAN_IN is also acceptable (gateway uses DoH, not DoT/DoQ for upstream)
+                if ((targetsExternalZone || isLegacyLanIn) && FirewallGroupHelper.RuleBlocksPortAndProtocol(rule, "853", "tcp"))
+                {
+                    result.HasDotBlockRule = true;
+                    result.DotRuleName = name;
+                    _logger.LogDebug("Found DoT block rule: {Name} (protocol={Protocol}, opposite={Opposite}, zone={Zone})",
+                        name, protocol, matchOppositeProtocol, destZoneId ?? "any");
+
+                    if (networks != null)
+                        AddCoveredNetworks(networks, rule, family, result.DotCoveredNetworkIds, result.DotRuleCoverage, name);
+                }
+
+                // Check for DNS over QUIC (port 853 UDP) blocking (RFC 9250)
+                if ((targetsExternalZone || isLegacyLanIn) && FirewallGroupHelper.RuleBlocksPortAndProtocol(rule, "853", "udp"))
+                {
+                    result.HasDoqBlockRule = true;
+                    result.DoqRuleName = name;
+                    _logger.LogDebug("Found DoQ block rule: {Name} (protocol={Protocol}, opposite={Opposite}, zone={Zone})",
+                        name, protocol, matchOppositeProtocol, destZoneId ?? "any");
+
+                    if (networks != null)
+                        AddCoveredNetworks(networks, rule, family, result.DoqCoveredNetworkIds, result.DoqRuleCoverage, name);
+                }
+            }
+
+            // Check for DoH/DoH3 blocking (port 443 with web domains covering major DoH providers).
+            // Requires all 4 major providers (Cloudflare, Google, Quad9, OpenDNS) to be covered
+            // to prevent partial blocks from getting credit. Uses DohProviderRegistry hostname
+            // matching rather than loose substring patterns.
+            if ((targetsExternalZone || isLegacyLanIn) && matchingTarget == "WEB" && webDomains?.Count > 0)
+            {
+                var (matchedCount, matchedProviders) = DohProviderRegistry.MatchKnownDohDomains(webDomains);
+
+                if (RequiredDohProviders.IsSubsetOf(matchedProviders))
+                {
+                    var blocksDoh = FirewallGroupHelper.RuleBlocksPortAndProtocol(rule, "443", "tcp");
+                    var blocksDoh3 = FirewallGroupHelper.RuleBlocksPortAndProtocol(rule, "443", "udp");
+
+                    if (blocksDoh)
+                    {
+                        result.HasDohBlockRule = true;
+                        result.DohRuleName ??= name;
+                        foreach (var domain in webDomains)
+                        {
+                            if (DohProviderRegistry.IdentifyProvider(domain) != null && !result.DohBlockedDomains.Contains(domain))
+                                result.DohBlockedDomains.Add(domain);
+                        }
+                        _logger.LogDebug("Found DoH block rule: {Name} (zone={Zone}) matched {Count} domains across {ProviderCount} providers: {Providers}",
+                            name, destZoneId ?? "any", matchedCount, matchedProviders.Count, string.Join(", ", matchedProviders));
+                    }
+
+                    if (blocksDoh3)
+                    {
+                        result.HasDoh3BlockRule = true;
+                        result.Doh3RuleName ??= name;
+                        _logger.LogDebug("Found DoH3 block rule: {Name} (zone={Zone}) matched {Count} domains across {ProviderCount} providers: {Providers}",
+                            name, destZoneId ?? "any", matchedCount, matchedProviders.Count, string.Join(", ", matchedProviders));
+                    }
+                }
+            }
+
+            // Check for IP-based DoH/DoH3 blocking (destination is a list of known DoH provider IPs).
+            // Catches rules using an IP group or inline IP list of DoH endpoints, which UniFi users
+            // frequently deploy as the primary or supplemental DoH-bypass mechanism. The MinDoh*
+            // thresholds avoid false positives from rules that happen to block one or two DoH IPs
+            // for unrelated reasons.
+            if ((targetsExternalZone || isLegacyLanIn) && matchingTarget == "IP" && rule.DestinationIps?.Count > 0)
+            {
+                var blocksDoh = FirewallGroupHelper.RuleBlocksPortAndProtocol(rule, "443", "tcp");
+                var blocksDoh3 = FirewallGroupHelper.RuleBlocksPortAndProtocol(rule, "443", "udp");
+
+                if (blocksDoh || blocksDoh3)
+                {
+                    // Each family needs its own provider addresses blocked
+                    var (matchedCount, matchedProviders) = DohProviderRegistry.MatchKnownDohIps(
+                        rule.DestinationIps.Where(ip => IsAddressOfFamily(ip, family)));
+
+                    if (matchedCount >= MinDohIpMatches && RequiredDohProviders.IsSubsetOf(matchedProviders))
+                    {
+                        if (blocksDoh)
+                        {
+                            result.HasDohBlockRule = true;
+                            result.DohRuleName ??= name;
+                            _logger.LogDebug("Found IP-based DoH block rule: {Name} (zone={Zone}) matched {Count} IPs across {ProviderCount} providers: {Providers}",
+                                name, destZoneId ?? "any", matchedCount, matchedProviders.Count, string.Join(", ", matchedProviders));
+                        }
+
+                        if (blocksDoh3)
+                        {
+                            result.HasDoh3BlockRule = true;
+                            result.Doh3RuleName ??= name;
+                            _logger.LogDebug("Found IP-based DoH3 block rule: {Name} (zone={Zone}) matched {Count} IPs across {ProviderCount} providers: {Providers}",
+                                name, destZoneId ?? "any", matchedCount, matchedProviders.Count, string.Join(", ", matchedProviders));
+                        }
+                    }
+                }
+            }
+
+            // === App-based DNS blocking detection ===
+            // App IDs are port-based under the hood, so app-based rules provide similar coverage to port-based rules
+            // Legacy rules (from combined-traffic API) have no protocol field - assume ALL protocols
+            var appIds = rule.AppIds;
+            var isAppBasedRule = appIds?.Count > 0 && matchingTarget == "APP";
+
+            if (targetsExternalZone && isAppBasedRule)
+            {
+                // For legacy rules (protocol == "all" or null), assume all protocols blocked
+                var legacyAllProtocols = string.IsNullOrEmpty(protocol) || protocol == "all";
+                var blocksUdp = FirewallGroupHelper.BlocksProtocol(rule.Protocol, rule.MatchOppositeProtocol, "udp");
+                var blocksTcp = FirewallGroupHelper.BlocksProtocol(rule.Protocol, rule.MatchOppositeProtocol, "tcp");
+
+                // DNS app (port 53) - blocks UDP DNS
+                if (appIds!.Any(DnsAppIds.IsDns53App))
+                {
+                    if (legacyAllProtocols || blocksUdp)
+                    {
+                        result.HasDns53BlockRule = true;
+                        // App-based DNS rules target the DNS app (port 53) specifically, so this is always
+                        // an intentional DNS-53 blocking strategy, not incidental blanket coverage.
+                        result.HasDns53BlockStrategy = true;
+                        result.Dns53RuleName ??= name;
+                        _logger.LogDebug("Found app-based DNS53 block rule: {Name} (appIds={AppIds}, protocol={Protocol})",
+                            name, string.Join(",", appIds!), protocol ?? "all");
+
+                        // Track network coverage
+                        if (networks != null)
+                        {
+                            AddCoveredNetworks(networks, rule, family, result.Dns53CoveredNetworkIds, result.Dns53RuleCoverage, name);
+                        }
+                    }
+                }
+
+                // Port 853 app - covers DoT (TCP) and DoQ (UDP)
+                if (appIds!.Any(DnsAppIds.IsPort853App))
+                {
+                    if (legacyAllProtocols || blocksTcp)
+                    {
+                        result.HasDotBlockRule = true;
+                        result.DotRuleName ??= name;
+                        _logger.LogDebug("Found app-based DoT block rule: {Name} (appIds={AppIds}, protocol={Protocol})",
+                            name, string.Join(",", appIds!), protocol ?? "all");
+
+                        if (networks != null)
+                            AddCoveredNetworks(networks, rule, family, result.DotCoveredNetworkIds, result.DotRuleCoverage, name);
+                    }
+                    if (legacyAllProtocols || blocksUdp)
+                    {
+                        result.HasDoqBlockRule = true;
+                        result.DoqRuleName ??= name;
+                        _logger.LogDebug("Found app-based DoQ block rule: {Name} (appIds={AppIds}, protocol={Protocol})",
+                            name, string.Join(",", appIds!), protocol ?? "all");
+
+                        if (networks != null)
+                            AddCoveredNetworks(networks, rule, family, result.DoqCoveredNetworkIds, result.DoqRuleCoverage, name);
+                    }
+                }
+
+                // Port 443 app - covers DoH (TCP) and DoH3 (UDP/QUIC)
+                if (appIds!.Any(DnsAppIds.IsPort443App))
+                {
+                    if (legacyAllProtocols || blocksTcp)
+                    {
+                        result.HasDohBlockRule = true;
+                        result.DohRuleName ??= name;
+                        _logger.LogDebug("Found app-based DoH block rule: {Name} (appIds={AppIds}, protocol={Protocol})",
+                            name, string.Join(",", appIds!), protocol ?? "all");
+                    }
+                    if (legacyAllProtocols || blocksUdp)
+                    {
+                        result.HasDoh3BlockRule = true;
+                        result.Doh3RuleName ??= name;
+                        _logger.LogDebug("Found app-based DoH3 block rule: {Name} (appIds={AppIds}, protocol={Protocol})",
+                            name, string.Join(",", appIds!), protocol ?? "all");
+                    }
+                }
+            }
+        }
+
+        // Calculate network coverage stats
+        if (networks != null)
+        {
+            if (result.HasDns53BlockRule)
+                result.Dns53ProvidesFullCoverage = CalculateCoverage(networks, result.Dns53CoveredNetworkIds, result.Dns53CoveredNetworks, result.Dns53UncoveredNetworks, "DNS53");
+            if (result.HasDotBlockRule)
+                result.DotProvidesFullCoverage = CalculateCoverage(networks, result.DotCoveredNetworkIds, result.DotCoveredNetworks, result.DotUncoveredNetworks, "DoT");
+            if (result.HasDoqBlockRule)
+                result.DoqProvidesFullCoverage = CalculateCoverage(networks, result.DoqCoveredNetworkIds, result.DoqCoveredNetworks, result.DoqUncoveredNetworks, "DoQ");
+        }
+    }
+
+    /// <summary>
+    /// Add covered networks to the set based on rule source matching.
+    /// Uses FirewallRule.AppliesToSourceNetwork() which handles zone, network ID, and IP/CIDR matching.
+    /// </summary>
+    private static void AddCoveredNetworks(
+        List<NetworkInfo> networks,
+        FirewallRule rule,
+        IpFamily family,
+        HashSet<string> coveredNetworkIds,
+        Dictionary<string, List<string>>? ruleCoverage = null,
+        string? ruleName = null)
+    {
+        foreach (var network in networks)
+        {
+            if (!rule.AppliesToSourceNetwork(network, family))
+                continue;
+
+            coveredNetworkIds.Add(network.Id);
+
+            if (ruleCoverage != null)
+            {
+                var key = string.IsNullOrWhiteSpace(ruleName) ? "(unnamed rule)" : ruleName;
+                if (!ruleCoverage.TryGetValue(key, out var covered))
+                {
+                    covered = new List<string>();
+                    ruleCoverage[key] = covered;
+                }
+                if (!covered.Contains(network.Name))
+                    covered.Add(network.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether an address, CIDR, or range (e.g., "1.1.1.1", "2606:4700::/32", "1.1.1.1-1.1.1.3")
+    /// belongs to the family, judged by its first address.
+    /// </summary>
+    private static bool IsAddressOfFamily(string ipOrCidr, IpFamily family)
+    {
+        var address = ipOrCidr.Split('/')[0].Split('-')[0].Trim();
+        if (!System.Net.IPAddress.TryParse(address, out var parsed))
+            return false;
+
+        return family == IpFamily.IPv6
+            ? parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+            : parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork;
+    }
+
+    /// <summary>
+    /// Calculate coverage statistics for a protocol after processing all rules.
+    /// Returns true if all networks are covered.
+    /// </summary>
+    private bool CalculateCoverage(List<NetworkInfo> networks, HashSet<string> coveredIds,
+        List<string> coveredNames, List<string> uncoveredNames, string protocolLabel)
+    {
+        foreach (var network in networks)
+        {
+            if (coveredIds.Contains(network.Id))
+                coveredNames.Add(network.Name);
+            else
+                uncoveredNames.Add(network.Name);
+        }
+
+        var fullCoverage = uncoveredNames.Count == 0;
+
+        if (!fullCoverage)
+        {
+            _logger.LogInformation("{Protocol} blocking provides partial coverage. Covered: {Covered}, Uncovered: {Uncovered}",
+                protocolLabel, string.Join(", ", coveredNames), string.Join(", ", uncoveredNames));
+        }
+
+        return fullCoverage;
+    }
+
+    /// <summary>
+    /// Convert a rule-name -> covered-network-names map into the CoveringRuleInfo list
+    /// attached to a partial-coverage finding. Returns null when no rules contributed,
+    /// so the UI only renders the detail when there's something to show.
+    /// </summary>
+    private static List<CoveringRuleInfo>? BuildCoveringRules(Dictionary<string, List<string>> ruleCoverage)
+    {
+        if (ruleCoverage.Count == 0)
+            return null;
+
+        return ruleCoverage
+            .Select(kvp => new CoveringRuleInfo { RuleName = kvp.Key, CoveredNetworks = kvp.Value })
+            .ToList();
+    }
+
+    /// <summary>
+    /// Categorize a set of uncovered network names into DMZ, Guest-with-third-party-DNS, and regular
+    /// buckets, dropping any network the user intentionally excluded from coverage checks. Shared by the
+    /// DNAT partial-coverage finding and the no-protection finding so carve-out handling stays consistent.
+    /// </summary>
+    private static (List<string> Dmz, List<string> GuestThirdParty, List<string> Regular) CategorizeUncoveredNetworks(
+        IEnumerable<string> uncoveredNetworkNames,
+        List<NetworkInfo>? networks,
+        DnsSecurityResult result,
+        Services.FirewallZoneLookup? zoneLookup)
+    {
+        var networksByName = networks?
+            .Where(n => !string.IsNullOrEmpty(n.Name))
+            .ToDictionary(n => n.Name, n => n, StringComparer.OrdinalIgnoreCase)
+            ?? new Dictionary<string, NetworkInfo>(StringComparer.OrdinalIgnoreCase);
+        var excluded = new HashSet<string>(result.ExcludedFromCoverageNetworks, StringComparer.OrdinalIgnoreCase);
+
+        var dmz = new List<string>();
+        var guestThirdParty = new List<string>();
+        var regular = new List<string>();
+
+        foreach (var networkName in uncoveredNetworkNames)
+        {
+            // Intentionally excluded from coverage checks - never report as uncovered/exposed
+            if (excluded.Contains(networkName))
+                continue;
+
+            if (networksByName.TryGetValue(networkName, out var network))
+            {
+                // Check if this is a DMZ network (by firewall zone)
+                var isDmz = zoneLookup?.IsDmzZone(network.FirewallZoneId) ?? false;
+
+                // Check if this is a Guest network with 3rd party LAN DNS
+                // Guest networks are identified by IsUniFiGuestNetwork or Purpose == Guest
+                var isGuest = network.IsUniFiGuestNetwork || network.Purpose == NetworkPurpose.Guest;
+                var hasThirdPartyLanDns = result.HasThirdPartyDns && result.IsSiteWideThirdPartyDns;
+
+                if (isDmz)
+                    dmz.Add(networkName);
+                else if (isGuest && hasThirdPartyLanDns)
+                    guestThirdParty.Add(networkName);
+                else
+                    regular.Add(networkName);
+            }
+            else
+            {
+                // Network not found in lookup - treat as regular
+                regular.Add(networkName);
+            }
+        }
+
+        return (dmz, guestThirdParty, regular);
+    }
+
+    private static string GetCorrectDnsOrder(List<string> servers, List<string?> ptrResults)
+    {
+        // Pair IPs with their PTR results and sort by dns1 first, dns2 second
+        var paired = servers.Zip(ptrResults, (ip, ptr) => (Ip: ip, Ptr: ptr ?? "")).ToList();
+
+        // Sort: dns1 should come before dns2
+        var sorted = paired
+            .OrderBy(p => p.Ptr.Contains("dns2", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+            .Select(p => p.Ip)
+            .ToList();
+
+        return string.Join(", ", sorted);
+    }
+
+
+    private async Task GenerateAuditIssuesAsync(DnsSecurityResult result, List<NetworkInfo>? networks = null, Services.FirewallZoneLookup? zoneLookup = null)
+    {
+        // Issue: DoH not configured
+        if (!result.DohConfigured)
+        {
+            if (result.HasThirdPartyDns)
+            {
+                var dnsServerIps = result.ThirdPartyDnsServers.Select(t => t.DnsServerIp).Distinct().ToList();
+                var networkNames = result.ThirdPartyDnsServers.Select(t => t.NetworkName).Distinct().ToList();
+
+                // Known providers (Pi-hole, AdGuard Home, Technitium DNS, NextDNS CLI, ControlD) are trusted - neutral score impact
+                // Unknown third-party DNS servers get a minor penalty since we can't verify their filtering
+                var isKnownProvider = result.IsPiholeDetected || result.IsAdGuardHomeDetected || result.IsTechnitiumDnsDetected || result.IsNextDnsDetected || result.IsControlDDetected;
+                var scoreImpact = isKnownProvider ? 0 : 3; // Minor penalty for unknown providers
+                var severity = isKnownProvider ? AuditSeverity.Informational : AuditSeverity.Recommended;
+                var recommendedAction = isKnownProvider
+                    ? "Verify third-party DNS provides adequate security and filtering. Consider enabling DNS firewall rules to prevent bypass."
+                    : "Configure the third-party DNS management port or URL in Settings to enable detection. Otherwise, consider a known DNS filtering solution (Pi-hole, AdGuard Home, Technitium DNS, NextDNS, ControlD) or CyberSecure Encrypted DNS (DoH).";
+
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsThirdPartyDetected,
+                    Severity = severity,
+                    DeviceName = result.GatewayName,
+                    Message = $"{result.ThirdPartyDnsProviderName} detected handling DNS queries. Networks using third-party DNS: {string.Join(", ", networkNames)}. DNS server(s): {string.Join(", ", dnsServerIps)}.",
+                    RecommendedAction = recommendedAction,
+                    RuleId = "DNS-3RDPARTY-001",
+                    ScoreImpact = scoreImpact,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "third_party_dns_ips", dnsServerIps },
+                        { "is_pihole", result.IsPiholeDetected },
+                        { "is_adguard_home", result.IsAdGuardHomeDetected },
+                        { "is_technitium_dns", result.IsTechnitiumDnsDetected },
+                        { "is_nextdns", result.IsNextDnsDetected },
+                        { "is_controld", result.IsControlDDetected },
+                        { "is_known_provider", isKnownProvider },
+                        { "affected_networks", networkNames },
+                        { "provider_name", result.ThirdPartyDnsProviderName ?? "Third-Party LAN DNS" },
+                        { "configurable_setting", "Configure third-party DNS management port or URL in Settings if detection fails" }
+                    }
+                });
+
+                // Add hardening note only for known providers
+                if (isKnownProvider)
+                {
+                    result.HardeningNotes.Add($"{result.ThirdPartyDnsProviderName} configured as DNS resolver on {networkNames.Count} network(s)");
+                }
+            }
+            else
+            {
+                // No DoH and no third-party DNS - flag as needing attention
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsUnknownConfig,
+                    Severity = AuditSeverity.Informational,
+                    DeviceName = result.GatewayName,
+                    Message = "Unable to determine DNS security solution. No DoH configured and no third-party LAN DNS detected.",
+                    RecommendedAction = "Enable CyberSecure Encrypted DNS (DoH) in Network Settings or deploy a DNS filtering solution like Pi-hole or AdGuard Home.",
+                    RuleId = "DNS-UNKNOWN-001",
+                    ScoreImpact = 0  // No score impact - shown alongside DNS_NO_DOH which carries the penalty
+                });
+
+                // Also add the standard DoH recommendation
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsNoDoh,
+                    Severity = AuditSeverity.Critical,
+                    DeviceName = result.GatewayName,
+                    Message = "DNS-over-HTTPS (DoH) is not configured. Network traffic uses unencrypted DNS which can be monitored or manipulated.",
+                    RecommendedAction = "Enable CyberSecure Encrypted DNS (DoH) in Network Settings with a trusted provider like NextDNS or Cloudflare.",
+                    RuleId = "DNS-DOH-001",
+                    ScoreImpact = 12
+                });
+            }
+        }
+        else if (result.DohState == "auto")
+        {
+            // DoH auto mode uses default providers whose privacy practices you may not have reviewed
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsDohAuto,
+                Severity = AuditSeverity.Informational,
+                DeviceName = result.GatewayName,
+                Message = "DoH is using default providers whose privacy policies you may not have reviewed. Default providers may log queries and do not guarantee anonymity.",
+                RecommendedAction = "Consider configuring custom DoH servers from privacy-focused providers if DNS query privacy is important.",
+                RuleId = "DNS-DOH-002",
+                ScoreImpact = 3
+            });
+        }
+
+        // Validate WAN DNS against DoH provider (uses PTR lookup)
+        await ValidateWanDnsConfigurationAsync(result);
+        await ValidateWanIpv6DnsAsync(result);
+
+        // Issue: Networks using DNS servers outside configured subnets (bypasses local DNS filtering)
+        if (result.HasExternalDns)
+        {
+            // Build a set of DMZ network names for quick lookup
+            var dmzNetworkNames = (networks ?? Enumerable.Empty<NetworkInfo>())
+                .Where(n => zoneLookup?.IsDmzZone(n.FirewallZoneId) == true)
+                .Select(n => n.Name)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            // Group by public vs private, then by provider
+            var publicDns = result.ExternalDnsNetworks.Where(e => e.IsPublicDns).ToList();
+            var privateDns = result.ExternalDnsNetworks.Where(e => !e.IsPublicDns).ToList();
+
+            // Separate DMZ networks from regular networks for public DNS
+            var publicDnsDmz = publicDns.Where(e => dmzNetworkNames.Contains(e.NetworkName)).ToList();
+            var publicDnsRegular = publicDns.Where(e => !dmzNetworkNames.Contains(e.NetworkName)).ToList();
+
+            // DMZ networks with public DNS - Informational (expected for isolated networks)
+            foreach (var group in publicDnsDmz.GroupBy(e => e.ProviderName ?? "unknown provider"))
+            {
+                var netNames = group.Select(e => e.NetworkName).Distinct().ToList();
+                var dnsIps = group.Select(e => e.DnsServerIp).Distinct().ToList();
+                var providerName = group.Key;
+
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsExternalBypass,
+                    Severity = AuditSeverity.Informational,
+                    DeviceName = result.GatewayName,
+                    Message = $"DMZ network(s) ({string.Join(", ", netNames)}) configured to use external public DNS ({providerName}: {string.Join(", ", dnsIps)}). This is expected for isolated DMZ networks.",
+                    RecommendedAction = "If local DNS filtering is desired for DMZ networks, create firewall rules to allow DNS traffic from DMZ to your internal DNS server.",
+                    RuleId = "DNS-EXT-BYPASS-DMZ",
+                    ScoreImpact = 0,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "affected_networks", netNames },
+                        { "external_dns_servers", dnsIps },
+                        { "provider_name", providerName },
+                        { "is_public_dns", true },
+                        { "is_dmz", true }
+                    }
+                });
+            }
+
+            // Regular networks with public DNS - Recommended (likely intentional but bypasses filtering)
+            foreach (var group in publicDnsRegular.GroupBy(e => e.ProviderName ?? "unknown provider"))
+            {
+                var netNames = group.Select(e => e.NetworkName).Distinct().ToList();
+                var dnsIps = group.Select(e => e.DnsServerIp).Distinct().ToList();
+                var providerName = group.Key;
+
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsExternalBypass,
+                    Severity = AuditSeverity.Recommended,
+                    DeviceName = result.GatewayName,
+                    Message = $"Network(s) ({string.Join(", ", netNames)}) configured to use external public DNS ({providerName}: {string.Join(", ", dnsIps)}). This bypasses local DNS filtering including gateway DoH and Pi-hole/AdGuard.",
+                    RecommendedAction = "Remove custom DNS configuration from these networks to use gateway DNS, or point them to your local DNS filtering solution (e.g., Pi-hole, AdGuard Home). If intentional, create DNAT rules to redirect DNS traffic.",
+                    RuleId = "DNS-EXT-BYPASS-001",
+                    ScoreImpact = 8,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "affected_networks", netNames },
+                        { "external_dns_servers", dnsIps },
+                        { "provider_name", providerName },
+                        { "is_public_dns", true }
+                    }
+                });
+            }
+
+            // Private DNS outside configured subnets - could be misconfiguration or unconfigured network
+            if (privateDns.Any())
+            {
+                var netNames = privateDns.Select(e => e.NetworkName).Distinct().ToList();
+                var dnsIps = privateDns.Select(e => e.DnsServerIp).Distinct().ToList();
+
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsExternalBypass,
+                    Severity = AuditSeverity.Recommended,
+                    DeviceName = result.GatewayName,
+                    Message = $"Network(s) ({string.Join(", ", netNames)}) configured to use private DNS servers outside configured subnets ({string.Join(", ", dnsIps)}). These may be on an unconfigured network or misconfigured.",
+                    RecommendedAction = "Verify these DNS servers are intentional. If they're local DNS servers (e.g., Pi-hole), ensure their subnet is configured in the network settings. Otherwise, remove the custom DNS configuration.",
+                    RuleId = "DNS-EXT-BYPASS-002",
+                    ScoreImpact = 6,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "affected_networks", netNames },
+                        { "external_dns_servers", dnsIps },
+                        { "is_public_dns", false }
+                    }
+                });
+            }
+        }
+
+        // Issue: No DNS port 53 blocking (DNS leak prevention)
+        // DNAT rules can be an alternative when DoH or third-party DNS is configured
+        // and the redirect destination is correct
+        var hasDnsControlSolution = result.DohConfigured || result.HasThirdPartyDns;
+        var dnatIsValidAlternative = result.DnatProvidesFullCoverage
+            && hasDnsControlSolution
+            && result.DnatRedirectTargetIsValid
+            && result.DnatDestinationFilterIsValid;
+
+        // Issue: networks with NO DNS leak protection (catch-all exposure).
+        // Fires only when neither a dedicated DNS-53 blocking strategy nor DNAT rules are in play - the
+        // strategy-specific findings own those cases and report their own gaps (belt-and-suspenders).
+        // Exposure is computed from ABSOLUTE block coverage: a blanket "block all internet" rule counts as
+        // a port-53 block, so a network is exposed only when it has neither a port-53 block nor a DNAT
+        // redirect. Without this, blanket isolation rules set HasDns53BlockRule=true and silently
+        // suppressed the no-block finding while no strategy reported the genuinely exposed networks - so
+        // removing all DNS protection paradoxically improved the score.
+        if (!result.HasDns53BlockStrategy && !result.HasDnatDnsRules)
+        {
+            // A network is exposed when it has neither a port-53 block nor a DNAT redirect. Compute from the
+            // full network list, not Dns53UncoveredNetworks - that set is only populated when a block rule
+            // exists, so it's empty in the "nothing blocks anything" case even though every network leaks.
+            var exposedNetworks = new List<string>();
+            bool shouldFire;
+            if (networks != null && networks.Count > 0)
+            {
+                var protectedNetworks = new HashSet<string>(result.Dns53CoveredNetworks, StringComparer.OrdinalIgnoreCase);
+                protectedNetworks.UnionWith(result.DnatCoveredNetworks);
+                var uncovered = networks
+                    .Select(n => n.Name)
+                    .Where(name => !string.IsNullOrEmpty(name) && !protectedNetworks.Contains(name));
+                var (dmzExposed, guestExposed, regularExposed) = CategorizeUncoveredNetworks(uncovered, networks, result, zoneLookup);
+                exposedNetworks = regularExposed;
+                shouldFire = exposedNetworks.Any();
+
+                // Parity with the DNAT partial-coverage path: carved-out DMZ / guest-on-third-party-DNS
+                // networks get a courtesy Informational note rather than being silently dropped. Deduped by
+                // type so we don't double up with the third-party-DNS consistency check (which runs earlier
+                // and emits the same finding types when third-party DNS is configured).
+                if (dmzExposed.Any() && !result.Issues.Any(i => i.Type == IssueTypes.DnsDmzNetworkInfo))
+                {
+                    result.Issues.Add(new AuditIssue
+                    {
+                        Type = IssueTypes.DnsDmzNetworkInfo,
+                        Severity = AuditSeverity.Informational,
+                        DeviceName = result.GatewayName,
+                        Message = $"DMZ network(s) ({string.Join(", ", dmzExposed)}) have no DNS leak protection (no firewall port 53 block or DNAT redirect). This is expected for DMZ networks.",
+                        RecommendedAction = "If internal DNS resolution or filtering is desired for DMZ networks, create firewall rules to allow DNS traffic from DMZ to your internal DNS server or gateway.",
+                        RuleId = "DNS-DMZ-001",
+                        ScoreImpact = 0,
+                        Metadata = new Dictionary<string, object>
+                        {
+                            { "dmz_networks", dmzExposed },
+                            { "network_type", "dmz" }
+                        }
+                    });
+                }
+                if (guestExposed.Any() && !result.Issues.Any(i => i.Type == IssueTypes.DnsGuestThirdPartyInfo))
+                {
+                    result.Issues.Add(new AuditIssue
+                    {
+                        Type = IssueTypes.DnsGuestThirdPartyInfo,
+                        Severity = AuditSeverity.Informational,
+                        DeviceName = result.GatewayName,
+                        Message = $"Guest network(s) ({string.Join(", ", guestExposed)}) using third-party LAN DNS have no DNS leak protection (no firewall port 53 block or DNAT redirect).",
+                        RecommendedAction = "If internal DNS resolution or filtering is desired for Guest networks using third-party DNS, create firewall rules to allow DNS traffic from the Guest network to your internal DNS server.",
+                        RuleId = "DNS-GUEST-001",
+                        ScoreImpact = 0,
+                        Metadata = new Dictionary<string, object>
+                        {
+                            { "guest_networks", guestExposed },
+                            { "network_type", "guest" },
+                            { "third_party_dns", result.ThirdPartyDnsProviderName ?? "unknown" }
+                        }
+                    });
+                }
+            }
+            else
+            {
+                // No network list to enumerate - fall back to the absolute signal: if nothing blocks port 53
+                // anywhere, every network can leak.
+                shouldFire = !result.HasDns53BlockRule;
+            }
+
+            if (shouldFire)
+            {
+                // Scale severity to how much is exposed, consistent with the two partial-coverage findings
+                // (so the score moves monotonically with protection). When the whole network list is exposed
+                // - or unavailable - this is the "no DNS protection at all" case, which stays Critical.
+                var totalNetworks = networks?.Count ?? 0;
+                var coverageRatio = totalNetworks > 0 ? (double)(totalNetworks - exposedNetworks.Count) / totalNetworks : 0;
+                var severity = coverageRatio >= 2.0 / 3.0 ? AuditSeverity.Recommended : AuditSeverity.Critical;
+                var scoreImpact = severity == AuditSeverity.Recommended ? 6 : 10;
+
+                // Name the exposed networks when a partial block exists; otherwise nothing is blocked
+                // anywhere and the generic wording applies.
+                var message = exposedNetworks.Any() && result.HasDns53BlockRule
+                    ? $"Networks with no DNS leak protection: {string.Join(", ", exposedNetworks)}. These networks have no firewall port 53 block and no DNAT redirect, so devices on them can bypass network DNS settings and leak queries to untrusted servers."
+                    : "No firewall rule blocks external DNS (port 53). Devices can bypass network DNS settings and leak queries to untrusted servers.";
+
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsNo53Block,
+                    Severity = severity,
+                    DeviceName = result.GatewayName,
+                    Message = message,
+                    RecommendedAction = "Create firewall rule: Block outbound UDP port 53 to Internet for all VLANs (except gateway), or configure DNAT rules to redirect DNS traffic.",
+                    RuleId = "DNS-LEAK-001",
+                    ScoreImpact = scoreImpact,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "exposed_networks", exposedNetworks },
+                        { "block_covered_networks", result.Dns53CoveredNetworks },
+                        { "coverage_ratio", coverageRatio }
+                    }
+                });
+            }
+        }
+
+        // Issue: DNS53 firewall blocking *strategy* provides partial coverage (some networks not covered).
+        // Gated on HasDns53BlockStrategy (a dedicated port-53 rule), NOT raw block coverage: a blanket
+        // "block all internet" isolation rule provides block coverage for its networks but doesn't mean
+        // the user runs a DNS-53 blocking strategy, so it must not, on its own, trigger this enforcement.
+        // Reported independently of DNAT (belt-and-suspenders). DNAT only shapes severity here: a network
+        // the block misses but DNAT redirects can't leak, so it softens the finding rather than suppressing it.
+        if (result.HasDns53BlockStrategy && !result.Dns53ProvidesFullCoverage && result.Dns53UncoveredNetworks.Any())
+        {
+            var dnatCoveredNetworks = new HashSet<string>(result.DnatCoveredNetworks, StringComparer.OrdinalIgnoreCase);
+            var exposedNetworks = result.Dns53UncoveredNetworks.Where(n => !dnatCoveredNetworks.Contains(n)).ToList();
+            var dnatBackstoppedNetworks = result.Dns53UncoveredNetworks.Where(n => dnatCoveredNetworks.Contains(n)).ToList();
+
+            var totalNetworks = result.Dns53CoveredNetworks.Count + result.Dns53UncoveredNetworks.Count;
+            var coverageRatio = totalNetworks > 0 ? (double)result.Dns53CoveredNetworks.Count / totalNetworks : 0;
+
+            AuditSeverity severity;
+            int scoreImpact;
+            string message;
+            if (exposedNetworks.Any())
+            {
+                // Networks with neither a port-53 block nor a DNAT redirect can leak DNS.
+                // If 2/3 or more networks are covered, use Recommended severity; otherwise Critical.
+                severity = coverageRatio >= 2.0 / 3.0 ? AuditSeverity.Recommended : AuditSeverity.Critical;
+                scoreImpact = severity == AuditSeverity.Recommended ? 6 : 10;
+                message = $"DNS port 53 blocking rules provide partial network coverage. Uncovered networks: {string.Join(", ", exposedNetworks)}. Devices on these networks can bypass DNS settings.";
+                if (dnatBackstoppedNetworks.Any())
+                    message += $" ({string.Join(", ", dnatBackstoppedNetworks)} are not blocked but are covered by DNAT redirection.)";
+            }
+            else
+            {
+                // Every network the block misses is redirected by DNAT - not exposed, just a strategy gap.
+                severity = AuditSeverity.Informational;
+                scoreImpact = 0;
+                message = $"DNS port 53 blocking rules don't cover all networks ({string.Join(", ", dnatBackstoppedNetworks)} not blocked), but DNAT redirection covers them. This is just for your awareness.";
+            }
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.Dns53PartialCoverage,
+                Severity = severity,
+                DeviceName = result.GatewayName,
+                Message = message,
+                RecommendedAction = "Update firewall rules to cover all networks, or create separate rules for uncovered networks, or configure DNAT rules as an alternative.",
+                RuleId = "DNS-LEAK-002",
+                ScoreImpact = scoreImpact,
+                CoveringRules = BuildCoveringRules(result.Dns53RuleCoverage),
+                Metadata = new Dictionary<string, object>
+                {
+                    { "covered_networks", result.Dns53CoveredNetworks },
+                    { "uncovered_networks", result.Dns53UncoveredNetworks },
+                    { "exposed_networks", exposedNetworks },
+                    { "dnat_backstopped_networks", dnatBackstoppedNetworks },
+                    { "coverage_ratio", coverageRatio }
+                }
+            });
+        }
+
+        // Add hardening note if DNAT provides full coverage as alternative
+        if (dnatIsValidAlternative && !result.HasDns53BlockRule)
+        {
+            result.HardeningNotes.Add($"DNS leak prevention via DNAT redirect to {result.DnatRedirectTarget ?? "gateway"} (covers all DHCP networks)");
+        }
+
+        // Issue: DNAT provides partial coverage (some networks not covered)
+        // If DNS53 firewall blocking provides full coverage, downgrade to Informational (DNAT is redundant/supplementary)
+        // Otherwise, severity depends on coverage ratio
+        // Special handling for DMZ and Guest networks - they get Info issues instead of Recommended/Critical
+        if (result.HasDnatDnsRules && !result.DnatProvidesFullCoverage && result.DnatUncoveredNetworks.Any())
+        {
+            // Separate DMZ and Guest networks with 3rd party LAN DNS from regular uncovered networks
+            var (dmzNetworks, guestNetworksWithThirdPartyDns, regularUncoveredNetworks) =
+                CategorizeUncoveredNetworks(result.DnatUncoveredNetworks, networks, result, zoneLookup);
+
+            // Create Info issue for DMZ networks that need firewall rules for internal DNS
+            if (dmzNetworks.Any())
+            {
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsDmzNetworkInfo,
+                    Severity = AuditSeverity.Informational,
+                    DeviceName = result.GatewayName,
+                    Message = $"DMZ network(s) ({string.Join(", ", dmzNetworks)}) are not covered by DNS DNAT rules. This is expected for DMZ networks.",
+                    RecommendedAction = "If internal DNS resolution or filtering is desired for DMZ networks, create firewall rules to allow DNS traffic from DMZ to your internal DNS server or gateway.",
+                    RuleId = "DNS-DMZ-001",
+                    ScoreImpact = 0,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "dmz_networks", dmzNetworks },
+                        { "network_type", "dmz" }
+                    }
+                });
+            }
+
+            // Create Info issue for Guest networks with 3rd party LAN DNS
+            if (guestNetworksWithThirdPartyDns.Any())
+            {
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsGuestThirdPartyInfo,
+                    Severity = AuditSeverity.Informational,
+                    DeviceName = result.GatewayName,
+                    Message = $"Guest network(s) ({string.Join(", ", guestNetworksWithThirdPartyDns)}) are using third-party LAN DNS and are not covered by DNS DNAT rules.",
+                    RecommendedAction = "If internal DNS resolution or filtering is desired for Guest networks using third-party DNS, create firewall rules to allow DNS traffic from the Guest network to your internal DNS server.",
+                    RuleId = "DNS-GUEST-001",
+                    ScoreImpact = 0,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "guest_networks", guestNetworksWithThirdPartyDns },
+                        { "network_type", "guest" },
+                        { "third_party_dns", result.ThirdPartyDnsProviderName ?? "unknown" }
+                    }
+                });
+            }
+
+            // Only create the regular partial coverage issue if there are non-DMZ/Guest uncovered networks
+            if (regularUncoveredNetworks.Any())
+            {
+                var totalNetworks = result.DnatCoveredNetworks.Count + regularUncoveredNetworks.Count;
+                var coverageRatio = totalNetworks > 0 ? (double)result.DnatCoveredNetworks.Count / totalNetworks : 0;
+
+                // Severity is shaped by absolute block coverage, evaluated PER NETWORK: a DNAT gap on a
+                // network that firewall port 53 blocking already covers can't leak (a strategy gap), but a
+                // gap on a network with neither DNAT nor a port-53 block is genuinely exposed. The global
+                // HasDns53BlockRule flag must not be used here - firewall blocking on Management/Security
+                // says nothing about whether the uncovered Main/IoT networks are protected.
+                var firewallBlockedNetworks = new HashSet<string>(result.Dns53CoveredNetworks, StringComparer.OrdinalIgnoreCase);
+                var exposedNetworks = regularUncoveredNetworks.Where(n => !firewallBlockedNetworks.Contains(n)).ToList();
+                var firewallBackstoppedNetworks = regularUncoveredNetworks.Where(n => firewallBlockedNetworks.Contains(n)).ToList();
+
+                AuditSeverity severity;
+                int scoreImpact;
+                string message;
+                string action;
+
+                if (!exposedNetworks.Any())
+                {
+                    // Every DNAT gap is already blocked at port 53 by the firewall - not exposed, just a
+                    // strategy gap worth noting.
+                    severity = AuditSeverity.Informational;
+                    scoreImpact = 0;
+                    message = $"DNAT DNS rules don't cover all networks ({string.Join(", ", firewallBackstoppedNetworks)} not covered), but firewall port 53 blocking covers them. This is just for your awareness.";
+                    action = "If you intend to use DNAT as primary DNS control, add rules for uncovered networks. Otherwise, this can be ignored.";
+                }
+                else if (result.HasDns53BlockStrategy && !result.Dns53ProvidesFullCoverage)
+                {
+                    // A dedicated DNS-53 blocking strategy is also in play, and its partial-coverage finding
+                    // already scores these exposed networks. Report the DNAT gap for visibility
+                    // (belt-and-suspenders) but don't double-deduct - the exposure is scored once, there.
+                    severity = AuditSeverity.Informational;
+                    scoreImpact = 0;
+                    message = $"DNAT DNS rules don't cover {string.Join(", ", exposedNetworks)}. These networks are also flagged as exposed by your firewall DNS-53 coverage (scored there); this notes the DNAT gap.";
+                    action = "Add DNAT rules for these networks, or extend the firewall port 53 block to cover them.";
+                }
+                else
+                {
+                    // Some networks have neither a DNAT redirect nor a port-53 block - genuinely exposed,
+                    // and DNAT is the only DNS-control strategy in play, so this finding owns the score.
+                    severity = coverageRatio >= 2.0 / 3.0 ? AuditSeverity.Recommended : AuditSeverity.Critical;
+                    scoreImpact = severity == AuditSeverity.Recommended ? 6 : 10;
+                    message = $"DNAT DNS rules provide partial coverage. Networks without DNAT coverage: {string.Join(", ", exposedNetworks)}. Devices on these networks can bypass DNS settings.";
+                    if (firewallBackstoppedNetworks.Any())
+                        message += $" ({string.Join(", ", firewallBackstoppedNetworks)} are not redirected but are covered by firewall port 53 blocking.)";
+                    action = "Add DNAT rules for the remaining networks, create a firewall rule to block outbound UDP port 53, or exclude intentionally uncovered networks in Settings";
+                }
+
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsDnatPartialCoverage,
+                    Severity = severity,
+                    DeviceName = result.GatewayName,
+                    Message = message,
+                    RecommendedAction = action,
+                    RuleId = "DNS-DNAT-001",
+                    ScoreImpact = scoreImpact,
+                    CoveringRules = BuildCoveringRules(result.DnatRuleCoverage),
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "covered_networks", result.DnatCoveredNetworks.ToList() },
+                        { "uncovered_networks", regularUncoveredNetworks },
+                        { "exposed_networks", exposedNetworks },
+                        { "firewall_backstopped_networks", firewallBackstoppedNetworks },
+                        { "dmz_networks_excluded", dmzNetworks },
+                        { "guest_networks_excluded", guestNetworksWithThirdPartyDns },
+                        { "redirect_target", result.DnatRedirectTarget ?? "" },
+                        { "coverage_ratio", coverageRatio },
+                        { "has_dns53_block", result.HasDns53BlockRule },
+                        { "dns53_full_coverage", result.Dns53ProvidesFullCoverage },
+                        { "configurable_setting", "Exclude VLANs from coverage checks in Settings → Audit Settings → DNAT DNS Coverage: Excluded VLANs" }
+                    }
+                });
+            }
+        }
+
+        // Issue: Single IP DNAT rules (abnormal configuration)
+        if (result.DnatSingleIpRules.Any())
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsDnatSingleIp,
+                Severity = AuditSeverity.Informational,
+                DeviceName = result.GatewayName,
+                Message = $"DNAT DNS rules target single IP addresses instead of network ranges: {string.Join(", ", result.DnatSingleIpRules)}. This provides limited coverage and may indicate misconfiguration.",
+                RecommendedAction = "Configure DNAT rules to use network references or CIDR ranges for complete coverage.",
+                RuleId = "DNS-DNAT-002",
+                ScoreImpact = 2,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "single_ip_sources", result.DnatSingleIpRules.ToList() }
+                }
+            });
+        }
+
+        // Issue: DNAT redirects to wrong translated IP
+        if (result.HasDnatDnsRules && !result.DnatRedirectTargetIsValid && result.InvalidDnatRules.Any())
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsDnatWrongDestination,
+                Severity = AuditSeverity.Critical,
+                DeviceName = result.GatewayName,
+                Message = $"DNAT DNS rules have incorrect translated IP address. {string.Join("; ", result.InvalidDnatRules)}.",
+                RecommendedAction = result.IsSiteWideThirdPartyDns
+                    ? "Update the translated IP address in DNAT rules to your Pi-hole/DNS server IP"
+                    : "Update the translated IP address in DNAT rules to a gateway IP",
+                RuleId = "DNS-DNAT-003",
+                ScoreImpact = 10,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "invalid_rules", result.InvalidDnatRules.ToList() },
+                    { "expected_destinations", result.ExpectedDnatDestinations.ToList() },
+                    { "is_site_wide_third_party_dns", result.IsSiteWideThirdPartyDns }
+                }
+            });
+        }
+
+        // Issue: DNAT has restricted destination filter (only catches some bypass attempts)
+        if (result.HasDnatDnsRules && !result.DnatDestinationFilterIsValid && result.RestrictedDestinationRules.Any())
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsDnatRestrictedDestination,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = $"DNAT DNS rules have restricted destination filters that only catch some bypass attempts. {string.Join("; ", result.RestrictedDestinationRules)}.",
+                RecommendedAction = "Set destination to 'Any' or use 'invert address' to match traffic NOT going to your DNS server.",
+                RuleId = "DNS-DNAT-004",
+                ScoreImpact = 5,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "restricted_rules", result.RestrictedDestinationRules.ToList() }
+                }
+            });
+        }
+
+        // Issue: No DoT (853) blocking or partial coverage
+        if (!result.HasDotBlockRule)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsNoDotBlock,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = "No firewall rule blocks DNS-over-TLS (port 853). Devices can use encrypted DNS that bypasses your DoH configuration.",
+                RecommendedAction = "Create firewall rule: Block outbound TCP port 853 to Internet for all VLANs.",
+                RuleId = "DNS-LEAK-002",
+                ScoreImpact = 6
+            });
+        }
+        else if (!result.DotProvidesFullCoverage && result.DotUncoveredNetworks.Count > 0)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsNoDotBlock,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = $"DNS-over-TLS (port 853) blocking has partial coverage. Uncovered networks: {string.Join(", ", result.DotUncoveredNetworks)}",
+                RecommendedAction = "Extend DoT blocking rule to cover all networks, or create additional rules for uncovered networks.",
+                RuleId = "DNS-LEAK-002",
+                ScoreImpact = 4,
+                CoveringRules = BuildCoveringRules(result.DotRuleCoverage)
+            });
+        }
+
+        // Issue: No DoH bypass blocking
+        if (!result.HasDohBlockRule && result.DohConfigured)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsNoDohBlock,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = "No firewall rule blocks public DoH providers. Devices can bypass your DNS filtering by using their own DoH servers.",
+                RecommendedAction = "Create firewall rule: Block TCP 443 to known DoH provider domains.",
+                RuleId = "DNS-LEAK-003",
+                ScoreImpact = 5,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "suggested_domains", "dns.google, cloudflare-dns.com, dns.quad9.net, doh.opendns.com" }
+                }
+            });
+        }
+
+        // Issue: No DoQ (DNS over QUIC) bypass blocking or partial coverage
+        if (!result.HasDoqBlockRule && result.DohConfigured)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsNoDoqBlock,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = "No firewall rule blocks DNS over QUIC (DoQ). Devices can bypass your DNS filtering using QUIC-based DNS on UDP port 853.",
+                RecommendedAction = "Create firewall rule: Block outbound UDP port 853 to Internet for all VLANs.",
+                RuleId = "DNS-LEAK-004",
+                ScoreImpact = 4
+            });
+        }
+        else if (result.HasDoqBlockRule && !result.DoqProvidesFullCoverage && result.DoqUncoveredNetworks.Count > 0 && result.DohConfigured)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsNoDoqBlock,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = $"DNS over QUIC (DoQ) blocking has partial coverage. Uncovered networks: {string.Join(", ", result.DoqUncoveredNetworks)}",
+                RecommendedAction = "Extend DoQ blocking rule to cover all networks, or create additional rules for uncovered networks.",
+                RuleId = "DNS-LEAK-004",
+                ScoreImpact = 3,
+                CoveringRules = BuildCoveringRules(result.DoqRuleCoverage)
+            });
+        }
+
+        // Issue: Using ISP DNS
+        if (result.UsingIspDns && !result.DohConfigured)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsIsp,
+                Severity = AuditSeverity.Informational,
+                DeviceName = result.GatewayName,
+                Message = "Network is using ISP-provided DNS servers. This may expose browsing history to your ISP and lacks filtering capabilities.",
+                RecommendedAction = "Configure custom DNS servers or enable DoH with a privacy-focused provider.",
+                RuleId = "DNS-ISP-001",
+                ScoreImpact = 4
+            });
+        }
+
+        AddIpv6CoverageIssues(result, networks, zoneLookup);
+
+        // Positive: All protections in place (with full coverage)
+        // When no networks were provided, coverage can't be calculated - treat rule presence as sufficient
+        var dns53HasNetworks = result.Dns53CoveredNetworks.Count > 0 || result.Dns53UncoveredNetworks.Count > 0;
+        var dotHasNetworks = result.DotCoveredNetworks.Count > 0 || result.DotUncoveredNetworks.Count > 0;
+        var doqHasNetworks = result.DoqCoveredNetworks.Count > 0 || result.DoqUncoveredNetworks.Count > 0;
+        var dns53FullCoverage = result.HasDns53BlockRule && (!dns53HasNetworks || result.Dns53ProvidesFullCoverage) &&
+                                result.Ipv6Dns53UncoveredNetworks.Count == 0;
+        var dotFullCoverage = result.HasDotBlockRule && (!dotHasNetworks || result.DotProvidesFullCoverage) &&
+                              result.Ipv6DotUncoveredNetworks.Count == 0;
+        var doqFullCoverage = result.HasDoqBlockRule && (!doqHasNetworks || result.DoqProvidesFullCoverage) &&
+                              result.Ipv6DoqUncoveredNetworks.Count == 0;
+        var dohBlocked = result.HasDohBlockRule && !result.Ipv6DohUnblocked;
+
+        if (result.DohConfigured && dns53FullCoverage && dotFullCoverage && dohBlocked && doqFullCoverage)
+        {
+            var protocols = "DNS53, DoT, DoH, DoQ";
+            if (result.HasDoh3BlockRule)
+                protocols += ", DoH3";
+            result.HardeningNotes.Add($"DNS leak prevention fully configured with DoH and firewall blocking ({protocols})");
+        }
+        else if (result.DohConfigured && dns53FullCoverage && dotFullCoverage && dohBlocked)
+        {
+            result.HardeningNotes.Add("DNS leak prevention configured with DoH and firewall blocking (DNS53, DoT, DoH)");
+        }
+        else if (result.DohConfigured && dns53FullCoverage)
+        {
+            result.HardeningNotes.Add("DoH configured with basic DNS leak prevention (port 53 blocked)");
+        }
+        else if (result.DohConfigured)
+        {
+            result.HardeningNotes.Add($"DoH configured: {string.Join(", ", result.ConfiguredServers.Where(s => s.Enabled).Select(s => s.ServerName))}");
+        }
+    }
+
+    private async Task ValidateWanDnsConfigurationAsync(DnsSecurityResult result)
+    {
+        // Skip validation only if BOTH DoH is off AND no third-party DNS is detected.
+        // Pi-hole/AdGuard users without gateway DoH still need WAN DNS validated against their local DNS IPs.
+        if ((!result.DohConfigured && !result.HasThirdPartyDns) || result.WanDnsServers.Count == 0)
+            return;
+
+        // When third-party DNS (Pi-hole, AdGuard Home) is detected, check if WAN DNS
+        // points to those servers. If so, mark as correct - no need for PTR validation.
+        if (result.HasThirdPartyDns && result.ThirdPartyDnsServers.Any())
+        {
+            var thirdPartyIps = result.ThirdPartyDnsServers
+                .Select(t => t.DnsServerIp)
+                .Distinct()
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            // Check if all WAN DNS servers match third-party DNS IPs
+            // Require at least one WAN DNS server and all must match (not vacuously true)
+            var allWanDnsMatchThirdParty = result.WanDnsServers.Any() &&
+                                           result.WanDnsServers.All(wanDns => thirdPartyIps.Contains(wanDns));
+
+            if (allWanDnsMatchThirdParty)
+            {
+                var providerName = result.ThirdPartyDnsProviderName ?? "Third-Party DNS";
+                result.ExpectedDnsProvider = providerName;
+                result.WanDnsProvider = providerName;
+                result.WanDnsMatchesDoH = true;
+
+                // Mark all WAN interfaces as matching
+                foreach (var wanInterface in result.WanInterfaces)
+                {
+                    if (wanInterface.HasStaticDns)
+                    {
+                        wanInterface.MatchesDoH = true;
+                        wanInterface.DetectedProvider = providerName;
+                    }
+                }
+
+                result.HardeningNotes.Add($"WAN DNS correctly configured for {providerName}");
+                _logger.LogInformation("WAN DNS servers {Servers} match third-party DNS ({Provider})",
+                    string.Join(", ", result.WanDnsServers), providerName);
+                return;
+            }
+        }
+
+        var expectedProvider = await IdentifyExpectedDnsProviderAsync(result);
+        if (expectedProvider == null)
+        {
+            _logger.LogDebug("Could not identify DoH provider for WAN DNS validation");
+            return;
+        }
+
+        result.ExpectedDnsProvider = expectedProvider.Name;
+
+        var validationResults = await ValidateAllWanInterfacesAsync(result, expectedProvider);
+
+        result.WanDnsMatchesDoH = validationResults.CorrectInterfaces.Any() &&
+                                  !validationResults.MismatchedInterfaces.Any() &&
+                                  !validationResults.NoStaticDnsInterfaces.Any();
+
+        if (result.WanDnsMatchesDoH)
+            result.HardeningNotes.Add($"WAN DNS correctly configured for {expectedProvider.Name}");
+
+        AddDnsMismatchIssues(result, expectedProvider, validationResults.MismatchedInterfaces);
+        AddDnsOrderIssues(result);
+        AddNoStaticDnsIssues(result, validationResults.NoStaticDnsInterfaces);
+    }
+
+    /// <summary>
+    /// The IPv6 counterpart of <see cref="ValidateWanDnsConfigurationAsync"/>, for WANs that run IPv6.
+    /// Same rules: static IPv6 DNS must be the third-party LAN resolvers or the DoH provider's servers,
+    /// and with DoH on, a WAN taking its IPv6 DNS from the ISP leaks there if DoH fails.
+    /// </summary>
+    private async Task ValidateWanIpv6DnsAsync(DnsSecurityResult result)
+    {
+        var ipv6Wans = result.WanInterfaces.Where(w => w.HasIpv6 && !w.IsCellular).ToList();
+        if (ipv6Wans.Count == 0 || (!result.DohConfigured && !result.HasThirdPartyDns))
+            return;
+
+        var thirdPartyIpv6 = result.Ipv6ThirdPartyDnsServers.Select(t => t.DnsServerIp).ToList();
+        var expectedProvider = result.DohConfigured ? await IdentifyExpectedDnsProviderAsync(result) : null;
+        result.Ipv6ExpectedDnsProvider = expectedProvider?.Name;
+
+        foreach (var wan in ipv6Wans)
+        {
+            if (wan.Ipv6DnsServers.Count == 0)
+            {
+                if (result.DohConfigured)
+                    result.Ipv6WanNoStaticDns.Add(wan.InterfaceName);
+                continue;
+            }
+
+            if (thirdPartyIpv6.Count > 0 &&
+                wan.Ipv6DnsServers.All(s => thirdPartyIpv6.Any(t => NetworkUtilities.IpAddressesAreEqual(t, s))))
+                continue;
+
+            if (expectedProvider == null)
+                continue;
+
+            var mismatched = new List<string>();
+            var ptrResults = new List<string?>();
+            foreach (var server in wan.Ipv6DnsServers)
+            {
+                var (provider, reverseDns) = await DohProviderRegistry.IdentifyProviderFromIpWithPtrAsync(server);
+                ptrResults.Add(reverseDns);
+                if (provider?.Name != expectedProvider.Name)
+                    mismatched.Add($"{server} ({provider?.Name ?? (string.IsNullOrEmpty(reverseDns) ? "Unknown" : reverseDns)})");
+            }
+
+            if (mismatched.Count > 0)
+            {
+                result.Ipv6WanDnsMismatches.Add(new Ipv6WanDnsMismatch(wan.InterfaceName, wan.PortName, mismatched, expectedProvider));
+            }
+            else if (expectedProvider.Name == "NextDNS" && ptrResults.Count >= 2)
+            {
+                var roles = wan.Ipv6DnsServers.Select((s, i) => NextDnsIpv6Role(s, ptrResults[i])).ToList();
+                if (roles[0]?.StartsWith("dns2") == true && roles[1]?.StartsWith("dns1") == true)
+                    result.Ipv6WanDnsWrongOrder.Add((wan, roles));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Which NextDNS server ("dns1." / "dns2.") an IPv6 address is: from its PTR name, else from the
+    /// anycast prefix. NextDNS publishes no PTR for its dns1 IPv6 range (2a07:a8c0::/32, while
+    /// 2a07:a8c1:: answers dns2.nextdns.io), so over IPv6 the prefix is the only reliable signal.
+    /// </summary>
+    internal static string? NextDnsIpv6Role(string server, string? reverseDns)
+    {
+        if (reverseDns?.Contains("dns1.", StringComparison.OrdinalIgnoreCase) == true) return "dns1.";
+        if (reverseDns?.Contains("dns2.", StringComparison.OrdinalIgnoreCase) == true) return "dns2.";
+        if (server.StartsWith("2a07:a8c0:", StringComparison.OrdinalIgnoreCase)) return "dns1.";
+        if (server.StartsWith("2a07:a8c1:", StringComparison.OrdinalIgnoreCase)) return "dns2.";
+        return null;
+    }
+
+    private async Task<DohProviderInfo?> IdentifyExpectedDnsProviderAsync(DnsSecurityResult result)
+    {
+        var primaryServer = result.ConfiguredServers.FirstOrDefault(s => s.Enabled);
+        if (primaryServer == null)
+            return null;
+
+        // Try multiple sources to identify the provider
+        var provider = primaryServer.StampInfo?.ProviderInfo ?? primaryServer.Provider;
+
+        if (provider == null)
+            provider = DohProviderRegistry.IdentifyProviderFromName(primaryServer.ServerName);
+
+        if (provider == null && primaryServer.StampInfo?.Hostname != null)
+            provider = DohProviderRegistry.IdentifyProvider(primaryServer.StampInfo.Hostname);
+
+        if (provider == null && result.WanDnsServers.Any())
+        {
+            // Last resort: identify from WAN DNS IPs
+            foreach (var wanDns in result.WanDnsServers)
+            {
+                var (wanProvider, _) = await DohProviderRegistry.IdentifyProviderFromIpWithPtrAsync(wanDns);
+                if (wanProvider != null)
+                {
+                    _logger.LogInformation("Identified DoH provider from WAN DNS IP {Ip}: {Provider}", wanDns, wanProvider.Name);
+                    return wanProvider;
+                }
+            }
+        }
+
+        return provider;
+    }
+
+    private record WanValidationResults(
+        List<string> CorrectInterfaces,
+        List<(string Interface, string? PortName, List<string> Servers)> MismatchedInterfaces,
+        List<string> NoStaticDnsInterfaces);
+
+    private async Task<WanValidationResults> ValidateAllWanInterfacesAsync(DnsSecurityResult result, DohProviderInfo expectedProvider)
+    {
+        var correctInterfaces = new List<string>();
+        var mismatchedInterfaces = new List<(string Interface, string? PortName, List<string> Servers)>();
+        var noStaticDnsInterfaces = new List<string>();
+
+        foreach (var wanInterface in result.WanInterfaces)
+        {
+            if (!wanInterface.HasStaticDns)
+            {
+                noStaticDnsInterfaces.Add(wanInterface.InterfaceName);
+                continue;
+            }
+
+            var mismatchedServers = await ValidateSingleWanInterfaceAsync(result, wanInterface, expectedProvider);
+
+            if (wanInterface.MatchesDoH)
+                correctInterfaces.Add(wanInterface.InterfaceName);
+            else if (mismatchedServers.Any())
+                mismatchedInterfaces.Add((wanInterface.InterfaceName, wanInterface.PortName, mismatchedServers));
+        }
+
+        return new WanValidationResults(correctInterfaces, mismatchedInterfaces, noStaticDnsInterfaces);
+    }
+
+    private async Task<List<string>> ValidateSingleWanInterfaceAsync(
+        DnsSecurityResult result,
+        WanInterfaceDns wanDns,
+        DohProviderInfo expectedProvider)
+    {
+        var matchingServers = new List<string>();
+        var mismatchedServers = new List<string>();
+        var ptrResults = new List<string?>();
+
+        foreach (var dnsServer in wanDns.DnsServers)
+        {
+            var (wanProvider, reverseDns) = await DohProviderRegistry.IdentifyProviderFromIpWithPtrAsync(dnsServer);
+            ptrResults.Add(reverseDns);
+            wanDns.DetectedProvider = wanProvider?.Name;
+
+            if (wanProvider != null)
+            {
+                result.WanDnsProvider = wanProvider.Name;
+                if (wanProvider.Name == expectedProvider.Name)
+                {
+                    matchingServers.Add(dnsServer);
+                    if (!string.IsNullOrEmpty(reverseDns))
+                        _logger.LogDebug("WAN DNS {Ip} verified as {Provider} via PTR: {ReverseDns}", dnsServer, wanProvider.Name, reverseDns);
+                }
+                else
+                {
+                    mismatchedServers.Add($"{dnsServer} ({wanProvider.Name})");
+                }
+            }
+            else
+            {
+                var unknownLabel = !string.IsNullOrEmpty(reverseDns) ? reverseDns : "Unknown";
+                mismatchedServers.Add($"{dnsServer} ({unknownLabel})");
+            }
+        }
+
+        wanDns.ReverseDnsResults = ptrResults;
+        wanDns.MatchesDoH = matchingServers.Count > 0 && mismatchedServers.Count == 0;
+
+        // For NextDNS, verify correct ordering (dns1 before dns2)
+        if (wanDns.MatchesDoH && expectedProvider.Name == "NextDNS" && ptrResults.Count >= 2)
+            CheckNextDnsOrdering(wanDns, ptrResults);
+
+        return mismatchedServers;
+    }
+
+    private void CheckNextDnsOrdering(WanInterfaceDns wanDns, List<string?> ptrResults)
+    {
+        var first = ptrResults[0]?.ToLowerInvariant() ?? "";
+        var second = ptrResults[1]?.ToLowerInvariant() ?? "";
+
+        if (first.Contains("dns2.") && second.Contains("dns1."))
+        {
+            wanDns.OrderCorrect = false;
+            _logger.LogWarning("NextDNS WAN DNS servers are in reverse order: {First}, {Second}", ptrResults[0], ptrResults[1]);
+        }
+        else if (first.Contains("dns1.") && second.Contains("dns2."))
+        {
+            _logger.LogDebug("NextDNS WAN DNS servers are correctly ordered: {First}, {Second}", ptrResults[0], ptrResults[1]);
+        }
+    }
+
+    private void AddDnsMismatchIssues(
+        DnsSecurityResult result,
+        DohProviderInfo expectedProvider,
+        List<(string Interface, string? PortName, List<string> Servers)> mismatchedInterfaces)
+    {
+        foreach (var (interfaceName, portName, mismatchedServers) in mismatchedInterfaces)
+        {
+            var displayName = NetworkFormatHelpers.FormatWanInterfaceName(interfaceName, portName);
+            var expectedIps = expectedProvider.DnsIps.Where(ip => !ip.EndsWith('.')).Take(2).ToList();
+            var expectedIpsStr = expectedIps.Any() ? string.Join(", ", expectedIps) : "";
+            var recommendation = expectedIps.Any()
+                ? $"Set DNS to {expectedProvider.Name} servers: {expectedIpsStr}"
+                : $"Set DNS to {expectedProvider.Name} servers";
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsWanMismatch,
+                Severity = AuditSeverity.Recommended,
+                Message = $"{displayName} uses {string.Join(", ", mismatchedServers)} instead of {expectedProvider.Name}",
+                RecommendedAction = recommendation,
+                DeviceName = result.GatewayName,
+                Port = NetworkFormatHelpers.FormatWanInterfaceName(interfaceName, null),
+                PortName = portName,
+                RuleId = "DNS-WAN-001",
+                ScoreImpact = 4,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "interface", interfaceName },
+                    { "port_name", portName ?? "" },
+                    { "expected_provider", expectedProvider.Name },
+                    { "expected_ips", expectedProvider.DnsIps },
+                    { "actual_servers", mismatchedServers }
+                }
+            });
+        }
+    }
+
+    private void AddDnsOrderIssues(DnsSecurityResult result)
+    {
+        foreach (var wanInterface in result.WanInterfaces.Where(w => w.MatchesDoH && !w.OrderCorrect))
+        {
+            var displayName = NetworkFormatHelpers.FormatWanInterfaceName(wanInterface.InterfaceName, wanInterface.PortName);
+            var ips = string.Join(", ", wanInterface.DnsServers);
+            var correctOrder = GetCorrectDnsOrder(wanInterface.DnsServers, wanInterface.ReverseDnsResults);
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsWanOrder,
+                Severity = AuditSeverity.Recommended,
+                Message = $"{displayName} DNS in wrong order: {ips}. Should be {correctOrder}",
+                RecommendedAction = $"Swap DNS order to {correctOrder}",
+                DeviceName = result.GatewayName,
+                Port = NetworkFormatHelpers.FormatWanInterfaceName(wanInterface.InterfaceName, null),
+                PortName = wanInterface.PortName,
+                RuleId = "DNS-WAN-002",
+                ScoreImpact = 2,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "interface", wanInterface.InterfaceName },
+                    { "port_name", wanInterface.PortName ?? "" },
+                    { "dns_servers", wanInterface.DnsServers }
+                }
+            });
+        }
+    }
+
+    private void AddNoStaticDnsIssues(DnsSecurityResult result, List<string> interfacesWithNoDns)
+    {
+        if (!result.DohConfigured || !interfacesWithNoDns.Any())
+            return;
+
+        var providerName = result.ExpectedDnsProvider ?? "your DoH provider";
+        var expectedIps = result.ConfiguredServers
+            .Where(s => s.Enabled)
+            .SelectMany(s => (s.StampInfo?.ProviderInfo?.DnsIps ?? s.Provider?.DnsIps)?.ToList() ?? new List<string>())
+            .Take(2)
+            .ToList();
+
+        foreach (var interfaceName in interfacesWithNoDns)
+        {
+            var wanInterface = result.WanInterfaces.FirstOrDefault(w => w.InterfaceName == interfaceName);
+            var displayName = NetworkFormatHelpers.FormatWanInterfaceName(interfaceName, wanInterface?.PortName);
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsWanNoStatic,
+                Severity = AuditSeverity.Recommended,
+                Message = $"WAN interface '{displayName}' has no static DNS configured. If DoH fails, DNS queries will leak to your ISP's DNS servers.",
+                RecommendedAction = $"Configure static DNS on {displayName} to use {providerName} servers",
+                DeviceName = result.GatewayName,
+                Port = NetworkFormatHelpers.FormatWanInterfaceName(interfaceName, null),
+                PortName = wanInterface?.PortName,
+                RuleId = "DNS-WAN-002",
+                ScoreImpact = 3,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "interface", interfaceName },
+                    { "port_name", wanInterface?.PortName ?? "" },
+                    { "ip_address", wanInterface?.IpAddress ?? "" }
+                }
+            });
+
+            _logger.LogInformation("WAN interface '{Interface}' has no static DNS - using ISP DNS", displayName);
+        }
+    }
+
+    /// <summary>
+    /// Build a set of globally valid DNS targets (valid regardless of which subnet the device is on).
+    /// Includes the native/VLAN 1 gateway and any admin-configured DHCP DNS servers (Pi-hole, etc.).
+    /// Per-device subnet gateway checks are handled separately via <see cref="FindDeviceSubnetGateway"/>.
+    /// </summary>
+    private static HashSet<string> BuildGlobalValidDnsTargets(List<NetworkInfo> networks)
+    {
+        var targets = new HashSet<string>();
+
+        // Native/VLAN 1 gateway is always valid (main gateway IP)
+        var nativeNetwork = networks.FirstOrDefault(n => n.IsNative);
+        if (!string.IsNullOrEmpty(nativeNetwork?.Gateway))
+            targets.Add(nativeNetwork.Gateway);
+
+        // Admin-configured DHCP DNS servers (Pi-hole, AdGuard Home, etc.)
+        foreach (var network in networks)
+        {
+            if (network.DnsServers != null)
+            {
+                foreach (var dns in network.DnsServers)
+                {
+                    if (!string.IsNullOrEmpty(dns))
+                        targets.Add(dns);
+                }
+            }
+        }
+
+        return targets;
+    }
+
+    /// <summary>
+    /// Find the gateway IP of the subnet a device belongs to by matching its IP against network subnets.
+    /// </summary>
+    private static string? FindDeviceSubnetGateway(string? deviceIp, List<NetworkInfo> networks)
+    {
+        if (string.IsNullOrEmpty(deviceIp))
+            return null;
+
+        foreach (var network in networks)
+        {
+            if (!string.IsNullOrEmpty(network.Subnet) && !string.IsNullOrEmpty(network.Gateway)
+                && NetworkUtilities.IsIpInSubnet(deviceIp, network.Subnet))
+            {
+                return network.Gateway;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Check if a device's DNS is valid: its own subnet's gateway, the native gateway, or admin-configured DNS.
+    /// </summary>
+    private static bool IsValidDeviceDns(string dns, string? deviceIp, HashSet<string> globalTargets, List<NetworkInfo> networks)
+    {
+        // Check global targets (native gateway + third-party DNS)
+        if (globalTargets.Contains(dns))
+            return true;
+
+        // Check device's own subnet gateway
+        var subnetGateway = FindDeviceSubnetGateway(deviceIp, networks);
+        return subnetGateway != null && dns == subnetGateway;
+    }
+
+    /// <summary>
+    /// Get the primary gateway IP for display purposes (management network preferred).
+    /// </summary>
+    private static string? GetPrimaryGatewayIp(List<NetworkInfo> networks)
+    {
+        var managementNetwork = networks.FirstOrDefault(n => n.Purpose == NetworkPurpose.Management)
+            ?? networks.FirstOrDefault(n => n.IsNative);
+
+        return managementNetwork?.Gateway
+            ?? networks.FirstOrDefault(n => !string.IsNullOrEmpty(n.Gateway))?.Gateway;
+    }
+
+    private void AnalyzeDeviceDnsConfiguration(List<SwitchInfo> switches, List<NetworkInfo> networks, DnsSecurityResult result)
+    {
+        // Find the gateway device from switches list
+        var gateway = switches.FirstOrDefault(s => s.IsGateway);
+        if (gateway == null)
+        {
+            _logger.LogDebug("No gateway found for device DNS validation");
+            return;
+        }
+
+        // Build globally valid DNS targets (native gateway + admin-configured DNS like Pi-hole)
+        // Per-device subnet gateway is checked separately
+        var globalTargets = BuildGlobalValidDnsTargets(networks);
+        var primaryGatewayIp = GetPrimaryGatewayIp(networks);
+
+        if (string.IsNullOrEmpty(primaryGatewayIp) && globalTargets.Count == 0)
+        {
+            _logger.LogDebug("Could not determine any valid DNS targets for device DNS validation");
+            return;
+        }
+
+        _logger.LogDebug("Device DNS validation: global targets: {Targets}", string.Join(", ", globalTargets));
+
+        // Get all non-gateway devices from switches list
+        // Note: This list includes switches but may not include APs (which don't have port_table)
+        // For comprehensive DNS checking, we also need to analyze raw device data
+        var allDevices = switches.Where(s => !s.IsGateway).ToList();
+
+        _logger.LogDebug("Device DNS validation: {DeviceCount} non-gateway switches/routers found", allDevices.Count);
+
+        // Separate devices by network config type
+        var devicesWithStaticDns = allDevices.Where(s => !string.IsNullOrEmpty(s.ConfiguredDns1)).ToList();
+        var devicesWithDhcp = allDevices.Where(s =>
+            string.IsNullOrEmpty(s.ConfiguredDns1) &&
+            (s.NetworkConfigType == "dhcp" || string.IsNullOrEmpty(s.NetworkConfigType))).ToList();
+
+        _logger.LogDebug("Device DNS: {StaticCount} with static DNS, {DhcpCount} with DHCP",
+            devicesWithStaticDns.Count, devicesWithDhcp.Count);
+
+        result.TotalDevicesChecked = devicesWithStaticDns.Count;
+        result.DhcpDeviceCount = devicesWithDhcp.Count;
+
+        // Check devices with static DNS configuration
+        foreach (var device in devicesWithStaticDns)
+        {
+            var pointsToGateway = IsValidDeviceDns(device.ConfiguredDns1!, device.IpAddress, globalTargets, networks);
+
+            result.DeviceDnsDetails.Add(new DeviceDnsInfo
+            {
+                DeviceName = device.Name,
+                DeviceType = device.Type ?? "unknown",
+                DeviceIp = device.IpAddress,
+                ConfiguredDns = device.ConfiguredDns1,
+                ExpectedGateway = primaryGatewayIp ?? globalTargets.FirstOrDefault() ?? "unknown",
+                PointsToGateway = pointsToGateway,
+                UsesDhcp = false
+            });
+
+            if (pointsToGateway)
+            {
+                result.DevicesWithCorrectDns++;
+            }
+        }
+
+        // Track DHCP devices (assumed to get DNS from gateway's DHCP server)
+        foreach (var device in devicesWithDhcp)
+        {
+            result.DeviceDnsDetails.Add(new DeviceDnsInfo
+            {
+                DeviceName = device.Name,
+                DeviceType = device.Type ?? "unknown",
+                DeviceIp = device.IpAddress,
+                ConfiguredDns = null,
+                ExpectedGateway = primaryGatewayIp ?? globalTargets.FirstOrDefault() ?? "unknown",
+                PointsToGateway = true, // Assumed correct if using DHCP
+                UsesDhcp = true
+            });
+        }
+
+        result.DeviceDnsPointsToGateway = result.DevicesWithCorrectDns == result.TotalDevicesChecked;
+
+        // Generate summary notes and issues
+        if (result.TotalDevicesChecked > 0 || result.DhcpDeviceCount > 0)
+        {
+            var summaryParts = new List<string>();
+
+            if (result.TotalDevicesChecked > 0 && !result.DeviceDnsPointsToGateway)
+            {
+                var misconfigured = result.TotalDevicesChecked - result.DevicesWithCorrectDns;
+                var deviceNames = result.DeviceDnsDetails
+                    .Where(d => !d.PointsToGateway && !d.UsesDhcp)
+                    .Select(d => d.DeviceName)
+                    .ToList();
+
+                var displayGateway = primaryGatewayIp ?? globalTargets.FirstOrDefault() ?? "gateway";
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsDeviceMisconfigured,
+                    Severity = AuditSeverity.Informational,
+                    Message = $"{misconfigured} of {result.TotalDevicesChecked} infrastructure devices have DNS pointing to an unexpected address",
+                    RecommendedAction = $"Configure device DNS to point to a valid DNS target ({displayGateway})",
+                    RuleId = "DNS-DEVICE-001",
+                    ScoreImpact = 3,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "misconfigured_devices", deviceNames },
+                        { "expected_gateway", displayGateway }
+                    }
+                });
+            }
+        }
+    }
+
+    /// <summary>
+    /// Analyze DNS configuration for ALL devices (switches and APs) from raw device data.
+    /// This includes APs which are not in the switches list.
+    /// </summary>
+    private void AnalyzeAllDeviceDnsConfiguration(JsonElement deviceData, List<NetworkInfo> networks, DnsSecurityResult result)
+    {
+        // Build globally valid DNS targets (native gateway + admin-configured DNS like Pi-hole)
+        // Per-device subnet gateway is checked separately
+        var globalTargets = BuildGlobalValidDnsTargets(networks);
+        var primaryGatewayIp = GetPrimaryGatewayIp(networks);
+
+        if (string.IsNullOrEmpty(primaryGatewayIp) && globalTargets.Count == 0)
+        {
+            _logger.LogDebug("Could not determine any valid DNS targets for device DNS validation");
+            return;
+        }
+
+        _logger.LogDebug("Device DNS validation: global targets: {Targets}", string.Join(", ", globalTargets));
+
+        // Process ALL devices from raw device data
+        foreach (var device in deviceData.UnwrapDataArray())
+        {
+            var deviceType = device.GetStringOrNull("type");
+            var name = device.GetStringFromAny("name", "mac") ?? "Unknown";
+            var ip = device.GetStringOrNull("ip");
+
+            // Skip gateways - they're not expected to point to themselves
+            if (FromUniFiApiType(deviceType).IsGateway())
+                continue;
+
+            // Get DNS configuration from config_network
+            string? dns1 = null;
+            string? networkConfigType = null;
+            if (device.TryGetProperty("config_network", out var configNetwork))
+            {
+                dns1 = configNetwork.GetStringOrNull("dns1");
+                networkConfigType = configNetwork.GetStringOrNull("type"); // "dhcp" or "static"
+            }
+
+            if (!string.IsNullOrEmpty(dns1))
+            {
+                // Device has static DNS configured
+                var pointsToGateway = IsValidDeviceDns(dns1, ip, globalTargets, networks);
+                result.TotalDevicesChecked++;
+
+                result.DeviceDnsDetails.Add(new DeviceDnsInfo
+                {
+                    DeviceName = name,
+                    DeviceType = deviceType ?? "unknown",
+                    DeviceIp = ip,
+                    ConfiguredDns = dns1,
+                    ExpectedGateway = primaryGatewayIp ?? globalTargets.FirstOrDefault() ?? "unknown",
+                    PointsToGateway = pointsToGateway,
+                    UsesDhcp = false
+                });
+
+                if (pointsToGateway)
+                {
+                    result.DevicesWithCorrectDns++;
+                }
+            }
+            else if (networkConfigType == "dhcp" || string.IsNullOrEmpty(networkConfigType))
+            {
+                // Device uses DHCP - DNS comes from DHCP server (gateway)
+                result.DhcpDeviceCount++;
+
+                result.DeviceDnsDetails.Add(new DeviceDnsInfo
+                {
+                    DeviceName = name,
+                    DeviceType = deviceType ?? "unknown",
+                    DeviceIp = ip,
+                    ConfiguredDns = null,
+                    ExpectedGateway = primaryGatewayIp ?? globalTargets.FirstOrDefault() ?? "unknown",
+                    PointsToGateway = true, // Assumed correct via DHCP
+                    UsesDhcp = true
+                });
+            }
+        }
+
+        _logger.LogDebug("Device DNS check: {StaticCount} static, {DhcpCount} DHCP, {CorrectCount} correct",
+            result.TotalDevicesChecked, result.DhcpDeviceCount, result.DevicesWithCorrectDns);
+
+        result.DeviceDnsPointsToGateway = result.DevicesWithCorrectDns == result.TotalDevicesChecked;
+
+        // Generate summary notes and issues
+        if (result.TotalDevicesChecked > 0 || result.DhcpDeviceCount > 0)
+        {
+            var summaryParts = new List<string>();
+
+            if (result.TotalDevicesChecked > 0 && !result.DeviceDnsPointsToGateway)
+            {
+                var misconfigured = result.TotalDevicesChecked - result.DevicesWithCorrectDns;
+                var deviceNames = result.DeviceDnsDetails
+                    .Where(d => !d.PointsToGateway && !d.UsesDhcp)
+                    .Select(d => d.DeviceName)
+                    .ToList();
+
+                var displayGateway = primaryGatewayIp ?? globalTargets.FirstOrDefault() ?? "gateway";
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsDeviceMisconfigured,
+                    Severity = AuditSeverity.Informational,
+                    Message = $"{misconfigured} of {result.TotalDevicesChecked} infrastructure devices have DNS pointing to an unexpected address",
+                    RecommendedAction = $"Configure device DNS to point to a valid DNS target ({displayGateway})",
+                    RuleId = "DNS-DEVICE-001",
+                    ScoreImpact = 3,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        { "misconfigured_devices", deviceNames },
+                        { "expected_gateway", displayGateway }
+                    }
+                });
+            }
+        }
+    }
+
+    /// <summary>
+    /// Detect third-party LAN DNS servers (like Pi-hole, AdGuard Home) across networks
+    /// </summary>
+    private async Task AnalyzeThirdPartyDnsAsync(List<NetworkInfo> networks, DnsSecurityResult result, int? customPort = null, Services.FirewallZoneLookup? zoneLookup = null, string? customDnsManagementUrl = null)
+    {
+        var thirdPartyResults = await _thirdPartyDetector.DetectThirdPartyDnsAsync(networks, customPort, customDnsManagementUrl);
+
+        if (thirdPartyResults.Any())
+        {
+            result.HasThirdPartyDns = true;
+            result.ThirdPartyDnsServers.AddRange(thirdPartyResults);
+
+            // Determine provider name (Pi-hole takes precedence, then AdGuard Home, then Technitium DNS, then NextDNS CLI)
+            if (thirdPartyResults.Any(t => t.IsPihole))
+            {
+                result.ThirdPartyDnsProviderName = "Pi-hole";
+                _logger.LogInformation("Pi-hole detected as third-party DNS on {Count} network(s)",
+                    thirdPartyResults.Count(t => t.IsPihole));
+            }
+            else if (thirdPartyResults.Any(t => t.IsAdGuardHome))
+            {
+                result.ThirdPartyDnsProviderName = "AdGuard Home";
+                _logger.LogInformation("AdGuard Home detected as third-party DNS on {Count} network(s)",
+                    thirdPartyResults.Count(t => t.IsAdGuardHome));
+            }
+            else if (thirdPartyResults.Any(t => t.IsTechnitiumDns))
+            {
+                result.ThirdPartyDnsProviderName = "Technitium DNS";
+                _logger.LogInformation("Technitium DNS detected as third-party DNS on {Count} network(s)",
+                    thirdPartyResults.Count(t => t.IsTechnitiumDns));
+            }
+            else if (thirdPartyResults.Any(t => t.IsNextDns))
+            {
+                result.ThirdPartyDnsProviderName = "NextDNS CLI";
+                _logger.LogInformation("NextDNS CLI detected as third-party DNS on {Count} network(s)",
+                    thirdPartyResults.Count(t => t.IsNextDns));
+            }
+            else if (thirdPartyResults.Any(t => t.IsControlD))
+            {
+                result.ThirdPartyDnsProviderName = "ControlD";
+                _logger.LogInformation("ControlD detected as third-party DNS on {Count} network(s)",
+                    thirdPartyResults.Count(t => t.IsControlD));
+            }
+            else
+            {
+                result.ThirdPartyDnsProviderName = "Third-Party LAN DNS";
+                _logger.LogInformation("Third-party LAN DNS detected on {Count} network(s)",
+                    thirdPartyResults.Count);
+            }
+
+            // Determine if this is a site-wide DNS solution or just specialized corporate DNS
+            // Site-wide = configured on at least one non-Corporate network
+            var networkNamesWithThirdPartyDns = thirdPartyResults
+                .Select(r => r.NetworkName)
+                .Distinct()
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var nonCorporateNetworksWithThirdPartyDns = networks
+                .Where(n => networkNamesWithThirdPartyDns.Contains(n.Name))
+                .Where(n => n.Purpose != NetworkPurpose.Corporate)
+                .ToList();
+
+            result.IsSiteWideThirdPartyDns = nonCorporateNetworksWithThirdPartyDns.Count > 0;
+
+            if (result.IsSiteWideThirdPartyDns)
+            {
+                // Populate the site-wide DNS IPs
+                var siteWideDnsIps = thirdPartyResults
+                    .Select(r => r.DnsServerIp)
+                    .Distinct()
+                    .ToList();
+                result.SiteWideDnsServerIps.AddRange(siteWideDnsIps);
+
+                _logger.LogInformation("Third-party DNS is site-wide (configured on non-Corporate networks): {Ips}",
+                    string.Join(", ", siteWideDnsIps));
+
+                // Check for DNS consistency across all DHCP-enabled networks
+                CheckDnsConsistencyAcrossNetworks(networks, thirdPartyResults, result, zoneLookup);
+            }
+            else
+            {
+                _logger.LogInformation("Third-party DNS only on Corporate networks - treating as specialized internal DNS, not site-wide");
+            }
+        }
+
+        // IPv6: LAN resolvers handed out over DHCPv6/RDNSS, and networks that hand out a third-party
+        // resolver over IPv4 but the gateway over IPv6 - dual-stack clients prefer IPv6, so they bypass it.
+        // Kept in their own fields so the IPv4 findings above are unaffected.
+        if (networks.Any(n => n.HasIpv6))
+        {
+            result.Ipv6ThirdPartyDnsServers.AddRange(
+                await _thirdPartyDetector.DetectThirdPartyIpv6DnsAsync(networks, customPort, customDnsManagementUrl));
+
+            var ipv4ThirdPartyNetworks = thirdPartyResults.Select(r => r.NetworkName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            result.Ipv6ThirdPartyBypassNetworks.AddRange(networks
+                .Where(n => n.Enabled && ipv4ThirdPartyNetworks.Contains(n.Name) && ThirdPartyDnsDetector.HandsOutGatewayOverIpv6(n))
+                .Select(n => n.Name));
+        }
+
+        // Probe for user-installed DNS tunnels on the gateway (NextDNS CLI, ControlD ctrld).
+        // These are manually installed via SSH, distinct from UniFi's built-in CyberSecure
+        // DoH. Only probe when DoH is not configured, since these services handle encryption
+        // themselves and their presence prevents false "DoH not configured" warnings.
+        if (!result.DohConfigured)
+        {
+            var gatewayResults = await _thirdPartyDetector.ProbeGatewayDnsAsync(networks);
+            if (gatewayResults.Any())
+            {
+                result.HasThirdPartyDns = true;
+                result.ThirdPartyDnsServers.AddRange(gatewayResults);
+
+                if (result.ThirdPartyDnsProviderName == null)
+                {
+                    if (gatewayResults.Any(t => t.IsNextDns))
+                    {
+                        result.ThirdPartyDnsProviderName = "NextDNS CLI";
+                        _logger.LogInformation("NextDNS CLI detected on gateway across {Count} network(s)",
+                            gatewayResults.Count(t => t.IsNextDns));
+                    }
+                    else if (gatewayResults.Any(t => t.IsControlD))
+                    {
+                        result.ThirdPartyDnsProviderName = "ControlD";
+                        _logger.LogInformation("ControlD detected on gateway across {Count} network(s)",
+                            gatewayResults.Count(t => t.IsControlD));
+                    }
+                }
+
+                if (!result.IsSiteWideThirdPartyDns)
+                {
+                    var gatewayNetworkNames = gatewayResults
+                        .Select(r => r.NetworkName)
+                        .Distinct()
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                    var nonCorporateGatewayNetworks = networks
+                        .Where(n => gatewayNetworkNames.Contains(n.Name))
+                        .Where(n => n.Purpose != NetworkPurpose.Corporate)
+                        .ToList();
+
+                    if (nonCorporateGatewayNetworks.Count > 0)
+                    {
+                        result.IsSiteWideThirdPartyDns = true;
+                        var siteWideDnsIps = gatewayResults
+                            .Select(r => r.DnsServerIp)
+                            .Distinct()
+                            .ToList();
+                        result.SiteWideDnsServerIps.AddRange(siteWideDnsIps);
+                    }
+                }
+            }
+        }
+
+        // Detect networks using external public DNS (bypasses all local DNS filtering)
+        var externalDnsResults = _thirdPartyDetector.DetectExternalDns(networks);
+        if (externalDnsResults.Any())
+        {
+            result.HasExternalDns = true;
+            result.ExternalDnsNetworks.AddRange(externalDnsResults);
+            _logger.LogWarning("Found {Count} network(s) using external public DNS (bypasses local filtering): {Networks}",
+                externalDnsResults.Count,
+                string.Join(", ", externalDnsResults.Select(e => $"{e.NetworkName} ({e.DnsServerIp})")));
+        }
+    }
+
+    /// <summary>
+    /// Check if all DHCP-enabled networks use the same third-party DNS server.
+    /// If a third-party DNS (like Pi-hole) is configured on some networks but not all,
+    /// this creates a security gap where DNS filtering can be bypassed.
+    /// Note: This is only called if IsSiteWideThirdPartyDns is true (already determined by caller).
+    /// </summary>
+    private void CheckDnsConsistencyAcrossNetworks(
+        List<NetworkInfo> networks,
+        List<ThirdPartyDnsDetector.ThirdPartyDnsInfo> thirdPartyResults,
+        DnsSecurityResult result,
+        Services.FirewallZoneLookup? zoneLookup = null)
+    {
+        // Get the unique third-party DNS IPs that were detected
+        var thirdPartyDnsIps = thirdPartyResults
+            .Select(r => r.DnsServerIp)
+            .Distinct()
+            .ToHashSet();
+
+        // Get all enabled DHCP networks (disabled networks are dormant config)
+        var dhcpNetworks = networks.Where(n => n.Enabled && n.DhcpEnabled).ToList();
+
+        if (dhcpNetworks.Count == 0)
+        {
+            _logger.LogDebug("No DHCP-enabled networks found, skipping DNS consistency check");
+            return;
+        }
+
+        // Get the networks where third-party DNS was detected
+        var networksWithThirdPartyDns = thirdPartyResults
+            .Select(r => r.NetworkName)
+            .Distinct()
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Get DHCP networks that are NOT using the third-party DNS
+        // Exempt Corporate networks - they may legitimately use internal corporate DNS servers
+        var networksWithoutThirdPartyDns = dhcpNetworks
+            .Where(n => !networksWithThirdPartyDns.Contains(n.Name))
+            .Where(n => n.Purpose != NetworkPurpose.Corporate)
+            .ToList();
+
+        // Separate DMZ networks - they require manual firewall rules for DNS
+        var dmzNetworks = networksWithoutThirdPartyDns
+            .Where(n => zoneLookup?.IsDmzZone(n.FirewallZoneId) == true)
+            .ToList();
+
+        // Separate infrastructure networks (Security/Management) - they use gateway DNS by design
+        var infraNetworks = networksWithoutThirdPartyDns
+            .Where(n => n.Purpose is NetworkPurpose.Security or NetworkPurpose.Management)
+            .Where(n => !dmzNetworks.Contains(n)) // Don't double-count if somehow both
+            .ToList();
+
+        // Separate Guest networks with third-party DNS configured elsewhere
+        // (they also require manual firewall rules since gateway doesn't auto-punch holes for third-party DNS)
+        var guestNetworksWithoutThirdParty = networksWithoutThirdPartyDns
+            .Where(n => n.IsUniFiGuestNetwork || n.Purpose == NetworkPurpose.Guest)
+            .Where(n => !dmzNetworks.Contains(n) && !infraNetworks.Contains(n)) // Don't double-count
+            .ToList();
+
+        // Remove DMZ, infrastructure, and Guest networks from the standard consistency check
+        networksWithoutThirdPartyDns = networksWithoutThirdPartyDns
+            .Except(dmzNetworks)
+            .Except(infraNetworks)
+            .Except(guestNetworksWithoutThirdParty)
+            .ToList();
+
+        // Create Info issues for DMZ networks
+        if (dmzNetworks.Any())
+        {
+            var providerName = result.ThirdPartyDnsProviderName ?? "Third-Party DNS";
+            var dnsServerIps = string.Join(", ", thirdPartyDnsIps);
+            var dmzNetworkNames = dmzNetworks.Select(n => n.Name).ToList();
+
+            _logger.LogInformation(
+                "DMZ network(s) not using {ProviderName}: {Networks}. Firewall rules required for DNS filtering.",
+                providerName, string.Join(", ", dmzNetworkNames));
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsDmzNetworkInfo,
+                Severity = AuditSeverity.Informational,
+                DeviceName = result.GatewayName,
+                Message = $"DMZ network(s) ({string.Join(", ", dmzNetworkNames)}) are not configured to use {providerName}. DMZ networks are isolated from the gateway by design.",
+                RecommendedAction = $"If DNS filtering is desired for DMZ network(s), create firewall rules to allow traffic from the DMZ zone to {providerName} ({dnsServerIps}) on port 53.",
+                RuleId = "DNS-DMZ-INFO-001",
+                ScoreImpact = 0,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "dmz_networks", dmzNetworkNames },
+                    { "third_party_dns_ips", thirdPartyDnsIps.ToList() },
+                    { "provider_name", providerName }
+                }
+            });
+        }
+
+        // Create Info issues for infrastructure networks (Security/Management) using gateway DNS
+        if (infraNetworks.Any())
+        {
+            var providerName = result.ThirdPartyDnsProviderName ?? "Third-Party DNS";
+            var infraNetworkNames = infraNetworks.Select(n => n.Name).ToList();
+
+            _logger.LogInformation(
+                "Infrastructure network(s) not using {ProviderName}: {Networks}. These networks use gateway DNS by design.",
+                providerName, string.Join(", ", infraNetworkNames));
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsInfraNetworkInfo,
+                Severity = AuditSeverity.Informational,
+                DeviceName = result.GatewayName,
+                Message = $"Infrastructure network(s) ({string.Join(", ", infraNetworkNames)}) are not configured to use {providerName}. Security and management networks typically use gateway DNS, which is fine for devices like cameras and network infrastructure.",
+                RecommendedAction = $"No action needed. If DNS filtering via {providerName} is desired, configure it in the DHCP settings for these networks.",
+                RuleId = "DNS-INFRA-INFO-001",
+                ScoreImpact = 0,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "infra_networks", infraNetworkNames },
+                    { "network_type", "infrastructure" },
+                    { "provider_name", providerName }
+                }
+            });
+        }
+
+        // Create Info issues for Guest networks with third-party DNS configured elsewhere
+        if (guestNetworksWithoutThirdParty.Any())
+        {
+            var providerName = result.ThirdPartyDnsProviderName ?? "Third-Party DNS";
+            var dnsServerIps = string.Join(", ", thirdPartyDnsIps);
+            var guestNetworkNames = guestNetworksWithoutThirdParty.Select(n => n.Name).ToList();
+
+            _logger.LogInformation(
+                "Guest network(s) not using {ProviderName}: {Networks}. Firewall rules required for DNS filtering with third-party DNS.",
+                providerName, string.Join(", ", guestNetworkNames));
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsGuestThirdPartyInfo,
+                Severity = AuditSeverity.Informational,
+                DeviceName = result.GatewayName,
+                Message = $"Guest network(s) ({string.Join(", ", guestNetworkNames)}) are not configured to use {providerName}. The gateway automatically allows DNS to itself (for DoH/CyberSecure), but third-party LAN DNS servers require explicit firewall rules.",
+                RecommendedAction = $"If DNS filtering via {providerName} is desired for guest network(s), create firewall rules to allow traffic from the Hotspot zone to {providerName} ({dnsServerIps}) on port 53.",
+                RuleId = "DNS-GUEST-THIRDPARTY-INFO-001",
+                ScoreImpact = 0,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "guest_networks", guestNetworkNames },
+                    { "third_party_dns_ips", thirdPartyDnsIps.ToList() },
+                    { "provider_name", providerName }
+                }
+            });
+        }
+
+        if (networksWithoutThirdPartyDns.Any())
+        {
+            var providerName = result.ThirdPartyDnsProviderName ?? "Third-Party DNS";
+            var missingNetworkNames = networksWithoutThirdPartyDns.Select(n => n.Name).ToList();
+            var configuredNetworkNames = networksWithThirdPartyDns.ToList();
+            var dnsServerIps = string.Join(", ", thirdPartyDnsIps);
+
+            _logger.LogWarning(
+                "DNS consistency issue: {ProviderName} ({DnsIps}) configured on {ConfiguredCount} networks but missing on {MissingCount} DHCP-enabled networks: {MissingNetworks}",
+                providerName, dnsServerIps, configuredNetworkNames.Count, missingNetworkNames.Count, string.Join(", ", missingNetworkNames));
+
+            // Adjust message based on whether DoH is configured
+            var message = result.DohConfigured
+                ? $"{providerName} is configured on {configuredNetworkNames.Count} network(s) but {missingNetworkNames.Count} DHCP-enabled network(s) are using CyberSecure DoH instead: {string.Join(", ", missingNetworkNames)}."
+                : $"{providerName} is configured on {configuredNetworkNames.Count} network(s) but {missingNetworkNames.Count} DHCP-enabled network(s) are not using it: {string.Join(", ", missingNetworkNames)}. Devices on these networks can bypass DNS filtering.";
+
+            var recommendation = result.DohConfigured
+                ? $"Configure all DHCP-enabled networks to use {providerName} ({dnsServerIps}) for consistent filtering, or keep CyberSecure DoH for those networks"
+                : $"Configure all DHCP-enabled networks to use {providerName} ({dnsServerIps}) for consistent DNS filtering, or verify this is intentional";
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsInconsistentConfig,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = message,
+                RecommendedAction = recommendation,
+                RuleId = "DNS-CONSISTENCY-001",
+                ScoreImpact = 5,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "third_party_dns_ips", thirdPartyDnsIps.ToList() },
+                    { "configured_networks", configuredNetworkNames },
+                    { "missing_networks", missingNetworkNames },
+                    { "provider_name", providerName },
+                    { "doh_configured", result.DohConfigured }
+                }
+            });
+        }
+        else
+        {
+            _logger.LogInformation(
+                "DNS consistency check passed: All {Count} DHCP-enabled networks use {ProviderName}",
+                dhcpNetworks.Count, result.ThirdPartyDnsProviderName);
+        }
+
+        // Check for networks using a different DNS IP than the majority
+        // e.g., most networks use 192.168.53.220 (Pi-hole) but one uses 192.168.1.220
+        CheckDnsIpConsistency(thirdPartyResults, networks, result);
+    }
+
+    /// <summary>
+    /// Check if all networks using third-party DNS point to the same IP.
+    /// If most use one IP but some use a different one, flag the outliers.
+    /// Excludes gateway IPs since networks often have both Pi-hole + gateway as DNS.
+    /// </summary>
+    private void CheckDnsIpConsistency(
+        List<ThirdPartyDnsDetector.ThirdPartyDnsInfo> thirdPartyResults,
+        List<NetworkInfo> networks,
+        DnsSecurityResult result)
+    {
+        if (thirdPartyResults.Count < 2)
+            return;
+
+        // Build a set of gateway IPs to exclude - networks often list both Pi-hole and gateway
+        var gatewayIps = networks
+            .Where(n => !string.IsNullOrEmpty(n.Gateway))
+            .Select(n => n.Gateway!)
+            .ToHashSet();
+
+        // Build a set of corporate network names to exclude - corporate networks often use
+        // different DNS infrastructure (e.g., Active Directory DNS)
+        var corporateNetworkNames = networks
+            .Where(n => n.Purpose == NetworkPurpose.Corporate && !string.IsNullOrEmpty(n.Name))
+            .Select(n => n.Name!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Filter out results where the DNS IP is a gateway or the network is corporate
+        var nonGatewayResults = thirdPartyResults
+            .Where(r => !gatewayIps.Contains(r.DnsServerIp))
+            .Where(r => !corporateNetworkNames.Contains(r.NetworkName))
+            .ToList();
+
+        if (nonGatewayResults.Count < 2)
+            return;
+
+        // Group by network to get each network's set of third-party DNS IPs.
+        // A network with dual DNS (primary + secondary, e.g. two Pi-holes) will have
+        // multiple IPs - we compare the full set, not individual IPs.
+        var networkDnsSets = nonGatewayResults
+            .GroupBy(r => r.NetworkName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(r => r.DnsServerIp).OrderBy(ip => ip).ToList(),
+                StringComparer.OrdinalIgnoreCase);
+
+        if (networkDnsSets.Count < 2)
+            return;
+
+        // Create a canonical string key for each network's DNS IP set for comparison
+        var networkSetKeys = networkDnsSets
+            .Select(kvp => new { Network = kvp.Key, SetKey = string.Join(",", kvp.Value), Ips = kvp.Value })
+            .ToList();
+
+        // Group networks by their DNS IP set to find the most common configuration
+        var setGroups = networkSetKeys
+            .GroupBy(n => n.SetKey)
+            .OrderByDescending(g => g.Count())
+            .ToList();
+
+        // If all networks use the same set of IPs, no inconsistency
+        if (setGroups.Count <= 1)
+            return;
+
+        // The most common set is considered the "expected" one
+        var expectedSet = setGroups[0].First().Ips;
+        var expectedSetDisplay = string.Join(", ", expectedSet);
+        var providerName = result.ThirdPartyDnsProviderName ?? "Third-Party DNS";
+
+        // Flag networks using a different set of IPs
+        var mismatchedNetworks = setGroups
+            .Skip(1)
+            .SelectMany(g => g.Select(n => new { n.Network, DnsIps = string.Join(", ", n.Ips) }))
+            .ToList();
+
+        if (mismatchedNetworks.Any())
+        {
+            var networkDetails = mismatchedNetworks
+                .Select(n => $"{n.Network} ({n.DnsIps})")
+                .ToList();
+
+            _logger.LogWarning(
+                "DNS IP inconsistency: Most networks use [{ExpectedIps}] but {Count} network(s) use different IPs: {Details}",
+                expectedSetDisplay, mismatchedNetworks.Count, string.Join(", ", networkDetails));
+
+            var allMismatchedIps = setGroups
+                .Skip(1)
+                .SelectMany(g => g.SelectMany(n => n.Ips))
+                .Distinct()
+                .ToList();
+
+            // Check if all mismatched networks are isolation-sensitive (IoT, Guest, Security, DMZ, Server).
+            // Using separate DNS for these VLANs is a common security practice to prevent
+            // internal DNS leakage - e.g., separate AdGuard/Pi-hole instances per trust zone.
+            var isolationPurposes = new HashSet<NetworkPurpose>
+            {
+                NetworkPurpose.IoT, NetworkPurpose.Guest,
+                NetworkPurpose.Security, NetworkPurpose.Dmz,
+                NetworkPurpose.Server
+            };
+            var mismatchedNetworkNames = mismatchedNetworks.Select(n => n.Network).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var mismatchedNetworkInfos = networks
+                .Where(n => !string.IsNullOrEmpty(n.Name) && mismatchedNetworkNames.Contains(n.Name))
+                .ToList();
+            var allIsolationNetworks = mismatchedNetworkInfos.Count > 0
+                && mismatchedNetworkInfos.All(n => isolationPurposes.Contains(n.Purpose));
+
+            var severity = allIsolationNetworks ? AuditSeverity.Informational : AuditSeverity.Recommended;
+            var message = allIsolationNetworks
+                ? $"{providerName} uses different IPs for {string.Join(", ", networkDetails)} vs. most networks ({expectedSetDisplay}). This is common when using separate DNS instances for network isolation."
+                : $"{providerName} IP mismatch: most networks use {expectedSetDisplay} but {string.Join(", ", networkDetails)} use different IPs. This may indicate misconfiguration.";
+            var recommendation = allIsolationNetworks
+                ? "Verify this is intentional. Using separate DNS instances for isolated VLANs is a security best practice."
+                : $"Update the DHCP DNS settings for the affected network(s) to use {expectedSetDisplay}.";
+            var scoreImpact = allIsolationNetworks ? 0 : 5;
+
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsInconsistentConfig,
+                Severity = severity,
+                DeviceName = result.GatewayName,
+                Message = message,
+                RecommendedAction = recommendation,
+                RuleId = "DNS-IP-MISMATCH-001",
+                ScoreImpact = scoreImpact,
+                Metadata = new Dictionary<string, object>
+                {
+                    { "expected_ip", expectedSet.First() },
+                    { "expected_ips", expectedSet },
+                    { "mismatched_networks", mismatchedNetworks.Select(n => n.Network).ToList() },
+                    { "mismatched_ips", allMismatchedIps },
+                    { "provider_name", providerName },
+                    { "intentional_isolation", allIsolationNetworks }
+                }
+            });
+        }
+    }
+
+    /// <summary>
+    /// Analyze DNAT rules for DNS port 53 coverage.
+    /// DNAT rules that redirect UDP port 53 to a trusted DNS server (gateway, Pi-hole)
+    /// can be an alternative to firewall blocking when DoH or third-party DNS is configured.
+    /// </summary>
+    private void AnalyzeDnatDnsRules(JsonElement natRulesData, List<NetworkInfo> networks, DnsSecurityResult result, List<int>? excludedVlanIds = null, Dictionary<string, UniFiFirewallGroup>? firewallGroups = null, List<string>? trustedDnsRedirectTargets = null)
+    {
+        var dnatAnalyzer = new DnatDnsAnalyzer();
+        var coverageResult = dnatAnalyzer.Analyze(natRulesData, networks, excludedVlanIds, firewallGroups);
+
+        result.HasDnatDnsRules = coverageResult.HasDnatDnsRules;
+        result.DnatProvidesFullCoverage = coverageResult.HasFullCoverage;
+        result.DnatRedirectTarget = coverageResult.RedirectTargetIp;
+        result.DnatCoveredNetworks.AddRange(coverageResult.CoveredNetworkNames);
+        result.DnatUncoveredNetworks.AddRange(coverageResult.UncoveredNetworkNames);
+        result.DnatSingleIpRules.AddRange(coverageResult.SingleIpRules);
+        foreach (var kvp in coverageResult.RuleCoverage)
+            result.DnatRuleCoverage[kvp.Key] = kvp.Value;
+
+        if (coverageResult.HasDnatDnsRules)
+        {
+            _logger.LogInformation(
+                "DNAT DNS rules detected: {RuleCount} rules, full coverage: {FullCoverage}, redirect target: {Target}",
+                coverageResult.Rules.Count, coverageResult.HasFullCoverage, coverageResult.RedirectTargetIp);
+
+            if (!coverageResult.HasFullCoverage)
+            {
+                _logger.LogWarning(
+                    "DNAT DNS rules provide partial coverage. Covered: {Covered}, Uncovered: {Uncovered}",
+                    string.Join(", ", coverageResult.CoveredNetworkNames),
+                    string.Join(", ", coverageResult.UncoveredNetworkNames));
+            }
+
+            if (coverageResult.SingleIpRules.Any())
+            {
+                _logger.LogWarning(
+                    "DNAT DNS rules with single IP sources detected (abnormal configuration): {Ips}",
+                    string.Join(", ", coverageResult.SingleIpRules));
+            }
+        }
+
+        // Validate redirect destinations
+        ValidateDnatRedirectTargets(coverageResult, result, networks, trustedDnsRedirectTargets);
+
+        // Validate destination filters (should be Any or inverted)
+        ValidateDnatDestinationFilters(coverageResult, result);
+    }
+
+    /// <summary>
+    /// Record the DNS protection that holds over IPv4 but not over IPv6. Coverage is compared only
+    /// for networks with a known IPv6 prefix; a network unprotected over IPv4 is already reported
+    /// by the IPv4 findings, so it is never repeated here.
+    /// </summary>
+    /// <remarks>
+    /// A network with IPv6 but no known prefix is skipped on purpose, with no finding either way:
+    /// a gap that cannot be proven is not reported. See <see cref="NetworkInfo.IsIpv6Evaluable"/>.
+    /// </remarks>
+    private void AnalyzeIpv6Coverage(
+        List<FirewallRule>? firewallRules,
+        JsonElement? natRulesData,
+        List<NetworkInfo> networks,
+        DnsSecurityResult result,
+        string? externalZoneId,
+        List<int>? excludedVlanIds,
+        Dictionary<string, UniFiFirewallGroup>? firewallGroups,
+        List<string>? trustedDnsRedirectTargets)
+    {
+        var excludedVlans = excludedVlanIds?.ToHashSet() ?? [];
+        var ipv6Networks = networks.Where(n => n.IsIpv6Evaluable && !excludedVlans.Contains(n.VlanId)).ToList();
+
+        var ipv6 = new DnsSecurityResult();
+        if (firewallRules is { Count: > 0 })
+            AnalyzeFirewallRules(firewallRules, ipv6Networks, ipv6, externalZoneId, IpFamily.IPv6);
+
+        var ipv6DnatCoveredIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (natRulesData.HasValue && ipv6Networks.Count > 0)
+        {
+            var dnat = new DnatDnsAnalyzer().Analyze(natRulesData, ipv6Networks, excludedVlanIds, firewallGroups, IpFamily.IPv6);
+            ipv6DnatCoveredIds.UnionWith(dnat.CoveredNetworkIds);
+            ValidateIpv6DnatRedirectTargets(dnat, result, networks, trustedDnsRedirectTargets);
+        }
+
+        var ipv4DnatCoveredNames = new HashSet<string>(result.DnatCoveredNetworks, StringComparer.OrdinalIgnoreCase);
+        foreach (var network in ipv6Networks)
+        {
+            var dns53OverIpv4 = result.Dns53CoveredNetworkIds.Contains(network.Id) || ipv4DnatCoveredNames.Contains(network.Name);
+            var dns53OverIpv6 = ipv6.Dns53CoveredNetworkIds.Contains(network.Id) || ipv6DnatCoveredIds.Contains(network.Id);
+            if (dns53OverIpv4 && !dns53OverIpv6)
+                result.Ipv6Dns53UncoveredNetworks.Add(network.Name);
+
+            if (result.DotCoveredNetworkIds.Contains(network.Id) && !ipv6.DotCoveredNetworkIds.Contains(network.Id))
+                result.Ipv6DotUncoveredNetworks.Add(network.Name);
+
+            if (result.DoqCoveredNetworkIds.Contains(network.Id) && !ipv6.DoqCoveredNetworkIds.Contains(network.Id))
+                result.Ipv6DoqUncoveredNetworks.Add(network.Name);
+        }
+
+        result.Ipv6DohUnblocked = result.HasDohBlockRule && !ipv6.HasDohBlockRule;
+
+        if (result.HasIpv6DnsGaps)
+        {
+            _logger.LogInformation(
+                "IPv6 DNS protection gaps: DNS53={Dns53}, DoT={Dot}, DoQ={Doq}, DoH unblocked={Doh}",
+                string.Join(", ", result.Ipv6Dns53UncoveredNetworks), string.Join(", ", result.Ipv6DotUncoveredNetworks),
+                string.Join(", ", result.Ipv6DoqUncoveredNetworks), result.Ipv6DohUnblocked);
+        }
+    }
+
+    /// <summary>
+    /// The IPv6 counterpart of <see cref="ValidateDnatRedirectTargets"/>, for NAT rules matching IPv6.
+    /// A rule's valid targets are its network's custom IPv6 DNS servers; else, with site-wide
+    /// third-party DNS, the third-party LAN resolvers handed out over IPv6; else, with DoH, the gateway's IPv6
+    /// addresses on the rule's network and the native network. Trusted targets always count. A rule
+    /// with no known valid target is not judged, since its target cannot be proven wrong.
+    /// </summary>
+    private static void ValidateIpv6DnatRedirectTargets(
+        DnatCoverageResult coverageResult,
+        DnsSecurityResult result,
+        List<NetworkInfo> networks,
+        List<string>? trustedDnsRedirectTargets)
+    {
+        var byId = networks.ToDictionary(n => n.Id, StringComparer.OrdinalIgnoreCase);
+        var nativeNetwork = networks.FirstOrDefault(n => n.IsNative || n.VlanId == 1);
+        var siteWideIpv6Dns = result.Ipv6ThirdPartyDnsServers.Select(t => t.DnsServerIp).ToList();
+        var trustedIpv6 = (trustedDnsRedirectTargets ?? [])
+            .Select(t => t.Trim())
+            .Where(t => System.Net.IPAddress.TryParse(t, out var ip) &&
+                ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+            .ToList();
+
+        var expected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rule in coverageResult.Rules)
+        {
+            if (string.IsNullOrEmpty(rule.RedirectIp))
+                continue;
+
+            var valid = new HashSet<string>(trustedIpv6, StringComparer.OrdinalIgnoreCase);
+            var ruleNetworkId = rule.InInterface ?? rule.NetworkId;
+            if (!string.IsNullOrEmpty(ruleNetworkId) && byId.TryGetValue(ruleNetworkId, out var network))
+            {
+                if (network.Ipv6DnsServers is { Count: > 0 })
+                    valid.UnionWith(network.Ipv6DnsServers);
+                else if (result.IsSiteWideThirdPartyDns)
+                    valid.UnionWith(siteWideIpv6Dns);
+                else if (result.DohConfigured)
+                {
+                    valid.UnionWith(network.Ipv6GatewayAddresses ?? []);
+                    valid.UnionWith(nativeNetwork?.Ipv6GatewayAddresses ?? []);
+                }
+            }
+
+            if (valid.Count == 0)
+                continue;
+
+            expected.UnionWith(valid);
+            if (!IsValidRedirectTarget(rule.RedirectIp, valid))
+            {
+                result.Ipv6InvalidDnatRules.Add(
+                    $"Rule '{rule.Description ?? rule.Id}' redirects to {rule.RedirectIp} (expected {string.Join(" or ", valid)})");
+            }
+        }
+
+        result.Ipv6ExpectedDnatDestinations.AddRange(expected);
+    }
+
+    /// <summary>
+    /// Findings for DNS protection that holds over IPv4 but not over IPv6. Each mirrors its IPv4
+    /// finding type with "over IPv6" in the message and an ip_family tag.
+    /// </summary>
+    private void AddIpv6CoverageIssues(DnsSecurityResult result, List<NetworkInfo>? networks, Services.FirewallZoneLookup? zoneLookup)
+    {
+        if (result.Ipv6ThirdPartyBypassNetworks.Count > 0)
+        {
+            var providerName = result.ThirdPartyDnsProviderName ?? "Third-Party DNS";
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsInconsistentConfig,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = $"{providerName} is bypassed{IpFamilyText.OverIpv6} on: {string.Join(", ", result.Ipv6ThirdPartyBypassNetworks)}. These networks give devices {providerName} as their DNS server over IPv4, but the gateway over IPv6. Devices with IPv6 usually ask the IPv6 server first, so their lookups skip {providerName}.",
+                RecommendedAction = $"In each network's IPv6 settings, set Advanced to Manual, uncheck Auto DNS Server, and add {providerName}'s IPv6 address. Or add an IPv6 DNAT rule that redirects port 53 to {providerName}.",
+                RuleId = "DNS-CONSISTENCY-001",
+                ScoreImpact = 5,
+                Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                {
+                    { "bypass_networks", result.Ipv6ThirdPartyBypassNetworks.ToList() },
+                    { "provider_name", providerName }
+                }, ipv6Only: true)
+            });
+        }
+
+        foreach (var mismatch in result.Ipv6WanDnsMismatches)
+        {
+            var displayName = NetworkFormatHelpers.FormatWanInterfaceName(mismatch.InterfaceName, mismatch.PortName);
+            var expectedIps = mismatch.ExpectedProvider.Ipv6Addresses?.Take(2).ToList() ?? [];
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsWanMismatch,
+                Severity = AuditSeverity.Recommended,
+                Message = $"{displayName} uses {string.Join(", ", mismatch.Servers)} instead of {mismatch.ExpectedProvider.Name}{IpFamilyText.OverIpv6}",
+                RecommendedAction = expectedIps.Count > 0
+                    ? $"Set IPv6 DNS to {mismatch.ExpectedProvider.Name} servers: {string.Join(", ", expectedIps)}"
+                    : $"Set IPv6 DNS to {mismatch.ExpectedProvider.Name} servers",
+                DeviceName = result.GatewayName,
+                Port = NetworkFormatHelpers.FormatWanInterfaceName(mismatch.InterfaceName, null),
+                PortName = mismatch.PortName,
+                RuleId = "DNS-WAN-001",
+                ScoreImpact = 4,
+                Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                {
+                    { "interface", mismatch.InterfaceName },
+                    { "port_name", mismatch.PortName ?? "" },
+                    { "expected_provider", mismatch.ExpectedProvider.Name },
+                    { "actual_servers", mismatch.Servers }
+                }, ipv6Only: true)
+            });
+        }
+
+        foreach (var (wan, reverseDns) in result.Ipv6WanDnsWrongOrder)
+        {
+            var displayName = NetworkFormatHelpers.FormatWanInterfaceName(wan.InterfaceName, wan.PortName);
+            var ips = string.Join(", ", wan.Ipv6DnsServers);
+            var correctOrder = GetCorrectDnsOrder(wan.Ipv6DnsServers, reverseDns);
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsWanOrder,
+                Severity = AuditSeverity.Recommended,
+                Message = $"{displayName} DNS in wrong order{IpFamilyText.OverIpv6}: {ips}. Should be {correctOrder}",
+                RecommendedAction = $"Swap IPv6 DNS order to {correctOrder}",
+                DeviceName = result.GatewayName,
+                Port = NetworkFormatHelpers.FormatWanInterfaceName(wan.InterfaceName, null),
+                PortName = wan.PortName,
+                RuleId = "DNS-WAN-002",
+                ScoreImpact = 2,
+                Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                {
+                    { "interface", wan.InterfaceName },
+                    { "port_name", wan.PortName ?? "" },
+                    { "dns_servers", wan.Ipv6DnsServers.ToList() }
+                }, ipv6Only: true)
+            });
+        }
+
+        foreach (var interfaceName in result.Ipv6WanNoStaticDns)
+        {
+            var wanInterface = result.WanInterfaces.FirstOrDefault(w => w.InterfaceName == interfaceName);
+            var displayName = NetworkFormatHelpers.FormatWanInterfaceName(interfaceName, wanInterface?.PortName);
+            var providerName = result.Ipv6ExpectedDnsProvider ?? "your DoH provider";
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsWanNoStatic,
+                Severity = AuditSeverity.Recommended,
+                Message = $"WAN interface '{displayName}' has no static DNS configured{IpFamilyText.OverIpv6}. If DoH fails, DNS queries will leak to your ISP's DNS servers.",
+                RecommendedAction = $"Configure static IPv6 DNS on {displayName} to use {providerName} servers",
+                DeviceName = result.GatewayName,
+                Port = NetworkFormatHelpers.FormatWanInterfaceName(interfaceName, null),
+                PortName = wanInterface?.PortName,
+                RuleId = "DNS-WAN-002",
+                ScoreImpact = 3,
+                Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                {
+                    { "interface", interfaceName },
+                    { "port_name", wanInterface?.PortName ?? "" }
+                }, ipv6Only: true)
+            });
+        }
+
+        if (result.Ipv6InvalidDnatRules.Count > 0)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsDnatWrongDestination,
+                Severity = AuditSeverity.Critical,
+                DeviceName = result.GatewayName,
+                Message = $"DNAT DNS rules have incorrect translated IP address{IpFamilyText.OverIpv6}. {string.Join("; ", result.Ipv6InvalidDnatRules)}.",
+                RecommendedAction = result.IsSiteWideThirdPartyDns
+                    ? "Update the translated IP address in the IPv6 DNAT rules to your Pi-hole/DNS server's IPv6 address"
+                    : "Update the translated IP address in the IPv6 DNAT rules to a gateway IPv6 address",
+                RuleId = "DNS-DNAT-003",
+                ScoreImpact = 10,
+                Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                {
+                    { "invalid_rules", result.Ipv6InvalidDnatRules.ToList() },
+                    { "expected_destinations", result.Ipv6ExpectedDnatDestinations.ToList() },
+                    { "is_site_wide_third_party_dns", result.IsSiteWideThirdPartyDns }
+                }, ipv6Only: true)
+            });
+        }
+
+        if (result.Ipv6Dns53UncoveredNetworks.Count > 0)
+        {
+            // DMZ and guest-on-third-party-DNS networks are carved out, as in the IPv4 findings
+            var (_, _, exposed) = CategorizeUncoveredNetworks(result.Ipv6Dns53UncoveredNetworks, networks, result, zoneLookup);
+            if (exposed.Count > 0)
+            {
+                result.Issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsNo53Block,
+                    Severity = AuditSeverity.Recommended,
+                    DeviceName = result.GatewayName,
+                    Message = $"Networks with no DNS leak protection{IpFamilyText.OverIpv6}: {string.Join(", ", exposed)}. These networks have no firewall port 53 block and no DNAT redirect{IpFamilyText.OverIpv6}, so devices on them can bypass network DNS settings and leak queries to untrusted servers.",
+                    RecommendedAction = "Extend the port 53 block or DNAT redirect to IPv6 for these networks.",
+                    RuleId = "DNS-LEAK-001",
+                    ScoreImpact = 6,
+                    Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                    {
+                        { "exposed_networks", exposed }
+                    }, ipv6Only: true)
+                });
+            }
+        }
+
+        if (result.Ipv6DotUncoveredNetworks.Count > 0)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsNoDotBlock,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = $"DNS-over-TLS (port 853) blocking has partial coverage{IpFamilyText.OverIpv6}. Uncovered networks: {string.Join(", ", result.Ipv6DotUncoveredNetworks)}",
+                RecommendedAction = "Extend DoT blocking to IPv6 for the uncovered networks.",
+                RuleId = "DNS-LEAK-002",
+                ScoreImpact = 4,
+                Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                {
+                    { "uncovered_networks", result.Ipv6DotUncoveredNetworks.ToList() }
+                }, ipv6Only: true)
+            });
+        }
+
+        if (result.Ipv6DohUnblocked && result.DohConfigured)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsNoDohBlock,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = $"No firewall rule blocks public DoH providers{IpFamilyText.OverIpv6}. Devices can bypass your DNS filtering by using their own DoH servers.",
+                RecommendedAction = "Extend DoH blocking to IPv6: block TCP 443 to known DoH provider domains, or to their IPv6 addresses.",
+                RuleId = "DNS-LEAK-003",
+                ScoreImpact = 5,
+                Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                {
+                    { "suggested_domains", "dns.google, cloudflare-dns.com, dns.quad9.net, doh.opendns.com" }
+                }, ipv6Only: true)
+            });
+        }
+
+        if (result.Ipv6DoqUncoveredNetworks.Count > 0 && result.DohConfigured)
+        {
+            result.Issues.Add(new AuditIssue
+            {
+                Type = IssueTypes.DnsNoDoqBlock,
+                Severity = AuditSeverity.Recommended,
+                DeviceName = result.GatewayName,
+                Message = $"DNS over QUIC (DoQ) blocking has partial coverage{IpFamilyText.OverIpv6}. Uncovered networks: {string.Join(", ", result.Ipv6DoqUncoveredNetworks)}",
+                RecommendedAction = "Extend DoQ blocking to IPv6 for the uncovered networks.",
+                RuleId = "DNS-LEAK-004",
+                ScoreImpact = 3,
+                Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                {
+                    { "uncovered_networks", result.Ipv6DoqUncoveredNetworks.ToList() }
+                }, ipv6Only: true)
+            });
+        }
+    }
+
+    /// <summary>
+    /// Validate that DNAT redirect destinations point to the correct DNS server.
+    /// - With site-wide third-party DNS (Pi-hole on non-Corporate networks): must redirect to the third-party server IP
+    /// - With DoH (no site-wide third-party DNS): must redirect to native VLAN gateway OR the specific VLAN gateway
+    /// Note: Third-party DNS only on Corporate networks is NOT considered site-wide and falls through to DoH/gateway validation.
+    /// </summary>
+    private void ValidateDnatRedirectTargets(
+        DnatCoverageResult coverageResult,
+        DnsSecurityResult result,
+        List<NetworkInfo> networks,
+        List<string>? trustedDnsRedirectTargets = null)
+    {
+        if (!coverageResult.HasDnatDnsRules)
+            return;
+
+        if (result.IsSiteWideThirdPartyDns)
+        {
+            // Site-wide third-party DNS: DNAT must point to the third-party server(s)
+            // Also accept gateway IPs that are configured as DNS servers (common dual-DNS setup)
+            var validDestinations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var ip in result.SiteWideDnsServerIps)
+                validDestinations.Add(ip);
+
+            // Also include any gateway IPs that are configured as DHCP DNS servers
+            // This handles the common case where DHCP DNS 1 = gateway and DNS 2 = Pi-hole
+            foreach (var network in networks)
+            {
+                if (network.DnsServers == null) continue;
+                foreach (var dnsServer in network.DnsServers)
+                {
+                    if (!string.IsNullOrEmpty(dnsServer) && dnsServer == network.Gateway)
+                    {
+                        validDestinations.Add(dnsServer);
+                    }
+                }
+            }
+
+            // User-configured trusted DNS redirect targets (VIPs, anycast, etc.)
+            if (trustedDnsRedirectTargets != null)
+            {
+                foreach (var ip in trustedDnsRedirectTargets.Where(s => !string.IsNullOrWhiteSpace(s)))
+                    validDestinations.Add(ip.Trim());
+            }
+
+            result.ExpectedDnatDestinations.AddRange(validDestinations);
+
+            foreach (var rule in coverageResult.Rules)
+            {
+                if (string.IsNullOrEmpty(rule.RedirectIp))
+                    continue;
+
+                if (!IsValidRedirectTarget(rule.RedirectIp, validDestinations))
+                {
+                    result.DnatRedirectTargetIsValid = false;
+                    result.InvalidDnatRules.Add(
+                        $"Rule '{rule.Description ?? rule.Id}' redirects to {rule.RedirectIp}");
+                }
+            }
+        }
+        else
+        {
+            // No site-wide third-party DNS: validate each rule against its network's DHCP DNS servers
+            // If a network has DHCP DNS configured, DNAT should redirect to those servers
+            // If no DHCP DNS but DoH is configured, validate against gateways
+            // If neither, skip validation
+
+            // Build lookup of network ID to DNS servers and gateway
+            var networkDnsMap = networks
+                .ToDictionary(
+                    n => n.Id,
+                    n => new { DnsServers = n.DnsServers ?? new List<string>(), Gateway = n.Gateway ?? string.Empty },
+                    StringComparer.OrdinalIgnoreCase);
+
+            // Find native VLAN gateway for DoH fallback
+            var nativeNetwork = networks.FirstOrDefault(n => n.IsNative || n.VlanId == 1);
+            var nativeGateway = nativeNetwork?.Gateway;
+
+            // Track all valid destinations for reporting
+            var allValidDestinations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var rule in coverageResult.Rules)
+            {
+                if (string.IsNullOrEmpty(rule.RedirectIp))
+                    continue;
+
+                // Build valid destinations for THIS rule based on the network's DHCP DNS settings
+                var ruleValidDestinations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                var ruleNetworkId = rule.InInterface ?? rule.NetworkId;
+                if (!string.IsNullOrEmpty(ruleNetworkId) && networkDnsMap.TryGetValue(ruleNetworkId, out var networkConfig))
+                {
+                    // If network has DHCP DNS servers configured, those are the valid destinations
+                    if (networkConfig.DnsServers.Any(s => !string.IsNullOrEmpty(s)))
+                    {
+                        foreach (var dns in networkConfig.DnsServers.Where(s => !string.IsNullOrEmpty(s)))
+                        {
+                            ruleValidDestinations.Add(dns);
+                            allValidDestinations.Add(dns);
+                        }
+                    }
+                    else if (result.DohConfigured)
+                    {
+                        // No DHCP DNS configured but DoH is enabled - validate against gateways
+                        // Native VLAN gateway is always valid
+                        if (!string.IsNullOrEmpty(nativeGateway))
+                        {
+                            ruleValidDestinations.Add(nativeGateway);
+                            allValidDestinations.Add(nativeGateway);
+                        }
+                        // Network's own gateway is also valid
+                        if (!string.IsNullOrEmpty(networkConfig.Gateway))
+                        {
+                            ruleValidDestinations.Add(networkConfig.Gateway);
+                            allValidDestinations.Add(networkConfig.Gateway);
+                        }
+                    }
+                    // else: No DHCP DNS and no DoH - skip validation for this rule
+                }
+
+                // User-configured trusted DNS redirect targets (VIPs, anycast, etc.).
+                // Added per-rule so a rule with no per-network DHCP DNS still validates against trusted IPs.
+                if (trustedDnsRedirectTargets != null)
+                {
+                    foreach (var ip in trustedDnsRedirectTargets.Where(s => !string.IsNullOrWhiteSpace(s)))
+                    {
+                        ruleValidDestinations.Add(ip.Trim());
+                        allValidDestinations.Add(ip.Trim());
+                    }
+                }
+
+                if (ruleValidDestinations.Count == 0)
+                {
+                    // Can't determine expected destination - skip validation for this rule
+                    continue;
+                }
+
+                if (!IsValidRedirectTarget(rule.RedirectIp, ruleValidDestinations))
+                {
+                    result.DnatRedirectTargetIsValid = false;
+                    var expectedDns = string.Join(" or ", ruleValidDestinations);
+                    result.InvalidDnatRules.Add(
+                        $"Rule '{rule.Description ?? rule.Id}' redirects to {rule.RedirectIp} (expected {expectedDns})");
+                }
+            }
+
+            result.ExpectedDnatDestinations.AddRange(allValidDestinations);
+        }
+
+        if (!result.DnatRedirectTargetIsValid)
+        {
+            _logger.LogWarning(
+                "DNAT DNS rules redirect to incorrect destinations. Invalid rules: {InvalidRules}. Expected: {Expected}",
+                string.Join("; ", result.InvalidDnatRules),
+                string.Join(", ", result.ExpectedDnatDestinations));
+        }
+    }
+
+    /// <summary>
+    /// Validate that DNAT destination filters are not restricted to specific IPs.
+    /// Valid configurations:
+    /// - No destination address (Any)
+    /// - Destination address with invert_address=true (matches traffic NOT going to DNS server)
+    /// Invalid:
+    /// - Specific destination address without invert (only catches some bypass attempts)
+    /// </summary>
+    private void ValidateDnatDestinationFilters(
+        DnatCoverageResult coverageResult,
+        DnsSecurityResult result)
+    {
+        if (!coverageResult.HasDnatDnsRules)
+            return;
+
+        foreach (var rule in coverageResult.Rules)
+        {
+            if (rule.HasRestrictedDestination)
+            {
+                result.DnatDestinationFilterIsValid = false;
+                result.RestrictedDestinationRules.Add(
+                    $"Rule '{rule.Description ?? rule.Id}' only matches traffic to {rule.DestinationAddress}");
+            }
+        }
+
+        if (!result.DnatDestinationFilterIsValid)
+        {
+            _logger.LogWarning(
+                "DNAT DNS rules have restricted destination filters: {Rules}",
+                string.Join("; ", result.RestrictedDestinationRules));
+        }
+    }
+
+    /// <summary>
+    /// Get a summary of DNS security status
+    /// </summary>
+    public DnsSecuritySummary GetSummary(DnsSecurityResult result)
+    {
+        var providerNames = result.ConfiguredServers
+            .Where(s => s.Enabled)
+            .Select(s => s.StampInfo?.ProviderInfo?.Name
+                ?? s.Provider?.Name
+                ?? DohProviderRegistry.IdentifyProviderFromName(s.ServerName)?.Name
+                ?? s.ServerName)
+            .Distinct()
+            .ToList();
+
+        return new DnsSecuritySummary
+        {
+            DohEnabled = result.DohConfigured,
+            DohProviders = providerNames,
+            DnsLeakProtection = ((result.HasDns53BlockRule && result.Dns53ProvidesFullCoverage) || (result.DnatProvidesFullCoverage && result.DnatRedirectTargetIsValid && result.DnatDestinationFilterIsValid)) && result.Ipv6Dns53UncoveredNetworks.Count == 0,
+            HasDns53BlockRule = result.HasDns53BlockRule,
+            Dns53ProvidesFullCoverage = result.Dns53ProvidesFullCoverage && result.Ipv6Dns53UncoveredNetworks.Count == 0,
+            DnatProvidesFullCoverage = result.DnatProvidesFullCoverage && result.DnatRedirectTargetIsValid && result.DnatDestinationFilterIsValid,
+            DotBlocked = result.HasDotBlockRule,
+            DotProvidesFullCoverage = result.DotProvidesFullCoverage && result.Ipv6DotUncoveredNetworks.Count == 0,
+            DohBypassBlocked = result.HasDohBlockRule && !result.Ipv6DohUnblocked,
+            DoqBypassBlocked = result.HasDoqBlockRule,
+            DoqProvidesFullCoverage = result.DoqProvidesFullCoverage && result.Ipv6DoqUncoveredNetworks.Count == 0,
+            FullyProtected = result.DohConfigured && (result.HasDns53BlockRule || (result.DnatProvidesFullCoverage && result.DnatRedirectTargetIsValid && result.DnatDestinationFilterIsValid)) && result.HasDotBlockRule && result.DotProvidesFullCoverage && result.HasDohBlockRule && result.HasDoqBlockRule && result.DoqProvidesFullCoverage && result.WanDnsMatchesDoH && result.DeviceDnsPointsToGateway && !result.HasIpv6DnsGaps,
+            IssueCount = result.Issues.Count,
+            CriticalIssueCount = result.Issues.Count(i => i.Severity == AuditSeverity.Critical),
+            WanDnsServers = result.WanDnsServers.ToList(),
+            WanDnsMatchesDoH = result.WanDnsMatchesDoH,
+            WanDnsProvider = result.WanDnsProvider,
+            ExpectedDnsProvider = result.ExpectedDnsProvider,
+            DeviceDnsPointsToGateway = result.DeviceDnsPointsToGateway,
+            TotalDevicesChecked = result.TotalDevicesChecked,
+            DevicesWithCorrectDns = result.DevicesWithCorrectDns,
+            DhcpDeviceCount = result.DhcpDeviceCount
+        };
+    }
+
+    /// <summary>
+    /// Parse an IP address or IP range into a list of individual IPs.
+    /// Delegates to NetworkUtilities.ExpandIpRange.
+    /// </summary>
+    public static List<string> ParseIpOrRange(string? ipOrRange)
+        => NetworkUtilities.ExpandIpRange(ipOrRange);
+
+    /// <summary>
+    /// Check if a redirect IP (which may be a range) is valid against the set of expected destinations.
+    /// For ranges, ALL IPs in the range must be valid destinations. Addresses compare by value,
+    /// so an IPv6 target written expanded matches the same address written compressed.
+    /// </summary>
+    public static bool IsValidRedirectTarget(string? redirectIp, HashSet<string> validDestinations)
+    {
+        if (string.IsNullOrEmpty(redirectIp))
+            return true; // No redirect IP to validate
+
+        var ips = ParseIpOrRange(redirectIp);
+        if (ips.Count == 0)
+            return true;
+
+        // All IPs in the range must be valid destinations
+        return ips.All(ip => validDestinations.Contains(ip)
+            || validDestinations.Any(dest => NetworkUtilities.IpAddressesAreEqual(ip, dest)));
+    }
+}
+
+/// <summary>
+/// Result of DNS security analysis
+/// </summary>
+public class DnsSecurityResult
+{
+    // DoH Configuration
+    public string DohState { get; set; } = "disabled";
+    public bool DohConfigured { get; set; }
+    public List<DnsServerConfig> ConfiguredServers { get; } = new();
+
+    // Gateway Info
+    public string? GatewayName { get; set; }
+
+    // WAN DNS Configuration
+    public List<string> WanDnsServers { get; } = new();
+    public List<WanInterfaceDns> WanInterfaces { get; } = new();
+    public bool UsingIspDns { get; set; }
+    public bool WanDnsMatchesDoH { get; set; }
+    public bool WanDnsOrderCorrect => WanInterfaces.All(w => w.OrderCorrect);
+    public List<string?> WanDnsPtrResults => WanInterfaces.SelectMany(w => w.ReverseDnsResults).ToList();
+    public string? WanDnsProvider { get; set; }
+    public string? ExpectedDnsProvider { get; set; }
+
+    // Firewall Rules
+    /// <summary>
+    /// Absolute block-coverage fact: at least one enabled firewall rule blocks external port 53 for
+    /// some network. Includes incidental coverage from blanket "block all internet" isolation rules.
+    /// Use this to reason about whether a network can actually leak DNS.
+    /// </summary>
+    public bool HasDns53BlockRule { get; set; }
+    /// <summary>
+    /// Strategy detection: a *dedicated* DNS port-53 block rule exists (a rule that specifically targets
+    /// port 53), indicating the user intentionally runs DNS-53 firewall blocking. A blanket "block all
+    /// internet" rule sets HasDns53BlockRule (block coverage) but NOT this flag. Drives the application
+    /// and severity of the DNS-53 partial-coverage finding so incidental isolation rules don't fabricate
+    /// a blocking strategy that isn't there.
+    /// </summary>
+    public bool HasDns53BlockStrategy { get; set; }
+    public string? Dns53RuleName { get; set; }
+    public bool HasDotBlockRule { get; set; }
+    public string? DotRuleName { get; set; }
+    public bool HasDohBlockRule { get; set; }
+    public string? DohRuleName { get; set; }
+    public bool HasDoqBlockRule { get; set; }
+    public string? DoqRuleName { get; set; }
+    public bool HasDoh3BlockRule { get; set; }
+    public string? Doh3RuleName { get; set; }
+    public List<string> DohBlockedDomains { get; } = new();
+    public List<string> DoqBlockedDomains { get; } = new();
+
+    /// <summary>DNS53 (port 53) firewall rule network coverage</summary>
+    public bool Dns53ProvidesFullCoverage { get; set; }
+    /// <summary>Network IDs covered by DNS53 blocking rules</summary>
+    public HashSet<string> Dns53CoveredNetworkIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Network names covered by DNS53 blocking rules</summary>
+    public List<string> Dns53CoveredNetworks { get; } = new();
+    /// <summary>Network names not covered by any DNS53 blocking rule</summary>
+    public List<string> Dns53UncoveredNetworks { get; } = new();
+    /// <summary>Maps each contributing DNS53 blocking rule name to the network names it covers</summary>
+    public Dictionary<string, List<string>> Dns53RuleCoverage { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>DoT (port 853/TCP) firewall rule network coverage</summary>
+    public bool DotProvidesFullCoverage { get; set; }
+    /// <summary>Network IDs covered by DoT blocking rules</summary>
+    public HashSet<string> DotCoveredNetworkIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Network names covered by DoT blocking rules</summary>
+    public List<string> DotCoveredNetworks { get; } = new();
+    /// <summary>Network names not covered by any DoT blocking rule</summary>
+    public List<string> DotUncoveredNetworks { get; } = new();
+    /// <summary>Maps each contributing DoT blocking rule name to the network names it covers</summary>
+    public Dictionary<string, List<string>> DotRuleCoverage { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>DoQ (port 853/UDP) firewall rule network coverage</summary>
+    public bool DoqProvidesFullCoverage { get; set; }
+    /// <summary>Network IDs covered by DoQ blocking rules</summary>
+    public HashSet<string> DoqCoveredNetworkIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Network names covered by DoQ blocking rules</summary>
+    public List<string> DoqCoveredNetworks { get; } = new();
+    /// <summary>Network names not covered by any DoQ blocking rule</summary>
+    public List<string> DoqUncoveredNetworks { get; } = new();
+    /// <summary>Maps each contributing DoQ blocking rule name to the network names it covers</summary>
+    public Dictionary<string, List<string>> DoqRuleCoverage { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    // IPv6-only gaps: networks protected over IPv4 but not over IPv6. The IPv4 fields above
+    // describe IPv4 traffic only; these are empty when no network carries IPv6.
+    /// <summary>Network names with port 53 blocked or redirected over IPv4 but not over IPv6</summary>
+    public List<string> Ipv6Dns53UncoveredNetworks { get; } = new();
+    /// <summary>Network names with DoT blocked over IPv4 but not over IPv6</summary>
+    public List<string> Ipv6DotUncoveredNetworks { get; } = new();
+    /// <summary>Network names with DoQ blocked over IPv4 but not over IPv6</summary>
+    public List<string> Ipv6DoqUncoveredNetworks { get; } = new();
+    /// <summary>DoH providers are blocked over IPv4 but not over IPv6 while IPv6 is enabled on a network</summary>
+    public bool Ipv6DohUnblocked { get; set; }
+    /// <summary>Third-party LAN resolvers handed out over DHCPv6/RDNSS (IPv4 ones are in <see cref="ThirdPartyDnsServers"/>)</summary>
+    public List<ThirdPartyDnsDetector.ThirdPartyDnsInfo> Ipv6ThirdPartyDnsServers { get; } = new();
+    /// <summary>Network names that hand out a third-party resolver over IPv4 but the gateway over IPv6</summary>
+    public List<string> Ipv6ThirdPartyBypassNetworks { get; } = new();
+    /// <summary>The DoH provider the IPv6 WAN DNS was checked against (set even when no WAN has IPv4 DNS)</summary>
+    public string? Ipv6ExpectedDnsProvider { get; set; }
+    /// <summary>WANs whose static IPv6 DNS is not the expected provider</summary>
+    public List<Ipv6WanDnsMismatch> Ipv6WanDnsMismatches { get; } = new();
+    /// <summary>WANs whose static NextDNS IPv6 servers are entered dns2 before dns1, with their PTR names</summary>
+    public List<(WanInterfaceDns Wan, List<string?> ReverseDns)> Ipv6WanDnsWrongOrder { get; } = new();
+    /// <summary>WANs that run IPv6 and take their IPv6 DNS from the ISP while DoH is on</summary>
+    public List<string> Ipv6WanNoStaticDns { get; } = new();
+    /// <summary>IPv6 DNAT DNS rules whose translated address is not a valid IPv6 DNS target</summary>
+    public List<string> Ipv6InvalidDnatRules { get; } = new();
+    /// <summary>The IPv6 addresses an IPv6 DNAT DNS rule was expected to redirect to</summary>
+    public List<string> Ipv6ExpectedDnatDestinations { get; } = new();
+    /// <summary>Whether any IPv6-only DNS protection gap was found</summary>
+    public bool HasIpv6DnsGaps => Ipv6Dns53UncoveredNetworks.Count > 0 || Ipv6DotUncoveredNetworks.Count > 0 ||
+                                  Ipv6DoqUncoveredNetworks.Count > 0 || Ipv6DohUnblocked || Ipv6InvalidDnatRules.Count > 0 ||
+                                  Ipv6ThirdPartyBypassNetworks.Count > 0 || Ipv6WanDnsMismatches.Count > 0 ||
+                                  Ipv6WanNoStaticDns.Count > 0;
+
+    // Device DNS Configuration
+    public bool DeviceDnsPointsToGateway { get; set; } = true;
+    public int TotalDevicesChecked { get; set; }
+    public int DevicesWithCorrectDns { get; set; }
+    public int DhcpDeviceCount { get; set; }
+    public List<DeviceDnsInfo> DeviceDnsDetails { get; } = new();
+
+    // Third-Party DNS (Pi-hole, AdGuard Home, etc.)
+    public bool HasThirdPartyDns { get; set; }
+    public List<ThirdPartyDnsDetector.ThirdPartyDnsInfo> ThirdPartyDnsServers { get; } = new();
+    public bool IsPiholeDetected => ThirdPartyDnsServers.Any(t => t.IsPihole);
+    public bool IsAdGuardHomeDetected => ThirdPartyDnsServers.Any(t => t.IsAdGuardHome);
+    public bool IsTechnitiumDnsDetected => ThirdPartyDnsServers.Any(t => t.IsTechnitiumDns);
+    public bool IsNextDnsDetected => ThirdPartyDnsServers.Any(t => t.IsNextDns);
+    public bool IsControlDDetected => ThirdPartyDnsServers.Any(t => t.IsControlD);
+    public string? ThirdPartyDnsProviderName { get; set; }
+
+    /// <summary>
+    /// Whether third-party DNS is configured as a site-wide solution (on at least one non-Corporate network).
+    /// If third-party DNS is ONLY on Corporate networks, it's considered specialized internal DNS,
+    /// not intended for all networks, and won't be used as the expected DNAT destination.
+    /// </summary>
+    public bool IsSiteWideThirdPartyDns { get; set; }
+
+    /// <summary>
+    /// The IPs of the site-wide third-party DNS servers (only populated if IsSiteWideThirdPartyDns is true)
+    /// </summary>
+    public List<string> SiteWideDnsServerIps { get; } = new();
+
+    // External Public DNS Detection
+    public bool HasExternalDns { get; set; }
+    public List<ThirdPartyDnsDetector.ExternalDnsInfo> ExternalDnsNetworks { get; } = new();
+
+    // DNAT DNS Coverage
+    public bool HasDnatDnsRules { get; set; }
+    public bool DnatProvidesFullCoverage { get; set; }
+    public string? DnatRedirectTarget { get; set; }
+    public List<string> DnatCoveredNetworks { get; } = new();
+    public List<string> DnatUncoveredNetworks { get; } = new();
+    public List<string> DnatSingleIpRules { get; } = new();
+    /// <summary>Maps each contributing DNAT DNS rule name to the network names it covers</summary>
+    public Dictionary<string, List<string>> DnatRuleCoverage { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Networks the user intentionally excluded from DNS coverage checks (Audit Settings → excluded VLANs).
+    /// These are carved out of all DNS coverage findings so an excluded VLAN never reads as exposed.
+    /// </summary>
+    public List<string> ExcludedFromCoverageNetworks { get; } = new();
+
+    // DNAT Redirect Destination Validation
+    public bool DnatRedirectTargetIsValid { get; set; } = true;
+    public List<string> InvalidDnatRules { get; } = new();
+    public List<string> ExpectedDnatDestinations { get; } = new();
+
+    // DNAT Destination Filter Validation
+    public bool DnatDestinationFilterIsValid { get; set; } = true;
+    public List<string> RestrictedDestinationRules { get; } = new();
+
+    // Audit Issues
+    public List<AuditIssue> Issues { get; } = new();
+    public List<string> HardeningNotes { get; } = new();
+}
+
+/// <summary>
+/// Device DNS configuration details
+/// </summary>
+public class DeviceDnsInfo
+{
+    public required string DeviceName { get; init; }
+    public required string DeviceType { get; init; }
+    public string? DeviceIp { get; init; }
+    public string? ConfiguredDns { get; init; }
+    public string? ExpectedGateway { get; init; }
+    public bool PointsToGateway { get; init; }
+    public bool UsesDhcp { get; init; }
+}
+
+/// <summary>
+/// A WAN whose static IPv6 DNS servers are not the expected DoH provider's.
+/// </summary>
+public record Ipv6WanDnsMismatch(string InterfaceName, string? PortName, List<string> Servers, DohProviderInfo ExpectedProvider);
+
+/// <summary>
+/// WAN interface DNS configuration details
+/// </summary>
+public class WanInterfaceDns
+{
+    public required string InterfaceName { get; init; }
+    public string? PortName { get; init; }
+    public string? IpAddress { get; init; }
+    public bool IsUp { get; init; }
+    public bool IsCellular { get; init; }
+    public List<string> DnsServers { get; init; } = new();
+    public bool HasStaticDns => DnsServers.Any();
+    public bool MatchesDoH { get; set; }
+    public bool OrderCorrect { get; set; } = true;
+    public string? DetectedProvider { get; set; }
+    /// <summary>
+    /// PTR lookup results for each DNS server IP, in order
+    /// </summary>
+    public List<string?> ReverseDnsResults { get; set; } = new();
+
+    /// <summary>
+    /// Whether the WAN runs IPv6 (networkconf wan_type_v6 set and not "disabled").
+    /// </summary>
+    public bool HasIpv6 { get; set; }
+
+    /// <summary>
+    /// Static IPv6 DNS servers (wan_ipv6_dns_preference "manual"). Kept apart from <see cref="DnsServers"/>,
+    /// which every IPv4 check reads. Empty when the WAN takes its IPv6 DNS from the ISP.
+    /// </summary>
+    public List<string> Ipv6DnsServers { get; } = new();
+}
+
+/// <summary>
+/// Configured DNS server information
+/// </summary>
+public class DnsServerConfig
+{
+    public required string ServerName { get; init; }
+    public DnsStampInfo? StampInfo { get; init; }
+    public DohProviderInfo? Provider { get; init; }
+    public bool Enabled { get; init; }
+    public bool IsCustom { get; init; }
+}
+
+/// <summary>
+/// Summary of DNS security status for display
+/// </summary>
+public class DnsSecuritySummary
+{
+    public bool DohEnabled { get; init; }
+    public List<string> DohProviders { get; init; } = new();
+    public bool DnsLeakProtection { get; init; }
+    public bool HasDns53BlockRule { get; init; }
+    public bool Dns53ProvidesFullCoverage { get; init; }
+    public bool DnatProvidesFullCoverage { get; init; }
+    public bool DotBlocked { get; init; }
+    public bool DotProvidesFullCoverage { get; init; }
+    public bool DohBypassBlocked { get; init; }
+    public bool DoqBypassBlocked { get; init; }
+    public bool DoqProvidesFullCoverage { get; init; }
+    public bool FullyProtected { get; init; }
+    public int IssueCount { get; init; }
+    public int CriticalIssueCount { get; init; }
+
+    // WAN DNS validation
+    public List<string> WanDnsServers { get; init; } = new();
+    public bool WanDnsMatchesDoH { get; init; }
+    public string? WanDnsProvider { get; init; }
+    public string? ExpectedDnsProvider { get; init; }
+
+    // Device DNS validation
+    public bool DeviceDnsPointsToGateway { get; init; }
+    public int TotalDevicesChecked { get; init; }
+    public int DevicesWithCorrectDns { get; init; }
+    public int DhcpDeviceCount { get; init; }
+}

@@ -1,0 +1,1468 @@
+@page "/wifi-optimizer"
+@attribute [Authorize(Policy = Policies.RequireViewer)]
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Web.Models
+@using NetworkOptimizer.WiFi
+@using NetworkOptimizer.WiFi.Helpers
+@using NetworkOptimizer.WiFi.Models
+@using NetworkOptimizer.Storage.Models
+@using Microsoft.AspNetCore.Authorization
+@using Microsoft.AspNetCore.Components.Authorization
+@using NetworkOptimizer.Web.Services.Authorization
+@inject WiFiOptimizerService WiFiService
+@inject IClientSpeedTestService SpeedTestService
+@inject ClientDashboardService DashboardService
+@inject UniFiConnectionService ConnectionService
+@inject NavigationManager NavigationManager
+@inject ApMapService ApMapService
+@inject IMeshOptimizationService MeshService
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteContextService SiteContext
+@inject PullToRefreshState PtrState
+@inject IApMapAdminService ApMapAdmin
+@inject IAuthorizationService Authz
+@inject IWiFiIssueAcknowledgmentService IssueAcknowledgments
+@implements IDisposable
+@rendermode InteractiveServer
+
+<PageTitle>Wi-Fi Optimizer - Network Optimizer</PageTitle>
+
+<div class="page-header">
+    <PageBackButton />
+    <h1>Wi-Fi Optimizer</h1>
+    <p class="page-description">Site health scoring, signal analysis, and optimization recommendations</p>
+</div>
+
+<RestrictedSiteNotice />
+
+<ApTelemetryBanner Message="AP Telemetry reads Wi-Fi data straight from your access points, for client stats, roam records, and radio health the UniFi Console does not report." />
+
+@if (!ConnectionService.IsConnected && ConnectionService.IsInitialized)
+{
+    <div class="connection-banner @(!string.IsNullOrEmpty(ConnectionService.LastError) ? "connection-error" : "")">
+        <div class="banner-content">
+            <span class="banner-icon">!</span>
+            <div class="banner-text">
+                @if (!string.IsNullOrEmpty(ConnectionService.LastError))
+                {
+                    <strong>Connection Error</strong>
+                    <span>@ConnectionService.LastError</span>
+                }
+                else
+                {
+                    <strong>Not Connected</strong>
+                    <span>Connect to your UniFi Console to analyze Wi-Fi data.</span>
+                }
+            </div>
+            <a href="/settings?tab=connection#console-connection" class="btn btn-primary">@(!string.IsNullOrEmpty(ConnectionService.LastError) ? "Check Settings" : "Connect Now")</a>
+        </div>
+    </div>
+}
+
+@if (!string.IsNullOrEmpty(_toastMessage))
+{
+    <div class="wifi-toast alert @_toastClass">
+        <div>@_toastMessage</div>
+        @if (!string.IsNullOrEmpty(_toastNote))
+        {
+            <div class="wifi-toast-note">@_toastNote</div>
+        }
+    </div>
+}
+
+@if (ConnectionService.IsConnected)
+{
+    <!-- Quick Stats Row -->
+    <div class="stats-row wifi-stats-row">
+        <div class="stat-card">
+            <div class="stat-icon wifi-health-icon @GetScoreClass(_summary?.HealthScore)">
+                @if (_loading)
+                {
+                    <span class="spinner-sm"></span>
+                }
+                else
+                {
+                    <span class="health-score-num">@(_summary?.HealthScore?.ToString() ?? "-")</span>
+                }
+            </div>
+            <div class="stat-content">
+                <div class="stat-value @GetScoreClass(_summary?.HealthScore)">
+                    @if (_loading)
+                    {
+                        <span class="spinner-sm"></span>
+                    }
+                    else
+                    {
+                        @GetScoreLabel(_summary?.HealthScore)
+                    }
+                </div>
+                <div class="stat-label">Site Health</div>
+            </div>
+        </div>
+
+        <div class="stat-card">
+            <svg class="stat-icon-svg" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" width="32" height="32">
+                <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" opacity="0.7"></path>
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10Zm4-10a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z" opacity="0.6"></path>
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Zm-1 0a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" style="fill: var(--primary-hover)"></path>
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M22 12c0 5.523-4.477 10-10 10S2 17.523 2 12 6.477 2 12 2s10 4.477 10 10Zm-1 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"></path>
+            </svg>
+            <div class="stat-content">
+                <div class="stat-value">
+                    @if (_loading)
+                    {
+                        <span class="spinner-sm"></span>
+                    }
+                    else
+                    {
+                        @(_summary?.TotalAps ?? 0)
+                    }
+                </div>
+                <div class="stat-label">Access Points</div>
+            </div>
+        </div>
+
+        <div class="stat-card">
+            <svg class="stat-icon-svg stat-icon-sm" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" width="32" height="32">
+                <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/>
+            </svg>
+            <div class="stat-content">
+                <div class="stat-value">
+                    @if (_loading)
+                    {
+                        <span class="spinner-sm"></span>
+                    }
+                    else
+                    {
+                        @(_summary?.TotalClients ?? 0)
+                    }
+                </div>
+                <div class="stat-label">Wireless Clients</div>
+            </div>
+        </div>
+
+        <div class="stat-card @(_summary?.WeakSignalClients > 0 ? "stat-warning" : "")">
+            <svg class="stat-icon-svg stat-icon-sm" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" width="32" height="32">
+                <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/>
+            </svg>
+            <div class="stat-content">
+                <div class="stat-value">
+                    @if (_loading)
+                    {
+                        <span class="spinner-sm"></span>
+                    }
+                    else
+                    {
+                        @(_summary?.WeakSignalClients ?? 0)
+                    }
+                </div>
+                <div class="stat-label">Weak Signal</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- View Tabs -->
+    <div class="wifi-view-tabs-wrapper">
+        <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-left" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: -200, behavior: 'smooth'})">&#8249;</button>
+        <div class="wifi-view-tabs">
+            <button class="wifi-view-tab @(_activeTab == "overview" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("overview"))">
+                Overview
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "metrics" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("metrics"))">
+                Metrics
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "spectrum" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("spectrum"))">
+                RF Environment
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "channels" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("channels"))">
+                Channels
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "client" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("client"))">
+                Client Stats
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "coverage" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("coverage"))">
+                Speed Map
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "floorplan" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("floorplan"))">
+                Signal Map
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "roaming" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("roaming"))">
+                Roaming
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "power" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("power"))">
+                Power/Coverage
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "loadbalance" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("loadbalance"))">
+                Load Balance
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "connectivity" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("connectivity"))">
+                Connectivity
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "bandsteering" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("bandsteering"))">
+                Band Steering
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "airtime" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("airtime"))">
+                Airtime
+            </button>
+            <button class="wifi-view-tab @(_activeTab == "environment" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("environment"))">
+                Environment
+            </button>
+            @* Jumps to Settings rather than rendering here, matching Monitoring's Data Usage tab. *@
+            <button class="wifi-view-tab" @onclick='() => NavigationManager.NavigateTo("/settings#ap-telemetry")'>
+                AP Telemetry
+            </button>
+        </div>
+        <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-right" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: 200, behavior: 'smooth'})">&#8250;</button>
+    </div>
+
+    @if (_activeTab == "metrics")
+    {
+        <!-- Metrics - Time Series Charts -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.Metrics InitialApMac="@_initialApMac" InitialBand="@_initialBand" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "client")
+    {
+        <!-- Client Stats Timeline -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.ClientTimeline InitialClientMac="@_initialClientMac" InitialApMac="@_initialApMac" InitialBand="@_initialBand" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "coverage")
+    {
+        <!-- Coverage / Speed Map -->
+        <SpeedTestMap Results="_speedTestResults"
+                      ApMarkers="_apMapMarkers"
+                      OnApLocationChanged="HandleApLocationChanged"
+                      OnClientClick="HandleMapClientClick"
+                      OnRefresh="RefreshData"
+                      OnTimeRangeChanged="HandleSpeedTestTimeRangeChanged"
+                      TimeFilterHours="_speedTestTimeRangeHours"
+                      ClientDetailMode="true"
+                      ShowDashboardLinks="true"
+                      MapHeight="676px" />
+    }
+    else if (_activeTab == "floorplan")
+    {
+        <!-- Signal Map / Floor Plan Editor -->
+        <NetworkOptimizer.Web.Components.Shared.WiFi.FloorPlanEditor MapHeight="676px" SpeedTestResults="_speedTestResults" SignalLogMarkers="_signalMapPoints" OnClientClick="HandleMapClientClick" OnSignalTimeRangeChanged="HandleSignalTimeRangeChanged" SignalTimeFilterHours="_signalTimeRangeHours" />
+    }
+    else if (_activeTab == "roaming")
+    {
+        <!-- Roaming Analytics -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.RoamingAnalytics OnClientClick="HandleMapClientClick" InitialEdge="@_initialEdge" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "channels")
+    {
+        <!-- Channel Analysis -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.ChannelAnalysis OnClientClick="HandleMapClientClick" InitialBand="@_initialBand" InitialChannel="@_initialChannel" AutoRunRecommendation="@_autoRunRecommendation" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "spectrum")
+    {
+        <!-- Spectrum Analysis -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.SpectrumAnalysis OnClientClick="HandleMapClientClick" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "loadbalance")
+    {
+        <!-- AP Load Balance -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.ApLoadBalance OnClientClick="HandleMapClientClick" OnNavigateToClients="HandleApLoadBalanceNavigate" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "power")
+    {
+        <!-- Power & Coverage Analysis -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.PowerCoverageAnalysis OnClientClick="HandleMapClientClick" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "bandsteering")
+    {
+        <!-- Band Steering Analysis -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.BandSteeringAnalysis OnClientClick="HandleMapClientClick" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "airtime")
+    {
+        <!-- Airtime Fairness Analysis -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.AirtimeFairness OnClientClick="HandleMapClientClick" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "environment")
+    {
+        <!-- Environmental Correlation -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.EnvironmentalCorrelation OnClientClick="HandleMapClientClick" />
+            </div>
+        </div>
+    }
+    else if (_activeTab == "connectivity")
+    {
+        <!-- Connectivity Flow -->
+        <div class="card card-full-width">
+            <div class="card-body">
+                <NetworkOptimizer.Web.Components.Shared.WiFi.ConnectivityFlow OnClientClick="HandleMapClientClick" />
+            </div>
+        </div>
+    }
+
+    <!-- Main Content (shown on Overview tab or always for context) -->
+    @if (_activeTab == "overview")
+    {
+    <div class="content-grid wifi-content-grid">
+        <!-- Health Score Card -->
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Site Health Score</h2>
+                <button class="btn btn-sm btn-secondary" @onclick="RefreshData" disabled="@_refreshing">
+                    @if (_refreshing)
+                    {
+                        <span class="spinner-sm"></span>
+                    }
+                    else
+                    {
+                        <span>Refresh</span>
+                    }
+                </button>
+            </div>
+            <div class="card-body">
+                @if (_loading)
+                {
+                    <div class="loading-state">
+                        <span class="spinner"></span>
+                        <span>Loading health score...</span>
+                    </div>
+                }
+                else if (_healthScore == null)
+                {
+                    <div class="empty-state">
+                        <p>Unable to calculate health score. Ensure UniFi is connected and APs are online.</p>
+                    </div>
+                }
+                else
+                {
+                    <div class="health-score-display">
+                        <div class="health-score-main">
+                            <div class="score-circle @GetScoreClass(_healthScore.OverallScore)">
+                                <span class="score-value @(_healthScore.OverallScore == 100 ? "score-perfect" : "")">@_healthScore.OverallScore</span>
+                                <span class="score-max">/100</span>
+                            </div>
+                            <div class="score-label">@GetScoreLabel(_healthScore.OverallScore)</div>
+                            <div class="health-score-timestamp">
+                                Last updated: @_healthScore.Timestamp.ToLocalTime().ToString("h:mm tt")
+                            </div>
+                        </div>
+
+                        <div class="health-dimensions">
+                            @foreach (var dimension in GetDimensions())
+                            {
+                                <div class="dimension-row">
+                                    <div class="dimension-label">@dimension.Name</div>
+                                    <div class="dimension-bar-container">
+                                        <div class="dimension-bar @GetDimensionBarClass(dimension.Score)" style="width: @dimension.Score%"></div>
+                                    </div>
+                                    <div class="dimension-score">@dimension.Score</div>
+                                </div>
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+
+        <!-- Client Band Distribution + Channel Optimization (stacked in one grid cell) -->
+        <div class="wifi-overview-stack">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Client Band Distribution</h2>
+            </div>
+            <div class="card-body">
+                @if (_loading)
+                {
+                    <div class="loading-state">
+                        <span class="spinner-sm"></span>
+                        <span>Loading...</span>
+                    </div>
+                }
+                else if (_summary?.TotalClients == 0)
+                {
+                    <div class="empty-state">
+                        <p>No wireless clients connected</p>
+                    </div>
+                }
+                else
+                {
+                    <div class="band-distribution">
+                        <div class="band-item clickable" @onclick="@(() => NavigateToTab("client", null, RadioBand.Band2_4GHz))">
+                            <div class="band-bar-container">
+                                <div class="band-bar band-2ghz" style="height: @GetBandPercentage(_summary?.ClientsOn2_4GHz ?? 0)%"></div>
+                            </div>
+                            <div class="band-value">@(_summary?.ClientsOn2_4GHz ?? 0)</div>
+                            <div class="band-label">2.4 GHz</div>
+                        </div>
+                        <div class="band-item clickable" @onclick="@(() => NavigateToTab("client", null, RadioBand.Band5GHz))">
+                            <div class="band-bar-container">
+                                <div class="band-bar band-5ghz" style="height: @GetBandPercentage(_summary?.ClientsOn5GHz ?? 0)%"></div>
+                            </div>
+                            <div class="band-value">@(_summary?.ClientsOn5GHz ?? 0)</div>
+                            <div class="band-label">5 GHz</div>
+                        </div>
+                        <div class="band-item clickable" @onclick="@(() => NavigateToTab("client", null, RadioBand.Band6GHz))">
+                            <div class="band-bar-container">
+                                <div class="band-bar band-6ghz" style="height: @GetBandPercentage(_summary?.ClientsOn6GHz ?? 0)%"></div>
+                            </div>
+                            <div class="band-value">@(_summary?.ClientsOn6GHz ?? 0)</div>
+                            <div class="band-label">6 GHz</div>
+                        </div>
+                    </div>
+
+                    <div class="band-stats">
+                        @if (_summary?.AvgSatisfaction.HasValue == true)
+                        {
+                            <div class="band-stat">
+                                <span class="band-stat-label">Avg Satisfaction:</span>
+                                <span class="band-stat-value @GetSatisfactionClass(_summary.AvgSatisfaction.Value)">@_summary.AvgSatisfaction%</span>
+                            </div>
+                        }
+                        @if (_summary?.AvgSignal.HasValue == true)
+                        {
+                            <div class="band-stat">
+                                <span class="band-stat-label">Avg Signal:</span>
+                                <span class="band-stat-value @SignalClassification.GetSignalClass(_summary.AvgSignal.Value, RadioBand.Band5GHz)" style="color: @SignalClassification.GetSignalColor(_summary.AvgSignal.Value, RadioBand.Band5GHz)">@_summary.AvgSignal dBm</span>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+
+        <!-- Channel Optimization Card -->
+        <div class="card channel-rec-card" data-tour="wifi-channel-optimization">
+            <div class="card-header">
+                <h2 class="card-title">Channel Optimization</h2>
+            </div>
+            <div class="card-body">
+                @if (_loading || _loadingRecs)
+                {
+                    <div class="loading-state">
+                        <span class="spinner-sm"></span>
+                        <span>Analyzing channels...</span>
+                    </div>
+                }
+                else if (_channelPlans == null || _channelPlans.Count == 0)
+                {
+                    <div class="empty-state">
+                        <p>Channel analysis unavailable. Ensure APs are online.</p>
+                    </div>
+                }
+                else if (TotalChannelChanges == 0)
+                {
+                    <div class="channel-rec-summary">
+                        <div class="channel-rec-status optimal">
+                            <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                            </svg>
+                            <span>Channels look optimal</span>
+                        </div>
+                        <button class="btn-recommend" @onclick="NavigateToChannelRecommendations">Review Channel Plan</button>
+                    </div>
+                }
+                else
+                {
+                    <div class="channel-rec-summary">
+                        <div class="channel-rec-status">
+                            <span class="channel-rec-count">@TotalChannelChanges</span>
+                            <span>channel change@(TotalChannelChanges != 1 ? "s" : "") suggested</span>
+                        </div>
+                        <div class="channel-rec-bands">
+                            @if (ChannelChangeCount(RadioBand.Band2_4GHz) > 0)
+                            {
+                                <span class="band-badge band-2ghz">2.4 GHz: @ChannelChangeCount(RadioBand.Band2_4GHz)</span>
+                            }
+                            @if (ChannelChangeCount(RadioBand.Band5GHz) > 0)
+                            {
+                                <span class="band-badge band-5ghz">5 GHz: @ChannelChangeCount(RadioBand.Band5GHz)</span>
+                            }
+                            @if (ChannelChangeCount(RadioBand.Band6GHz) > 0)
+                            {
+                                <span class="band-badge band-6ghz">6 GHz: @ChannelChangeCount(RadioBand.Band6GHz)</span>
+                            }
+                        </div>
+                        <button class="btn-recommend" @onclick="NavigateToChannelRecommendations">Recommend Best Channels</button>
+                    </div>
+                }
+            </div>
+        </div>
+        </div>
+
+        <!-- Issues Card -->
+        <div class="card card-span-2" data-tour="wifi-health-issues">
+            <div class="card-header">
+                <h2 class="card-title">Health Issues</h2>
+                @{
+                    var activeIssues = _healthScore?.Issues.Where(i => i.ShowOnOverview && !i.IsAcknowledged).ToList() ?? new List<HealthIssue>();
+                    var acknowledgedIssues = _healthScore?.Issues.Where(i => i.ShowOnOverview && i.IsAcknowledged).ToList() ?? new List<HealthIssue>();
+                }
+                @* Same tab row as Security Audit's Issues Found card. *@
+                <div class="filter-tabs">
+                    <button class="tab @(_issueTab == "active" ? "active" : "")" @onclick='() => _issueTab = "active"'>Active (@activeIssues.Count)</button>
+                    <button class="tab tab-muted @(_issueTab == "acknowledged" ? "active" : "")" @onclick='() => _issueTab = "acknowledged"'>Acknowledged (@acknowledgedIssues.Count)</button>
+                </div>
+            </div>
+            <div class="card-body">
+                @if (_loading)
+                {
+                    <div class="loading-state">
+                        <span class="spinner-sm"></span>
+                        <span>Loading...</span>
+                    </div>
+                }
+                else if (_issueTab == "acknowledged")
+                {
+                    @* Acknowledged issues: hidden from Active, still scored. *@
+                    @if (acknowledgedIssues.Count == 0)
+                    {
+                        <div class="no-issues">
+                            <p>No acknowledged issues are present right now.</p>
+                        </div>
+                    }
+                    else
+                    {
+                        <p class="acknowledged-note">Acknowledged issues stay in the health score. They are hidden here, not fixed.</p>
+                        <IssuesList Issues="acknowledgedIssues" ShowDetails="true" OnClientClick="HandleMapClientClick" OnRestore="RestoreIssueAsync" />
+                    }
+                }
+                else
+                {
+                    @if (activeIssues.Count == 0)
+                    {
+                        <div class="empty-state success-state">
+                            <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48">
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                            </svg>
+                            <p>No issues detected. Your Wi-Fi network is healthy!</p>
+                        </div>
+                    }
+                    else
+                    {
+                        <IssuesList Issues="activeIssues" ShowDetails="true" OnClientClick="HandleMapClientClick" OnAcknowledge="AcknowledgeIssueAsync" />
+                    }
+                }
+            </div>
+        </div>
+
+        <!-- Access Points Card -->
+        <div class="card card-span-2">
+            <div class="card-header">
+                <h2 class="card-title">Access Points</h2>
+                <button class="btn btn-sm btn-secondary" @onclick="RefreshData" disabled="@_refreshing">
+                    @if (_refreshing)
+                    {
+                        <span class="spinner-sm"></span>
+                    }
+                    else
+                    {
+                        <span>Refresh</span>
+                    }
+                </button>
+            </div>
+            <div class="card-body">
+                @if (_loading)
+                {
+                    <div class="loading-state">
+                        <span class="spinner-sm"></span>
+                        <span>Loading access points...</span>
+                    </div>
+                }
+                else if (_accessPoints.Count == 0)
+                {
+                    <div class="empty-state">
+                        <p>No access points found</p>
+                    </div>
+                }
+                else
+                {
+                    <div class="ap-list">
+                        @foreach (var ap in _accessPoints)
+                        {
+                            <div class="ap-card @(ap.Status.IsOffline ? "ap-offline" : "")">
+                                <div class="ap-header">
+                                    <DeviceIcon Model="@ap.Model" Size="xl" />
+                                    <div class="ap-header-text">
+                                        <span class="ap-name">@ap.Name</span>
+                                        <span class="ap-model">@ap.Model</span>
+                                    </div>
+                                    <div class="ap-status">
+                                        <span class="status-dot @ap.Status.CssClass"></span>
+                                        <span class="ap-status-text">@ap.Status.Label</span>
+                                    </div>
+                                </div>
+                                <div class="ap-stats @(ap.IsMeshChild ? "ap-stats-mesh" : "") @(ap.MeshUplinkIsMlo || ap.MeshChildren.Any(c => c.IsMlo) ? "ap-stats-mlo" : "")">
+                                    <div class="ap-stat clickable" @onclick="@(() => NavigateToTab("client", ap.Mac))" @onclick:stopPropagation="true">
+                                        <span class="ap-stat-value">@ap.TotalClients</span>
+                                        <span class="ap-stat-label">Clients</span>
+                                    </div>
+                                    @* Being a mesh child is the whole condition: the backhaul interface the
+                                       re-pair needs is read off the device when UniFi does not report it,
+                                       and signal comes from the same half that can go missing. *@
+                                    @if (ap.IsMeshChild)
+                                    {
+                                        <div class="ap-mesh-info @(_canOperate ? "ap-mesh-info-with-action" : "")">
+                                            <SiteOperatorOnly>
+                                                <button class="btn btn-sm btn-primary optimize-mesh-btn"
+                                                        @onclick="@(() => OptimizeMeshAsync(ap))"
+                                                        disabled="@(!ap.IsOnline || _optimizingMacs.Contains(ap.Mac) || IsLicenseRestricted)"
+                                                        data-tooltip="Re-scans the mesh uplink so this AP reconnects to its highest Uplink Priority parent when it's stuck on a weaker one. Safe to re-run.">
+                                                    @if (_optimizingMacs.Contains(ap.Mac))
+                                                    {
+                                                        <span class="spinner-sm"></span>
+                                                        <span>Re-pairing...</span>
+                                                    }
+                                                    else
+                                                    {
+                                                        <span class="optimize-mesh-icon">&#x21bb;</span>
+                                                        <span>Re-pair Uplink</span>
+                                                    }
+                                                </button>
+                                            </SiteOperatorOnly>
+                                            @if (ap.MeshUplinkIsMlo && ap.MeshUplinkLinks.Count > 0)
+                                            {
+                                                @* Child's perspective: its own uplink.mlo_links (signal as the child
+                                                   measures it), or the parent's downlink_table flipped when the child
+                                                   reports no links. The empty signal span keeps a row at three grid
+                                                   cells so the columns stay aligned. *@
+                                                <div class="mesh-mlo-links">
+                                                    @foreach (var link in ap.MeshUplinkLinks.OrderByDescending(l => l.Band))
+                                                    {
+                                                        <div class="mesh-mlo-link">
+                                                            <span class="band-badge @GetBandCssClass(link.Band ?? RadioBand.Band5GHz)">@((link.Band ?? RadioBand.Band5GHz).ToDisplayString())</span>
+                                                            <span class="mesh-signal-value mesh-mlo-signal">
+                                                                @if (link.SignalDbm.HasValue)
+                                                                {
+                                                                    <span class="@SignalClassification.GetSignalClass(link.SignalDbm.Value, link.Band ?? RadioBand.Band5GHz)" style="color: @SignalClassification.GetSignalColor(link.SignalDbm.Value, link.Band ?? RadioBand.Band5GHz)">@link.SignalDbm</span> <span class="mesh-unit">dBm</span>
+                                                                }
+                                                            </span>
+                                                            <span class="mesh-rates">
+                                                                @if (link.TxRateMbps.HasValue)
+                                                                {
+                                                                    <span class="mesh-rate wifi-speed-tx">TX @link.TxRateMbps</span>
+                                                                }
+                                                                @if (link.RxRateMbps.HasValue)
+                                                                {
+                                                                    <span class="mesh-rate wifi-speed-rx">RX @link.RxRateMbps</span>
+                                                                }
+                                                            </span>
+                                                        </div>
+                                                    }
+                                                </div>
+                                            }
+                                            else if (ap.MeshUplinkSignalDbm.HasValue)
+                                            {
+                                                <div class="mesh-signal">
+                                                    <span class="mesh-signal-value"><span class="@SignalClassification.GetSignalClass(ap.MeshUplinkSignalDbm.Value, ap.MeshUplinkBand ?? RadioBand.Band5GHz)" style="color: @SignalClassification.GetSignalColor(ap.MeshUplinkSignalDbm.Value, ap.MeshUplinkBand ?? RadioBand.Band5GHz)">@ap.MeshUplinkSignalDbm</span> <span class="mesh-unit">dBm</span></span>
+                                                    @if (ap.MeshUplinkTxRateMbps.HasValue || ap.MeshUplinkRxRateMbps.HasValue)
+                                                    {
+                                                        <span class="mesh-rates">
+                                                            @if (ap.MeshUplinkTxRateMbps.HasValue)
+                                                            {
+                                                                <span class="mesh-rate wifi-speed-tx">TX @ap.MeshUplinkTxRateMbps</span>
+                                                            }
+                                                            @if (ap.MeshUplinkRxRateMbps.HasValue)
+                                                            {
+                                                                <span class="mesh-rate wifi-speed-rx">RX @ap.MeshUplinkRxRateMbps</span>
+                                                            }
+                                                        </span>
+                                                    }
+                                                </div>
+                                            }
+                                            <span class="ap-stat-label"><strong>Mesh Uplink@(ap.MeshUplinkIsMlo ? " (MLO)" : "")</strong>@(ap.MeshParentName != null ? $" to {ap.MeshParentName}" : "")</span>
+                                        </div>
+                                    }
+                                    @if (ap.MeshChildren.Count > 0)
+                                    {
+                                        @foreach (var child in ap.MeshChildren)
+                                        {
+                                            <div class="ap-mesh-info">
+                                                @if (child.IsMlo && child.Links.Count > 0)
+                                                {
+                                                    <div class="mesh-mlo-links">
+                                                        @foreach (var link in child.Links.OrderByDescending(l => l.Band))
+                                                        {
+                                                            <div class="mesh-mlo-link">
+                                                                <span class="band-badge @GetBandCssClass(link.Band ?? RadioBand.Band5GHz)">@((link.Band ?? RadioBand.Band5GHz).ToDisplayString())</span>
+                                                                <span class="mesh-signal-value mesh-mlo-signal">
+                                                                    @if (link.SignalDbm.HasValue)
+                                                                    {
+                                                                        <span class="@SignalClassification.GetSignalClass(link.SignalDbm.Value, link.Band ?? RadioBand.Band5GHz)" style="color: @SignalClassification.GetSignalColor(link.SignalDbm.Value, link.Band ?? RadioBand.Band5GHz)">@link.SignalDbm</span> <span class="mesh-unit">dBm</span>
+                                                                    }
+                                                                </span>
+                                                                <span class="mesh-rates">
+                                                                    @if (link.TxRateMbps.HasValue)
+                                                                    {
+                                                                        <span class="mesh-rate wifi-speed-tx">TX @link.TxRateMbps</span>
+                                                                    }
+                                                                    @if (link.RxRateMbps.HasValue)
+                                                                    {
+                                                                        <span class="mesh-rate wifi-speed-rx">RX @link.RxRateMbps</span>
+                                                                    }
+                                                                </span>
+                                                            </div>
+                                                        }
+                                                    </div>
+                                                }
+                                                else
+                                                {
+                                                    <div class="mesh-signal">
+                                                        @if (child.SignalDbm.HasValue)
+                                                        {
+                                                            <span class="mesh-signal-value"><span class="@SignalClassification.GetSignalClass(child.SignalDbm.Value, child.UplinkBand ?? RadioBand.Band5GHz)" style="color: @SignalClassification.GetSignalColor(child.SignalDbm.Value, child.UplinkBand ?? RadioBand.Band5GHz)">@child.SignalDbm</span> <span class="mesh-unit">dBm</span></span>
+                                                        }
+                                                        @if (child.TxRateMbps.HasValue || child.RxRateMbps.HasValue)
+                                                        {
+                                                            <span class="mesh-rates">
+                                                                @if (child.TxRateMbps.HasValue)
+                                                                {
+                                                                    <span class="mesh-rate wifi-speed-tx">TX @child.TxRateMbps</span>
+                                                                }
+                                                                @if (child.RxRateMbps.HasValue)
+                                                                {
+                                                                    <span class="mesh-rate wifi-speed-rx">RX @child.RxRateMbps</span>
+                                                                }
+                                                            </span>
+                                                        }
+                                                    </div>
+                                                }
+                                                <span class="ap-stat-label"><strong>Mesh Child@(child.IsMlo ? " (MLO)" : ""):</strong> @child.Name</span>
+                                            </div>
+                                        }
+                                    }
+                                </div>
+                                <div class="ap-radios">
+                                    @foreach (var radio in ap.Radios)
+                                    {
+                                        @if (radio.Channel.HasValue)
+                                        {
+                                            <div class="ap-radio">
+                                                <span class="radio-band clickable @GetBandCssClass(radio.Band)"
+                                                      @onclick="@(() => NavigateToTab("metrics", ap.Mac, radio.Band))"
+                                                      @onclick:stopPropagation="true">@radio.Band.ToDisplayString()</span>
+                                                <span class="radio-channel clickable"
+                                                      @onclick="@(() => NavigateToTab("channels", null, radio.Band, radio.Channel))"
+                                                      @onclick:stopPropagation="true">Ch @radio.Channel</span>
+                                                @if (radio.ChannelUtilization.HasValue)
+                                                {
+                                                    <span class="radio-util clickable @GetUtilizationClass(radio.ChannelUtilization.Value)"
+                                                          @onclick="@(() => NavigateToTab("metrics", ap.Mac, radio.Band))"
+                                                          @onclick:stopPropagation="true">@radio.ChannelUtilization% util</span>
+                                                }
+                                                @if (radio.Eirp.HasValue)
+                                                {
+                                                    <span class="radio-eirp clickable"
+                                                          @onclick="@(() => NavigateToTab("power"))"
+                                                          @onclick:stopPropagation="true">@(radio.Eirp) dBm</span>
+                                                }
+                                                <span class="radio-clients clickable"
+                                                      @onclick="@(() => NavigateToTab("client", ap.Mac, radio.Band))"
+                                                      @onclick:stopPropagation="true">@radio.ClientCount clients</span>
+                                            </div>
+                                        }
+                                        else
+                                        {
+                                            <div class="ap-radio radio-disabled">
+                                                <span class="radio-band @GetBandCssClass(radio.Band)">@radio.Band.ToDisplayString()</span>
+                                                @if (radio.Band == RadioBand.Band6GHz && ap.IsAfcEnabled)
+                                                {
+                                                    <span class="radio-channel">AFC</span>
+                                                }
+                                                else
+                                                {
+                                                    <span class="radio-channel">Disabled</span>
+                                                }
+                                            </div>
+                                        }
+                                    }
+                                </div>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+
+        @if (_speedTestResults.Any(r => r.Latitude.HasValue && r.Longitude.HasValue) || _apMapMarkers.Any())
+        {
+            <SpeedTestMap Results="_speedTestResults"
+                          ApMarkers="_apMapMarkers"
+                          OnApLocationChanged="HandleApLocationChanged"
+                          OnClientClick="HandleMapClientClick"
+                          OnRefresh="RefreshData"
+                          OnTimeRangeChanged="HandleSpeedTestTimeRangeChanged"
+                          TimeFilterHours="_speedTestTimeRangeHours"
+                          ClientDetailMode="true"
+                          ShowDashboardLinks="true" />
+        }
+    } @* End of overview tab *@
+}
+
+@code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
+    [SupplyParameterFromQuery(Name = "client")]
+    public string? ClientQueryParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "tab")]
+    public string? TabParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "ap")]
+    public string? ApQueryParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "band")]
+    public string? BandQueryParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "channel")]
+    public int? ChannelQueryParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "recommend")]
+    public bool? RecommendQueryParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "edge")]
+    public string? EdgeQueryParam { get; set; }
+
+    private string? _lastTabParam;
+
+    private bool _loading = true;
+    private bool _refreshing = false;
+    private string _activeTab = "overview";
+    private string? _initialClientMac;
+    private string? _initialApMac;
+    private RadioBand? _initialBand;
+    private int? _initialChannel;
+    private bool _autoRunRecommendation;
+    private string? _initialEdge;
+
+    private static readonly HashSet<string> ValidTabs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "overview", "metrics", "spectrum", "channels", "client", "coverage",
+        "floorplan", "roaming", "power", "loadbalance", "connectivity",
+        "bandsteering", "airtime", "environment"
+    };
+
+    private static string ResolveTab(string? param)
+    {
+        if (param != null && ValidTabs.Contains(param))
+            return param.ToLowerInvariant();
+        return "overview";
+    }
+
+    private async Task SetActiveTab(string tab)
+    {
+        _activeTab = tab;
+        // Clear all drill-down filters when manually switching tabs
+        _initialClientMac = null;
+        _initialApMac = null;
+        _initialBand = null;
+        _initialChannel = null;
+        _initialEdge = null;
+        _autoRunRecommendation = false;
+
+        // Reload AP markers when entering Speed Map tab (may have been edited on Signal Map)
+        if (tab == "coverage")
+            await LoadApMarkers();
+
+        // Build clean URL - drop filter params when manually switching
+        var uri = "/wifi-optimizer?tab=" + tab;
+        NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
+        _lastTabParam = tab;
+    }
+
+    private void NavigateToTab(string tab, string? apMac = null, RadioBand? band = null, int? channel = null)
+    {
+        _activeTab = tab;
+        _initialApMac = apMac;
+        _initialBand = band;
+        _initialChannel = channel;
+        _initialClientMac = null;
+        _autoRunRecommendation = false;
+
+        // Build URL with filter params
+        var uri = "/wifi-optimizer?tab=" + tab;
+        if (!string.IsNullOrEmpty(apMac))
+            uri += "&ap=" + Uri.EscapeDataString(apMac);
+        if (band.HasValue)
+            uri += "&band=" + BandToQueryString(band.Value);
+        if (channel.HasValue)
+            uri += "&channel=" + channel.Value;
+
+        NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
+        _lastTabParam = tab;
+    }
+
+    private static string BandToQueryString(RadioBand band) => band switch
+    {
+        RadioBand.Band2_4GHz => "2.4",
+        RadioBand.Band5GHz => "5",
+        RadioBand.Band6GHz => "6",
+        _ => ""
+    };
+
+    private static RadioBand? BandFromQueryString(string? value) => value switch
+    {
+        "2.4" => RadioBand.Band2_4GHz,
+        "5" => RadioBand.Band5GHz,
+        "6" => RadioBand.Band6GHz,
+        _ => null
+    };
+
+    // --- Channel Optimization overview card ---
+    private Dictionary<RadioBand, ChannelPlan>? _channelPlans;
+    private bool _loadingRecs;
+
+    private int ChannelChangeCount(RadioBand band) =>
+        _channelPlans != null && _channelPlans.TryGetValue(band, out var plan)
+            ? plan.Recommendations.Count(r => r.IsChanged)
+            : 0;
+
+    private int TotalChannelChanges =>
+        _channelPlans?.Values.Sum(p => p.Recommendations.Count(r => r.IsChanged)) ?? 0;
+
+    /// <summary>
+    /// Compute channel recommendations for the overview summary card. Runs the full engine,
+    /// so it is kicked off in the background after the overview paints rather than blocking it.
+    /// </summary>
+    private async Task LoadChannelRecommendationsAsync()
+    {
+        if (_loadingRecs) return;
+        _loadingRecs = true;
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            _channelPlans = await WiFiService.GetAllChannelRecommendationsAsync(new RecommendationOptions());
+        }
+        catch
+        {
+            _channelPlans = null;
+        }
+        finally
+        {
+            _loadingRecs = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void NavigateToChannelRecommendations()
+    {
+        _activeTab = "channels";
+        _initialApMac = null;
+        _initialBand = null;
+        _initialChannel = null;
+        _initialClientMac = null;
+        _initialEdge = null;
+        _autoRunRecommendation = true;
+        NavigationManager.NavigateTo("/wifi-optimizer?tab=channels&recommend=true", forceLoad: false, replace: false);
+        _lastTabParam = "channels";
+    }
+
+    private SiteHealthScore? _healthScore;
+    private WiFiSummary? _summary;
+    private List<AccessPointSnapshot> _accessPoints = new();
+    /// <summary>Health Issues card tab: "active" or "acknowledged".</summary>
+    private string _issueTab = "active";
+
+    /// <summary>Acknowledge: hidden from the active list, still scored. The issue object moves groups in place.</summary>
+    private async Task AcknowledgeIssueAsync(HealthIssue issue)
+    {
+        // An issue without a key cannot be remembered, so it must not vanish either.
+        if (string.IsNullOrEmpty(issue.Key)) return;
+        await IssueAcknowledgments.AcknowledgeAsync(issue.Key);
+        issue.IsAcknowledged = true;
+    }
+
+    private async Task RestoreIssueAsync(HealthIssue issue)
+    {
+        if (string.IsNullOrEmpty(issue.Key)) return;
+        await IssueAcknowledgments.RestoreAsync(issue.Key);
+        issue.IsAcknowledged = false;
+    }
+    private List<Iperf3Result> _speedTestResults = new();
+    private List<SignalMapPoint> _signalMapPoints = new();
+    private List<ApMapMarker> _apMapMarkers = new();
+    private System.Threading.Timer? _mapPollTimer;
+
+    // MACs of mesh children with an in-flight Optimize Mesh action (drives the per-card spinner).
+    private readonly HashSet<string> _optimizingMacs = new();
+    private string? _toastMessage;
+    private string? _toastNote;
+    private string _toastClass = "alert-info";
+
+    // Auto-refresh the Overview tab once the health score has aged past this, so a parked
+    // tab doesn't show indefinitely stale data. Checked on each map-poll tick.
+    private static readonly TimeSpan HealthScoreStaleAfter = TimeSpan.FromMinutes(1);
+
+    private int _signalTimeRangeHours = 168; // 1 week default, matches FloorPlanEditor slider
+    private int _speedTestTimeRangeHours = 720; // 30 days default, matches SpeedTestMap slider
+
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>
+    /// Whether this user may act on the site. Drives layout only - the controls themselves are
+    /// gated by SiteOperatorOnly, and the service behind them is the actual boundary. The
+    /// mesh row reserves space for a button that a Viewer never gets, so it needs to know.
+    /// </summary>
+    private bool _canOperate = true;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _canOperate = AuthState is null
+            || (await Authz.AuthorizeAsync((await AuthState).User, SiteContext.Slug, Policies.SiteOperator)).Succeeded;
+    }
+
+    protected override void OnInitialized()
+    {
+        // Deep link: auto-open Client Stats tab with specific client
+        if (!string.IsNullOrEmpty(ClientQueryParam))
+        {
+            _activeTab = "client";
+            _initialClientMac = ClientQueryParam;
+            _lastTabParam = "client";
+        }
+        else if (!string.IsNullOrEmpty(TabParam))
+        {
+            _activeTab = ResolveTab(TabParam);
+            _lastTabParam = TabParam;
+
+            // Parse drill-down filter params
+            _initialApMac = ApQueryParam;
+            _initialBand = BandFromQueryString(BandQueryParam);
+            _initialChannel = ChannelQueryParam;
+            _autoRunRecommendation = RecommendQueryParam == true;
+            _initialEdge = EdgeQueryParam;
+        }
+        else
+        {
+            _lastTabParam = TabParam;
+        }
+
+        ConnectionService.OnConnectionChanged += OnConnectionChanged;
+        PtrState.RefreshCallback = () => RefreshData();
+        PtrState.NotifyStateChanged = StateHasChanged;
+        _ = LoadDataAsync();
+
+        // Poll for new speed test results and signal data every 5 seconds
+        _mapPollTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    // While the user sits on the Overview tab, the health score (and channel plan)
+                    // only refresh on load or manual refresh. Once the score goes stale, run the
+                    // full refresh so it picks everything up - health, APs, speed tests, signal
+                    // data, and channel recommendations. RefreshData re-pulls it all, so skip the
+                    // lighter speed/signal update this tick.
+                    // Only when connected: RefreshData doesn't wait for the console, so firing it
+                    // mid-reconnect (e.g. during a deploy) would hang on a dead connection. On
+                    // reconnect, OnConnectionChanged -> LoadDataAsync does a connection-aware reload.
+                    if (_activeTab == "overview" && ConnectionService.IsConnected && !_refreshing
+                        && _healthScore != null
+                        && DateTimeOffset.UtcNow - _healthScore.Timestamp >= HealthScoreStaleAfter)
+                    {
+                        await RefreshData();
+                        return;
+                    }
+
+                    var now = DateTime.UtcNow;
+                    var speedTestTask = SpeedTestService.GetResultsAsync(count: 0, hours: _speedTestTimeRangeHours);
+                    var signalTask = DashboardService.GetSignalMapPointsAsync(
+                        null, _signalTimeRangeHours > 0 ? now.AddHours(-_signalTimeRangeHours) : DateTime.MinValue, now);
+
+                    await Task.WhenAll(speedTestTask, signalTask);
+
+                    _speedTestResults = await speedTestTask;
+                    _signalMapPoints = await signalTask;
+                    StateHasChanged();
+                });
+            }
+            catch { /* prevent timer death */ }
+        }, null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+    }
+
+    protected override void OnParametersSet()
+    {
+        // Handle query param changes when already on this page (Blazor reuses the component)
+        if (!string.IsNullOrEmpty(ClientQueryParam) && ClientQueryParam != _initialClientMac)
+        {
+            _activeTab = "client";
+            _initialClientMac = ClientQueryParam;
+        }
+        else if (!string.IsNullOrEmpty(EdgeQueryParam) && EdgeQueryParam != _initialEdge)
+        {
+            _activeTab = "roaming";
+            _initialEdge = EdgeQueryParam;
+        }
+        else if (TabParam != _lastTabParam && _lastTabParam != null)
+        {
+            var newTab = ResolveTab(TabParam);
+            if (newTab != _activeTab)
+            {
+                _activeTab = newTab;
+                _initialClientMac = null;
+
+                // Re-parse drill-down params for the new tab
+                _initialApMac = ApQueryParam;
+                _initialBand = BandFromQueryString(BandQueryParam);
+                _initialChannel = ChannelQueryParam;
+                _autoRunRecommendation = RecommendQueryParam == true;
+                _initialEdge = EdgeQueryParam;
+
+                StateHasChanged();
+            }
+        }
+        _lastTabParam = TabParam;
+    }
+
+    private async void OnConnectionChanged()
+    {
+        // Fires from a background thread (console reconnect), so marshal the whole
+        // reload onto the dispatcher - LoadDataAsync calls StateHasChanged directly -
+        // and swallow exceptions so this async void handler can't crash the circuit.
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                WiFiService.ClearCache();
+                await LoadDataAsync();
+                StateHasChanged();
+            });
+        }
+        catch { /* component may be disposed */ }
+    }
+
+    private async Task LoadDataAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        try
+        {
+            await ConnectionService.WaitForConnectionAsync();
+
+            // Load all data in parallel
+            var now = DateTime.UtcNow;
+            var summaryTask = WiFiService.GetSummaryAsync();
+            var healthTask = WiFiService.GetSiteHealthScoreAsync();
+            var apsTask = WiFiService.GetAccessPointsAsync();
+            var speedTestTask = SpeedTestService.GetResultsAsync(count: 0, hours: _speedTestTimeRangeHours);
+            var signalTask = DashboardService.GetSignalMapPointsAsync(
+                null, _signalTimeRangeHours > 0 ? now.AddHours(-_signalTimeRangeHours) : DateTime.MinValue, now);
+
+            await Task.WhenAll(summaryTask, healthTask, apsTask, speedTestTask, signalTask);
+
+            _summary = await summaryTask;
+            _healthScore = await healthTask;
+            _accessPoints = await apsTask;
+            _speedTestResults = await speedTestTask;
+            _signalMapPoints = await signalTask;
+
+            // Build AP map markers (join AP snapshots with saved locations)
+            await LoadApMarkers();
+        }
+        finally
+        {
+            _loading = false;
+            await InvokeAsync(StateHasChanged);
+        }
+
+        // Channel recommendations run the full engine; compute in the background so they don't
+        // delay the overview paint. The card shows its own loading state until ready.
+        _ = LoadChannelRecommendationsAsync();
+    }
+
+    private async Task OptimizeMeshAsync(AccessPointSnapshot ap)
+    {
+        if (_optimizingMacs.Contains(ap.Mac)) return;
+
+        _optimizingMacs.Add(ap.Mac);
+        StateHasChanged();
+
+        try
+        {
+            var result = await MeshService.OptimizeAsync(ap.Ip, ap.MeshUplinkInterface, ap.Name, ap.Mac);
+            // Only warn about the data lag when it actually roamed - there's nothing to wait for
+            // on a noop or a failure.
+            var note = result.Action == "moved"
+                ? "It may take a minute for the AP data to update."
+                : null;
+            ShowToast(result.Message, result.Ok ? "alert-success" : "alert-warning", note);
+
+            // Pull once now in case the controller already caught up, then again after delays:
+            // the UniFi controller's device list lags the actual roam by ~30s, so the immediate
+            // pull usually still shows the old parent. The +5s catches a fast update and the +30s
+            // catches the typical controller lag.
+            _accessPoints = await WiFiService.GetAccessPointsAsync(forceRefresh: true);
+            _ = RefreshAccessPointsLater(TimeSpan.FromSeconds(5));
+            _ = RefreshAccessPointsLater(TimeSpan.FromSeconds(30));
+        }
+        catch
+        {
+            // The service logs the detail; surface a friendly message to the user.
+            ShowToast("Couldn't optimize the mesh uplink. Check the AP's SSH connection.", "alert-warning");
+        }
+        finally
+        {
+            _optimizingMacs.Remove(ap.Mac);
+            StateHasChanged();
+        }
+    }
+
+    private async Task RefreshAccessPointsLater(TimeSpan delay)
+    {
+        try
+        {
+            await Task.Delay(delay);
+            var aps = await WiFiService.GetAccessPointsAsync(forceRefresh: true);
+            await InvokeAsync(() =>
+            {
+                _accessPoints = aps;
+                StateHasChanged();
+            });
+        }
+        catch
+        {
+            // Best-effort follow-up refresh; ignore failures (e.g., the circuit went away).
+        }
+    }
+
+    private void ShowToast(string message, string cssClass, string? note = null)
+    {
+        _toastMessage = message;
+        _toastNote = note;
+        _toastClass = cssClass;
+        StateHasChanged();
+
+        // Auto-dismiss after a few seconds without blocking.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(6));
+            await InvokeAsync(() =>
+            {
+                _toastMessage = null;
+                _toastNote = null;
+                StateHasChanged();
+            });
+        });
+    }
+
+    private async Task RefreshData()
+    {
+        _refreshing = true;
+        StateHasChanged();
+
+        try
+        {
+            WiFiService.ClearCache();
+
+            var now = DateTime.UtcNow;
+            var summaryTask = WiFiService.GetSummaryAsync();
+            var healthTask = WiFiService.GetSiteHealthScoreAsync(forceRefresh: true);
+            var apsTask = WiFiService.GetAccessPointsAsync(forceRefresh: true);
+            var speedTestTask = SpeedTestService.GetResultsAsync(count: 0, hours: _speedTestTimeRangeHours);
+            var signalTask = DashboardService.GetSignalMapPointsAsync(
+                null, _signalTimeRangeHours > 0 ? now.AddHours(-_signalTimeRangeHours) : DateTime.MinValue, now);
+
+            await Task.WhenAll(summaryTask, healthTask, apsTask, speedTestTask, signalTask);
+
+            _summary = await summaryTask;
+            _healthScore = await healthTask;
+            _accessPoints = await apsTask;
+            _speedTestResults = await speedTestTask;
+            _signalMapPoints = await signalTask;
+
+            await LoadApMarkers();
+        }
+        finally
+        {
+            _refreshing = false;
+            StateHasChanged();
+        }
+
+        // Refresh cleared the cache, so recompute the channel recommendations summary too.
+        _ = LoadChannelRecommendationsAsync();
+    }
+
+    private async Task LoadApMarkers()
+    {
+        try
+        {
+            _apMapMarkers = await ApMapService.GetApMapMarkersAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"LoadApMarkers error: {ex.Message}");
+        }
+    }
+
+    private async Task HandleApLocationChanged((string Mac, double Lat, double Lng) args)
+    {
+        try
+        {
+            await ApMapAdmin.SaveApLocationAsync(args.Mac, args.Lat, args.Lng);
+
+            var marker = _apMapMarkers.FirstOrDefault(m => m.Mac.Equals(args.Mac, StringComparison.OrdinalIgnoreCase));
+            if (marker != null)
+            {
+                marker.Latitude = args.Lat;
+                marker.Longitude = args.Lng;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error saving AP location: {ex.Message}");
+        }
+    }
+
+    private void HandleMapClientClick(string mac)
+    {
+        _activeTab = "client";
+        _initialClientMac = mac;
+        NavigationManager.NavigateTo("/wifi-optimizer?tab=client&client=" + Uri.EscapeDataString(mac), forceLoad: false, replace: false);
+        _lastTabParam = "client";
+    }
+
+    private void HandleApLoadBalanceNavigate((string? ApMac, RadioBand? Band) filter)
+    {
+        NavigateToTab("client", filter.ApMac, filter.Band);
+    }
+
+    private async Task HandleSignalTimeRangeChanged(int hours)
+    {
+        _signalTimeRangeHours = hours;
+        var now = DateTime.UtcNow;
+        _signalMapPoints = await DashboardService.GetSignalMapPointsAsync(
+            null, hours > 0 ? now.AddHours(-hours) : DateTime.MinValue, now);
+        StateHasChanged();
+    }
+
+    private async Task HandleSpeedTestTimeRangeChanged(int hours)
+    {
+        _speedTestTimeRangeHours = hours;
+        _speedTestResults = await SpeedTestService.GetResultsAsync(count: 0, hours: hours);
+        StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        _mapPollTimer?.Dispose();
+        ConnectionService.OnConnectionChanged -= OnConnectionChanged;
+    }
+
+    private IEnumerable<ScoreDimension> GetDimensions()
+    {
+        if (_healthScore == null) yield break;
+
+        yield return _healthScore.SignalQuality;
+        yield return _healthScore.ChannelHealth;
+        yield return _healthScore.ClientSatisfaction;
+        yield return _healthScore.AirtimeEfficiency;
+        yield return _healthScore.RoamingPerformance;
+        yield return _healthScore.CapacityHeadroom;
+    }
+
+    private string GetScoreClass(int? score) => score switch
+    {
+        >= 90 => "score-excellent",
+        >= 75 => "score-good",
+        >= 60 => "score-fair",
+        _ => "score-poor"
+    };
+
+    private string GetScoreLabel(int? score) => score switch
+    {
+        null => "-",
+        >= 90 => "Excellent",
+        >= 75 => "Good",
+        >= 60 => "Fair",
+        _ => "Needs Work"
+    };
+
+    private string GetDimensionBarClass(int score) => score switch
+    {
+        >= 80 => "bar-excellent",
+        >= 60 => "bar-good",
+        >= 40 => "bar-fair",
+        _ => "bar-poor"
+    };
+
+    private string GetSatisfactionClass(int satisfaction) => satisfaction switch
+    {
+        >= 80 => "satisfaction-excellent",
+        >= 60 => "satisfaction-good",
+        >= 40 => "satisfaction-fair",
+        _ => "satisfaction-poor"
+    };
+
+
+    private string GetUtilizationClass(int utilization) => utilization switch
+    {
+        <= 30 => "util-low",
+        <= 60 => "util-medium",
+        _ => "util-high"
+    };
+
+    private string GetBandCssClass(RadioBand band) => band switch
+    {
+        RadioBand.Band2_4GHz => "band-2ghz",
+        RadioBand.Band5GHz => "band-5ghz",
+        RadioBand.Band6GHz => "band-6ghz",
+        _ => ""
+    };
+
+    private int GetBandPercentage(int count)
+    {
+        var total = _summary?.TotalClients ?? 0;
+        if (total == 0) return 0;
+        return (int)Math.Round((double)count / total * 100);
+    }
+}

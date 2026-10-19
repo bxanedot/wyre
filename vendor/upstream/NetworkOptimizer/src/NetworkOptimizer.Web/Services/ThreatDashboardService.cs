@@ -1,0 +1,1234 @@
+using System.Text.Json;
+using NetworkOptimizer.Core.Helpers;
+using NetworkOptimizer.Storage.Services;
+using NetworkOptimizer.Threats.Analysis;
+using NetworkOptimizer.Threats.CrowdSec;
+using NetworkOptimizer.Threats.Enrichment;
+using NetworkOptimizer.Threats.Interfaces;
+using NetworkOptimizer.Threats.Models;
+using NetworkOptimizer.Storage.Models.Identity;
+using NetworkOptimizer.Web.Services.Gates;
+using NetworkOptimizer.UniFi.Models;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// Scoped service providing aggregated data for the Threat Intelligence Dashboard.
+/// </summary>
+/// <summary>
+/// Changing the threat noise filters (design doc 06, gate 9).
+///
+/// Every read stays off this interface - Threat Intelligence is a dashboard, and a Viewer is meant to
+/// read all of it. Only the filters are gated, and they are Site Admin rather than Operator because a
+/// noise filter SUPPRESSES rows: unlike tuning what is measured, the failure mode is a threat nobody
+/// is shown, which matches the gate the page already applies to them.
+/// </summary>
+[MutatingService(SiteScoped = true)]
+public interface IThreatFilterAdminService
+{
+    [RequireRole(Roles.Admin)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "threat_noise_filter")]
+    Task SaveNoiseFilterAsync(ThreatNoiseFilter filter, CancellationToken cancellationToken = default);
+
+    [RequireRole(Roles.Admin)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "threat_noise_filter")]
+    Task DeleteNoiseFilterAsync(int filterId, CancellationToken cancellationToken = default);
+}
+
+public class ThreatDashboardService : IThreatFilterAdminService
+{
+    private readonly ExposureValidator _exposureValidator;
+    private readonly CrowdSecEnrichmentService _crowdSecService;
+    private readonly GeoEnrichmentService _geoService;
+    private readonly IUniFiClientAccessor _uniFiClientAccessor;
+    private readonly SiteContextService _siteContext;
+    private readonly IThreatSettingsAccessor _settingsAccessor;
+    private readonly ICredentialProtectionService _credentialService;
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<ThreatDashboardService> _logger;
+
+    // Cached noise filters (loaded once per service scope, i.e., per request)
+    private List<ThreatNoiseFilter>? _activeFilters;
+
+    /// <summary>
+    /// When true, noise filters are not applied to queries (global disable toggle).
+    /// </summary>
+    public bool FiltersDisabled { get; set; }
+
+    /// <summary>
+    /// When non-null, only events with matching severity levels are included in query results.
+    /// </summary>
+    public int[]? SeverityFilter { get; set; }
+
+    public ThreatDashboardService(
+        ExposureValidator exposureValidator,
+        CrowdSecEnrichmentService crowdSecService,
+        GeoEnrichmentService geoService,
+        IUniFiClientAccessor uniFiClientAccessor,
+        SiteContextService siteContext,
+        IThreatSettingsAccessor settingsAccessor,
+        ICredentialProtectionService credentialService,
+        IServiceProvider serviceProvider,
+        ILogger<ThreatDashboardService> logger)
+    {
+        _exposureValidator = exposureValidator;
+        _crowdSecService = crowdSecService;
+        _geoService = geoService;
+        _uniFiClientAccessor = uniFiClientAccessor;
+        _siteContext = siteContext;
+        _settingsAccessor = settingsAccessor;
+        _credentialService = credentialService;
+        _serviceProvider = serviceProvider;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Create a fresh DI scope and resolve a private <see cref="IThreatRepository"/> from it.
+    /// Each public operation gets its own repository instance - and therefore its own DbContext
+    /// and its own noise/severity filter state - so concurrent calls on the same circuit (e.g. a
+    /// dashboard load overlapping a fire-and-forget drilldown) never share a DbContext or clobber
+    /// each other's filters. The caller must dispose the returned scope (use a `using` statement).
+    /// The scope is pinned to this service's already-resolved site rather than re-resolving from
+    /// the ambient HTTP context, which background continuations (CrowdSec hydration) can outlive.
+    /// </summary>
+    private IServiceScope NewRepositoryScope(out IThreatRepository repository)
+    {
+        var scope = _serviceProvider.CreateScope();
+        scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(_siteContext.Slug);
+        repository = scope.ServiceProvider.GetRequiredService<IThreatRepository>();
+        return scope;
+    }
+
+    public async Task<ThreatDashboardData> GetDashboardDataAsync(DateTime from, DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            repo.SetSeverityFilter(SeverityFilter);
+            var summary = await repo.GetThreatSummaryAsync(from, to, cancellationToken);
+            var killChain = await repo.GetKillChainDistributionAsync(from, to, cancellationToken);
+            var topSources = await repo.GetTopSourcesAsync(from, to, 10, cancellationToken);
+
+            // Re-enrich geo data directly on source IPs.
+            // Event-level CountryCode/AsnOrg may reflect the destination for flow events with private sources.
+            foreach (var source in topSources)
+            {
+                var geo = _geoService.Enrich(source.SourceIp);
+                source.CountryCode = geo.CountryCode;
+                source.City = geo.City;
+                source.Asn = geo.Asn;
+                source.AsnOrg = geo.AsnOrg;
+            }
+
+            var topPorts = await repo.GetTopTargetedPortsAsync(from, to, 10, cancellationToken);
+            var patterns = await repo.GetPatternsAsync(from, to, limit: 20, cancellationToken: cancellationToken);
+            repo.SetSeverityFilter(null);
+
+            // Enrich from DB cache (instant, no API calls) so previously looked-up IPs show badges
+            await EnrichFromCacheAsync(repo, topSources, cancellationToken);
+
+            // Determine which IPs need hydration and kick off background API calls.
+            // Returns the count so the caller can schedule a follow-up refresh.
+            var hydrationCount = await StartBackgroundHydrationAsync(topSources, cancellationToken);
+
+            return new ThreatDashboardData
+            {
+                Summary = summary,
+                KillChainDistribution = killChain,
+                TopSources = topSources,
+                TopTargetedPorts = topPorts,
+                RecentPatterns = patterns,
+                CtiHydrationCount = hydrationCount
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get threat dashboard data");
+            return new ThreatDashboardData();
+        }
+    }
+
+    /// <summary>
+    /// Determine which IPs need hydration and fire off a background task to call the CrowdSec API.
+    /// Returns the count of IPs being hydrated so the caller can schedule a follow-up refresh.
+    /// </summary>
+    private async Task<int> StartBackgroundHydrationAsync(List<SourceIpSummary> sources,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var apiKey = await GetDecryptedApiKeyAsync(cancellationToken);
+            if (apiKey == null) return 0;
+
+            var quotaStr = await _settingsAccessor.GetSettingAsync("crowdsec.daily_quota", cancellationToken);
+            var quota = int.TryParse(quotaStr, out var q) ? q : 30;
+            var autoBudget = Math.Max(1, quota / 2);
+
+            // Snapshot the IPs that need hydration before the scoped service disposes
+            var ipsToHydrate = sources
+                .Where(s => s.CrowdSecReputation == null && !NetworkUtilities.IsPrivateIpAddress(s.SourceIp))
+                .Select(s => s.SourceIp)
+                .Take(autoBudget)
+                .ToList();
+
+            if (ipsToHydrate.Count == 0) return 0;
+
+            _logger.LogDebug("CrowdSec background hydration starting for {Count} IPs", ipsToHydrate.Count);
+
+            // Run in a new scope so scoped services (repository) stay alive. Capture the
+            // site slug NOW: the continuation can outlive the triggering circuit scope and
+            // its HTTP context, so the fresh scope must be pinned explicitly or the
+            // repository could resolve to the default site's database.
+            var siteSlug = _siteContext.Slug;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var scope = _serviceProvider.CreateScope();
+                    scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(siteSlug);
+                    var repository = scope.ServiceProvider.GetRequiredService<IThreatRepository>();
+
+                    foreach (var ip in ipsToHydrate)
+                    {
+                        // Retry up to 3 times on burst throttle (backoff is built into the client)
+                        CrowdSecLookupOutcome outcome;
+                        for (var attempt = 0; attempt < 3; attempt++)
+                        {
+                            (_, outcome) = await _crowdSecService.GetReputationAsync(
+                                ip, apiKey, repository, cancellationToken: CancellationToken.None);
+
+                            if (outcome == CrowdSecLookupOutcome.QuotaExhausted)
+                            {
+                                _logger.LogDebug("CrowdSec background hydration stopped - daily quota exhausted");
+                                return;
+                            }
+
+                            if (outcome != CrowdSecLookupOutcome.BurstThrottled)
+                                break; // success, not-found, or error - move on
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "CrowdSec background hydration failed");
+                }
+            });
+
+            return ipsToHydrate.Count;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "CrowdSec CTI auto-enrichment setup failed");
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Check the DB cache for CrowdSec data without making any API calls.
+    /// This ensures previously looked-up IPs (both positive and negative hits) show their badge
+    /// even for low-quota users who use manual lookups.
+    /// </summary>
+    private async Task EnrichFromCacheAsync(IThreatRepository repository, List<SourceIpSummary> sources,
+        CancellationToken cancellationToken)
+    {
+        foreach (var source in sources)
+        {
+            if (source.CrowdSecReputation != null) continue;
+            if (NetworkUtilities.IsPrivateIpAddress(source.SourceIp)) continue;
+
+            var cached = await GetCachedCtiCoreAsync(repository, source.SourceIp, cancellationToken);
+            if (cached == null) continue;
+
+            source.CrowdSecReputation = cached.CrowdSecReputation;
+            source.ThreatScore = cached.ThreatScore;
+            source.TopBehaviors = cached.TopBehaviors;
+            source.MitreTechniques = cached.MitreTechniques;
+        }
+    }
+
+    /// <summary>
+    /// Check the DB cache for a single IP's CrowdSec reputation without making any API calls.
+    /// Returns a pre-enriched SourceIpSummary if cached, or null if not in cache.
+    /// </summary>
+    public async Task<SourceIpSummary?> GetCachedCtiAsync(string ip,
+        CancellationToken cancellationToken = default)
+    {
+        using var scope = NewRepositoryScope(out var repo);
+        return await GetCachedCtiCoreAsync(repo, ip, cancellationToken);
+    }
+
+    private async Task<SourceIpSummary?> GetCachedCtiCoreAsync(IThreatRepository repository, string ip,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var cached = await repository.GetCrowdSecCacheAsync(ip, cancellationToken);
+            if (cached == null) return null;
+
+            CrowdSecIpInfo? info = null;
+            if (cached.ReputationJson != "null")
+            {
+                try { info = JsonSerializer.Deserialize<CrowdSecIpInfo>(cached.ReputationJson); }
+                catch { return null; }
+            }
+
+            return new SourceIpSummary
+            {
+                SourceIp = ip,
+                CrowdSecReputation = CrowdSecEnrichmentService.GetReputationBadge(info),
+                ThreatScore = CrowdSecEnrichmentService.GetThreatScore(info),
+                TopBehaviors = info?.Behaviors.Count > 0
+                    ? string.Join(", ", info.Behaviors.Take(3).Select(b => b.Label))
+                    : null,
+                MitreTechniques = info?.MitreTechniques.Count > 0
+                    ? info.MitreTechniques.Select(t => (t.Name, t.Label, t.Description)).ToList()
+                    : null
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to check CTI cache for {Ip}", ip);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Look up CrowdSec CTI reputation for a single IP. Called by dashboard for manual lookups.
+    /// Returns (source, wasRateLimited).
+    /// </summary>
+    public async Task<(SourceIpSummary? Source, bool RateLimited)> EnrichSingleSourceAsync(
+        SourceIpSummary source, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var apiKey = await GetDecryptedApiKeyAsync(cancellationToken);
+            if (apiKey == null) return (null, false);
+
+            using var scope = NewRepositoryScope(out var repo);
+            var rateLimited = await EnrichSourcesAsync(repo, [source], apiKey, cancellationToken);
+            return (source, rateLimited);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to look up reputation for {Ip}", source.SourceIp);
+            return (null, false);
+        }
+    }
+
+    private async Task<string?> GetDecryptedApiKeyAsync(CancellationToken cancellationToken)
+    {
+        var stored = await _settingsAccessor.GetSettingAsync("crowdsec.api_key", cancellationToken);
+        if (string.IsNullOrWhiteSpace(stored)) return null;
+        return _credentialService.IsEncrypted(stored) ? _credentialService.Decrypt(stored) : stored;
+    }
+
+    private async Task<bool> EnrichSourcesAsync(IThreatRepository repository, List<SourceIpSummary> sources, string apiKey,
+        CancellationToken cancellationToken)
+    {
+        foreach (var source in sources)
+        {
+            if (NetworkUtilities.IsPrivateIpAddress(source.SourceIp)) continue;
+
+            try
+            {
+                CrowdSecIpInfo? info = null;
+                CrowdSecLookupOutcome outcome;
+
+                // Retry up to 3 times on burst throttle (backoff is built into the client)
+                for (var attempt = 0; attempt < 3; attempt++)
+                {
+                    (info, outcome) = await _crowdSecService.GetReputationAsync(
+                        source.SourceIp, apiKey, repository, cancellationToken: cancellationToken);
+
+                    if (outcome == CrowdSecLookupOutcome.QuotaExhausted)
+                        return true; // daily quota exhausted - stop enriching and show banner
+
+                    if (outcome != CrowdSecLookupOutcome.BurstThrottled)
+                        break; // success, not-found, or error - proceed
+                }
+
+                source.CrowdSecReputation = CrowdSecEnrichmentService.GetReputationBadge(info);
+                source.ThreatScore = CrowdSecEnrichmentService.GetThreatScore(info);
+                source.TopBehaviors = info?.Behaviors.Count > 0
+                    ? string.Join(", ", info.Behaviors.Take(3).Select(b => b.Label))
+                    : null;
+                source.MitreTechniques = info?.MitreTechniques.Count > 0
+                    ? info.MitreTechniques.Select(t => (t.Name, t.Label, t.Description)).ToList()
+                    : null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to enrich {Ip} with CrowdSec CTI", source.SourceIp);
+            }
+        }
+        return false;
+    }
+
+
+    public async Task<List<TimelineBucket>> GetTimelineDataAsync(DateTime from, DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            // Timeline returns per-severity columns; chart toggles visibility client-side.
+            // Fetch without severity filter so all hourly buckets are present (preserves X-axis range).
+            repo.SetSeverityFilter(null);
+
+            // Adaptive bucket granularity based on time range
+            var span = to - from;
+            var bucketMinutes = span.TotalHours switch
+            {
+                <= 2 => 5,    // 1hr: 5-minute buckets
+                <= 6 => 15,   // 4hr: 15-minute buckets
+                _ => 60       // 24h+: hourly buckets
+            };
+
+            var buckets = await repo.GetTimelineAsync(from, to, bucketMinutes, cancellationToken);
+
+            // Fill gaps with zero-count buckets so the chart shows continuous time progression
+            // instead of stalling at the last data point when there are no new threats.
+            // Lag by 30s so we don't plot a false zero before the current collection cycle finishes.
+            return FillTimelineGaps(buckets, from, to.AddSeconds(-30), bucketMinutes);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get threat timeline");
+            return [];
+        }
+    }
+
+    public async Task<Dictionary<string, int>> GetGeoDistributionAsync(DateTime from, DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            return await repo.GetCountryDistributionAsync(from, to, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get geo distribution");
+            return new();
+        }
+    }
+
+    public async Task<ExposureReport> GetExposureReportAsync(
+        DateTime from, DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+
+            // Auto-fetch port forward rules from UniFi API (this site's console)
+            List<UniFiPortForwardRule>? portForwardRules = null;
+            var apiClient = _uniFiClientAccessor.GetClient(_siteContext.Slug);
+            if (apiClient != null)
+            {
+                try
+                {
+                    portForwardRules = await apiClient.GetPortForwardRulesAsync(cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to fetch port forward rules for exposure report");
+                }
+            }
+
+            return await _exposureValidator.ValidateAsync(portForwardRules, repo, from, to, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get exposure report");
+            return new ExposureReport();
+        }
+    }
+
+    public async Task<List<ThreatEvent>> GetRecentEventsAsync(int limit = 50,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            return await repo.GetEventsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow,
+                limit: limit, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get recent events");
+            return [];
+        }
+    }
+
+    public async Task<CrowdSecIpInfo?> GetCrowdSecReputationAsync(string ip, string apiKey,
+        int cacheTtlHours = 720, CancellationToken cancellationToken = default)
+    {
+        using var scope = NewRepositoryScope(out var repo);
+        var (info, _) = await _crowdSecService.GetReputationAsync(ip, apiKey, repo, cacheTtlHours, cancellationToken);
+        return info;
+    }
+
+    /// <summary>
+    /// Lightweight hourly totals for sparkline display on the main dashboard.
+    /// </summary>
+    public async Task<(int TotalCount, List<ThreatTrendPoint> Points)> GetThreatTrendAsync(
+        int hours = 24, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            var from = DateTime.UtcNow.AddHours(-hours);
+            var to = DateTime.UtcNow;
+            var timeline = await repo.GetTimelineAsync(from, to, cancellationToken: cancellationToken);
+            var total = timeline.Sum(b => b.Total);
+            var points = timeline.Select(b => new ThreatTrendPoint
+            {
+                Hour = DateTime.SpecifyKind(b.Hour, DateTimeKind.Utc),
+                Count = b.Total
+            }).ToList();
+            return (total, points);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get threat trend");
+            return (0, []);
+        }
+    }
+
+    public async Task<List<SearchResultEntry>> SearchAsync(DateTime from, DateTime to,
+        ThreatSearchQuery query, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            // Search is unfiltered - show all data regardless of noise/severity filters
+            repo.SetNoiseFilters([]);
+            repo.SetSeverityFilter(null);
+
+            // For CIDR searches, determine if we can use SQL prefix matching or need post-filtering
+            string? ipPrefix = null;
+            string? cidrForPostFilter = null;
+            if (query.Cidr != null)
+            {
+                ipPrefix = NetworkUtilities.GetCidrLikePrefix(query.Cidr);
+                if (ipPrefix == null)
+                {
+                    // Non-octet-aligned CIDR: use maximum whole-octet prefix + in-memory filter
+                    var slashIdx = query.Cidr.IndexOf('/');
+                    var ipPart = query.Cidr[..slashIdx];
+                    var octets = ipPart.Split('.');
+                    if (int.TryParse(query.Cidr[(slashIdx + 1)..], out var bits) && bits > 0)
+                    {
+                        var wholeOctets = Math.Max(bits / 8, 1);
+                        ipPrefix = string.Join(".", octets.Take(wholeOctets)) + ".";
+                    }
+                    else
+                    {
+                        ipPrefix = octets[0] + ".";
+                    }
+                    cidrForPostFilter = query.Cidr;
+                }
+            }
+
+            var results = await repo.SearchIpsAsync(from, to,
+                ipExact: query.IpExact,
+                ipPrefix: ipPrefix ?? query.IpPrefix,
+                countryCode: query.CountryCode,
+                asnNumber: query.AsnNumber,
+                asnOrgLike: query.AsnOrgLike,
+                cancellationToken: cancellationToken);
+
+            // Post-filter for non-octet-aligned CIDR
+            if (cidrForPostFilter != null)
+            {
+                results = results.Where(r => NetworkUtilities.IsIpInSubnet(r.Ip, cidrForPostFilter)).ToList();
+            }
+
+            // For country/ASN/org searches, event-level geo only describes the source IP.
+            // Also search dest IPs by geo-enriching the top dest IPs and filtering by match.
+            var isGeoSearch = query.CountryCode != null || query.AsnNumber != null || query.AsnOrgLike != null;
+            if (isGeoSearch)
+            {
+                var topDests = await repo.GetTopDestinationIpsAsync(from, to, 500, cancellationToken);
+                var sourceIps = results.Select(r => r.Ip).ToHashSet();
+
+                foreach (var dest in topDests)
+                {
+                    if (sourceIps.Contains(dest.Ip)) continue; // Already in results as source
+
+                    var geo = _geoService.Enrich(dest.Ip);
+                    dest.CountryCode = geo.CountryCode;
+                    dest.AsnOrg = geo.AsnOrg;
+                    dest.Asn = geo.Asn;
+
+                    var matches = false;
+                    if (query.CountryCode != null)
+                        matches = string.Equals(geo.CountryCode, query.CountryCode, StringComparison.OrdinalIgnoreCase);
+                    else if (query.AsnNumber != null)
+                        matches = geo.Asn == query.AsnNumber;
+                    else if (query.AsnOrgLike != null)
+                        matches = geo.AsnOrg?.Contains(query.AsnOrgLike, StringComparison.OrdinalIgnoreCase) == true;
+
+                    if (matches)
+                        results.Add(dest);
+                }
+
+                // Re-sort after merging
+                results = results.OrderByDescending(r => r.EventCount).Take(200).ToList();
+            }
+
+            // Geo-enrich each result (source results + IP searches don't have geo yet)
+            foreach (var entry in results)
+            {
+                if (entry.CountryCode != null) continue; // Already enriched (dest IPs from geo search)
+                var geo = _geoService.Enrich(entry.Ip);
+                entry.CountryCode = geo.CountryCode;
+                entry.AsnOrg = geo.AsnOrg;
+                entry.Asn = geo.Asn;
+            }
+
+            return results;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to search threat data");
+            return [];
+        }
+    }
+
+    public async Task<List<AttackSequence>> GetAttackSequencesAsync(DateTime from, DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            return await repo.GetAttackSequencesAsync(from, to, 50, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get attack sequences");
+            return [];
+        }
+    }
+
+    public async Task<IpDrilldownData> GetIpDrilldownAsync(string ip, DateTime from, DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            var events = await repo.GetEventsByIpAsync(ip, from, to, cancellationToken: cancellationToken);
+
+            var asSource = events.Where(e => e.SourceIp == ip).ToList();
+            var asDest = events.Where(e => e.DestIp == ip).ToList();
+
+            // Peer groups: destinations when IP is source
+            var destinations = asSource
+                .GroupBy(e => e.DestIp)
+                .Select(g => BuildPeerGroup(g.Key, g.ToList()))
+                .OrderByDescending(p => p.EventCount)
+                .ToList();
+
+            // Peer groups: sources when IP is destination
+            var sources = asDest
+                .GroupBy(e => e.SourceIp)
+                .Select(g => BuildPeerGroup(g.Key, g.ToList()))
+                .OrderByDescending(p => p.EventCount)
+                .ToList();
+
+            // Port range breakdown - group by (port, protocol) so non-port protocols
+            // (ICMP, GRE, etc.) that share port 0 get separate rows
+            var portGroups = events
+                .GroupBy(e => (e.DestPort, Proto: e.DestPort == 0 ? e.Protocol : null))
+                .OrderByDescending(g => g.Count())
+                .Select(g => new PortRangeGroup
+                {
+                    Port = g.Key.DestPort,
+                    Service = g.Key.DestPort == 0
+                        ? g.Key.Proto ?? ""
+                        : GetServiceName(g.Key.DestPort),
+                    EventCount = g.Count(),
+                    BlockedCount = g.Count(e => e.Action == ThreatAction.Blocked),
+                    DetectedCount = g.Count(e => e.Action != ThreatAction.Blocked)
+                })
+                .ToList();
+
+            // Collapse consecutive ports into ranges
+            var portRanges = CollapsePortRanges(portGroups);
+
+            // Top signatures
+            var signatures = BuildSignatureGroups(events);
+
+            // Country code: direct GeoIP lookup on the drilled-into IP
+            // (event CountryCode is enriched on the source/attacker IP, not this IP)
+            var geoInfo = _geoService.Enrich(ip);
+            var countryCode = geoInfo.CountryCode;
+
+            return new IpDrilldownData
+            {
+                Ip = ip,
+                CountryCode = countryCode,
+                AsnOrg = geoInfo.AsnOrg,
+                TotalEvents = events.Count,
+                BlockedCount = events.Count(e => e.Action == ThreatAction.Blocked),
+                DetectedCount = events.Count(e => e.Action != ThreatAction.Blocked),
+                AsSourceCount = asSource.Count,
+                AsDestCount = asDest.Count,
+                FirstSeen = events.Count > 0 ? events.Min(e => e.Timestamp) : (DateTime?)null,
+                LastSeen = events.Count > 0 ? events.Max(e => e.Timestamp) : (DateTime?)null,
+                Destinations = destinations,
+                Sources = sources,
+                PortRanges = portRanges,
+                TopSignatures = signatures
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get IP drilldown for {Ip}", ip);
+            return new IpDrilldownData { Ip = ip };
+        }
+    }
+
+    public async Task<PortDrilldownData> GetPortDrilldownAsync(int port, DateTime from, DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            var events = await repo.GetEventsByPortAsync(port, from, to, cancellationToken: cancellationToken);
+
+            var topSources = BuildTopSources(events);
+
+            // Top destination IPs (what's being targeted on this port)
+            var topDestinations = events
+                .GroupBy(e => e.DestIp)
+                .Select(g => new PortDrilldownDest
+                {
+                    Ip = g.Key,
+                    EventCount = g.Count(),
+                    BlockedCount = g.Count(e => e.Action == ThreatAction.Blocked),
+                    UniqueSourceIps = g.Select(e => e.SourceIp).Distinct().Count()
+                })
+                .OrderByDescending(d => d.EventCount)
+                .Take(20)
+                .ToList();
+
+            // Top signatures
+            var signatures = BuildSignatureGroups(events);
+
+            // Protocols used
+            var protocols = events
+                .GroupBy(e => e.Protocol)
+                .Where(g => !string.IsNullOrEmpty(g.Key))
+                .Select(g => new ProtocolCount { Protocol = g.Key, EventCount = g.Count() })
+                .OrderByDescending(p => p.EventCount)
+                .ToList();
+
+            return new PortDrilldownData
+            {
+                Port = port,
+                ServiceName = GetServiceName(port),
+                TotalEvents = events.Count,
+                BlockedCount = events.Count(e => e.Action == ThreatAction.Blocked),
+                DetectedCount = events.Count(e => e.Action != ThreatAction.Blocked),
+                UniqueSourceIps = events.Select(e => e.SourceIp).Distinct().Count(),
+                FirstSeen = events.Count > 0 ? events.Min(e => e.Timestamp) : null,
+                LastSeen = events.Count > 0 ? events.Max(e => e.Timestamp) : null,
+                TopSources = topSources,
+                TopDestinations = topDestinations,
+                TopSignatures = signatures,
+                Protocols = protocols
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get port drilldown for port {Port}", port);
+            return new PortDrilldownData { Port = port };
+        }
+    }
+
+    public async Task<ProtocolDrilldownData> GetProtocolDrilldownAsync(string protocol, DateTime from, DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = NewRepositoryScope(out var repo);
+            await ApplyNoiseFiltersToRepository(repo, cancellationToken);
+            var events = await repo.GetEventsByProtocolAsync(protocol, from, to, cancellationToken: cancellationToken);
+
+            var topSources = BuildTopSources(events);
+
+            // Top targeted ports
+            var topPorts = events
+                .GroupBy(e => (e.DestPort, Proto: e.DestPort == 0 ? e.Protocol : null))
+                .Select(g => new PortCount
+                {
+                    Port = g.Key.DestPort,
+                    ServiceName = g.Key.DestPort == 0
+                        ? g.Key.Proto ?? ""
+                        : GetServiceName(g.Key.DestPort),
+                    EventCount = g.Count(),
+                    BlockedCount = g.Count(e => e.Action == ThreatAction.Blocked)
+                })
+                .OrderByDescending(p => p.EventCount)
+                .Take(20)
+                .ToList();
+
+            // Top signatures
+            var signatures = BuildSignatureGroups(events);
+
+            return new ProtocolDrilldownData
+            {
+                Protocol = protocol,
+                TotalEvents = events.Count,
+                BlockedCount = events.Count(e => e.Action == ThreatAction.Blocked),
+                DetectedCount = events.Count(e => e.Action != ThreatAction.Blocked),
+                UniqueSourceIps = events.Select(e => e.SourceIp).Distinct().Count(),
+                UniqueDestPorts = events.Select(e => e.DestPort).Distinct().Count(),
+                FirstSeen = events.Count > 0 ? events.Min(e => e.Timestamp) : null,
+                LastSeen = events.Count > 0 ? events.Max(e => e.Timestamp) : null,
+                TopSources = topSources,
+                TopPorts = topPorts,
+                TopSignatures = signatures
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get protocol drilldown for {Protocol}", protocol);
+            return new ProtocolDrilldownData { Protocol = protocol };
+        }
+    }
+
+    /// <summary>
+    /// Build top source IP list with direct GeoIP lookup on the source IP.
+    /// Event-level CountryCode/AsnOrg may reflect the destination for flow events with private sources.
+    /// </summary>
+    private List<PortDrilldownSource> BuildTopSources(List<ThreatEvent> events, int limit = 50)
+    {
+        return events
+            .GroupBy(e => e.SourceIp)
+            .Select(g =>
+            {
+                var geo = _geoService.Enrich(g.Key);
+                return new PortDrilldownSource
+                {
+                    Ip = g.Key,
+                    CountryCode = geo.CountryCode,
+                    AsnOrg = geo.AsnOrg,
+                    EventCount = g.Count(),
+                    BlockedCount = g.Count(e => e.Action == ThreatAction.Blocked),
+                    FirstSeen = g.Min(e => e.Timestamp),
+                    LastSeen = g.Max(e => e.Timestamp)
+                };
+            })
+            .OrderByDescending(s => s.EventCount)
+            .Take(limit)
+            .ToList();
+    }
+
+    private IpPeerGroup BuildPeerGroup(string peerIp, List<ThreatEvent> events)
+    {
+        var ports = events.Select(e => e.DestPort).Distinct().OrderBy(p => p).ToList();
+        var portRangesStr = FormatPortRanges(ports);
+        var services = events
+            .Select(e =>
+            {
+                // Prefer our port lookup over raw CrowdSec service when it's generic
+                if (string.IsNullOrEmpty(e.Service) || string.Equals(e.Service, "other", StringComparison.OrdinalIgnoreCase))
+                {
+                    var portName = GetServiceName(e.DestPort);
+                    if (!string.IsNullOrEmpty(portName)) return portName;
+                }
+                return e.Service;
+            })
+            .Where(s => !string.IsNullOrEmpty(s))
+            .Distinct()
+            .ToList();
+
+        return new IpPeerGroup
+        {
+            Ip = peerIp,
+            Domain = events.FirstOrDefault(e => !string.IsNullOrEmpty(e.Domain))?.Domain,
+            PortRanges = portRangesStr,
+            Services = services.Count > 0 ? string.Join(", ", services) : null,
+            EventCount = events.Count,
+            BlockedCount = events.Count(e => e.Action == ThreatAction.Blocked)
+        };
+    }
+
+    private static string FormatPortRanges(List<int> sortedPorts)
+    {
+        if (sortedPorts.Count == 0) return "-";
+
+        // First pass: collapse ports within 10 of each other
+        var ranges = CollapsePortsWithGap(sortedPorts, 10);
+
+        // If still more than 10 entries, group tighter (ports within 100 of each other)
+        if (ranges.Count > 10)
+            ranges = CollapsePortsWithGap(sortedPorts, 100);
+
+        return string.Join(", ", ranges);
+    }
+
+    private static List<string> CollapsePortsWithGap(List<int> sortedPorts, int maxGap)
+    {
+        var ranges = new List<string>();
+        var start = sortedPorts[0];
+        var end = start;
+
+        for (var i = 1; i < sortedPorts.Count; i++)
+        {
+            if (sortedPorts[i] - end <= maxGap)
+            {
+                end = sortedPorts[i];
+            }
+            else
+            {
+                ranges.Add(start == end ? start.ToString() : $"{start}-{end}");
+                start = sortedPorts[i];
+                end = start;
+            }
+        }
+        ranges.Add(start == end ? start.ToString() : $"{start}-{end}");
+
+        return ranges;
+    }
+
+    private static List<SignatureGroup> BuildSignatureGroups(List<ThreatEvent> events)
+    {
+        return events
+            .GroupBy(e => e.SignatureName)
+            .Where(g => !string.IsNullOrEmpty(g.Key))
+            .Select(g =>
+            {
+                var evts = g.ToList();
+                var topPort = evts.GroupBy(e => e.DestPort).OrderByDescending(pg => pg.Count()).First().Key;
+                var topDomain = evts.Where(e => !string.IsNullOrEmpty(e.Domain))
+                    .GroupBy(e => e.Domain).OrderByDescending(dg => dg.Count()).FirstOrDefault()?.Key;
+                return new SignatureGroup
+                {
+                    Name = g.Key,
+                    Category = evts[0].Category,
+                    EventCount = evts.Count,
+                    MaxSeverity = evts.Max(e => e.Severity),
+                    BlockedCount = evts.Count(e => e.Action == ThreatAction.Blocked),
+                    DetectedCount = evts.Count(e => e.Action != ThreatAction.Blocked),
+                    TopDestPort = topPort,
+                    Domain = topDomain
+                };
+            })
+            .OrderByDescending(s => s.EventCount)
+            .Take(20)
+            .ToList();
+    }
+
+    private static List<PortRangeGroup> CollapsePortRanges(List<PortRangeGroup> portGroups)
+    {
+        if (portGroups.Count == 0) return portGroups;
+
+        var sorted = portGroups.OrderBy(p => p.Port).ToList();
+        var result = new List<PortRangeGroup>();
+        var current = sorted[0];
+
+        for (var i = 1; i < sorted.Count; i++)
+        {
+            if (sorted[i].Port == current.Port + 1 && string.IsNullOrEmpty(current.Service) == string.IsNullOrEmpty(sorted[i].Service))
+            {
+                // Merge into range
+                current = new PortRangeGroup
+                {
+                    Port = current.Port,
+                    PortEnd = sorted[i].PortEnd > 0 ? sorted[i].PortEnd : sorted[i].Port,
+                    Service = current.Service ?? sorted[i].Service,
+                    EventCount = current.EventCount + sorted[i].EventCount,
+                    BlockedCount = current.BlockedCount + sorted[i].BlockedCount,
+                    DetectedCount = current.DetectedCount + sorted[i].DetectedCount
+                };
+            }
+            else
+            {
+                result.Add(current);
+                current = sorted[i];
+            }
+        }
+        result.Add(current);
+        return result.OrderByDescending(r => r.EventCount).ToList();
+    }
+
+    private static List<TimelineBucket> FillTimelineGaps(
+        List<TimelineBucket> buckets, DateTime from, DateTime to, int bucketMinutes)
+    {
+        if (buckets.Count == 0)
+            return [];
+
+        // Start from the earliest real data point, not 'from' - avoids backfilling zeros
+        // before we actually have any data in the DB.
+        var earliest = buckets[0].Hour;
+        var startMinute = (earliest.Minute / bucketMinutes) * bucketMinutes;
+        var cursor = new DateTime(earliest.Year, earliest.Month, earliest.Day, earliest.Hour, startMinute, 0, DateTimeKind.Utc);
+
+        var existing = buckets.ToDictionary(b => b.Hour);
+        var filled = new List<TimelineBucket>();
+
+        while (cursor <= to)
+        {
+            filled.Add(existing.TryGetValue(cursor, out var bucket)
+                ? bucket
+                : new TimelineBucket { Hour = cursor });
+
+            cursor = cursor.AddMinutes(bucketMinutes);
+        }
+
+        return filled;
+    }
+
+    private async Task ApplyNoiseFiltersToRepository(IThreatRepository repository, CancellationToken cancellationToken)
+    {
+        if (FiltersDisabled)
+        {
+            repository.SetNoiseFilters([]);
+        }
+        else
+        {
+            var filters = await GetActiveFiltersAsync(repository, cancellationToken);
+            repository.SetNoiseFilters(filters);
+        }
+
+        // Severity filter is only applied by overview methods that explicitly opt in.
+        // Clear it here so non-overview tabs (geographic, exposure, sequences, drilldowns) see all severities.
+        repository.SetSeverityFilter(null);
+    }
+
+    // --- Noise Filter Management ---
+
+    public async Task<List<ThreatNoiseFilter>> GetNoiseFiltersAsync(CancellationToken cancellationToken = default)
+    {
+        using var scope = NewRepositoryScope(out var repo);
+        return await repo.GetNoiseFiltersAsync(cancellationToken);
+    }
+
+    public async Task SaveNoiseFilterAsync(ThreatNoiseFilter filter, CancellationToken cancellationToken = default)
+    {
+        using var scope = NewRepositoryScope(out var repo);
+        await repo.SaveNoiseFilterAsync(filter, cancellationToken);
+        _activeFilters = null; // Invalidate cache
+    }
+
+    public async Task DeleteNoiseFilterAsync(int filterId, CancellationToken cancellationToken = default)
+    {
+        using var scope = NewRepositoryScope(out var repo);
+        await repo.DeleteNoiseFilterAsync(filterId, cancellationToken);
+        _activeFilters = null;
+    }
+
+    public async Task ToggleNoiseFilterAsync(int filterId, bool enabled, CancellationToken cancellationToken = default)
+    {
+        using var scope = NewRepositoryScope(out var repo);
+        await repo.ToggleNoiseFilterAsync(filterId, enabled, cancellationToken);
+        _activeFilters = null;
+    }
+
+    private async Task<List<ThreatNoiseFilter>> GetActiveFiltersAsync(IThreatRepository repository, CancellationToken cancellationToken = default)
+    {
+        _activeFilters ??= (await repository.GetNoiseFiltersAsync(cancellationToken))
+            .Where(f => f.Enabled).ToList();
+        return _activeFilters;
+    }
+
+    /// <summary>
+    /// Apply noise filters to a list of events, removing matches.
+    /// </summary>
+    private List<ThreatEvent> ApplyNoiseFilters(List<ThreatEvent> events, List<ThreatNoiseFilter> filters)
+    {
+        if (filters.Count == 0) return events;
+        return events.Where(e => !filters.Any(f => f.Matches(e.SourceIp, e.DestIp, e.DestPort))).ToList();
+    }
+
+    private static string GetServiceName(int port)
+        => Core.Helpers.NetworkUtilities.GetPortServiceName(port) ?? "";
+}
+
+/// <summary>
+/// Aggregated dashboard data DTO.
+/// </summary>
+public class ThreatDashboardData
+{
+    public ThreatSummary Summary { get; set; } = new();
+    public Dictionary<KillChainStage, int> KillChainDistribution { get; set; } = new();
+    public List<SourceIpSummary> TopSources { get; set; } = [];
+    public List<TargetPortSummary> TopTargetedPorts { get; set; } = [];
+    public List<ThreatPattern> RecentPatterns { get; set; } = [];
+
+    /// <summary>
+    /// Number of IPs being hydrated in the background. 0 means no hydration in progress.
+    /// Caller can use this to schedule a follow-up refresh at roughly Count * 600ms.
+    /// </summary>
+    public int CtiHydrationCount { get; set; }
+}
+
+/// <summary>
+/// Single data point for the threat trend sparkline.
+/// </summary>
+public record ThreatTrendPoint
+{
+    public DateTime Hour { get; init; }
+    public int Count { get; init; }
+}
+
+/// <summary>
+/// All data for the IP drill-down view.
+/// </summary>
+public class IpDrilldownData
+{
+    public string Ip { get; set; } = string.Empty;
+    public string? CountryCode { get; set; }
+    public string? AsnOrg { get; set; }
+    public int TotalEvents { get; set; }
+    public int BlockedCount { get; set; }
+    public int DetectedCount { get; set; }
+    public int AsSourceCount { get; set; }
+    public int AsDestCount { get; set; }
+    public DateTime? FirstSeen { get; set; }
+    public DateTime? LastSeen { get; set; }
+    public List<IpPeerGroup> Destinations { get; set; } = [];
+    public List<IpPeerGroup> Sources { get; set; } = [];
+    public List<PortRangeGroup> PortRanges { get; set; } = [];
+    public List<SignatureGroup> TopSignatures { get; set; } = [];
+}
+
+/// <summary>
+/// A peer IP group within drill-down (destination or source).
+/// </summary>
+public class IpPeerGroup
+{
+    public string Ip { get; set; } = string.Empty;
+    public string? Domain { get; set; }
+    public string PortRanges { get; set; } = "-";
+    public string? Services { get; set; }
+    public int EventCount { get; set; }
+    public int BlockedCount { get; set; }
+}
+
+/// <summary>
+/// Port or port range with event counts.
+/// </summary>
+public class PortRangeGroup
+{
+    public int Port { get; set; }
+    public int PortEnd { get; set; }
+    public string Service { get; set; } = string.Empty;
+    public int EventCount { get; set; }
+    public int BlockedCount { get; set; }
+    public int DetectedCount { get; set; }
+
+    public string RangeLabel => PortEnd > 0 && PortEnd != Port ? $"{Port}-{PortEnd}" : Port.ToString();
+}
+
+/// <summary>
+/// Signature aggregation within drill-down.
+/// </summary>
+public class SignatureGroup
+{
+    public string Name { get; set; } = string.Empty;
+    public string Category { get; set; } = string.Empty;
+    public int EventCount { get; set; }
+    public int MaxSeverity { get; set; }
+    public int BlockedCount { get; set; }
+    public int DetectedCount { get; set; }
+    public int TopDestPort { get; set; }
+    public string? Domain { get; set; }
+}
+
+/// <summary>
+/// All data for the port drill-down view.
+/// </summary>
+public class PortDrilldownData
+{
+    public int Port { get; set; }
+    public string ServiceName { get; set; } = string.Empty;
+    public int TotalEvents { get; set; }
+    public int BlockedCount { get; set; }
+    public int DetectedCount { get; set; }
+    public int UniqueSourceIps { get; set; }
+    public DateTime? FirstSeen { get; set; }
+    public DateTime? LastSeen { get; set; }
+    public List<PortDrilldownSource> TopSources { get; set; } = [];
+    public List<PortDrilldownDest> TopDestinations { get; set; } = [];
+    public List<SignatureGroup> TopSignatures { get; set; } = [];
+    public List<ProtocolCount> Protocols { get; set; } = [];
+}
+
+public class PortDrilldownSource
+{
+    public string Ip { get; set; } = string.Empty;
+    public string? CountryCode { get; set; }
+    public string? AsnOrg { get; set; }
+    public int EventCount { get; set; }
+    public int BlockedCount { get; set; }
+    public DateTime FirstSeen { get; set; }
+    public DateTime LastSeen { get; set; }
+}
+
+public class PortDrilldownDest
+{
+    public string Ip { get; set; } = string.Empty;
+    public int EventCount { get; set; }
+    public int BlockedCount { get; set; }
+    public int UniqueSourceIps { get; set; }
+}
+
+public class ProtocolCount
+{
+    public string Protocol { get; set; } = string.Empty;
+    public int EventCount { get; set; }
+}
+
+public class PortCount
+{
+    public int Port { get; set; }
+    public string ServiceName { get; set; } = string.Empty;
+    public int EventCount { get; set; }
+    public int BlockedCount { get; set; }
+}
+
+/// <summary>
+/// All data for the protocol drill-down view.
+/// </summary>
+public class ProtocolDrilldownData
+{
+    public string Protocol { get; set; } = string.Empty;
+    public int TotalEvents { get; set; }
+    public int BlockedCount { get; set; }
+    public int DetectedCount { get; set; }
+    public int UniqueSourceIps { get; set; }
+    public int UniqueDestPorts { get; set; }
+    public DateTime? FirstSeen { get; set; }
+    public DateTime? LastSeen { get; set; }
+    public List<PortDrilldownSource> TopSources { get; set; } = [];
+    public List<PortCount> TopPorts { get; set; } = [];
+    public List<SignatureGroup> TopSignatures { get; set; } = [];
+}
+
+/// <summary>
+/// Structured search query for threat data. Exactly one field should be set.
+/// </summary>
+public record ThreatSearchQuery
+{
+    public string? IpExact { get; init; }
+    public string? IpPrefix { get; init; }
+    public string? Cidr { get; init; }
+    public string? CountryCode { get; init; }
+    public int? AsnNumber { get; init; }
+    public string? AsnOrgLike { get; init; }
+}

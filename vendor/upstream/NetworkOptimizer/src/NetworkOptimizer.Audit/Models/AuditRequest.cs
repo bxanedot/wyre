@@ -1,0 +1,147 @@
+using System.Text.Json;
+using NetworkOptimizer.Core.Models;
+using NetworkOptimizer.UniFi.Models;
+
+namespace NetworkOptimizer.Audit.Models;
+
+/// <summary>
+/// Request parameters for running a security audit.
+/// Consolidates all optional inputs into a single parameter object.
+/// </summary>
+public class AuditRequest
+{
+    /// <summary>
+    /// Required: JSON string containing UniFi device data
+    /// </summary>
+    public required string DeviceDataJson { get; init; }
+
+    /// <summary>
+    /// Optional: List of currently connected clients
+    /// </summary>
+    public List<UniFiClientResponse>? Clients { get; init; }
+
+    /// <summary>
+    /// Optional: Historical client data for offline device analysis
+    /// </summary>
+    public List<UniFiClientDetailResponse>? ClientHistory { get; init; }
+
+    /// <summary>
+    /// Optional: UniFi fingerprint database for device detection
+    /// </summary>
+    public UniFiFingerprintDatabase? FingerprintDb { get; init; }
+
+    /// <summary>
+    /// Optional: UniFi controller settings data
+    /// </summary>
+    public JsonElement? SettingsData { get; init; }
+
+    /// <summary>
+    /// Optional: Parsed firewall rules (from v2 firewall-policies or v1 firewallrule API).
+    /// Both formats are normalized to FirewallRule objects before passing here.
+    /// </summary>
+    public List<FirewallRule>? FirewallRules { get; init; }
+
+    /// <summary>
+    /// Optional: Firewall groups (port groups and address groups) for flattening
+    /// group references in firewall policies
+    /// </summary>
+    public List<UniFiFirewallGroup>? FirewallGroups { get; init; }
+
+    /// <summary>
+    /// Optional: NAT rules data from UniFi API for DNAT DNS detection
+    /// </summary>
+    public JsonElement? NatRulesData { get; init; }
+
+    /// <summary>
+    /// Optional: User-defined device allowance settings
+    /// </summary>
+    public DeviceAllowanceSettings? AllowanceSettings { get; init; }
+
+    /// <summary>
+    /// Optional: UniFi Protect camera collection
+    /// </summary>
+    public ProtectCameraCollection? ProtectCameras { get; init; }
+
+    /// <summary>
+    /// Optional: Port profiles from UniFi /rest/portconf endpoint.
+    /// Used to resolve port settings when ports reference a profile via portconf_id.
+    /// </summary>
+    public List<UniFiPortProfile>? PortProfiles { get; init; }
+
+    /// <summary>
+    /// Optional: MACs of clients this console's UniFi apps own, from the v2 client list with UniFi devices
+    /// included (unifi_device). Null when unavailable; a client's product_line decides instead.
+    /// </summary>
+    public IReadOnlyCollection<string>? UniFiDeviceClientMacs { get; init; }
+
+    /// <summary>
+    /// Optional: UniFi Network application version (from stat/sysinfo), e.g. "10.6.106".
+    /// Gates rules that need a minimum application version (Lock Port to UniFi Device).
+    /// </summary>
+    public string? NetworkApplicationVersion { get; init; }
+
+    /// <summary>
+    /// Optional: Client name for display purposes
+    /// </summary>
+    public string? ClientName { get; init; }
+
+    /// <summary>
+    /// Optional: VLAN IDs to exclude from DNAT DNS coverage checks
+    /// </summary>
+    public List<int>? DnatExcludedVlanIds { get; init; }
+
+    /// <summary>
+    /// Optional: Additional IPs to accept as valid DNAT DNS redirect targets.
+    /// Use for DNS VIPs (keepalived, HAProxy, anycast) or DNS servers not in
+    /// LAN DNS configuration. IPs are added to the valid-target set used by
+    /// the DNAT redirect destination validator.
+    /// </summary>
+    public List<string>? TrustedDnsRedirectTargets { get; init; }
+
+    /// <summary>
+    /// Optional: Custom port for third-party DNS management interface (Pi-hole, AdGuard Home, etc.)
+    /// If not specified, auto-probes ports 80, 443, 8080, 3000
+    /// </summary>
+    public int? PiholeManagementPort { get; init; }  // Name kept for backwards compatibility
+
+    /// <summary>
+    /// Optional: Custom URL for third-party DNS management interface (e.g., https://pihole.local)
+    /// Used when Pi-hole/AdGuard Home is behind a reverse proxy.
+    /// </summary>
+    public string? PiholeManagementUrl { get; init; }
+
+    /// <summary>
+    /// Optional: Whether UPnP is enabled on the gateway (from GetUpnpEnabledAsync)
+    /// </summary>
+    public bool? UpnpEnabled { get; init; }
+
+    /// <summary>
+    /// Optional: Port forwarding rules including UPnP mappings (from GetPortForwardRulesAsync)
+    /// </summary>
+    public List<UniFiPortForwardRule>? PortForwardRules { get; init; }
+
+    /// <summary>
+    /// Optional: Network configurations from /rest/networkconf API.
+    /// Used to determine the External/WAN firewall zone ID for firewall rule analysis.
+    /// </summary>
+    public List<UniFiNetworkConfig>? NetworkConfigs { get; init; }
+
+    /// <summary>
+    /// Optional: Firewall zones from /proxy/network/v2/api/site/{site}/firewall/zone API.
+    /// Used to validate zone assumptions and identify DMZ/Hotspot networks.
+    /// </summary>
+    public List<UniFiFirewallZone>? FirewallZones { get; init; }
+
+    /// <summary>
+    /// Optional: User overrides for network purpose classification.
+    /// Keys are UniFi network IDs, values are NetworkPurpose enum names (e.g., "IoT", "Guest").
+    /// Overrides are applied after VlanAnalyzer extraction in Phase 1.
+    /// </summary>
+    public Dictionary<string, string>? NetworkPurposeOverrides { get; init; }
+
+    /// <summary>
+    /// Optional: Threat intelligence context for threat-informed scoring.
+    /// When present, port forward issues targeting actively attacked ports get severity bumps.
+    /// </summary>
+    public ConfigAuditEngine.ThreatContext? ThreatContext { get; init; }
+}

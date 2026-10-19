@@ -1,0 +1,791 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using Microsoft.EntityFrameworkCore;
+using NetworkOptimizer.AgentProtocol;
+using NetworkOptimizer.Alerts.Events;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Services;
+using NetworkOptimizer.UniFi;
+using NetworkOptimizer.Web.Services.Ssh;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// Service for running WAN speed tests via UWN's distributed HTTP speed test network.
+/// Executes the local uwnspeedtest Go binary and parses its JSON output.
+/// </summary>
+public class UwnSpeedTestService : WanSpeedTestServiceBase, IUwnSpeedTestService
+{
+    private readonly IConfiguration _configuration;
+    private readonly UniFiConnectionService _connectionService;
+    private readonly IGatewaySshService _gatewaySsh;
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly SiteTunnelRouting _tunnelRouting;
+    private readonly SiteAgentCoverage _agentCoverage;
+    private readonly AgentUwnService _agentUwn;
+    private readonly AgentWanTestVantageResolver _vantageResolver;
+
+    // WAN context the in-flight agent run was pointed at, for attributing the result. Set by the
+    // agent path only; a local run measures whatever this host's route takes, whatever was asked
+    // for. Runs serialize per site instance, so one field is enough.
+    private WanContext? _runContext;
+
+    // The agent the in-flight run was dispatched to. The trace source must be THAT agent, not
+    // whichever one reported in last.
+    private int? _runAgentId;
+    private readonly AgentEnrollmentService _agentEnrollment;
+
+    protected override SpeedTestDirection Direction => SpeedTestDirection.UwnWan;
+
+    // Include historical Cloudflare WAN results so the UI shows all server-side WAN test history
+    protected override SpeedTestDirection[] OwnedDirections =>
+        [SpeedTestDirection.UwnWan, SpeedTestDirection.CloudflareWan];
+
+    private int Streams => MaxMode ? 48 : 20;
+    private int ServerCount => MaxMode ? 12 : 4;
+
+    // Per-direction test duration and overall binary timeout, shared by the local
+    // run and the agent request so both invoke uwnspeedtest identically.
+    private const int UwnDurationSeconds = 8;
+    private const int UwnTimeoutSeconds = 90;
+
+    public UwnSpeedTestService(
+        ILogger<UwnSpeedTestService> logger,
+        IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+        INetworkPathAnalyzer pathAnalyzer,
+        IConfiguration configuration,
+        Iperf3ServerService iperf3ServerService,
+        SiteConnectionRegistry siteConnections,
+        GatewaySshRegistry gatewaySshRegistry,
+        IServiceScopeFactory scopeFactory,
+        SiteTunnelRouting tunnelRouting,
+        SiteAgentCoverage agentCoverage,
+        AgentUwnService agentUwn,
+        AgentWanTestVantageResolver vantageResolver,
+        AgentEnrollmentService agentEnrollment,
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+        Licensing.LicenseStateService licenseState,
+        IAlertEventBus? alertEventBus = null,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
+        : base(dbFactory, pathAnalyzer, logger, iperf3ServerService, alertEventBus, siteDbFactory, siteSlug, licenseState)
+    {
+        _configuration = configuration;
+        _connectionService = siteConnections.GetFor(SiteSlug);
+        _gatewaySsh = gatewaySshRegistry.GetFor(SiteSlug);
+        _scopeFactory = scopeFactory;
+        _tunnelRouting = tunnelRouting;
+        _agentCoverage = agentCoverage;
+        _agentUwn = agentUwn;
+        _vantageResolver = vantageResolver;
+        _agentEnrollment = agentEnrollment;
+    }
+
+    /// <summary>
+    /// Whether this site's WAN test runs on its agent rather than on this server.
+    /// The agent runs the uwnspeedtest binary itself and dials no device, so this asks who owns
+    /// the site's measurements - never devices.via_agent, which only decides whether device
+    /// endpoints are reached through the tunnel and has nothing to say about where a test runs.
+    /// </summary>
+    private bool RunsOnAgent => _agentCoverage.AgentOwnsPathMeasurement(SiteSlug);
+
+    /// <summary>
+    /// The default site runs the binary locally; a non-default site can run only
+    /// when its agent is online (the agent runs the binary at the site, measuring
+    /// the site's WAN rather than this server's).
+    /// </summary>
+    protected override Task<bool> CanRunForSiteAsync() =>
+        Task.FromResult(IsDefaultSite || (RunsOnAgent && _tunnelRouting.IsAgentOnline(SiteSlug)));
+
+    /// <summary>
+    /// Scope pinned to this instance's site so scoped services (SQM WAN lookup)
+    /// resolve that site's database and console.
+    /// </summary>
+    private IServiceScope CreateSiteScope()
+    {
+        var scope = _scopeFactory.CreateScope();
+        scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(SiteSlug);
+        // The child scope has no user caller, so gated services resolved from it run as system
+        // (design doc 06). The scope owns the caller context, so the restore handle dies with it.
+        Identity.SystemScope.Enter(scope.ServiceProvider, "speedtest:wan");
+        return scope;
+    }
+
+    protected override async Task<Iperf3Result?> RunTestCoreAsync(
+        Action<string, int, string?> report,
+        CancellationToken cancellationToken)
+    {
+        // A site whose agent owns its measurements runs the binary at the site, so the measured
+        // WAN is the site's rather than this server's. CanRunForSiteAsync has already refused
+        // non-default sites without an online agent, and RunsOnAgent answers false for the default
+        // site unless it has been handed to its agent.
+        if (RunsOnAgent)
+            return await RunViaAgentAsync(report, cancellationToken);
+
+        _runContext = null;
+        _runAgentId = null;
+        return await RunLocalAsync(report, cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs the uwnspeedtest binary at the site's agent and builds the result from
+    /// the JSON it returns. Progress is coarse (the agent returns only the final
+    /// JSON), but the stored result is identical to a local run.
+    /// </summary>
+    private async Task<Iperf3Result?> RunViaAgentAsync(
+        Action<string, int, string?> report,
+        CancellationToken cancellationToken)
+    {
+        // Which agent, and which WAN it measures. A refusal here is the answer - it is never
+        // retried on another agent, because that agent is on another WAN and the result would be
+        // filed under the WAN the caller asked for.
+        var (vantage, refusal) = await _vantageResolver.ResolveAsync(SiteSlug, WanContextId, cancellationToken);
+        if (vantage == null)
+            throw new InvalidOperationException(refusal ?? "No agent is available to run this WAN speed test.");
+        _runContext = vantage.Context;
+        _runAgentId = vantage.AgentId;
+
+        Logger.LogInformation(
+            "Dispatching UWN WAN speed test to site {Slug}'s agent {AgentId} ({Wan}, {Streams} streams, {Servers} servers)",
+            SiteSlug, vantage.AgentId, vantage.Context?.Name ?? "default path", Streams, ServerCount);
+        // The agent returns only the final JSON over the tunnel, so there's no live progress to
+        // stream. Report the SAME phase boundaries the local run does and let the page interpolate
+        // download (20->55) and upload (60->95) between them, so the bar climbs smoothly. Reporting
+        // fine-grained steps here fights that interpolation and makes the bar jump. The local
+        // (this-server) run keeps its accurate per-line stdout progress in RunLocalAsync.
+        var agentTask = _agentUwn.RunAsync(
+            SiteSlug, vantage.AgentId, Streams, ServerCount, UwnDurationSeconds, UwnTimeoutSeconds, cancellationToken);
+        await WanSpeedTestProgressAnimator.AnimatePhasesAsync(agentTask, report, UwnDurationSeconds, cancellationToken);
+        var (success, output) = await agentTask;
+        if (!success)
+            throw new InvalidOperationException($"Agent WAN speed test failed: {output}");
+
+        return await BuildResultFromJsonAsync(output, wanIp: null, isp: null, serverInfo: null, viaAgent: true, report, cancellationToken);
+    }
+
+    /// <summary>Runs the uwnspeedtest binary locally on this host (default site).</summary>
+    private async Task<Iperf3Result?> RunLocalAsync(
+        Action<string, int, string?> report,
+        CancellationToken cancellationToken)
+    {
+        var binaryPath = GetLocalBinaryPath();
+        if (!File.Exists(binaryPath))
+            throw new InvalidOperationException(
+                $"UWN speed test binary not found at {binaryPath}. " +
+                "Ensure the binary is built for this platform.");
+
+        Logger.LogInformation(
+            "Starting UWN WAN speed test via local binary ({Streams} streams, {Servers} servers, binary: {Binary})",
+            Streams, ServerCount, Path.GetFileName(binaryPath));
+
+        report("Starting", 0, null);
+
+        var args = UwnClientArgs.Build(Streams, ServerCount, UwnDurationSeconds, UwnTimeoutSeconds);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = binaryPath,
+            Arguments = args,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start uwnspeedtest process");
+
+        // Track metadata from stderr for early UI display
+        string? serverInfo = null;
+        string? wanIp = null;
+        string? isp = null;
+
+        // Parse stderr lines for progress reporting
+        var stderrTask = Task.Run(async () =>
+        {
+            try
+            {
+                while (await process.StandardError.ReadLineAsync(cancellationToken) is { } line)
+                {
+                    Logger.LogDebug("uwnspeedtest: {Line}", line);
+
+                    if (line.StartsWith("Acquiring"))
+                        report("Acquiring token", 2, "Getting test token...");
+                    else if (line.StartsWith("IP: "))
+                    {
+                        // Parse "IP: 1.2.3.4 (ISP Name)"
+                        var content = line[4..];
+                        var parenIdx = content.IndexOf(" (", StringComparison.Ordinal);
+                        if (parenIdx >= 0)
+                        {
+                            wanIp = content[..parenIdx].Trim();
+                            isp = content[(parenIdx + 2)..].TrimEnd(')');
+                        }
+                        else
+                        {
+                            wanIp = content.Trim();
+                        }
+                    }
+                    else if (line.StartsWith("Discovering"))
+                        report("Discovering servers", 5, "Finding nearby servers...");
+                    else if (line.StartsWith("Found"))
+                        report("Selecting servers", 7, line);
+                    else if (line.StartsWith("Servers: "))
+                    {
+                        serverInfo = line[9..].Trim();
+                        SetMetadata(new WanTestMetadata(
+                            ServerInfo: serverInfo,
+                            Location: isp ?? "",
+                            WanIp: wanIp));
+                        report("Servers selected", 8, serverInfo);
+                    }
+                    else if (line.StartsWith("Measuring latency"))
+                        report("Testing latency", 10, null);
+                    else if (line.StartsWith("Latency: "))
+                        report("Latency measured", 15, line);
+                    else if (line.StartsWith("Testing download"))
+                        report("Testing download", 20, null);
+                    else if (line.StartsWith("Download: "))
+                        report("Download complete", 55, "Down: " + line[10..].Trim());
+                    else if (line.StartsWith("Testing upload"))
+                        report("Testing upload", 60, null);
+                    else if (line.StartsWith("Upload: "))
+                        report("Upload complete", 95, null);
+                }
+            }
+            catch (OperationCanceledException) { /* expected */ }
+        }, CancellationToken.None);
+
+        // Read all stdout (JSON output)
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+
+        // Wait for process with timeout
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(120));
+
+        try
+        {
+            await process.WaitForExitAsync(timeoutCts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
+            throw new TimeoutException("UWN speed test timed out after 120 seconds");
+        }
+        catch (OperationCanceledException)
+        {
+            try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
+            throw;
+        }
+
+        await stderrTask;
+        var stdout = await stdoutTask;
+
+        if (string.IsNullOrWhiteSpace(stdout))
+            throw new InvalidOperationException(
+                $"UWN speed test binary produced no output (exit code: {process.ExitCode})");
+
+        return await BuildResultFromJsonAsync(stdout, wanIp, isp, serverInfo, viaAgent: false, report, cancellationToken);
+    }
+
+    /// <summary>
+    /// Parses the uwnspeedtest JSON (from a local run or the site's agent) into a
+    /// stored result, including WAN interface identification. The
+    /// <paramref name="wanIp"/>, <paramref name="isp"/>, and
+    /// <paramref name="serverInfo"/> hints come from a local run's stderr and are
+    /// null for an agent run, which relies on the JSON metadata alone.
+    /// </summary>
+    private async Task<Iperf3Result?> BuildResultFromJsonAsync(
+        string stdout,
+        string? wanIp,
+        string? isp,
+        string? serverInfo,
+        bool viaAgent,
+        Action<string, int, string?> report,
+        CancellationToken cancellationToken)
+    {
+        // Parse JSON output
+        report("Processing", 96, null);
+        var json = JsonSerializer.Deserialize<WanSpeedTestResult>(stdout, JsonOptions);
+        if (json == null)
+            throw new InvalidOperationException("Failed to parse speed test JSON output");
+
+        if (!json.Success)
+            throw new InvalidOperationException($"Speed test failed: {json.Error}");
+
+        // Build result
+        var primaryServerHost = !string.IsNullOrEmpty(json.Metadata?.ServerHost)
+            ? json.Metadata.ServerHost : "UWN Test";
+        var deviceName = !string.IsNullOrEmpty(json.Metadata?.Colo)
+            ? json.Metadata.Colo : serverInfo ?? "UWN";
+        var downloadMbps = (json.Download?.Bps ?? 0) / 1_000_000.0;
+        var uploadMbps = (json.Upload?.Bps ?? 0) / 1_000_000.0;
+
+        // Update metadata with final values from JSON
+        var finalWanIp = !string.IsNullOrEmpty(json.Metadata?.Ip) ? json.Metadata.Ip : wanIp;
+        var finalIsp = !string.IsNullOrEmpty(json.Metadata?.Country) ? json.Metadata.Country : isp;
+        var finalServerInfo = !string.IsNullOrEmpty(json.Metadata?.Colo) ? json.Metadata.Colo : serverInfo;
+        SetMetadata(new WanTestMetadata(
+            ServerInfo: finalServerInfo ?? "UWN",
+            Location: finalIsp ?? "",
+            WanIp: finalWanIp));
+
+        // Local endpoint the test ran from, for path analysis. An agent run measures from the agent
+        // it was DISPATCHED to, so the trace starts at that agent's LAN IP - asking the site for
+        // its most recently seen agent traced one WAN's test from another WAN's box.
+        var serverIp = viaAgent
+            ? (_runAgentId is int ranOn
+                ? await _vantageResolver.AgentLanIpAsync(ranOn, cancellationToken)
+                : await _agentEnrollment.GetOnlineAgentLanIpAsync(SiteSlug))
+            : _configuration["HOST_IP"];
+
+        var result = new Iperf3Result
+        {
+            Direction = SpeedTestDirection.UwnWan,
+            DeviceHost = primaryServerHost,
+            DeviceName = deviceName,
+            DeviceType = "WAN",
+            LocalIp = serverIp,
+            DownloadBitsPerSecond = json.Download?.Bps ?? 0,
+            UploadBitsPerSecond = json.Upload?.Bps ?? 0,
+            DownloadBytes = json.Download?.Bytes ?? 0,
+            UploadBytes = json.Upload?.Bytes ?? 0,
+            PingMs = json.Latency?.UnloadedMs ?? 0,
+            JitterMs = json.Latency?.JitterMs ?? 0,
+            DownloadLatencyMs = json.Download?.LoadedLatencyMs > 0 ? json.Download.LoadedLatencyMs : null,
+            DownloadJitterMs = json.Download?.LoadedJitterMs > 0 ? json.Download.LoadedJitterMs : null,
+            UploadLatencyMs = json.Upload?.LoadedLatencyMs > 0 ? json.Upload.LoadedLatencyMs : null,
+            UploadJitterMs = json.Upload?.LoadedJitterMs > 0 ? json.Upload.LoadedJitterMs : null,
+            TestTime = DateTime.UtcNow,
+            Success = true,
+            ParallelStreams = json.Streams,
+            DurationSeconds = json.DurationSeconds,
+        };
+
+        // Identify WAN connection
+        try
+        {
+            var isMultiWan = false;
+            List<NetworkInfo>? wanNetworks = null;
+            if (_connectionService.IsConnected)
+            {
+                var networks = await _connectionService.GetNetworksAsync();
+
+                // Use device-level WAN interface detection to determine which WANs
+                // are actually active on the gateway. The network config's "enabled"
+                // field is unreliable - UniFi reports disabled WANs as enabled=true.
+                HashSet<string>? activeWanGroups = null;
+                using (var scope = CreateSiteScope())
+                {
+                    var sqmService = scope.ServiceProvider.GetRequiredService<ISqmService>();
+                    var activeWans = await sqmService.GetWanInterfacesFromControllerAsync();
+                    if (activeWans.Count > 0)
+                    {
+                        activeWanGroups = new HashSet<string>(
+                            activeWans.Where(w => !string.IsNullOrEmpty(w.NetworkGroup))
+                                .Select(w => w.NetworkGroup!),
+                            StringComparer.OrdinalIgnoreCase);
+                    }
+                    else
+                    {
+                        Logger.LogWarning("No active WAN interfaces detected on gateway - falling back to network config filter");
+                    }
+                }
+
+                wanNetworks = networks.Where(n => n.IsWan && n.Enabled
+                    && (activeWanGroups == null || activeWanGroups.Contains(n.WanNetworkgroup ?? "WAN")))
+                    .ToList();
+                isMultiWan = wanNetworks.Count > 1;
+            }
+
+            if (isMultiWan)
+            {
+                // Try SSH route lookup to identify which WANs were actually used
+                var combo = await IdentifyWanComboViaSshAsync(
+                    json.Metadata?.ServerIps, serverIp, wanNetworks!, cancellationToken);
+
+                if (combo != null)
+                {
+                    result.WanNetworkGroup = combo.Value.Group;
+                    result.WanName = combo.Value.Name;
+                }
+                else
+                {
+                    // Without the gateway there is no observation of where the traffic went, only
+                    // inference. What the site can still say for itself comes first.
+                    var (siteGroup, siteName) = await IdentifyWanFromSiteFactsAsync(cancellationToken);
+                    if (!string.IsNullOrEmpty(siteGroup))
+                    {
+                        result.WanNetworkGroup = siteGroup;
+                        result.WanName = siteName;
+                    }
+                    else
+                    {
+                        // Fallback: if measured speed exceeds 125% of any single WAN's
+                        // configured speed, assume multiple WANs are bonded. The 25% margin
+                        // accounts for ISP overprovisioning and burst headroom.
+                        //
+                        // Only where bonding is possible at all. A failover site carries one test on
+                        // one WAN whatever the numbers say, and the ceiling this compares against is a
+                        // plan speed somebody typed in - left stale, every result looks impossible for
+                        // a single WAN and the test gets attributed to ALL of them at once.
+                        var maxSingleDown = wanNetworks!.Max(n => n.WanDownloadMbps ?? 0);
+                        var maxSingleUp = wanNetworks!.Max(n => n.WanUploadMbps ?? 0);
+                        const double fudgeFactor = 1.25;
+
+                        if (await SiteLoadBalancesAsync(cancellationToken)
+                            && (downloadMbps > maxSingleDown * fudgeFactor || uploadMbps > maxSingleUp * fudgeFactor))
+                        {
+                            var groups = wanNetworks!
+                                .Select(n => n.WanNetworkgroup ?? "WAN")
+                                .Distinct().OrderBy(g => g);
+                            result.WanNetworkGroup = string.Join("+", groups);
+                            var names = wanNetworks!
+                                .Select(n => !string.IsNullOrEmpty(n.Name) ? n.Name : n.WanNetworkgroup ?? "WAN")
+                                .Distinct().OrderBy(n => n);
+                            result.WanName = string.Join(" + ", names);
+                        }
+                        else
+                        {
+                            var (wanGroup, wanName) = await PathAnalyzer.IdentifyWanConnectionAsync(
+                                finalWanIp ?? "", downloadMbps, uploadMbps, cancellationToken);
+                            result.WanNetworkGroup = wanGroup;
+                            result.WanName = wanName;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var (wanGroup, wanName) = await PathAnalyzer.IdentifyWanConnectionAsync(
+                    finalWanIp ?? "", downloadMbps, uploadMbps, cancellationToken);
+                result.WanNetworkGroup = wanGroup;
+                result.WanName = wanName;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not identify WAN connection");
+        }
+
+        Logger.LogInformation(
+            "UWN WAN speed test complete: Down {Download:F1} Mbps, Up {Upload:F1} Mbps, Latency {Latency:F1} ms",
+            downloadMbps, uploadMbps, json.Latency?.UnloadedMs ?? 0);
+
+        report("Complete", 100, $"Down: {downloadMbps:F1} / Up: {uploadMbps:F1} Mbps");
+
+        return result;
+    }
+
+    protected override Iperf3Result CreateFailedResult(string errorMessage) => new()
+    {
+        Direction = SpeedTestDirection.UwnWan,
+        DeviceHost = "UWN Test",
+        DeviceName = "UWN",
+        DeviceType = "WAN",
+        TestTime = DateTime.UtcNow,
+        Success = false,
+        ErrorMessage = errorMessage,
+    };
+
+    /// <summary>
+    /// Whether the site spreads traffic across its WANs, from what a connected console last
+    /// recorded. Unknown is not a yes: a site nobody has resolved cannot be assumed to bond.
+    /// </summary>
+    private async Task<bool> SiteLoadBalancesAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var scope = CreateSiteScope();
+            var siteDb = scope.ServiceProvider.GetRequiredService<SiteDbContextFactory>();
+            var siteCtx = scope.ServiceProvider.GetRequiredService<SiteContextService>();
+            await using var db = siteDb.CreateForSite(siteCtx.Slug, siteCtx.IsDefault);
+            return await EntityFrameworkQueryableExtensions.AnyAsync(db.WanProfiles, p => p.SiteLoadBalances == true, ct);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not read whether the site load balances; assuming it does not");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Which WAN this test went out, from what the site knows about itself rather than from what
+    /// the numbers resemble.
+    /// <para>
+    /// Two answers, both about the box that actually ran the test - this server, or the site's
+    /// agent. A single vantage on that side names its WAN outright; several means several boxes,
+    /// and which one ran the test is not knowable from here. Failing that, a site that fails
+    /// over sends everything unpinned out its primary, which is true except for the length of an
+    /// outage. A load-balancing site gets neither, because there the WAN genuinely was whichever
+    /// the balancer picked and only the gateway could have seen it.
+    /// </para>
+    /// </summary>
+    private async Task<(string? Group, string? Name)> IdentifyWanFromSiteFactsAsync(CancellationToken ct)
+    {
+        try
+        {
+            var viaAgent = RunsOnAgent;
+            using var scope = CreateSiteScope();
+            var siteDb = scope.ServiceProvider.GetRequiredService<SiteDbContextFactory>();
+            var siteCtx = scope.ServiceProvider.GetRequiredService<SiteContextService>();
+            await using var db = siteDb.CreateForSite(siteCtx.Slug, siteCtx.IsDefault);
+
+            // A vantage names the WAN its box probes over, which is the same box and the same
+            // path this test took. Scoped to whoever ran it: a vantage bound to an agent says
+            // nothing about a test this server ran, or the other way round. Only one candidate
+            // may answer - two agent-bound vantages are two boxes on two WANs, and without a
+            // chosen one we cannot tell which ran the test, so guessing would name a WAN at random.
+            var vantages = await EntityFrameworkQueryableExtensions.ToListAsync(
+                db.WanContexts.AsNoTracking().Where(c => c.WanInterface != null && c.WanInterface != ""), ct);
+            // A run pointed at a context needs no inference: that context IS the answer, and
+            // narrowing to it rather than short-circuiting keeps one naming path for both cases.
+            var candidates = _runContext != null
+                ? vantages.Where(c => c.Id == _runContext.Id).ToList()
+                : vantages.Where(c => viaAgent ? c.AgentId != null : c.AgentId == null).ToList();
+            if (candidates.Count > 1)
+            {
+                Logger.LogDebug(
+                    "WAN attribution: {Count} vantages sit on the {Runner} side, so none of them identifies this test",
+                    candidates.Count, viaAgent ? "agent" : "server");
+            }
+            var owning = candidates.Count == 1 ? candidates[0] : null;
+            if (owning?.WanInterface is string vantageWan)
+            {
+                var group = GatewayWanHelper.WanNetworkGroupFromKey(vantageWan);
+                Logger.LogInformation(
+                    "WAN attribution: vantage '{Name}' covers the {Runner} that ran this test, so it went out {Group}",
+                    owning.Name, viaAgent ? "agent" : "server", group);
+                return (group, owning.Name);
+            }
+
+            if (await EntityFrameworkQueryableExtensions.AnyAsync(db.WanProfiles, p => p.SiteLoadBalances == true, ct))
+                return (null, null);
+
+            var primary = await EntityFrameworkQueryableExtensions.FirstOrDefaultAsync(
+                db.WanProfiles.AsNoTracking(), p => p.IsPrimary == true, ct);
+            if (primary?.WanNetworkgroup is string primaryGroup)
+            {
+                Logger.LogInformation(
+                    "WAN attribution: the site fails over, so an unpinned test left by the primary ({Group})",
+                    primaryGroup);
+                return (primaryGroup, primary.Name);
+            }
+            return (null, null);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not identify the WAN from the site's own records");
+            return (null, null);
+        }
+    }
+
+    /// <summary>
+    /// Use SSH route lookup on the gateway to determine which WAN interfaces
+    /// traffic to the test servers traverses. Returns the combo group and name,
+    /// or null if SSH is unavailable or route lookup fails.
+    /// </summary>
+    private async Task<(string Group, string Name)?> IdentifyWanComboViaSshAsync(
+        List<string>? serverIps,
+        string? nasIp,
+        List<NetworkInfo> wanNetworks,
+        CancellationToken cancellationToken)
+    {
+        if (serverIps == null || serverIps.Count == 0)
+            return null;
+
+        try
+        {
+            var settings = await _gatewaySsh.GetSettingsAsync();
+            if (string.IsNullOrEmpty(settings.Host) || !settings.HasCredentials || !settings.Enabled)
+                return null;
+
+            // Get interface→group mapping from SqmService (scoped)
+            Dictionary<string, (string? Group, string Name)> ifToWan;
+            List<string> wanIfaceNames;
+            using (var scope = CreateSiteScope())
+            {
+                var sqmService = scope.ServiceProvider.GetRequiredService<ISqmService>();
+                var wanInterfaces = await sqmService.GetWanInterfacesFromControllerAsync();
+                if (wanInterfaces.Count == 0)
+                    return null;
+
+                ifToWan = wanInterfaces.ToDictionary(
+                    w => w.Interface,
+                    w => (w.NetworkGroup, w.Name));
+                wanIfaceNames = wanInterfaces.Select(w => w.Interface).ToList();
+            }
+
+            var validIps = serverIps.Distinct()
+                .Where(ip => System.Net.IPAddress.TryParse(ip, out _))
+                .ToList();
+
+            if (validIps.Count == 0)
+                return null;
+
+            // Single SSH command:
+            // 1. Get WAN interface public IPs (to map conntrack reply dst → WAN)
+            // 2. Query conntrack for connections from NAS to speed test servers
+            var ipAddrCmds = string.Join("; ", wanIfaceNames.Select(iface => $"ip -4 -o addr show {iface}"));
+            var escapedIps = string.Join("|", validIps.Select(ip => Regex.Escape(ip)));
+
+            string conntrackCmd;
+            if (!string.IsNullOrEmpty(nasIp) && System.Net.IPAddress.TryParse(nasIp, out _))
+                conntrackCmd = $"conntrack -L -s {nasIp} 2>/dev/null | grep -E '{escapedIps}'";
+            else
+                conntrackCmd = $"conntrack -L 2>/dev/null | grep -E '{escapedIps}'";
+
+            var fullCmd = $"{ipAddrCmds}; echo '---CONNTRACK---'; {conntrackCmd}";
+            var (success, output) = await _gatewaySsh.RunCommandAsync(
+                fullCmd, TimeSpan.FromSeconds(10), cancellationToken);
+
+            if (!success || string.IsNullOrEmpty(output))
+                return null;
+
+            // Split output into ip addr section and conntrack section
+            var separatorIdx = output.IndexOf("---CONNTRACK---", StringComparison.Ordinal);
+            if (separatorIdx < 0)
+                return null;
+
+            var ipAddrOutput = output[..separatorIdx];
+            var conntrackOutput = output[(separatorIdx + "---CONNTRACK---".Length)..];
+
+            // Build WAN public IP → interface mapping
+            // Format: "2: eth2    inet 198.51.100.10/24 ..."
+            var wanIpToIface = new Dictionary<string, string>();
+            foreach (Match match in Regex.Matches(ipAddrOutput, @"\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/"))
+            {
+                var iface = match.Groups[1].Value;
+                var ip = match.Groups[2].Value;
+                if (ifToWan.ContainsKey(iface))
+                    wanIpToIface[ip] = iface;
+            }
+
+            Logger.LogDebug("WAN IP mapping: {Mapping}",
+                string.Join(", ", wanIpToIface.Select(kv => $"{kv.Value}={kv.Key}")));
+
+            // Parse conntrack: each line has two dst= values
+            // Original: src=<nas> dst=<server> ... Reply: src=<server> dst=<wan_public_ip>
+            var wanGroups = new HashSet<string>();
+            var wanNames = new HashSet<string>();
+
+            foreach (var line in conntrackOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var dstMatches = Regex.Matches(line, @"dst=(\d+\.\d+\.\d+\.\d+)");
+                if (dstMatches.Count >= 2)
+                {
+                    // Second dst= is the reply direction → WAN public IP
+                    var replyDstIp = dstMatches[1].Groups[1].Value;
+                    if (wanIpToIface.TryGetValue(replyDstIp, out var iface) &&
+                        ifToWan.TryGetValue(iface, out var wan))
+                    {
+                        wanGroups.Add(wan.Group ?? "WAN");
+                        wanNames.Add(wan.Name);
+                    }
+                }
+            }
+
+            if (wanGroups.Count == 0)
+            {
+                Logger.LogDebug("Conntrack found no WAN matches for {Count} server IPs", validIps.Count);
+                return null;
+            }
+
+            var sortedGroups = wanGroups.OrderBy(g => g).ToList();
+            var combo = string.Join("+", sortedGroups);
+
+            // Build name in same order as groups
+            var nameMap = ifToWan.Values
+                .Where(w => wanGroups.Contains(w.Group ?? "WAN"))
+                .DistinctBy(w => w.Group)
+                .OrderBy(w => w.Group)
+                .Select(w => w.Name);
+            var comboName = string.Join(" + ", nameMap);
+
+            Logger.LogInformation(
+                "Conntrack identified WAN combo: {Combo} ({Name}) from {ServerCount} server IPs",
+                combo, comboName, validIps.Count);
+
+            return (combo, comboName);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "SSH-based WAN identification failed, falling back");
+            return null;
+        }
+    }
+
+    #region Binary Resolution
+
+    /// <summary>
+    /// Resolves the local uwnspeedtest binary path based on the current platform.
+    /// Binary naming convention: uwnspeedtest-{os}-{arch}[.exe]
+    /// </summary>
+    private static string GetLocalBinaryPath()
+    {
+        var os = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows"
+            : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "darwin"
+            : "linux";
+
+        var arch = RuntimeInformation.OSArchitecture switch
+        {
+            Architecture.X64 => "amd64",
+            Architecture.Arm64 => "arm64",
+            Architecture.X86 => "386",
+            _ => "amd64"
+        };
+
+        var ext = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? ".exe" : "";
+        var binaryName = $"uwnspeedtest-{os}-{arch}{ext}";
+        return Path.Combine(AppContext.BaseDirectory, "tools", binaryName);
+    }
+
+    #endregion
+
+    #region JSON Models
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        Converters = { new JsonStringEnumConverter() }
+    };
+
+    private sealed class WanSpeedTestResult
+    {
+        public bool Success { get; set; }
+        public string? Error { get; set; }
+        public WanMetadata? Metadata { get; set; }
+        public WanLatency? Latency { get; set; }
+        public WanThroughput? Download { get; set; }
+        public WanThroughput? Upload { get; set; }
+        public int Streams { get; set; }
+        public int DurationSeconds { get; set; }
+    }
+
+    private sealed class WanMetadata
+    {
+        public string Ip { get; set; } = "";
+        public string Colo { get; set; } = "";
+        public string Country { get; set; } = "";
+        public string ServerHost { get; set; } = "";
+        public List<string>? ServerIps { get; set; }
+    }
+
+    private sealed class WanLatency
+    {
+        public double UnloadedMs { get; set; }
+        public double JitterMs { get; set; }
+    }
+
+    private sealed class WanThroughput
+    {
+        public double Bps { get; set; }
+        public long Bytes { get; set; }
+        public double LoadedLatencyMs { get; set; }
+        public double LoadedJitterMs { get; set; }
+    }
+
+    #endregion
+}

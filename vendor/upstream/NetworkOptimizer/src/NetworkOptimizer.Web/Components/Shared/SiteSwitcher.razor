@@ -1,0 +1,169 @@
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Web.Services
+@inject ISiteManagementService SiteManagement
+@inject NetworkOptimizer.Web.Services.Authorization.ISiteAccessFilter SiteAccess
+@inject SiteContextService SiteContext
+@inject SiteConnectionRegistry SiteConnections
+@inject SiteRegistryChangeNotifier ChangeNotifier
+@inject NavigationManager NavigationManager
+@implements IDisposable
+
+@if (_enabled && _sites.Count > 0)
+{
+    <div class="site-switcher" @onkeydown="HandleKeyDown">
+        <button type="button" class="site-switcher-trigger" @onclick="ToggleDropdown" @onclick:stopPropagation="true">
+            <img src="/icons/sites.png" alt="" class="site-switcher-icon" />
+            <span class="site-switcher-name">@(_currentSite?.Name ?? "Site")</span>
+            <svg class="site-switcher-chevron @(_open ? "open" : "")" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd" />
+            </svg>
+        </button>
+
+        @if (_open)
+        {
+            <div class="site-switcher-backdrop" @onclick="CloseDropdown"></div>
+            <div class="site-switcher-menu">
+                @foreach (var site in _sites)
+                {
+                    @* A real anchor whose href is this page pinned to the site. The
+                       site-context.js click handler turns a plain left click into the
+                       switch (cookie write + full reload, same target as the href) and
+                       preventDefaults it, while ctrl / cmd / shift / middle clicks fall
+                       through to the browser and open the site in a new tab - pinning
+                       that tab without touching this one or the browser default. Handled
+                       in JS, not @@onclick, so those modified clicks stay native. *@
+                    <a class="site-switcher-item @(site.Slug == SiteContext.Slug ? "active" : "")"
+                       href="@GetSiteHref(site)"
+                       data-site-switch="@site.Slug"
+                       data-site-current="@(site.Slug == SiteContext.Slug ? "" : null)">
+                        <span class="site-switcher-item-name">
+                            <span class="status-dot @(SiteConnections.GetFor(site.Slug).IsConnected ? "online" : "offline")"></span>
+                            @site.Name
+                        </span>
+                        <span class="site-switcher-item-slug">@site.Slug</span>
+                    </a>
+                }
+                <a class="site-switcher-all" href="/sites" @onclick="CloseDropdown">All sites</a>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private bool _enabled;
+    private bool _open;
+    private List<Site> _sites = new();
+    private Site? _currentSite;
+
+    protected override async Task OnInitializedAsync()
+    {
+        ChangeNotifier.SitesChanged += OnSitesChanged;
+        await LoadSitesAsync();
+    }
+
+    private async Task LoadSitesAsync()
+    {
+        _enabled = await SiteManagement.IsMultiSiteEnabledAsync();
+        if (!_enabled)
+            return;
+
+        // Disabled sites are managed (re-enabled/removed) from Settings - Multi-Site;
+        // they don't belong in the switcher.
+        _sites = await SiteAccess.FilterAsync(
+            (await SiteManagement.GetSitesAsync()).Where(s => s.Enabled), s => s.Slug);
+        _currentSite = _sites.FirstOrDefault(s => s.Slug == SiteContext.Slug)
+            ?? _sites.FirstOrDefault(s => s.IsDefault);
+    }
+
+    // Raised from whichever circuit changed the registry (create, rename,
+    // enable/disable, remove, multi-site toggle) - rebuild this circuit's list.
+    private void OnSitesChanged()
+    {
+        _ = InvokeAsync(async () =>
+        {
+            try
+            {
+                await LoadSitesAsync();
+
+                // The site this circuit is standing on has just gone out of reach. Everything scoped
+                // was resolved against it when the circuit started and cannot be re-pointed in place,
+                // so the parts that refetch start being refused while the parts that already have
+                // their data carry on showing it - access looks half taken away, and the address bar
+                // still names a site that is no longer theirs. A reload settles all of it: the root
+                // component falls back to a site they do hold and rewrites the URL to match.
+                // Deliberately not guarded on the list being non-empty: losing your LAST site is
+                // exactly when the circuit is standing on something it no longer holds, and skipping
+                // the reload there left the one user who had lost everything as the only one who was
+                // never moved. With no sites left the reload lands on the refusal page, which is the
+                // honest answer.
+                if (_enabled && _sites.All(site => site.Slug != SiteContext.Slug))
+                {
+                    NavigationManager.NavigateTo(NavigationManager.Uri, forceLoad: true);
+                    return;
+                }
+
+                _open = false;
+                StateHasChanged();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Circuit torn down between the event and the dispatch - nothing to update.
+            }
+        });
+    }
+
+    public void Dispose()
+    {
+        ChangeNotifier.SitesChanged -= OnSitesChanged;
+    }
+
+    private void ToggleDropdown() => _open = !_open;
+
+    private void CloseDropdown() => _open = false;
+
+    private void HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+            _open = false;
+    }
+
+    /// <summary>This page pinned to the given site - the anchor href (plain-click switch
+    /// target and modified-click new-tab target); see site-context.js.</summary>
+    private string GetSiteHref(Site site) =>
+        SiteContextService.WithSiteParam(CurrentSwitchTarget(), site.Slug);
+
+    /// <summary>
+    /// Where a site switch from the current page should land. The #fragment is kept
+    /// so an anchored spot (e.g. a highlighted setting) carries to the new site; the
+    /// changed ?site= query still guarantees the full reload.
+    /// </summary>
+    private string CurrentSwitchTarget()
+    {
+        // The all-sites overview isn't a per-site page, so switching sites from it
+        // should land on the new site's dashboard rather than reload the overview.
+        //
+        // The refusal page is the same: it says a page was not yours on the site you were on, so
+        // carrying it to the next site just refuses you again - and the page you were actually
+        // trying to reach is not in the URL to return to. Land on the new site's dashboard.
+        var pathOnly = NavigationManager.ToBaseRelativePath(NavigationManager.Uri)
+            .Split('?', '#')[0]
+            .TrimEnd('/');
+        if (string.Equals(pathOnly, "sites", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(pathOnly, "denied", StringComparison.OrdinalIgnoreCase))
+            return NavigationManager.BaseUri;
+
+        // A ?wan= names one site's WAN, and every reader of it matches by key or index - so
+        // carrying one across a switch either filters the new site to a WAN it does not have or,
+        // worse, quietly matches a different connection that happens to share the number. Dropped
+        // on every page; the rest of the query and the #fragment carry as before.
+        var target = SiteContextService.RemoveQueryParam(NavigationManager.Uri, "wan");
+
+        // Client Performance pins a specific client via ?ip= - that address
+        // belongs to the site being left, so a switch drops it and lands on the
+        // new site's own client view (tab/range params and the #fragment carry).
+        if (string.Equals(pathOnly, "client-dashboard", StringComparison.OrdinalIgnoreCase))
+            return SiteContextService.RemoveQueryParam(target, "ip");
+
+        return target;
+    }
+}

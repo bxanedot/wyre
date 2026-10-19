@@ -1,0 +1,55 @@
+using NetworkOptimizer.Monitoring.Models;
+
+namespace NetworkOptimizer.Monitoring.Providers;
+
+/// <summary>
+/// Strategy interface for polling cable modem DOCSIS stats.
+/// Implementations encapsulate vendor-specific HTTP scraping (Netgear, ARRIS, etc.)
+/// so CableModemMonitorService stays transport-agnostic.
+/// </summary>
+public interface ICableModemProvider
+{
+    /// <summary>
+    /// Stable identifier used to resolve a provider for a configured cable modem.
+    /// Lowercase, hyphenated (e.g. "netgear", "arris-surfboard").
+    /// Must be unique across providers.
+    /// </summary>
+    string ProviderKey { get; }
+
+    /// <summary>
+    /// Human-readable name shown in the UI and logs.
+    /// </summary>
+    string DisplayName { get; }
+
+    /// <summary>
+    /// Whether this provider needs a password to read the modem. Must match what the provider
+    /// actually does with <see cref="CmPollContext.Password"/>.
+    /// </summary>
+    CmCredentialRequirement Credentials { get; }
+
+    /// <summary>
+    /// True when this provider logs in as "admin" if the username is blank (whitespace included).
+    /// Settings shows the "admin" placeholder only then; elsewhere a blank username is sent, or
+    /// skipped, exactly as saved.
+    /// </summary>
+    bool BlankUsernameMeansAdmin { get; }
+
+    /// <summary>
+    /// Poll the cable modem and return its current stats.
+    /// Implementations should log internally and report transport or parsing failure
+    /// through <see cref="PollResult{TStats}.Failed"/>; throwing is reserved for
+    /// programming errors. Every failure carries a reason: it is what the Settings test
+    /// and the stats panel show.
+    /// </summary>
+    Task<PollResult<CableModemStats>> PollAsync(
+        CmPollContext context,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Verify connectivity and authentication without performing a full poll.
+    /// Used by the Settings page Test button.
+    /// </summary>
+    Task<(bool Success, string Message)> TestConnectionAsync(
+        CmPollContext context,
+        CancellationToken cancellationToken = default);
+}

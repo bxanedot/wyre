@@ -1,0 +1,689 @@
+@using NetworkOptimizer.Core.Interfaces
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Storage.Models.Identity
+@using Microsoft.AspNetCore.Components.Authorization
+@inject ISiteManagementService SiteManagement
+@inject SiteConnectionRegistry SiteConnections
+@inject IAgentEnrollmentService AgentEnrollment
+@inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteSwitchService SiteSwitch
+@inject SiteContextService SiteCtx
+@inject ISiteConfigurationService SiteConfig
+@implements IDisposable
+
+@* Step 1 creates a site, which is instance administration. Everything after it sets up an existing
+   site - its console and its agent - which that site's admin owns. Gating the whole wizard on Admin
+   took the agent setup away from the Site Admin who is meant to do it, so the gate is on the step. *@
+@if (_step > 1 || _canCreateSites)
+{
+<div class="site-wizard">
+    <div class="site-wizard-steps">
+        @{
+            var stepNames = new[] { "Name", "Console", "Agent", "Done" };
+        }
+        @for (var i = 0; i < stepNames.Length; i++)
+        {
+            var n = i + 1;
+            var stepClass = n < _step ? "done" : n == _step ? "current" : "upcoming";
+            <div class="site-wizard-step @stepClass">
+                <span class="site-wizard-step-node">
+                    @if (n < _step)
+                    {
+                        <text>&#x2713;</text>
+                    }
+                    else
+                    {
+                        @n
+                    }
+                </span>
+                <span class="site-wizard-step-label">@stepNames[i]</span>
+            </div>
+        }
+    </div>
+
+    @if (_step == 1)
+    {
+        <h3 class="site-wizard-title">Add a site</h3>
+        @if (_remainingSlots <= 0)
+        {
+            <p class="section-description">
+                @if (LicenseState.AnyKeysActive)
+                {
+                    <text>
+                        You've used all of your licensed site slots. Add or assign a license key in
+                        <a href="/settings?tab=application#licensing">Licensing settings</a>, remove a site to free a slot,
+                        or see <a href="https://ozarkconnect.net/network-optimizer/licensing" target="_blank" rel="noopener">licensing and pricing</a> for more sites.
+                    </text>
+                }
+                else
+                {
+                    <text>
+                        You've reached the @SiteManagementService.FreeSiteLimit-site limit for personal, non-commercial use.
+                        If you have a license key, add it in
+                        <a href="/settings?tab=application#licensing">Licensing settings</a> to unlock more sites.
+                        Otherwise remove a site to add another, or see
+                        <a href="https://ozarkconnect.net/network-optimizer/licensing" target="_blank" rel="noopener">licensing and pricing</a>.
+                    </text>
+                }
+            </p>
+        }
+        else
+        {
+            <div class="form-group">
+                <div class="input-with-button">
+                    <input type="text" id="site-name-input" class="form-control" @bind="_name" @bind:event="oninput"
+                           @bind:after="UpdateSlugPreviewAsync" @onkeydown="SiteNameKeyDownAsync"
+                           placeholder="Site name (e.g. Lake House)" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                    <button type="button" class="btn btn-primary btn-sm" @onclick="CreateSiteAsync"
+                            disabled="@(_busy || string.IsNullOrWhiteSpace(_name))">
+                        @if (_busy)
+                        {
+                            <span class="spinner"></span>
+                        }
+                        else
+                        {
+                            <span>Create Site</span>
+                        }
+                    </button>
+                </div>
+                @if (!string.IsNullOrWhiteSpace(_slugPreview))
+                {
+                    <small class="form-help">Site ID: <code>@_slugPreview</code> - permanent identifier used for the site's database file, InfluxDB buckets, and agent configuration.</small>
+                }
+            </div>
+        }
+    }
+    else if (_step == 2 && _site != null)
+    {
+        <h3 class="site-wizard-title">Connect the UniFi Console for @_site.Name</h3>
+        <p class="section-description">
+            If this site's UniFi Console is reachable from this server (site-to-site VPN or a public address),
+            connect it now. You can also skip this and connect later from Settings after switching to the site.
+        </p>
+        <div class="form-group">
+            <label class="form-label">Console URL</label>
+            <input type="text" class="form-control" @bind="_consoleUrl" placeholder="https://192.168.1.1" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+        </div>
+        <div class="form-group">
+            <label class="form-label">Authentication Method</label>
+            <div class="auth-method-toggle">
+                <label class="radio-label">
+                    <input type="radio" name="siteWizardAuth" checked="@(!_useApiKey)" @onchange="() => _useApiKey = false" />
+                    <span>Local Account</span>
+                </label>
+                <label class="radio-label">
+                    <input type="radio" name="siteWizardAuth" checked="@_useApiKey" @onchange="() => _useApiKey = true" />
+                    <span>API Key</span>
+                </label>
+            </div>
+        </div>
+        @if (!_useApiKey)
+        {
+            <div class="form-group">
+                <label class="form-label">Username</label>
+                <input type="text" class="form-control" @bind="_username" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+            </div>
+            <div class="form-group">
+                <label class="form-label">Password</label>
+                <input type="password" class="form-control" @bind="_password" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
+            </div>
+        }
+        else
+        {
+            <div class="form-group">
+                <label class="form-label">Network API Key</label>
+                <input type="password" class="form-control" @bind="_apiKey" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
+            </div>
+        }
+        <div class="form-group">
+            <label class="form-label">Site</label>
+            <div class="input-with-button">
+                @if (_availableSites.Count > 0)
+                {
+                    <select class="form-control" @bind="_consoleSite">
+                        @foreach (var site in _availableSites)
+                        {
+                            <option value="@site.Name">@site.Description (@site.Name) - @site.DeviceCount devices</option>
+                        }
+                    </select>
+                }
+                else
+                {
+                    <input type="text" class="form-control" @bind="_consoleSite" placeholder="default" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                }
+                <button type="button" class="btn btn-secondary btn-sm" @onclick="ListConsoleSitesAsync" disabled="@(_loadingSites || string.IsNullOrWhiteSpace(_consoleUrl))">
+                    @if (_loadingSites)
+                    {
+                        <span class="spinner"></span>
+                    }
+                    else
+                    {
+                        <span>List Sites</span>
+                    }
+                </button>
+            </div>
+            <small class="form-help">Leave as "default" for most local UniFi OS devices. If this console hosts multiple sites, click "List Sites" to fetch and pick one.</small>
+        </div>
+        <div class="action-buttons">
+            <button type="button" class="btn btn-primary" @onclick="ConnectAsync" disabled="@(_busy || string.IsNullOrWhiteSpace(_consoleUrl))">
+                @if (_busy)
+                {
+                    <span class="spinner"></span>
+                    <span>Connecting...</span>
+                }
+                else
+                {
+                    <span>Connect &amp; Save</span>
+                }
+            </button>
+            <button type="button" class="btn btn-secondary" @onclick="() => _step = 3" disabled="@_busy">Skip for Now</button>
+        </div>
+    }
+    else if (_step == 3 && _site != null)
+    {
+        <h3 class="site-wizard-title">On-Site Agent for @_site.Name</h3>
+        @if (!_wantAgent && _agentToken == null)
+        {
+            <p class="section-description">
+                An agent runs at the site and dials out to this server - no inbound access to the
+                site needed. It's what powers this site's network monitoring (SNMP, device stats,
+                Live View), ISP Health, LAN speed tests, and cable modem / ONT status from here.
+                Set one up unless this server already reaches the whole site over a VPN - and even
+                then, modem/ONT management IPs usually make an agent the cleaner path.
+            </p>
+            <div class="action-buttons">
+                <button type="button" class="btn btn-primary" @onclick="() => _wantAgent = true">Set Up an Agent</button>
+                <button type="button" class="btn btn-secondary" @onclick="() => _step = 4">No Agent Needed</button>
+            </div>
+        }
+        else if (_agentToken == null)
+        {
+            <div class="site-config-section">
+                <div class="site-config-section-title">What the agent does</div>
+                <label class="checkbox-toggle">
+                    <input type="checkbox" checked disabled />
+                    <span><strong>Site monitoring</strong> - reaches the site's devices for SNMP polling,
+                        latency/loss probing, and modem/ONT status pages. Always on; it's what the agent is for.</span>
+                </label>
+                <label class="checkbox-toggle">
+                    <input type="checkbox" @bind="_featureLanSpeedTest" />
+                    <span><strong>LAN speed test server</strong>
+                        <span class="tooltip-icon tooltip-icon-sm" data-tooltip="Hosts an OpenSpeedTest page and an iperf3 server at the site for the site's own clients" @onclick:stopPropagation="true" @onclick:preventDefault="true">?</span>
+                        - lets the site's clients run speed tests against the agent.</span>
+                </label>
+                <label class="checkbox-toggle">
+                    <input type="checkbox" @bind="_featureProxy" />
+                    <span><strong>SSH and UniFi Console proxy</strong> - this server reaches the site's console,
+                        gateway, and devices through the agent tunnel. Enables audits, gateway WAN speed
+                        tests, deployments, and modem / ONT monitoring with no VPN.</span>
+                </label>
+            </div>
+            <div class="action-buttons">
+                <button type="button" class="btn btn-primary" @onclick="CreateAgentAsync" disabled="@_busy">
+                    @if (_busy)
+                    {
+                        <span class="spinner"></span>
+                    }
+                    else
+                    {
+                        <span>Create Agent Token</span>
+                    }
+                </button>
+                <button type="button" class="btn btn-secondary" @onclick="() => { _wantAgent = false; _step = 4; }" disabled="@_busy">Skip</button>
+            </div>
+        }
+        else
+        {
+            <AgentInstallInstructions Token="@_agentToken" AgentId="@_agentId" TokenChanged="@(t => _agentToken = t)" LanSpeedTest="_featureLanSpeedTest" SiteSlug="@_site?.Slug" />
+            <div class="action-buttons">
+                <button type="button" class="btn btn-primary" @onclick="() => _step = 4">Continue</button>
+            </div>
+        }
+    }
+    else if (_step == 4 && _site != null)
+    {
+        <div class="site-wizard-success">
+            <span class="site-wizard-success-icon">&#x2713;</span>
+            <div>
+                <h3 class="site-wizard-title">@_site.Name is ready</h3>
+                <p class="section-description">
+                    The site's database is provisioned@(_connected ? ", its UniFi Console is connected" : "")@(_agentToken != null ? ", and its agent token is issued" : "").
+                    @NextStepSentence
+                </p>
+            </div>
+        </div>
+        <div class="action-buttons">
+            @* Telling someone to switch to the site they are already on is the one instruction that
+               cannot be followed, so when this is the current site the action points at the actual
+               next step instead: monitoring once the console is connected, the console itself when
+               it is not. *@
+            @if (!OnCreatedSite)
+            {
+                <button type="button" class="btn btn-primary" @onclick="SwitchToSiteAsync">Switch to @_site.Name</button>
+            }
+            else if (_connected)
+            {
+                <a class="btn btn-primary" href="/monitoring">Go to Monitoring</a>
+            }
+            else
+            {
+                <a class="btn btn-primary" href="/settings#console-connection">Connect UniFi Console</a>
+            }
+            <button type="button" class="btn btn-secondary" @onclick="ResetAsync">Add Another Site</button>
+        </div>
+    }
+
+    @if (!string.IsNullOrEmpty(_message))
+    {
+        <div class="alert alert-@_messageClass">@_message</div>
+    }
+</div>
+}
+
+@code {
+    [Parameter]
+    public EventCallback OnSitesChanged { get; set; }
+
+    /// <summary>Raised when the wizard changes a site's own settings, so an open panel can re-read them.</summary>
+    [Parameter]
+    public EventCallback<Site> OnSiteConfigChanged { get; set; }
+
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>Whether this caller may add a site at all - the wizard's first step.</summary>
+    private bool _canCreateSites;
+
+    private int _remainingSlots = int.MaxValue;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _canCreateSites = AuthState is null || (await AuthState).User.IsInRole(Roles.Admin);
+
+        LicenseState.OnStateChanged += HandleLicenseStateChanged;
+        await RefreshLimitAsync();
+    }
+
+    private async Task RefreshLimitAsync() => _remainingSlots = await SiteManagement.RemainingSiteSlotsAsync();
+
+    // The Add Site gate depends on the license-derived site limit, so re-evaluate it
+    // when license state changes (e.g. a key is added or removed).
+    private void HandleLicenseStateChanged() => _ = InvokeAsync(async () =>
+    {
+        await RefreshLimitAsync();
+        StateHasChanged();
+    });
+
+    public void Dispose() => LicenseState.OnStateChanged -= HandleLicenseStateChanged;
+
+    private int _step = 1;
+    private bool _busy;
+    private Site? _site;
+    private string _name = "";
+    private string _slugPreview = "";
+    private string _message = "";
+    private string _messageClass = "";
+
+    private string _consoleUrl = "";
+    private bool _useApiKey;
+    private string _username = "";
+    private string _password = "";
+    private string _apiKey = "";
+    private string _consoleSite = "default";
+    private List<UniFiSite> _availableSites = new();
+    private bool _loadingSites;
+    private bool _connected;
+    private string? _consoleName;
+
+    private bool _wantAgent;
+    private string? _agentToken;
+    private int _agentId;
+    private bool _featureLanSpeedTest;
+    private bool _featureProxy;
+
+    /// <summary>
+    /// Re-enters the wizard at the agent step (step 3) for a site that already
+    /// exists, landing on the feature selection so a site whose agent was never
+    /// finished can be set up without recreating the site. Called by the
+    /// Multi-Site settings panel when an agent is not fully enrolled.
+    /// </summary>
+    public void StartAgentSetupFor(Site site)
+    {
+        _site = site;
+        _connected = SiteConnections.GetFor(site.Slug).IsConnected;
+        _step = 3;
+        _wantAgent = true;
+        _agentToken = null;
+        _featureLanSpeedTest = false;
+        _featureProxy = false;
+        _message = "";
+        _messageClass = "";
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Asks the service what slug this name would actually get, rather than slugging the name
+    /// here: the answer depends on what is already taken, so a name that collides with an
+    /// existing site or with the reserved default slug gets its "-2" suffix shown up front
+    /// instead of surprising the user after the site is created.
+    /// </summary>
+    private async Task UpdateSlugPreviewAsync()
+    {
+        var name = _name;
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            _slugPreview = "";
+            return;
+        }
+
+        var preview = await SiteManagement.PreviewSlugAsync(name);
+        // Keystrokes can resolve out of order; a stale answer would show a slug for a
+        // name the field no longer holds.
+        if (name == _name)
+            _slugPreview = preview;
+    }
+
+    /// <summary>
+    /// Enter creates the site, matching the button beside the field. Guarded on the same conditions
+    /// the button is disabled by, so a stray Enter on an empty field or mid-create does nothing.
+    /// </summary>
+    private async Task SiteNameKeyDownAsync(KeyboardEventArgs e)
+    {
+        if (e.Key != "Enter" || _busy || string.IsNullOrWhiteSpace(_name))
+            return;
+        await CreateSiteAsync();
+    }
+
+    private async Task CreateSiteAsync()
+    {
+        // A fast double-click queues both click events before the disabled state
+        // renders; the circuit runs them sequentially, so by the time the second
+        // arrives _busy is false again and it would create a duplicate site
+        // (name-2). _site stays set after success, so it swallows the straggler.
+        if (_busy || _site != null)
+            return;
+
+        _busy = true;
+        _message = "";
+        StateHasChanged();
+        // SQLite completes EF's async calls synchronously, so provisioning never
+        // yields and the queued spinner render would only flush after it finishes.
+        // Yield once so the disabled+spinner state reaches the browser first.
+        await Task.Yield();
+
+        try
+        {
+            _site = await SiteManagement.CreateSiteAsync(_name);
+            _step = 2;
+            _message = $"Site '{_site.Name}' created with ID '{_site.Slug}'";
+            _messageClass = "success";
+            await OnSitesChanged.InvokeAsync();
+        }
+        catch (Exception ex)
+        {
+            _message = $"Error creating site: {ex.Message}";
+            _messageClass = "danger";
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private UniFiConnectionConfig BuildConfig() => new()
+    {
+        ControllerUrl = _consoleUrl.Trim(),
+        Username = _username,
+        Password = _password,
+        ApiKey = _useApiKey ? _apiKey : null,
+        Site = string.IsNullOrWhiteSpace(_consoleSite) ? "default" : _consoleSite.Trim(),
+    };
+
+    /// <summary>
+    /// Fetches the sites hosted on the entered console and populates the Site
+    /// dropdown, mirroring "List Sites" on Settings - UniFi Console Connection.
+    /// Selecting a site is optional; leaving it as "default" keeps the pre-existing
+    /// behaviour of connecting to the console's default site.
+    /// </summary>
+    private async Task ListConsoleSitesAsync()
+    {
+        if (_site == null || string.IsNullOrWhiteSpace(_consoleUrl))
+            return;
+
+        _loadingSites = true;
+        _message = "";
+        StateHasChanged();
+
+        try
+        {
+            var connection = SiteConnections.GetFor(_site.Slug);
+            var (success, error, sites) = await connection.GetSitesAsync(BuildConfig());
+
+            if (success)
+            {
+                _availableSites = sites;
+                if (sites.Count == 1)
+                {
+                    _consoleSite = sites[0].Name;
+                    _message = $"Found 1 site: {sites[0].Description}";
+                }
+                else
+                {
+                    _message = $"Found {sites.Count} sites. Select one from the dropdown.";
+                    // Keep the current selection if the console still lists it; otherwise
+                    // fall back to the first site so the dropdown always has a valid value.
+                    if (!sites.Any(s => s.Name == _consoleSite) && sites.Count > 0)
+                        _consoleSite = sites[0].Name;
+                }
+                _messageClass = "success";
+            }
+            else
+            {
+                _message = $"Failed to list sites: {error}";
+                _messageClass = "danger";
+            }
+        }
+        catch (Exception ex)
+        {
+            _message = $"Error listing sites: {ex.Message}";
+            _messageClass = "danger";
+        }
+        finally
+        {
+            _loadingSites = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task ConnectAsync()
+    {
+        if (_site == null)
+            return;
+
+        _busy = true;
+        _message = "";
+        StateHasChanged();
+
+        try
+        {
+            var connection = SiteConnections.GetFor(_site.Slug);
+            _connected = await connection.ConnectAsync(BuildConfig());
+            if (_connected)
+            {
+                _consoleName = await connection.GetCachedConsoleNameAsync();
+                _message = string.IsNullOrWhiteSpace(_consoleName)
+                    ? "Console connected. Credentials saved to the site's database."
+                    : $"Connected to {_consoleName}. Credentials saved to the site's database.";
+                _messageClass = "success";
+                _step = 3;
+                await OnSitesChanged.InvokeAsync();
+            }
+            else
+            {
+                _message = $"Connection failed: {connection.LastError ?? "unknown error"}";
+                _messageClass = "danger";
+            }
+        }
+        catch (Exception ex)
+        {
+            _message = $"Connection failed: {ex.Message}";
+            _messageClass = "danger";
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task CreateAgentAsync()
+    {
+        if (_site == null)
+            return;
+
+        _busy = true;
+        _message = "";
+        StateHasChanged();
+
+        try
+        {
+            // Reuse the site's not-yet-enrolled agent if one exists (re-entering
+            // setup should refresh its token, not stack up duplicate agents);
+            // only create a row when the site has none.
+            var existing = await AgentEnrollment.GetAgentsForSiteAsync(_site.Id);
+            var pending = existing.FirstOrDefault(a => a.EnrolledAt == null);
+            if (pending != null)
+            {
+                _agentToken = await AgentEnrollment.ReissueTokenAsync(_site.Slug, pending.Id);
+                _agentId = pending.Id;
+            }
+            if (_agentToken == null)
+            {
+                var (agent, token) = await AgentEnrollment.CreateAgentAsync(_site.Slug, "Agent");
+                _agentToken = token;
+                _agentId = agent.Id;
+            }
+
+            if (_featureProxy)
+            {
+                // The same per-site flags the Multi-Site panel's toggles set, written through the
+                // same gated service - so the panel behind this wizard is looking at one source of
+                // truth rather than at settings this component reached past it to change.
+                await SiteConfig.SetConsoleViaAgentAsync(_site.Slug, true);
+                await SiteConfig.SetDevicesViaAgentAsync(_site.Slug, true);
+            }
+
+            await OnSitesChanged.InvokeAsync();
+
+            // The configuration panel for this site is usually still open behind the wizard, showing
+            // the checkboxes these options just moved. Tell it to re-read them.
+            await OnSiteConfigChanged.InvokeAsync(_site);
+        }
+        catch (Exception ex)
+        {
+            _message = $"Failed to create agent: {ex.Message}";
+            _messageClass = "danger";
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private static void UpsertSetting(NetworkOptimizerDbContext db, string key, string value)
+    {
+        var setting = db.SystemSettings.Find(key);
+        if (setting == null)
+        {
+            db.SystemSettings.Add(new SystemSetting { Key = key, Value = value });
+        }
+        else
+        {
+            setting.Value = value;
+            setting.UpdatedAt = DateTime.UtcNow;
+        }
+    }
+
+    /// <summary>
+    /// Whether the finished site is the one already being viewed. Reachable through
+    /// <see cref="StartAgentSetupFor"/>, which re-enters the wizard for a site that already exists -
+    /// including the one currently selected.
+    /// </summary>
+    private bool OnCreatedSite =>
+        _site != null && string.Equals(_site.Slug, SiteCtx.Slug, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// What to do next, which depends on where the reader already is. Written out in full rather
+    /// than assembled from fragments: this is curated copy, and it should be legible as sentences.
+    /// </summary>
+    private string NextStepSentence => (OnCreatedSite, _connected) switch
+    {
+        (true, true) => "Configure monitoring, speed tests, and everything else here, exactly like a single-site install.",
+        (true, false) => "Connect its UniFi Console, then configure monitoring, speed tests, and everything else here, exactly like a single-site install.",
+        (false, true) => "Switch to the site to configure monitoring, speed tests, and everything else, exactly like a single-site install.",
+        (false, false) => "Switch to the site to connect its UniFi Console, then configure monitoring, speed tests, and everything else, exactly like a single-site install.",
+    };
+
+    private async Task SwitchToSiteAsync()
+    {
+        if (_site == null)
+            return;
+
+        await SiteSwitch.SwitchToAsync(_site.Slug, "/");
+    }
+
+    private async Task ResetAsync()
+    {
+        await RefreshLimitAsync();
+        ResetForm();
+        await OnSitesChanged.InvokeAsync();
+    }
+
+    /// <summary>
+    /// Clears the completed ("... is ready") success screen back to a fresh Add-a-Site
+    /// form. Called when the user opens a site's Configuration from the Sites table, so
+    /// the stale success state does not linger. No-op while a site is mid-setup, so
+    /// in-progress input is never discarded.
+    /// </summary>
+    public void ResetIfComplete()
+    {
+        if (_step != 4)
+            return;
+
+        ResetForm();
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Unconditionally returns the wizard to a fresh Add-a-Site form, whatever step
+    /// it is on. Used when the site it may be operating on is removed - e.g. deleting
+    /// a site while its agent-setup step is showing.
+    /// </summary>
+    public void Reset()
+    {
+        ResetForm();
+        StateHasChanged();
+    }
+
+    private void ResetForm()
+    {
+        _step = 1;
+        _site = null;
+        _name = "";
+        _slugPreview = "";
+        _consoleUrl = "";
+        _username = "";
+        _password = "";
+        _apiKey = "";
+        _useApiKey = false;
+        _consoleSite = "default";
+        _availableSites = new();
+        _loadingSites = false;
+        _connected = false;
+        _wantAgent = false;
+        _agentToken = null;
+        _featureLanSpeedTest = false;
+        _featureProxy = false;
+        _message = "";
+    }
+}

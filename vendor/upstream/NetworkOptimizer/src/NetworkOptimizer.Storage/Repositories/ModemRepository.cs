@@ -1,0 +1,220 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using NetworkOptimizer.Storage.Interfaces;
+using NetworkOptimizer.Storage.Models;
+
+namespace NetworkOptimizer.Storage.Repositories;
+
+/// <summary>
+/// Repository for modem configurations
+/// </summary>
+public class ModemRepository : IModemRepository
+{
+    private readonly NetworkOptimizerDbContext _context;
+    private readonly ILogger<ModemRepository> _logger;
+
+    public ModemRepository(NetworkOptimizerDbContext context, ILogger<ModemRepository> logger)
+    {
+        _context = context ?? throw new ArgumentNullException(nameof(context));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    /// <summary>
+    /// Retrieves all modem configurations.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A list of modem configurations ordered by name.</returns>
+    public async Task<List<ModemConfiguration>> GetModemConfigurationsAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await _context.ModemConfigurations
+                .AsNoTracking()
+                .OrderBy(m => m.Name)
+                .ToListAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get modem configurations");
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Retrieves only enabled modem configurations.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A list of enabled modem configurations ordered by name.</returns>
+    public async Task<List<ModemConfiguration>> GetEnabledModemConfigurationsAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await _context.ModemConfigurations
+                .AsNoTracking()
+                .Where(m => m.Enabled)
+                .OrderBy(m => m.Name)
+                .ToListAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get enabled modem configurations");
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Retrieves a specific modem configuration by ID.
+    /// </summary>
+    /// <param name="id">The modem configuration ID.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The modem configuration, or null if not found.</returns>
+    public async Task<ModemConfiguration?> GetModemConfigurationAsync(int id, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await _context.ModemConfigurations
+                .AsNoTracking()
+                .FirstOrDefaultAsync(m => m.Id == id, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get modem configuration {Id}", id);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Saves or updates a modem configuration.
+    /// </summary>
+    /// <param name="config">The modem configuration to save.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task SaveModemConfigurationAsync(ModemConfiguration config, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (config.Id > 0)
+            {
+                var existing = await _context.ModemConfigurations
+                    .FirstOrDefaultAsync(m => m.Id == config.Id, cancellationToken);
+                if (existing != null)
+                {
+                    existing.Name = config.Name;
+                    existing.Host = config.Host;
+                    existing.Port = config.Port;
+                    existing.Username = config.Username;
+                    existing.Password = config.Password;
+                    existing.PrivateKeyPath = config.PrivateKeyPath;
+                    existing.ModemType = config.ModemType;
+                    existing.QmiDevice = config.QmiDevice;
+                    existing.Provider = config.Provider;
+                    existing.Enabled = config.Enabled;
+                    existing.PollingIntervalSeconds = config.PollingIntervalSeconds;
+                    existing.LastPolled = config.LastPolled;
+                    existing.LastError = config.LastError;
+                    existing.UpdatedAt = DateTime.UtcNow;
+                }
+            }
+            else
+            {
+                config.CreatedAt = DateTime.UtcNow;
+                config.UpdatedAt = DateTime.UtcNow;
+                _context.ModemConfigurations.Add(config);
+            }
+
+            await _context.SaveChangesAsync(cancellationToken);
+            _logger.LogInformation("Saved modem configuration {Name} ({Host})", config.Name, config.Host);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save modem configuration {Name}", config.Name);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Deletes a modem configuration by ID.
+    /// </summary>
+    /// <param name="id">The modem configuration ID to delete.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task DeleteModemConfigurationAsync(int id, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var config = await _context.ModemConfigurations.FindAsync([id], cancellationToken);
+            if (config != null)
+            {
+                _context.ModemConfigurations.Remove(config);
+                await _context.SaveChangesAsync(cancellationToken);
+                _logger.LogInformation("Deleted modem configuration {Id}", id);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to delete modem configuration {Id}", id);
+            throw;
+        }
+    }
+
+    public async Task SetModemEnabledAsync(int id, bool enabled, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var config = await _context.ModemConfigurations.FirstOrDefaultAsync(m => m.Id == id, cancellationToken);
+            if (config == null)
+                return;
+
+            config.Enabled = enabled;
+            config.UpdatedAt = DateTime.UtcNow;
+            if (!enabled)
+                config.LastError = null;
+
+            await _context.SaveChangesAsync(cancellationToken);
+            _logger.LogDebug("Set modem configuration {Id} Enabled={Enabled}", id, enabled);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to set Enabled on modem configuration {Id}", id);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Placeholders safe to replace with a model the modem reports about itself. Only the
+    /// GL-iNet one qualifies: its model comes from the router's cellular service, whereas
+    /// a Netgear hotspot reports a user-settable device name in the same field.
+    /// </summary>
+    private static readonly string[] PlaceholderModemTypes = { "GL-iNet" };
+
+    public async Task<bool> UpdateModemPollResultAsync(int id, DateTime? lastPolled, string? lastError, string? detectedModel = null, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var config = await _context.ModemConfigurations.FirstOrDefaultAsync(m => m.Id == id, cancellationToken);
+            // Never resurrect or overwrite a config that was disabled while the poll was
+            // in flight - its frozen state (and cleared LastError) must stand.
+            if (config == null || !config.Enabled)
+                return false;
+
+            if (lastPolled.HasValue)
+                config.LastPolled = lastPolled.Value;
+            config.LastError = lastError;
+
+            if (!string.IsNullOrWhiteSpace(detectedModel) &&
+                detectedModel != config.ModemType &&
+                (string.IsNullOrWhiteSpace(config.ModemType) || PlaceholderModemTypes.Contains(config.ModemType)))
+            {
+                config.ModemType = detectedModel;
+            }
+
+            config.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync(cancellationToken);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to update modem poll result for {Id}", id);
+            throw;
+        }
+    }
+}

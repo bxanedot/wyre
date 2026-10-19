@@ -1,0 +1,1344 @@
+using Microsoft.Extensions.Logging;
+using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Core.Helpers;
+using NetworkOptimizer.UniFi.Models;
+
+namespace NetworkOptimizer.UniFi;
+
+/// <summary>
+/// Device discovery service using UniFi Controller API
+/// Unlike SNMP-based discovery, this uses the controller as the source of truth
+/// for all network devices and their configurations
+/// </summary>
+public class UniFiDiscovery
+{
+    private readonly UniFiApiClient _apiClient;
+    private readonly ILogger<UniFiDiscovery> _logger;
+
+    /// <summary>
+    /// Optional, and absent everywhere the AP Agent is not in play. Lets an agent's answer about
+    /// who its access point holds beat the Console's idle tolerance at the client filter below.
+    /// </summary>
+    private readonly Core.Interfaces.IAgentClientPresenceSource? _agentPresence;
+
+    public UniFiDiscovery(
+        UniFiApiClient apiClient,
+        ILogger<UniFiDiscovery> logger,
+        Core.Interfaces.IAgentClientPresenceSource? agentPresence = null)
+    {
+        _apiClient = apiClient;
+        _logger = logger;
+        _agentPresence = agentPresence;
+    }
+
+    /// <summary>
+    /// Discovers all UniFi devices via controller API
+    /// Returns devices with full metadata from controller
+    /// </summary>
+    public async Task<List<DiscoveredDevice>> DiscoverDevicesAsync(CancellationToken cancellationToken = default, bool useCache = true)
+    {
+        _logger.LogTrace("Starting UniFi device discovery via API");
+
+        // Fetch devices and network configs in parallel
+        var devicesTask = _apiClient.GetDevicesAsync(cancellationToken, useCache);
+        var networksTask = _apiClient.GetNetworkConfigsAsync(cancellationToken);
+
+        await Task.WhenAll(devicesTask, networksTask);
+
+        var devices = await devicesTask;
+        var networks = await networksTask;
+
+        if (devices == null || devices.Count == 0)
+        {
+            _logger.LogWarning("No devices discovered");
+            return new List<DiscoveredDevice>();
+        }
+
+        _logger.LogTrace("Discovered {Count} UniFi devices", devices.Count);
+
+        // Find the default LAN network gateway IP for gateways
+        var defaultLanGatewayIp = GetDefaultLanGatewayIp(networks);
+
+        // Collect all device MACs for uplink-based gateway detection
+        var allDeviceMacs = new HashSet<string>(
+            devices.Where(d => !string.IsNullOrEmpty(d.Mac)).Select(d => d.Mac.ToLowerInvariant()),
+            StringComparer.OrdinalIgnoreCase);
+
+        var discoveredDevices = devices
+            .Select(d => MapDevice(d, DetermineDeviceType(d, allDeviceMacs, _logger), defaultLanGatewayIp))
+            .ToList();
+
+        // Log wireless uplink details for debugging
+        foreach (var d in devices.Where(d => d.Uplink?.Type == "wireless"))
+        {
+            _logger.LogTrace("Wireless uplink for {Name}: Radio={Radio}, TxRate={Tx}Kbps, RxRate={Rx}Kbps, Channel={Ch}, IsMlo={Mlo}",
+                d.Name, d.Uplink?.RadioBand ?? "null", d.Uplink?.TxRate, d.Uplink?.RxRate, d.Uplink?.Channel, d.Uplink?.IsMlo);
+        }
+
+        return discoveredDevices;
+    }
+
+    /// <summary>
+    /// The nested second unit of every UniFi Building Bridge pair in <paramref name="devices"/>.
+    /// The console lists one unit of a pair as a device and tucks the other into its
+    /// <c>peer_ubb</c>, so the far building's whole subtree uplinks to a MAC no device list
+    /// carries. Units that are also listed in their own right are left out.
+    /// </summary>
+    public static List<UniFiDeviceResponse> BuildingBridgePeers(IReadOnlyList<UniFiDeviceResponse> devices)
+    {
+        var listed = new HashSet<string>(
+            devices.Where(d => !string.IsNullOrEmpty(d.Mac)).Select(d => NormalizeMac(d.Mac)),
+            StringComparer.OrdinalIgnoreCase);
+        var peers = new List<UniFiDeviceResponse>();
+        foreach (var d in devices)
+        {
+            var peer = d.PeerUbb;
+            if (peer == null || string.IsNullOrEmpty(peer.Mac)) continue;
+            if (!listed.Add(NormalizeMac(peer.Mac))) continue;
+            peers.Add(peer);
+        }
+        return peers;
+    }
+
+    /// <summary>
+    /// A nested Building Bridge unit (<see cref="BuildingBridgePeers"/>) as a device of its own,
+    /// mapped exactly as the listed devices are. A bridge unit is never a gateway, so the
+    /// listed-device type adjustment does not apply.
+    /// </summary>
+    public static DiscoveredDevice MapBuildingBridgePeer(UniFiDeviceResponse peer)
+        => MapDevice(peer, peer.DeviceType, defaultLanGatewayIp: null);
+
+    private static DiscoveredDevice MapDevice(UniFiDeviceResponse d, DeviceType effectiveType, string? defaultLanGatewayIp)
+    {
+        var link = ActiveBridgeLink(d);
+        var txRateKbps = link?.TxRate > 0 ? link.TxRate : d.Uplink?.TxRate ?? 0;
+        var rxRateKbps = link?.RxRate > 0 ? link.RxRate : d.Uplink?.RxRate ?? 0;
+
+        return new DiscoveredDevice
+        {
+            Id = d.Id,
+            Mac = d.Mac,
+            Name = d.Name,
+            Type = effectiveType,
+            HardwareType = d.DeviceType,
+            Model = d.Model,
+            Shortname = d.Shortname,
+            IpAddress = d.Ip,
+            // Set LAN IP for gateways from network config
+            LanIpAddress = effectiveType.IsGateway() ? defaultLanGatewayIp : null,
+            Firmware = d.DisplayableVersion ?? d.Version,
+            Adopted = d.Adopted,
+            State = d.State,
+            Uptime = TimeSpan.FromSeconds(d.Uptime),
+            LastSeen = DateTimeOffset.FromUnixTimeSeconds(d.LastSeen).DateTime,
+            Upgradable = d.Upgradable,
+            UpgradeToFirmware = d.UpgradeToFirmware,
+            SuricataVersion = d.SuricataVersion,
+            SupportedSuricataVersion = d.SupportedSuricataVersion,
+            SuricataUpgradePendingTarget = d.SuricataUpgradePendingTarget,
+            UplinkMac = d.Uplink?.UplinkMac,
+            LastUplinkMac = d.LastUplink?.UplinkMac,
+            UplinkPort = d.Uplink?.UplinkRemotePort,
+            LocalUplinkPort = d.Uplink?.PortIdx,
+            IsUplinkConnected = d.Uplink?.Up ?? false,
+            // For wireless uplinks, use tx_rate (Kbps -> Mbps); for wired, use speed (already Mbps)
+            UplinkSpeedMbps = d.Uplink?.Type == "wireless" && txRateKbps > 0
+                ? (int)(txRateKbps / 1000)
+                : d.Uplink?.Speed ?? 0,
+            // Wireless uplink rates in Kbps
+            UplinkTxRateKbps = txRateKbps,
+            UplinkRxRateKbps = rxRateKbps,
+            UplinkType = d.Uplink?.Type,
+            UplinkIsMlo = d.Uplink?.IsMlo == true || (d.Uplink?.MloLinks?.Count ?? 0) > 1,
+            UplinkMloLinks = BuildSelfReportedMloLinks(d),
+            // Active uplink interface name. For a wireless mesh child this is the
+            // wpa_supplicant STA backhaul iface (e.g. "vwiresta7"); for wired APs/gateways
+            // it's the wired/WAN iface. Callers must validate the "vwiresta" prefix before
+            // treating it as a mesh backhaul interface.
+            UplinkInterface = d.Uplink?.Name,
+            UplinkRadioBand = link?.Radio ?? d.Uplink?.RadioBand,
+            UplinkChannel = link?.Channel ?? d.Uplink?.Channel,
+            UplinkSignalDbm = link?.Signal ?? d.Uplink?.Signal,
+            UplinkNoiseDbm = link?.Noise ?? d.Uplink?.Noise,
+            CpuUsage = d.SystemStats?.Cpu,
+            MemoryUsage = d.SystemStats?.Mem,
+            LoadAverage = d.SystemStats?.LoadAvg1?.ToString("F2"),
+            TxBytes = d.Stats?.TxBytes ?? 0,
+            RxBytes = d.Stats?.RxBytes ?? 0,
+            PortCount = d.PortTable?.Count ?? 0,
+            WanInterfaceNames = GetWanInterfaceNames(d),
+            // Wi-Fi specific (APs only)
+            RadioTable = d.RadioTable,
+            RadioTableStats = d.RadioTableStats,
+            AntennaTable = d.AntennaTable,
+            VapTable = d.VapTable,
+            Satisfaction = d.Satisfaction,
+            ScanRadioTable = d.ScanRadioTable,
+            DownlinkTable = d.DownlinkTable,
+            AfcEnabled = d.AfcEnabled,
+            AfcState = d.AfcState
+        };
+    }
+
+    /// <summary>
+    /// The link a wirelessly-uplinked Building Bridge unit is actually carrying traffic on. Its
+    /// uplink block can describe the 5 GHz fallback radio (flagged inactive) while the 60 GHz
+    /// link is up; active_sta_table lists both and flags the live one. Null for anything else,
+    /// so the uplink block stands as reported.
+    /// </summary>
+    private static DownlinkTableEntry? ActiveBridgeLink(UniFiDeviceResponse d)
+    {
+        if (d.DeviceType != DeviceType.BuildingBridge) return null;
+        if (!string.Equals(d.Uplink?.Type, "wireless", StringComparison.OrdinalIgnoreCase)) return null;
+        return d.ActiveStaTable?.FirstOrDefault(l => l.Active == true);
+    }
+
+    private static string NormalizeMac(string mac) => mac.ToLowerInvariant().Replace('-', ':');
+
+    /// <summary>
+    /// Mesh parent for each child that does not report one itself, read from the other end.
+    ///
+    /// A mesh pair is described from both sides and either side can go missing: after a parent
+    /// reboots, UniFi has been seen listing the child in the parent's <c>downlink_table</c> while
+    /// the child's own uplink block stays empty. Consumers that key off the child's uplink alone
+    /// then lose the device entirely - it disappears from the topology, draws isolated on the maps,
+    /// and its mesh actions become unreachable. Only entries naming a known device are returned.
+    ///
+    /// Band, channel and the child's STA interface live on the missing half and are not
+    /// recoverable here; ask the device for the interface.
+    /// </summary>
+    /// <param name="devices">Every device in the site.</param>
+    public static Dictionary<string, MeshParentClaim> BuildMeshParentByChild(IEnumerable<DiscoveredDevice> devices)
+    {
+        var all = devices as IList<DiscoveredDevice> ?? devices.ToList();
+        return BuildMeshParentByChild(all.Select(d => (d.Mac, d.DownlinkTable, d.RadioTableStats, d.RadioTable)));
+    }
+
+    /// <summary>Raw-device overload for callers that hold <see cref="UniFiDeviceResponse"/>
+    /// (e.g. the fabric aggregate writer). Same derivation, same claims.</summary>
+    public static Dictionary<string, MeshParentClaim> BuildMeshParentByChild(IEnumerable<UniFiDeviceResponse> devices)
+    {
+        var all = devices as IList<UniFiDeviceResponse> ?? devices.ToList();
+        return BuildMeshParentByChild(all.Select(d => (d.Mac, d.DownlinkTable, d.RadioTableStats, d.RadioTable)));
+    }
+
+    private static Dictionary<string, MeshParentClaim> BuildMeshParentByChild(
+        IEnumerable<(string Mac, List<DownlinkTableEntry>? DownlinkTable, List<RadioTableStats>? RadioStats, List<RadioTableEntry>? RadioTable)> devices)
+    {
+        var all = devices as IList<(string Mac, List<DownlinkTableEntry>? DownlinkTable, List<RadioTableStats>? RadioStats, List<RadioTableEntry>? RadioTable)> ?? devices.ToList();
+        var known = new HashSet<string>(all.Where(d => !string.IsNullOrEmpty(d.Mac)).Select(d => d.Mac.ToLowerInvariant()));
+        var parentByChild = new Dictionary<string, MeshParentClaim>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var parent in all)
+        {
+            if (string.IsNullOrEmpty(parent.Mac)) continue;
+            // serialno (mld_mac on MLO links) is the child's base MAC; mac is its vwire BSSID,
+            // which matches nothing. An MLO backhaul is one entry PER LINK sharing that base MAC,
+            // so group first: the claim's rates are the sum over links (STR runs them
+            // concurrently), and each link is kept for per-band display.
+            foreach (var group in (parent.DownlinkTable ?? [])
+                .Select(l => (Key: (l.SerialNo ?? l.MldMac)?.ToLowerInvariant(), Link: l))
+                .Where(x => !string.IsNullOrEmpty(x.Key))
+                .GroupBy(x => x.Key!))
+            {
+                if (!known.Contains(group.Key)) continue;
+                // Aggregate ONLY is_mlo-flagged entries: a future firmware that also keeps a
+                // legacy combined row for the same child must not be double-counted, and a
+                // duplicate non-MLO listing keeps the pre-grouping last-entry-wins behavior
+                // rather than summing capacity that does not exist.
+                var members = group.Select(x => x.Link).ToList();
+                var mloMembers = members.Where(l => l.IsMlo == true).ToList();
+                members = mloMembers.Count > 0 ? mloMembers : [members[^1]];
+                var links = members.Select(l => new MeshLinkClaim(
+                    l.Radio, l.Channel, l.Signal, l.TxRate, l.RxRate)
+                {
+                    WidthMhz = ResolveRadioWidth(parent.RadioStats, parent.RadioTable, l.Radio),
+                }).ToList();
+                parentByChild[group.Key] = new MeshParentClaim(
+                    parent.Mac.ToLowerInvariant(),
+                    links.Sum(l => l.TxRateKbps),
+                    links.Sum(l => l.RxRateKbps))
+                {
+                    IsMlo = mloMembers.Count > 0,
+                    Links = links,
+                };
+            }
+        }
+
+        return parentByChild;
+    }
+
+    /// <summary>
+    /// One link of a mesh backhaul as the parent reports it in its downlink_table. Rates follow
+    /// <see cref="MeshParentClaim"/>'s convention: Tx is parent to child (the child's downstream).
+    /// Signal is the PARENT's reading of the link; the child's own reading of the same link is in
+    /// its uplink.mlo_links (<see cref="DiscoveredDevice.UplinkMloLinks"/>).
+    /// </summary>
+    public readonly record struct MeshLinkClaim(string? Radio, int? Channel, int? Signal, long TxRateKbps, long RxRateKbps)
+    {
+        /// <summary>Channel width in MHz, read off the parent's radio for the link's band -
+        /// the downlink entries themselves report chwidth 0.</summary>
+        public int? WidthMhz { get; init; }
+    }
+
+    /// <summary>A radio's width for a link's band: the operating width (stats bw) when
+    /// reported, else the configured width (radio_table ht).</summary>
+    private static int? ResolveRadioWidth(List<RadioTableStats>? stats, List<RadioTableEntry>? table, string? radio)
+    {
+        if (string.IsNullOrEmpty(radio)) return null;
+        var bw = stats?.FirstOrDefault(s => string.Equals(s.Radio, radio, StringComparison.OrdinalIgnoreCase))?.Bw;
+        if (bw is > 0) return bw;
+        var ht = table?.FirstOrDefault(t => string.Equals(t.Radio, radio, StringComparison.OrdinalIgnoreCase))?.ChannelWidth;
+        return ht is > 0 ? ht : null;
+    }
+
+    /// <summary>
+    /// The child's own per-link account of its mesh backhaul (uplink.mlo_links), child's
+    /// perspective: TX toward the parent, signal as the child measures it, width off the child's
+    /// radio for each link's band. Empty when the uplink reports no links (wired, a classic
+    /// backhaul, or a firmware that describes the backhaul only from the parent's end).
+    /// </summary>
+    public static List<MeshBackhaulLink> BuildSelfReportedMloLinks(UniFiDeviceResponse d)
+    {
+        var links = d.Uplink?.MloLinks;
+        if (links == null || links.Count == 0) return [];
+        return links.Select(l => new MeshBackhaulLink
+        {
+            Band = l.Radio,
+            Channel = l.Channel,
+            WidthMhz = ResolveRadioWidth(d.RadioTableStats, d.RadioTable, l.Radio),
+            SignalDbm = l.Signal,
+            TxRateMbps = l.TxRate > 0 ? (int)(l.TxRate / 1000) : null,
+            RxRateMbps = l.RxRate > 0 ? (int)(l.RxRate / 1000) : null,
+        }).ToList();
+    }
+
+    /// <summary>
+    /// A parent's account of one mesh child. Rates are the PARENT's perspective and are therefore
+    /// the inverse of the child's own uplink fields: the parent transmitting is the child receiving
+    /// (downstream), and the parent receiving is the child sending (upstream). Reading them the way
+    /// round the child's fields are read reports the link backwards.
+    /// </summary>
+    /// <param name="ParentMac">The parent's MAC, lower case.</param>
+    /// <param name="TxRateKbps">Parent to child, i.e. downstream. Summed over links on MLO.</param>
+    /// <param name="RxRateKbps">Child to parent, i.e. upstream. Summed over links on MLO.</param>
+    public readonly record struct MeshParentClaim(string ParentMac, long TxRateKbps, long RxRateKbps)
+    {
+        /// <summary>Whether the backhaul is an MLO (Wi-Fi 7 multi-link) pairing.</summary>
+        public bool IsMlo { get; init; }
+
+        /// <summary>Per-link detail, one entry per radio link. A classic backhaul has one.
+        /// Never null, including on a default-constructed claim.</summary>
+        public IReadOnlyList<MeshLinkClaim> Links { get => _links ?? []; init => _links = value; }
+        private readonly IReadOnlyList<MeshLinkClaim>? _links;
+
+        /// <summary>
+        /// True when the child's own uplink field does NOT name this parent - empty, or a
+        /// different device. Only then may a consumer absorb the claim; an agreeing child's own
+        /// report stays authoritative, keeping the derived path inert on healthy mesh pairs.
+        /// </summary>
+        public bool Contradicts(string? reportedUplinkMac) =>
+            !string.Equals(
+                string.IsNullOrEmpty(reportedUplinkMac) ? null : reportedUplinkMac.ToLowerInvariant().Replace('-', ':'),
+                ParentMac,
+                StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Whether a contradicting claim should replace the child's own uplink. Only when that report
+    /// is unusable: empty, naming no device of ours, or closing a loop (a child naming a device
+    /// downstream of itself). A child naming another live parent has re-paired, and the claim is
+    /// the old parent's last downlink table - true of every device behind an AP mid-upgrade.
+    /// </summary>
+    /// <param name="childMac">The child, normalized.</param>
+    /// <param name="reportedUplinkMac">What the child's own uplink field names, normalized or empty.</param>
+    /// <param name="ownUplinkByMac">Every device's own reported uplink, normalized, keyed by device.</param>
+    public static bool ClaimOutranksReportedUplink(
+        string childMac, string? reportedUplinkMac, IReadOnlyDictionary<string, string?> ownUplinkByMac)
+    {
+        if (string.IsNullOrEmpty(reportedUplinkMac)) return true;
+        if (!ownUplinkByMac.ContainsKey(reportedUplinkMac)) return true;
+
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var current = reportedUplinkMac;
+        while (!string.IsNullOrEmpty(current) && visited.Add(current))
+        {
+            if (string.Equals(current, childMac, StringComparison.OrdinalIgnoreCase)) return true;
+            ownUplinkByMac.TryGetValue(current, out current);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves the (physical, data-path) interface names of the gateway's ACTIVE WAN
+    /// uplink - the WAN currently carrying the default route. Selection order matches
+    /// the counter-interface rules above: the gateway's live uplink object, then the
+    /// port_table is_uplink entry, then the first WAN reported up. Shared by
+    /// <see cref="GetWanInterfaceNames"/> and the live gateway rate override so both
+    /// track the same active WAN. Returns (null, null) when no WAN can be resolved.
+    /// </summary>
+    public static (string? PhysicalIfName, string? UplinkIfName) ResolveActiveWanInterface(UniFiDeviceResponse d)
+    {
+        var wans = d.GetWanInterfaces();
+
+        var activeUplink = !string.IsNullOrEmpty(d.Uplink?.UplinkIfName) ? d.Uplink.UplinkIfName
+            : !string.IsNullOrEmpty(d.Uplink?.IfName) ? d.Uplink.IfName
+            : d.Uplink?.Name;
+        if (!string.IsNullOrEmpty(activeUplink))
+        {
+            var wan = wans.FirstOrDefault(w => w.UplinkIfName == activeUplink || w.IfName == activeUplink);
+            if (wan != null &&
+                !string.IsNullOrEmpty(NetworkUtilities.PreferredWanCounterInterface(wan.IfName, wan.UplinkIfName)))
+                return (wan.IfName, wan.UplinkIfName);
+        }
+
+        var uplinkPort = d.PortTable?.FirstOrDefault(p => p.IsUplink && !string.IsNullOrEmpty(p.IfName));
+        if (uplinkPort != null)
+        {
+            var wan = wans.FirstOrDefault(w =>
+                (!string.IsNullOrEmpty(w.IfName) && w.IfName == uplinkPort.IfName) ||
+                (w.PortIdx.HasValue && w.PortIdx == uplinkPort.PortIdx));
+            return wan != null
+                ? (wan.IfName ?? uplinkPort.IfName, wan.UplinkIfName)
+                : (uplinkPort.IfName, null);
+        }
+
+        foreach (var wan in wans.OrderBy(w => w.Up ? 0 : 1).ThenBy(w => w.Key, StringComparer.Ordinal))
+        {
+            if (!string.IsNullOrEmpty(NetworkUtilities.PreferredWanCounterInterface(wan.IfName, wan.UplinkIfName)))
+                return (wan.IfName, wan.UplinkIfName);
+        }
+        return (null, null);
+    }
+
+    /// <summary>
+    /// Resolves the interface name whose SNMP counters feed the WAN Live View and
+    /// Monitoring overview stats. For now this is the PRIMARY WAN interface only,
+    /// by design: the ISP / transit latency and loss cards shown alongside WAN
+    /// throughput are measured for a single WAN connection, so mixing failover or
+    /// cellular WAN traffic into the throughput numbers would disagree with them.
+    /// The primary WAN can be any connection type, including a GRE-tunneled
+    /// cellular WAN with no physical port.
+    /// Selection order, each translated to the counter-bearing interface via
+    /// <see cref="NetworkUtilities.PreferredWanCounterInterface"/> (ppp*/gre*
+    /// tunnel when the uplink is one, physical port otherwise):
+    /// 1. The gateway's uplink object, which names the active WAN's logical
+    ///    interface (field varies by firmware: uplink_ifname, ifname, or name),
+    ///    matched to its wan1..wan6 object. Tracks failover and covers virtual
+    ///    WANs that have no port_table entry.
+    /// 2. The port_table entry flagged is_uplink (the pre-#669 selector),
+    ///    matched to its wan object. Also covers non-gateway devices.
+    /// 3. The first wan object, preferring ones reported up (seen on PPPoE
+    ///    gateways where neither of the above is populated).
+    /// </summary>
+    internal static List<string> GetWanInterfaceNames(UniFiDeviceResponse d)
+    {
+        var (phys, uplink) = ResolveActiveWanInterface(d);
+        var name = NetworkUtilities.PreferredWanCounterInterface(phys, uplink);
+        return string.IsNullOrEmpty(name) ? new() : new List<string> { name };
+    }
+
+    /// <summary>
+    /// Discovers all devices with wireless radios for WiFi Optimizer.
+    /// Includes traditional APs (type=uap), UDM/UX mesh APs, and gateway-class devices
+    /// (UDR, UX, UDM) that have integrated wireless radios broadcasting Wi-Fi.
+    ///
+    /// Our basic "is this an AP" signal for a gateway is "does it report a non-empty
+    /// radio_table". That works for every device we've ever captured EXCEPT that certain
+    /// UniFi Network firmware hands back GARBAGE radio data: it populates radio_table for
+    /// Wi-Fi-less gateways that have no radios at all (a UXG-Fiber on firmware 5.0.16 -
+    /// see issue #994). Those phantom entries false-positive the radio_table check and the
+    /// gateway shows up as an AP with zero clients ("Significant Load Imbalance"). We can't
+    /// trust the API's radio data for gateways, so <see cref="IsWifiGateway(DiscoveredDevice)"/> makes
+    /// the final call by model. SmartPower devices (USP-Strip, USP-Plug) are excluded via
+    /// DeviceType classification.
+    /// </summary>
+    public async Task<List<DiscoveredDevice>> DiscoverAccessPointsAsync(CancellationToken cancellationToken = default, bool useCache = true)
+    {
+        var devices = await DiscoverDevicesAsync(cancellationToken, useCache);
+
+        // Breadcrumb: a gateway that reports radios but is excluded by the model allow-list.
+        // Normally this is the intended behavior (phantom radios on a Wi-Fi-less gateway, #994),
+        // but if a genuinely Wi-Fi-capable gateway we haven't listed shows up here, this log is
+        // how we'd catch it instead of it silently vanishing from the Wi-Fi Optimizer.
+        foreach (var d in devices.Where(d =>
+                     d.Type == DeviceType.Gateway && d.RadioTable is { Count: > 0 } && !IsWifiGateway(d)))
+        {
+            _logger.LogDebug(
+                "Excluding gateway {Name} ({Model}) from AP list: reports {RadioCount} radio(s) but is not in " +
+                "the Wi-Fi-capable gateway allow-list. If this model has integrated Wi-Fi, add it to WifiCapableGateways.",
+                d.Name, d.FriendlyModelName, d.RadioTable!.Count);
+        }
+
+        return devices.Where(BroadcastsWifi).ToList();
+    }
+
+    /// <summary>
+    /// Whether a device serves Wi-Fi clients: an access point, or a gateway with integrated radios
+    /// (UDR7, UX7, UCG-Industrial). The rule <see cref="DiscoverAccessPointsAsync"/> applies.
+    /// </summary>
+    public static bool BroadcastsWifi(DiscoveredDevice d) =>
+        d.Type == DeviceType.AccessPoint ||
+        (d.Type == DeviceType.Gateway && d.RadioTable is { Count: > 0 } && IsWifiGateway(d));
+
+    /// <summary>
+    /// The handful of gateways that DO have integrated Wi-Fi radios, keyed by
+    /// FriendlyModelName (the UI display name).
+    ///
+    /// This is an allow-list ONLY because the UniFi Network API can't be trusted to report a
+    /// gateway's radio capability honestly: on some firmware it emits phantom radio_table
+    /// entries for gateways that physically have no Wi-Fi (issue #994). We would much rather
+    /// key off the reported radios, but that data is garbage for this class of device, so we
+    /// fall back to a curated model list. Gateways are overwhelmingly Wi-Fi-less, so anything
+    /// not listed here is treated as having no Wi-Fi. Exact match cleanly separates the original
+    /// "UDM" (has Wi-Fi) from "UDM-Pro"/"UDM-SE"/"UDM-Pro-Max" (Wi-Fi-less).
+    ///
+    /// If UniFi ships a NEW gateway with built-in Wi-Fi (rare), add its FriendlyModelName here,
+    /// or it won't appear in the Wi-Fi Optimizer. See the matching note in UniFiProductDatabase.
+    /// </summary>
+    private static readonly HashSet<string> WifiCapableGateways = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "UDM",            // original Dream Machine
+        "UDW",            // Dream Wall
+        "UDR",            // Dream Router
+        "UDR7",           // Dream Router 7
+        "UDR-5G-Max",     // Dream Router 5G Max
+        "UX",             // Express
+        "UX7",            // Express 7
+        "UCG-Industrial", // only UCG with integrated Wi-Fi
+    };
+
+    /// <summary>
+    /// Returns true for a gateway model with integrated Wi-Fi radios. Only meaningful for
+    /// gateways: it answers false for any model not on the list, APs included.
+    /// Decides by model, NOT by the API's reported radio_table, because that data is
+    /// unreliable for gateways: some UniFi Network firmware reports phantom radio entries for
+    /// Wi-Fi-less gateways (issue #994), so trusting it false-positives them as APs. Any
+    /// gateway whose FriendlyModelName is not in <see cref="WifiCapableGateways"/> is treated
+    /// as having no Wi-Fi. True for: UDM, UDR(7)/UDR-5G-Max, UX(7), UDW, UCG-Industrial.
+    /// False for: UXG-*, UCG-Max/Fiber/Ultra, UDM-Pro/SE/Max, EFG, EF-Core, USG-*.
+    /// </summary>
+    internal static bool IsWifiGateway(DiscoveredDevice device)
+        => IsWifiGateway(device.FriendlyModelName);
+
+    internal static bool IsWifiGateway(UniFiDeviceResponse device)
+        => IsWifiGateway(device.FriendlyModelName);
+
+    private static bool IsWifiGateway(string friendlyModelName)
+        => WifiCapableGateways.Contains(friendlyModelName);
+
+    /// <summary>
+    /// Gets the gateway IP from the default LAN network configuration.
+    /// This is the gateway's LAN-facing IP (not the WAN IP).
+    /// </summary>
+    private string? GetDefaultLanGatewayIp(List<UniFiNetworkConfig>? networks)
+    {
+        if (networks == null || networks.Count == 0)
+            return null;
+
+        // Find the default LAN network - typically:
+        // 1. Purpose = "corporate" with no VLAN (the default LAN)
+        // 2. Or the first "corporate" network if all have VLANs
+        var defaultLan = networks
+            .Where(n => n.Purpose == "corporate" && n.Enabled)
+            .OrderBy(n => n.Vlan ?? 0) // Prefer no VLAN (0) first
+            .FirstOrDefault();
+
+        if (defaultLan == null)
+            return null;
+
+        // First try DhcpdGateway (explicitly configured gateway IP)
+        if (!string.IsNullOrEmpty(defaultLan.DhcpdGateway))
+        {
+            _logger.LogTrace("Gateway LAN IP from DhcpdGateway: {Ip}", defaultLan.DhcpdGateway);
+            return defaultLan.DhcpdGateway;
+        }
+
+        // Otherwise extract from ip_subnet (e.g., "192.168.1.1/24" -> "192.168.1.1")
+        if (!string.IsNullOrEmpty(defaultLan.IpSubnet))
+        {
+            var ip = defaultLan.IpSubnet.Split('/')[0];
+            _logger.LogTrace("Gateway LAN IP from IpSubnet: {Ip}", ip);
+            return ip;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Discovers all connected clients via controller API
+    /// Returns both wired and wireless clients
+    /// </summary>
+    public async Task<List<DiscoveredClient>> DiscoverClientsAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Starting UniFi client discovery via API");
+
+        var clients = await _apiClient.GetClientsAsync(cancellationToken);
+        if (clients == null || clients.Count == 0)
+        {
+            _logger.LogWarning("No clients discovered");
+            return new List<DiscoveredClient>();
+        }
+
+        _logger.LogDebug("Discovered {Count} connected clients", clients.Count);
+
+        // Check if any clients are missing IPs after trying BestIp fallback (ip > last_ip > fixed_ip)
+        var clientsMissingIps = clients.Where(c => string.IsNullOrEmpty(c.BestIp)).ToList();
+        var macToIp = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        if (clientsMissingIps.Count > 0)
+        {
+            _logger.LogDebug("{Count} clients missing IPs (after stat/sta fallbacks), fetching from active clients endpoint", clientsMissingIps.Count);
+            var activeClients = await GetActiveClientsForEnrichmentAsync(cancellationToken);
+            macToIp = ClientIpEnricher.BuildMacToIpLookup(activeClients);
+        }
+
+        // Log any MLO clients found
+        var mloClients = clients.Where(c => c.IsMlo == true).ToList();
+        if (mloClients.Any())
+        {
+            foreach (var c in mloClients)
+            {
+                var linksInfo = c.MloDetails != null
+                    ? string.Join(", ", c.MloDetails.Select(m => $"{m.Radio ?? "?"} ch{m.Channel} {m.Signal}dBm {m.ChannelWidth}MHz"))
+                    : "none";
+                _logger.LogDebug("MLO client found: {Name} ({Mac}), Radio={Radio}, Links: [{Links}]",
+                    c.Name ?? c.Hostname, c.Mac, c.Radio ?? "null", linksInfo);
+            }
+        }
+
+        // UniFi's friendly display name (fingerprint / system-selected) lives only on the v2
+        // active-clients endpoint, not on stat/sta. Pull it (cached 5 min, labels only) so the
+        // 2D/3D maps show the same name as Wi-Fi Optimizer - Client Stats instead of a raw MAC.
+        var displayNames = await ClientDisplayNameCache.GetAsync(_apiClient, cancellationToken);
+
+        // An access point keeps a wireless client associated long after it has left, and the
+        // Console reports that table faithfully, so a device twenty miles away is still "connected"
+        // here. Filtered at the point the Console's list becomes ours, because every surface that
+        // draws clients reads it from here. Where an AP Agent covers the access point, its own
+        // association table beats the idle tolerance in both directions.
+        var discoveredClients = clients
+            .Where(c => c.IsWired || NetworkOptimizer.Core.Helpers.ClientPresence.IsPresent(
+                c.IdleTime, c.ApMac, c.Radio, c.Signal,
+                hasMloLinks: c.MloDetails is { Count: > 0 },
+                agent: _agentPresence?.PresenceFor(c.ApMac, c.Mac)
+                    ?? NetworkOptimizer.Core.Helpers.AgentClientPresence.Unknown))
+            .Select(c =>
+        {
+            // Use stat/sta BestIp (ip > last_ip > fixed_ip), then active clients endpoint (UX/UX7 bug workaround)
+            var ipAddress = ClientIpEnricher.GetEnrichedIp(c.BestIp, c.Mac, macToIp);
+            if (string.IsNullOrEmpty(c.BestIp) && !string.IsNullOrEmpty(ipAddress))
+            {
+                _logger.LogDebug("Enriched IP for {Mac} from active clients: {Ip}", c.Mac, ipAddress);
+            }
+
+            return new DiscoveredClient
+            {
+                Id = c.Id,
+                Mac = c.Mac,
+                Hostname = c.Hostname,
+                Name = c.Name,
+                DisplayName = displayNames.TryGetValue(c.Mac.ToLowerInvariant(), out var dn) ? dn : string.Empty,
+                UcoreName = c.UnifiDeviceInfoFromUcore?.Name ?? string.Empty,
+                IpAddress = ipAddress ?? string.Empty,
+                Network = c.Network,
+                NetworkId = c.NetworkId,
+                VirtualNetworkOverrideEnabled = c.VirtualNetworkOverrideEnabled,
+                VirtualNetworkOverrideId = c.VirtualNetworkOverrideId,
+                Vlan = c.Vlan,
+                IsWired = c.IsWired,
+                IsGuest = c.IsGuest,
+                IsBlocked = c.Blocked,
+                ConnectionType = DetermineConnectionType(c),
+                ConnectedToDeviceMac = c.IsWired ? c.SwMac : c.ApMac,
+                SwitchPort = c.SwPort,
+                Uptime = TimeSpan.FromSeconds(c.Uptime),
+                LastSeen = DateTimeOffset.FromUnixTimeSeconds(c.LastSeen).DateTime,
+                FirstSeen = DateTimeOffset.FromUnixTimeSeconds(c.FirstSeen).DateTime,
+                // Wireless-specific
+                Essid = c.Essid,
+                Channel = c.Channel,
+                Rssi = c.Rssi,
+                SignalStrength = c.Signal,
+                NoiseLevel = c.Noise,
+                RadioProtocol = c.RadioProto,
+                Radio = c.Radio,
+                // Wi-Fi 7 MLO
+                IsMlo = c.IsMlo ?? false,
+                MloLinks = c.MloDetails?.Select(m => new MloLink
+                {
+                    Radio = m.Radio ?? "",
+                    Channel = m.Channel,
+                    ChannelWidth = m.ChannelWidth,
+                    SignalDbm = m.Signal,
+                    NoiseDbm = m.Noise,
+                    TxRateKbps = m.TxRate,
+                    RxRateKbps = m.RxRate
+                }).ToList(),
+                // Traffic stats
+                TxBytes = c.TxBytes,
+                RxBytes = c.RxBytes,
+                TxPackets = c.TxPackets,
+                RxPackets = c.RxPackets,
+                TxRate = c.TxRate,
+                RxRate = c.RxRate,
+                TxBytesRate = c.TxBytesRate,
+                RxBytesRate = c.RxBytesRate,
+                // QoS
+                Satisfaction = c.Satisfaction,
+                HasFixedIp = c.UseFixedIp,
+                FixedIp = c.FixedIp,
+                Note = c.Note,
+                Oui = c.Oui
+            };
+        }).ToList();
+
+        return discoveredClients;
+    }
+
+    /// <summary>
+    /// Fetches active clients for IP enrichment.
+    /// Used to get IPs for UX/UX7 connected clients that are missing IPs in stat/sta.
+    /// Gracefully returns empty list if the API fails.
+    /// </summary>
+    private async Task<List<Models.UniFiClientDetailResponse>> GetActiveClientsForEnrichmentAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _apiClient.GetActiveClientsAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to fetch active clients for IP enrichment, continuing without enrichment");
+            return new List<Models.UniFiClientDetailResponse>();
+        }
+    }
+
+    /// <summary>
+    /// Gets comprehensive network topology including devices and their connections
+    /// </summary>
+    public async Task<NetworkTopology> DiscoverTopologyAsync(CancellationToken cancellationToken = default, bool useCache = true)
+    {
+        _logger.LogDebug("Starting network topology discovery");
+
+        var devicesTask = DiscoverDevicesAsync(cancellationToken, useCache);
+        var clientsTask = DiscoverClientsAsync(cancellationToken);
+        var networksTask = _apiClient.GetNetworkConfigsAsync(cancellationToken);
+
+        await Task.WhenAll(devicesTask, clientsTask, networksTask);
+
+        var devices = await devicesTask;
+        var clients = await clientsTask;
+        var networks = await networksTask;
+
+        var topology = new NetworkTopology
+        {
+            Devices = devices,
+            Clients = clients,
+            Networks = networks?.Select(n => new NetworkInfo
+            {
+                Id = n.Id,
+                Name = n.Name,
+                Purpose = n.Purpose,
+                Enabled = n.Enabled,
+                VlanId = n.Vlan,
+                IpSubnet = n.IpSubnet,
+                IsDhcpEnabled = n.DhcpdEnabled,
+                DhcpRange = n.DhcpdEnabled ? $"{n.DhcpdStart} - {n.DhcpdStop}" : null,
+                Gateway = n.DhcpdGateway,
+                IsNat = n.IsNat,
+                WanUploadMbps = n.WanProviderCapabilities?.UploadMbps,
+                WanDownloadMbps = n.WanProviderCapabilities?.DownloadMbps,
+                WanNetworkgroup = n.WanNetworkgroup,
+                WanSmartqEnabled = n.WanSmartqEnabled
+            }).ToList() ?? new List<NetworkInfo>(),
+            DiscoveredAt = DateTime.UtcNow
+        };
+
+        // Build device hierarchy (uplink relationships)
+        BuildDeviceHierarchy(topology);
+
+        _logger.LogDebug("Topology discovered: {DeviceCount} devices, {ClientCount} clients, {NetworkCount} networks",
+            topology.Devices.Count, topology.Clients.Count, topology.Networks.Count);
+
+        return topology;
+    }
+
+    /// <summary>
+    /// Gets detailed firewall configuration
+    /// </summary>
+    public async Task<FirewallConfiguration> GetFirewallConfigurationAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Fetching firewall configuration");
+
+        var rulesTask = _apiClient.GetFirewallRulesAsync(cancellationToken);
+        var groupsTask = _apiClient.GetFirewallGroupsAsync(cancellationToken);
+
+        await Task.WhenAll(rulesTask, groupsTask);
+
+        var rules = await rulesTask;
+        var groups = await groupsTask;
+
+        var config = new FirewallConfiguration
+        {
+            Rules = rules ?? new List<UniFiFirewallRule>(),
+            Groups = groups ?? new List<UniFiFirewallGroup>(),
+            RetrievedAt = DateTime.UtcNow
+        };
+
+        _logger.LogInformation("Firewall config retrieved: {RuleCount} rules, {GroupCount} groups",
+            config.Rules.Count, config.Groups.Count);
+
+        return config;
+    }
+
+    /// <summary>
+    /// Gets controller information including licensing fingerprint
+    /// </summary>
+    public async Task<ControllerInfo?> GetControllerInfoAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Fetching controller information");
+
+        var sysInfo = await _apiClient.GetSystemInfoAsync(cancellationToken);
+        if (sysInfo == null)
+        {
+            _logger.LogWarning("Failed to retrieve controller information");
+            return null;
+        }
+
+        var controllerInfo = new ControllerInfo
+        {
+            ControllerId = sysInfo.AnonymousControllerId ?? "unknown",
+            DeviceId = sysInfo.AnonymousDeviceId,
+            Uuid = sysInfo.Uuid,
+            Name = sysInfo.Name,
+            Hostname = sysInfo.Hostname,
+            Version = sysInfo.Version,
+            Build = sysInfo.Build,
+            UpdateAvailable = sysInfo.UpdateAvailable,
+            IpAddresses = sysInfo.IpAddrs,
+            InformUrl = sysInfo.InformUrl,
+            Timezone = sysInfo.Timezone,
+            Uptime = TimeSpan.FromSeconds(sysInfo.Uptime),
+            HardwareModel = sysInfo.HardwareModel,
+            IsCloudKeyRunning = sysInfo.CloudKeyRunning,
+            IsUnifiGoEnabled = sysInfo.UnifiGoEnabled
+        };
+
+        _logger.LogInformation("Controller info retrieved: {Name} v{Version} (ID: {Id})",
+            controllerInfo.Name, controllerInfo.Version, controllerInfo.ControllerId);
+
+        return controllerInfo;
+    }
+
+    /// <summary>
+    /// Determines the device type, with special handling for UDM-family devices
+    /// that may be operating as access points rather than gateways.
+    /// </summary>
+    /// <remarks>
+    /// UX (Express) devices report type "udm" but may be configured as mesh APs
+    /// rather than gateways. Detection uses uplink analysis: if a UDM-type device
+    /// has an uplink to another UniFi device, it's acting as a mesh AP, not the gateway.
+    /// The actual gateway either has no uplink or uplinks to a non-UniFi device (ISP modem).
+    /// </remarks>
+    public static DeviceType DetermineDeviceType(
+        UniFiDeviceResponse device,
+        HashSet<string> allDeviceMacs,
+        ILogger logger)
+    {
+        var baseType = device.DeviceType;
+
+        // Only apply special handling to UDM-family devices (type = udm, uxg, ucg, etc.)
+        if (baseType != DeviceType.Gateway)
+        {
+            return baseType;
+        }
+
+        // Check if this device has an uplink to another UniFi device
+        var uplinkMac = device.Uplink?.UplinkMac;
+        var hasUplinkToUniFiDevice = !string.IsNullOrEmpty(uplinkMac) &&
+                                      allDeviceMacs.Contains(uplinkMac.ToLowerInvariant());
+
+        // Log classification details for gateway-class devices (UDR, UX, UDM, etc.)
+        logger.LogTrace(
+            "Gateway-class device: {Name} ({Model}) - API type={ApiType}, IP={Ip}, " +
+            "UplinkMac={UplinkMac}, UplinkToUniFi={HasUplinkToUniFi}, HasConfigNetworkLan={HasLan}",
+            device.Name,
+            device.Shortname ?? device.Model,
+            device.Type,
+            device.Ip,
+            uplinkMac ?? "(none)",
+            hasUplinkToUniFiDevice,
+            device.ConfigNetworkLan != null);
+
+        // Gateways without Wi-Fi (UDM-Pro, UDM-SE, UDM-Beast, EFG) never become
+        // APs even if the API reports an uplink to another UniFi device.
+        if (!IsWifiGateway(device))
+        {
+            return DeviceType.Gateway;
+        }
+
+        // If the gateway-class device has an uplink to another UniFi device,
+        // it's adopted as an AP, not the network gateway (an Express: UX, UX7)
+        if (hasUplinkToUniFiDevice)
+        {
+            logger.LogInformation(
+                "Classifying {Name} as AccessPoint (uplinks to another UniFi device: {UplinkMac})",
+                device.Name, uplinkMac);
+            return DeviceType.AccessPoint;
+        }
+
+        return DeviceType.Gateway;
+    }
+
+    /// <summary>
+    /// Gets the effective device type for a device, considering uplink topology.
+    /// Use this when you have a list of devices and need to determine the correct
+    /// type for each (e.g., an Express (UX, UX7) adopted as an AP).
+    ///
+    /// DEPRECATED: Prefer using GetDiscoveredDevicesAsync() which returns DiscoveredDevice
+    /// with Type already set to the effective type.
+    /// </summary>
+    /// <param name="device">The device to classify</param>
+    /// <param name="allDevices">All devices in the network (to check uplink relationships)</param>
+    /// <returns>The effective device type</returns>
+    public static DeviceType GetEffectiveDeviceType(UniFiDeviceResponse device, IEnumerable<UniFiDeviceResponse> allDevices)
+    {
+        var baseType = device.DeviceType;
+
+        // Only apply special handling to gateway-class devices
+        if (baseType != DeviceType.Gateway)
+        {
+            return baseType;
+        }
+
+        // Build set of all device MACs
+        var allDeviceMacs = new HashSet<string>(
+            allDevices.Where(d => !string.IsNullOrEmpty(d.Mac)).Select(d => d.Mac),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Check if this device has an uplink to another UniFi device
+        var uplinkMac = device.Uplink?.UplinkMac;
+        var hasUplinkToUniFiDevice = !string.IsNullOrEmpty(uplinkMac) &&
+                                      allDeviceMacs.Contains(uplinkMac.ToLowerInvariant());
+
+        if (!IsWifiGateway(device))
+            return DeviceType.Gateway;
+
+        return hasUplinkToUniFiDevice ? DeviceType.AccessPoint : DeviceType.Gateway;
+    }
+
+    private string DetermineConnectionType(UniFiClientResponse client)
+    {
+        if (client.IsWired)
+        {
+            return "Wired";
+        }
+
+        if (!string.IsNullOrEmpty(client.RadioProto))
+        {
+            return client.RadioProto.ToUpperInvariant() switch
+            {
+                "NA" or "AC" or "AX" or "BE" => $"WiFi {client.RadioProto.ToUpper()}",
+                _ => "WiFi"
+            };
+        }
+
+        return "Wireless";
+    }
+
+    private void BuildDeviceHierarchy(NetworkTopology topology)
+    {
+        var deviceDict = topology.Devices.ToDictionary(d => d.Mac, d => d);
+
+        foreach (var device in topology.Devices)
+        {
+            if (!string.IsNullOrEmpty(device.UplinkMac) && deviceDict.TryGetValue(device.UplinkMac, out var uplinkDevice))
+            {
+                device.UplinkDeviceName = uplinkDevice.Name;
+                uplinkDevice.DownstreamDevices ??= new List<string>();
+                uplinkDevice.DownstreamDevices.Add(device.Name);
+            }
+        }
+    }
+}
+
+#region Discovery Result Models
+
+public class DiscoveredDevice
+{
+    public string Id { get; set; } = string.Empty;
+    public string Mac { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>
+    /// The effective device type considering network topology.
+    /// For an Express (UX, UX7) adopted as an AP, this will be AccessPoint.
+    /// </summary>
+    public DeviceType Type { get; set; }
+
+    /// <summary>
+    /// The original hardware type from the UniFi API (before uplink-based adjustment).
+    /// Use this to identify gateway-class hardware regardless of its current role.
+    /// </summary>
+    public DeviceType HardwareType { get; set; }
+
+    /// <summary>
+    /// True when this is a gateway-class device (UDR, UX, etc.) with HardwareType = Gateway
+    /// that is acting as a mesh Access Point due to uplink to another UniFi device.
+    /// </summary>
+    public bool IsActingAsAccessPoint => HardwareType == DeviceType.Gateway && Type == DeviceType.AccessPoint;
+
+    public string Model { get; set; } = string.Empty;
+    public string? Shortname { get; set; }
+
+    /// <summary>
+    /// Best product name for display and image lookup.
+    /// Uses the same logic as UniFiDeviceResponse.FriendlyModelName.
+    /// </summary>
+    public string FriendlyModelName =>
+        UniFiProductDatabase.GetBestProductName(Model, Shortname);
+
+    /// <summary>
+    /// Whether this device can run iperf3 for LAN speed testing
+    /// </summary>
+    public bool CanRunIperf3 =>
+        UniFiProductDatabase.CanRunIperf3(FriendlyModelName);
+
+    public string IpAddress { get; set; } = string.Empty;
+
+    /// <summary>
+    /// LAN IP address for gateways (from network config).
+    /// For non-gateway devices, this is null.
+    /// </summary>
+    public string? LanIpAddress { get; set; }
+
+    /// <summary>
+    /// Gets the best IP address for display purposes.
+    /// For gateways, prefers LAN IP; for other devices, uses standard IP.
+    /// </summary>
+    public string DisplayIpAddress => !string.IsNullOrEmpty(LanIpAddress) ? LanIpAddress : IpAddress;
+
+    public string Firmware { get; set; } = string.Empty;
+    public bool Adopted { get; set; }
+    public int State { get; set; }
+    public TimeSpan Uptime { get; set; }
+    public DateTime LastSeen { get; set; }
+    public bool Upgradable { get; set; }
+    public string? UpgradeToFirmware { get; set; }
+
+    /// <summary>Running Suricata (CyberSecure IDS/IPS) engine version. Null until it has run one.</summary>
+    public int? SuricataVersion { get; set; }
+    /// <summary>Highest Suricata engine version this gateway's firmware supports.</summary>
+    public int? SupportedSuricataVersion { get; set; }
+    /// <summary>Suricata engine version the gateway is offering to upgrade to, when one is pending.</summary>
+    public int? SuricataUpgradePendingTarget { get; set; }
+
+    /// <summary>
+    /// True when the gateway is advertising a Suricata (CyberSecure IDS/IPS) engine upgrade it
+    /// hasn't taken yet: a pending target is set and above the running version (or the engine
+    /// isn't running any version yet). The upgrade is initiated in UniFi Network -> Settings -> CyberSecure.
+    /// </summary>
+    public bool SuricataUpgradeAvailable =>
+        SuricataUpgradePendingTarget is int target && target > (SuricataVersion ?? 0);
+
+    public string? UplinkMac { get; set; }
+    /// <summary>
+    /// The uplink the console last recorded, kept while the device is offline. For a gateway it
+    /// is the LAN-side attachment the live uplink never carries.
+    /// </summary>
+    public string? LastUplinkMac { get; set; }
+    /// <summary>Remote port on the upstream device that this device connects to.</summary>
+    public int? UplinkPort { get; set; }
+    /// <summary>Local port on this device that connects to the upstream device (wired only).</summary>
+    public int? LocalUplinkPort { get; set; }
+    public string? UplinkDeviceName { get; set; }
+    public bool IsUplinkConnected { get; set; }
+    public int UplinkSpeedMbps { get; set; }
+    /// <summary>TX rate in Kbps for wireless uplinks</summary>
+    public long UplinkTxRateKbps { get; set; }
+    /// <summary>RX rate in Kbps for wireless uplinks</summary>
+    public long UplinkRxRateKbps { get; set; }
+    public string? UplinkType { get; set; }  // "wire" or "wireless"
+
+    /// <summary>
+    /// Whether the device's own uplink is an MLO backhaul: more than one entry in
+    /// uplink.mlo_links (how UniFi reports a mesh child's side today), or uplink.is_mlo, which
+    /// UniFi does not set on the uplink block but is its standard MLO station flag elsewhere.
+    /// </summary>
+    public bool UplinkIsMlo { get; set; }
+
+    /// <summary>
+    /// The child's own per-link account of its MLO backhaul (uplink.mlo_links), child's
+    /// perspective: TX toward the parent, signal as the child measures it. The
+    /// Uplink*RateKbps fields above already sum these links. Empty when not reported.
+    /// </summary>
+    public List<MeshBackhaulLink> UplinkMloLinks { get; set; } = [];
+    /// <summary>
+    /// Active uplink interface name (uplink.name). For a wireless mesh child this is the
+    /// wpa_supplicant STA backhaul iface (e.g. "vwiresta7"); for wired APs/gateways it's the
+    /// wired/WAN iface. Validate the "vwiresta" prefix before using as a mesh backhaul iface.
+    /// </summary>
+    public string? UplinkInterface { get; set; }
+    public string? UplinkRadioBand { get; set; }  // "ng" (2.4GHz), "na" (5GHz), "6e" (6GHz)
+    public int? UplinkChannel { get; set; }
+    public int? UplinkSignalDbm { get; set; }
+    public int? UplinkNoiseDbm { get; set; }
+    public List<string>? DownstreamDevices { get; set; }
+    public string? CpuUsage { get; set; }
+    public string? MemoryUsage { get; set; }
+    public string? LoadAverage { get; set; }
+    public long TxBytes { get; set; }
+    public long RxBytes { get; set; }
+    public int PortCount { get; set; }
+
+    /// <summary>
+    /// Counter-bearing interface of the PRIMARY WAN only (single entry, by design). Feeds the
+    /// live WAN throughput tiles, which sit alongside ISP / transit latency measured over that
+    /// one connection, and serves as ISP Health's last-resort counter fallback. Multi-WAN
+    /// surfaces do NOT widen this list: per-WAN throughput resolves each WAN's own counter
+    /// interface (UniFiConnectionService.GetWanInterfacesForGroupAsync / the remembered
+    /// WanProfile row) behind the multi-WAN UI gate, and summing WANs into one series is
+    /// reserved for the usage fingerprint alone (see
+    /// MonitoringInfluxClient.QueryGatewayWanRatesAsync's contract). See
+    /// UniFiDiscovery.GetWanInterfaceNames for the selection rules.
+    /// </summary>
+    public List<string> WanInterfaceNames { get; set; } = new();
+
+    // Wi-Fi specific (APs only)
+    /// <summary>
+    /// Radio configuration table - per-radio settings (channel, tx_power, antenna).
+    /// Only present on access points.
+    /// </summary>
+    public List<RadioTableEntry>? RadioTable { get; set; }
+
+    /// <summary>
+    /// Radio statistics table - per-radio runtime stats (satisfaction, tx_retries).
+    /// Only present on access points.
+    /// </summary>
+    public List<RadioTableStats>? RadioTableStats { get; set; }
+
+    /// <summary>
+    /// Antenna table - available antenna modes (Internal, OMNI, etc.)
+    /// Only present on outdoor APs with switchable antenna modes.
+    /// </summary>
+    public List<AntennaTableEntry>? AntennaTable { get; set; }
+
+    /// <summary>
+    /// Virtual AP table - per-SSID/radio statistics.
+    /// Only present on access points.
+    /// </summary>
+    public List<VapTableEntry>? VapTable { get; set; }
+
+    /// <summary>
+    /// Device satisfaction score (0-100). Higher is better.
+    /// </summary>
+    public int? Satisfaction { get; set; }
+
+    /// <summary>
+    /// Scan radio table - contains spectrum scan results and channel utilization data.
+    /// Only present on access points that support spectrum scanning.
+    /// </summary>
+    public List<ScanRadioEntry>? ScanRadioTable { get; set; }
+
+    /// <summary>
+    /// Whether this AP has a dedicated scan radio that can scan without disrupting clients.
+    /// </summary>
+    public bool HasDedicatedScanRadio =>
+        ScanRadioTable?.Any(s => s.Radio?.Equals("scan", StringComparison.OrdinalIgnoreCase) == true) ?? false;
+
+    /// <summary>
+    /// Whether this AP supports spectrum/RF environment scanning.
+    /// </summary>
+    public bool SupportsSpectrumScan => ScanRadioTable != null;
+
+    /// <summary>
+    /// Downlink table - mesh children connected to this AP (parent's perspective).
+    /// Only present on mesh parent APs. Contains signal/rates as seen by the parent.
+    /// </summary>
+    public List<DownlinkTableEntry>? DownlinkTable { get; set; }
+
+    /// <summary>
+    /// Whether AFC (Automated Frequency Coordination) is enabled on this device.
+    /// </summary>
+    public bool? AfcEnabled { get; set; }
+
+    /// <summary>
+    /// AFC state: "disabled", "location_acquired", etc.
+    /// </summary>
+    public string? AfcState { get; set; }
+}
+
+public class DiscoveredClient
+{
+    public string Id { get; set; } = string.Empty;
+    public string Mac { get; set; } = string.Empty;
+    public string Hostname { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    /// <summary>
+    /// UniFi's system-selected friendly device name from the v2 active-clients endpoint
+    /// (the "device print name" the console shows, e.g. a fingerprint-derived "Apple TV"
+    /// for an unnamed device). Populated for currently-active clients; empty when unknown.
+    /// Prefer this over <see cref="Name"/>/<see cref="Hostname"/> for display labels.
+    /// </summary>
+    public string DisplayName { get; set; } = string.Empty;
+    /// <summary>
+    /// Friendly name of a bridged/adopted UniFi ecosystem device (from the console's ucore),
+    /// e.g. a UniFi Protect camera's "[Camera] Front Door" surfaced through a UniFi Device Bridge.
+    /// Empty for ordinary clients. Used as a display-label fallback below the user-set Name.
+    /// </summary>
+    public string UcoreName { get; set; } = string.Empty;
+    public string IpAddress { get; set; } = string.Empty;
+    public string Network { get; set; } = string.Empty;
+    public string NetworkId { get; set; } = string.Empty;
+    // Virtual network override (client assigned to different VLAN than SSID's native network)
+    public bool VirtualNetworkOverrideEnabled { get; set; }
+    public string? VirtualNetworkOverrideId { get; set; }
+    /// <summary>
+    /// The actual VLAN number the client is assigned to
+    /// </summary>
+    public int? Vlan { get; set; }
+    /// <summary>
+    /// Gets the effective network ID (considers virtual network override)
+    /// </summary>
+    public string EffectiveNetworkId =>
+        VirtualNetworkOverrideEnabled && !string.IsNullOrEmpty(VirtualNetworkOverrideId)
+            ? VirtualNetworkOverrideId
+            : NetworkId;
+    public bool IsWired { get; set; }
+    public bool IsGuest { get; set; }
+    public bool IsBlocked { get; set; }
+    public string ConnectionType { get; set; } = string.Empty;
+    public string? ConnectedToDeviceMac { get; set; }
+    public int? SwitchPort { get; set; }
+    public TimeSpan Uptime { get; set; }
+    public DateTime LastSeen { get; set; }
+    public DateTime FirstSeen { get; set; }
+    // Wireless-specific
+    public string? Essid { get; set; }
+    public int? Channel { get; set; }
+    public int? Rssi { get; set; }
+    public int? SignalStrength { get; set; }
+    public int? NoiseLevel { get; set; }
+    public string? RadioProtocol { get; set; }
+    public string? Radio { get; set; }  // "ng" (2.4GHz), "na" (5GHz), "6e" (6GHz)
+    // Wi-Fi 7 MLO (Multi-Link Operation)
+    public bool IsMlo { get; set; }
+    public List<MloLink>? MloLinks { get; set; }
+    // Traffic
+    public long TxBytes { get; set; }
+    public long RxBytes { get; set; }
+    public long TxPackets { get; set; }
+    public long RxPackets { get; set; }
+    public long TxRate { get; set; }
+    public long RxRate { get; set; }
+    public double TxBytesRate { get; set; }
+    public double RxBytesRate { get; set; }
+    // QoS
+    public int? Satisfaction { get; set; }
+    public bool HasFixedIp { get; set; }
+    public string? FixedIp { get; set; }
+    public string? Note { get; set; }
+    public string Oui { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// MLO link info for Wi-Fi 7 multi-link clients
+/// </summary>
+public class MloLink
+{
+    public string Radio { get; set; } = string.Empty;  // "ng", "na", "6e"
+    public int? Channel { get; set; }
+    public int? ChannelWidth { get; set; }  // 20, 40, 80, 160, 320
+    public int? SignalDbm { get; set; }
+    public int? NoiseDbm { get; set; }
+    public long? TxRateKbps { get; set; }
+    public long? RxRateKbps { get; set; }
+}
+
+public class NetworkTopology
+{
+    public List<DiscoveredDevice> Devices { get; set; } = new();
+    public List<DiscoveredClient> Clients { get; set; } = new();
+    public List<NetworkInfo> Networks { get; set; } = new();
+    public DateTime DiscoveredAt { get; set; }
+}
+
+public class NetworkInfo
+{
+    public string Id { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string Purpose { get; set; } = string.Empty;
+    public bool Enabled { get; set; }
+    public int? VlanId { get; set; }
+    public string? IpSubnet { get; set; }
+
+    /// <summary>VPN type when this network is a VPN client ("wireguard-client", "openvpn-client").</summary>
+    public string? VpnType { get; set; }
+
+    /// <summary>WireGuard client id; maps to the Linux interface "wgclt{id}".</summary>
+    public int? WireguardId { get; set; }
+
+    public bool IsDhcpEnabled { get; set; }
+    public string? DhcpRange { get; set; }
+    public string? Gateway { get; set; }
+    public bool IsNat { get; set; }
+
+    /// <summary>WAN upload speed in Mbps (only for WAN networks)</summary>
+    public int? WanUploadMbps { get; set; }
+
+    /// <summary>WAN download speed in Mbps (only for WAN networks)</summary>
+    public int? WanDownloadMbps { get; set; }
+
+    /// <summary>WAN network group: "WAN" for primary, "WAN2", "WAN3" for secondary</summary>
+    public string? WanNetworkgroup { get; set; }
+
+    /// <summary>Whether this is a WAN network</summary>
+    public bool IsWan => Purpose.Equals("wan", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether Smart Queues (SQM) is enabled on this WAN</summary>
+    public bool WanSmartqEnabled { get; set; }
+
+    /// <summary>WAN load balance type ("failover-only" or "weighted")</summary>
+    public string? WanLoadBalanceType { get; set; }
+
+    /// <summary>WAN load balance weight (higher = more traffic in weighted mode)</summary>
+    public int? WanLoadBalanceWeight { get; set; }
+
+    /// <summary>WAN failover priority (lower = higher priority)</summary>
+    public int? WanFailoverPriority { get; set; }
+
+    /// <summary>WAN interface name from networkconf (e.g., "eth4", "eth6")</summary>
+    public string? WanIfname { get; set; }
+
+    /// <summary>Whether this is the primary WAN (wan_networkgroup = "WAN")</summary>
+    public bool IsPrimaryWan => WanNetworkgroup?.Equals("WAN", StringComparison.OrdinalIgnoreCase) == true;
+}
+
+public class FirewallConfiguration
+{
+    public List<UniFiFirewallRule> Rules { get; set; } = new();
+    public List<UniFiFirewallGroup> Groups { get; set; } = new();
+    public DateTime RetrievedAt { get; set; }
+}
+
+public class ControllerInfo
+{
+    public string ControllerId { get; set; } = string.Empty;
+    public string? DeviceId { get; set; }
+    public string? Uuid { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string Hostname { get; set; } = string.Empty;
+    public string Version { get; set; } = string.Empty;
+    public string Build { get; set; } = string.Empty;
+    public bool UpdateAvailable { get; set; }
+    public List<string> IpAddresses { get; set; } = new();
+    public string InformUrl { get; set; } = string.Empty;
+    public string Timezone { get; set; } = string.Empty;
+    public TimeSpan Uptime { get; set; }
+    public string? HardwareModel { get; set; }
+    public bool IsCloudKeyRunning { get; set; }
+    public bool IsUnifiGoEnabled { get; set; }
+}
+
+#endregion

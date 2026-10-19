@@ -1,0 +1,604 @@
+using NetworkOptimizer.Reports;
+using QuestPDF.Fluent;
+using QuestPDF.Helpers;
+using QuestPDF.Infrastructure;
+
+namespace NetworkOptimizer.Web.Services.Monitoring.IspHealth;
+
+/// <summary>
+/// Renders an <see cref="IspHealthReport"/> as a PDF, following the Security Audit report's
+/// page setup, branding, and section styling (<see cref="PdfReportGenerator"/>).
+///
+/// It computes nothing. The report handed in is the same object the ISP Health tab renders,
+/// produced by the same scorer, and every derived string comes from
+/// <see cref="IspHealthPresentation"/> - so the PDF cannot drift from the screen. It lives
+/// here rather than in NetworkOptimizer.Reports only because the ISP Health models live in
+/// this assembly, which Reports sits below.
+/// </summary>
+public class IspHealthPdfGenerator
+{
+    private readonly BrandingOptions _branding;
+    private readonly IspHealthOptions _options;
+    private readonly byte[]? _logoBytes;
+
+    /// <param name="options">The scorer's own options, so the limiting-aspect column weighs
+    /// stability against congestion exactly as the tab does.</param>
+    public IspHealthPdfGenerator(BrandingOptions? branding = null, IspHealthOptions? options = null)
+    {
+        _branding = branding ?? BrandingOptions.OzarkConnect();
+        _options = options ?? new IspHealthOptions();
+        QuestPDF.Settings.License = LicenseType.Community;
+        _logoBytes = ReportAssets.Logo();
+    }
+
+    /// <summary>Renders the report to PDF bytes.</summary>
+    /// <param name="report">The scored report, exactly as the tab received it.</param>
+    /// <param name="siteName">Site the report covers, used in the title.</param>
+    public byte[] GenerateReportBytes(IspHealthReport report, string? siteName = null)
+    {
+        var generatedAt = DateTime.Now;
+        return Document.Create(container =>
+        {
+            container.Page(page =>
+            {
+                page.Size(PageSizes.Letter);
+                page.Margin(0.5f, Unit.Inch);
+                page.PageColor(Colors.White);
+                page.DefaultTextStyle(x => x.FontSize(9).FontColor(Colors.Black));
+
+                page.Header().Element(c => ComposeHeader(c, report, siteName, generatedAt));
+                page.Content().Element(c => ComposeContent(c, report));
+                page.Footer().Element(c => ComposeFooter(c, generatedAt));
+            });
+        }).GeneratePdf();
+    }
+
+    private void ComposeHeader(IContainer container, IspHealthReport report, string? siteName, DateTime generatedAt)
+    {
+        var primaryColor = _branding.Colors.Primary;
+
+        container.Column(column =>
+        {
+            if (_logoBytes is { Length: > 0 })
+                column.Item().AlignLeft().MaxWidth(1.5f, Unit.Inch).Image(_logoBytes);
+
+            var title = string.IsNullOrWhiteSpace(siteName)
+                ? "ISP Health Report"
+                : $"{siteName} ISP Health Report";
+
+            column.Item().AlignCenter().Text(title).FontSize(22).Bold().FontColor(primaryColor);
+
+            // Which link and which network this report is about, named once here so no
+            // section below has to repeat it. Either half is dropped when unknown rather
+            // than printed as a placeholder.
+            var subject = new[]
+                {
+                    IspHealthPresentation.ScoredWanLabel(report) is string wan ? $"WAN: {wan}" : null,
+                    IspHealthPresentation.AccessIspLabel(report) is string isp ? $"ISP: {isp}" : null
+                }
+                .Where(part => part != null);
+            var subjectLine = string.Join("    ", subject);
+            if (subjectLine.Length > 0)
+            {
+                column.Item().AlignLeft().PaddingTop(6).Text(subjectLine)
+                    .FontSize(10).FontColor(Colors.Grey.Darken1);
+            }
+
+            column.Item().AlignLeft().PaddingTop(subjectLine.Length > 0 ? 2 : 6)
+                .Text($"Generated: {generatedAt:MMMM dd, yyyy HH:mm}    Window: {IspHealthPresentation.WindowRangeLabel(report)}")
+                .FontSize(10).FontColor(Colors.Grey.Medium);
+
+            column.Item().PaddingBottom(10).LineHorizontal(0.5f).LineColor(Colors.Grey.Lighten2);
+        });
+    }
+
+    private void ComposeFooter(IContainer container, DateTime generatedAt)
+    {
+        container.Column(column =>
+        {
+            column.Item().LineHorizontal(0.5f).LineColor(Colors.Grey.Lighten2);
+            column.Item().PaddingTop(5);
+
+            if (!string.IsNullOrEmpty(_branding.CustomFooter))
+            {
+                column.Item().AlignCenter().Text(_branding.CustomFooter)
+                    .FontSize(8).FontColor(Colors.Grey.Medium);
+            }
+            else if (_branding.ShowProductAttribution)
+            {
+                column.Item().AlignCenter().Text(text =>
+                {
+                    text.Span("Generated by ").FontSize(8).FontColor(Colors.Grey.Medium);
+                    text.Span(_branding.ProductName).FontSize(8).FontColor(Colors.Grey.Medium).Bold();
+                    text.Span($" for {_branding.CompanyName}").FontSize(8).FontColor(Colors.Grey.Medium);
+                    text.Span($" | {generatedAt:yyyy-MM-dd HH:mm}").FontSize(8).FontColor(Colors.Grey.Lighten1);
+                });
+            }
+        });
+    }
+
+    private void ComposeContent(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            column.Item().Element(c => ComposeSummary(c, report));
+            column.Item().PaddingTop(20).Element(c => ComposeSpeedVsPlan(c, report));
+
+            if (report.Issues.Count > 0)
+                column.Item().PaddingTop(20).Element(c => ComposeFindings(c, report));
+
+            column.Item().PageBreak();
+            column.Item().Element(c => ComposeScoreBreakdown(c, report));
+
+            if (report.IspAsns.Count > 0 || report.TransitAsns.Count > 0)
+            {
+                column.Item().PageBreak();
+                column.Item().Element(c => ComposeNetworksOnPath(c, report));
+            }
+
+            if (report.Outages.Count > 0)
+                column.Item().PaddingTop(20).Element(c => ComposeOutages(c, report));
+
+            column.Item().PaddingTop(20).Element(c => ComposeEvents(c, report));
+        });
+    }
+
+    private void ComposeSummary(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            SectionHeading(column, "Summary");
+
+            column.Item().Row(row =>
+            {
+                // Centred in its own third of the row so the score sits under the middle of
+                // its caption rather than hanging off the left margin.
+                row.RelativeItem().AlignMiddle().Column(score =>
+                {
+                    score.Item().AlignCenter().Text($"{report.OverallScore}")
+                        .FontSize(42).Bold().FontColor(ScoreColor(report.OverallScore));
+                    score.Item().AlignCenter().Text(IspHealthReport.GradeLabel(report.OverallScore))
+                        .FontSize(12).FontColor(ScoreColor(report.OverallScore));
+                    score.Item().AlignCenter().PaddingTop(2).Text("Overall ISP Health")
+                        .FontSize(9).FontColor(Colors.Grey.Medium);
+                });
+
+                row.RelativeItem(2).Column(detail =>
+                {
+                    LabelledLine(detail, "Scored as", IspHealthPresentation.ScoredAsLabel(report));
+                    LabelledLine(detail, "Window",
+                        $"{IspHealthPresentation.WindowLabel(report)} - {IspHealthPresentation.WindowRangeLabel(report)}");
+                    LabelledLine(detail, "Computed", report.ComputedAt.ToLocalTime().ToString("MMM d, yyyy HH:mm"));
+                    LabelledLine(detail, "Outages in window", report.Outages.Count.ToString());
+                    LabelledLine(detail, "Congestion events", report.CongestionEvents.Count.ToString());
+                });
+            });
+
+            // Uptime leads the dimension grades for the same reason it leads the score card: those say
+            // how the path behaved, this says whether it was there at all. Column widths match the
+            // table below so it reads as that table's first line rather than a floating stat.
+            column.Item().PaddingTop(12).Row(row =>
+            {
+                row.RelativeItem(2f).Text("Uptime").FontSize(10).SemiBold();
+                row.RelativeItem(1f).Text(IspHealthPresentation.FormatUptime(report)).FontSize(10).Bold();
+                row.RelativeItem(1f).Text(IspHealthPresentation.FormatDowntime(report.Downtime))
+                    .FontSize(10).FontColor(Colors.Grey.Medium);
+            });
+
+            // No weight column: the three dimensions carry 1/1/1, so it printed 33% three times.
+            // The only report where they differ is one with an unscored dimension, and its "No data"
+            // grade already says the other two absorbed its share.
+            column.Item().PaddingTop(12).Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(2f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(1f);
+                });
+
+                HeaderRow(table, "Dimension", "Score", "Grade");
+
+                foreach (var dimension in new[] { report.AccessDimension, report.IspAsnDimension, report.TransitDimension })
+                {
+                    Cell(table, dimension.Name);
+                    Cell(table, ScoreText(dimension.Score), ScoreColor(dimension.Score));
+                    Cell(table, dimension.Score.HasValue ? IspHealthReport.GradeLabel(dimension.Score.Value) : "No data");
+                }
+            });
+        });
+    }
+
+    private void ComposeSpeedVsPlan(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            SectionHeading(column, "Speed vs Plan");
+
+            column.Item().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(1.5f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(2f);
+                });
+
+                HeaderRow(table, "Measure", "Download", "Upload", "Notes");
+
+                Cell(table, "Best measured");
+                Cell(table, $"{IspHealthPresentation.FormatSpeed(report.MeasuredDownloadMbps)} Mbps");
+                Cell(table, $"{IspHealthPresentation.FormatSpeed(report.MeasuredUploadMbps)} Mbps");
+                Cell(table, report.SpeedTestTime.HasValue
+                    ? $"Best result, {report.SpeedTestTime.Value.ToLocalTime():MMM d HH:mm}"
+                    : "No recent WAN speed test");
+
+                Cell(table, "Typical");
+                Cell(table, $"{IspHealthPresentation.FormatSpeed(report.TypicalDownloadMbps)} Mbps");
+                Cell(table, $"{IspHealthPresentation.FormatSpeed(report.TypicalUploadMbps)} Mbps");
+                Cell(table, "Median of the window's WAN tests");
+
+                Cell(table, "Plan");
+                Cell(table, $"{IspHealthPresentation.FormatSpeed(report.ExpectedDownloadMbps)} Mbps");
+                Cell(table, $"{IspHealthPresentation.FormatSpeed(report.ExpectedUploadMbps)} Mbps");
+                Cell(table, report.HasExpectedSpeeds
+                    ? $"(from {report.ExpectedSpeedSource ?? "the console"})"
+                    : "Not set in UniFi Network > Settings > Internet > Expected ISP Speeds");
+            });
+        });
+    }
+
+    private void ComposeFindings(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            SectionHeading(column, "Findings");
+
+            foreach (var issue in report.Issues)
+            {
+                var severityColor = issue.Severity switch
+                {
+                    IspIssueSeverity.Critical => _branding.Colors.Critical,
+                    IspIssueSeverity.Warning => _branding.Colors.Warning,
+                    _ => _branding.Colors.Tertiary
+                };
+
+                column.Item().PaddingBottom(8).BorderLeft(2).BorderColor(severityColor).PaddingLeft(8)
+                    .Column(issueColumn =>
+                    {
+                        issueColumn.Item().Text(text =>
+                        {
+                            text.Span($"{issue.Severity.ToString().ToUpperInvariant()}  ")
+                                .FontSize(8).Bold().FontColor(severityColor);
+                            text.Span(issue.Title).FontSize(10).Bold();
+                        });
+                        issueColumn.Item().PaddingTop(2).Text(issue.Description).FontSize(9);
+                        if (!string.IsNullOrEmpty(issue.Recommendation))
+                        {
+                            issueColumn.Item().PaddingTop(2).Text(issue.Recommendation)
+                                .FontSize(9).FontColor(Colors.Grey.Darken1);
+                        }
+                    });
+            }
+        });
+    }
+
+    private void ComposeScoreBreakdown(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            SectionHeading(column, "Score Breakdown");
+
+            foreach (var dimension in new[] { report.AccessDimension, report.IspAsnDimension, report.TransitDimension })
+            {
+                column.Item().PaddingTop(6).Text(text =>
+                {
+                    text.Span(dimension.Name).FontSize(11).Bold().FontColor(_branding.Colors.Primary);
+                    text.Span($"   {ScoreText(dimension.Score)}").FontSize(11).Bold()
+                        .FontColor(ScoreColor(dimension.Score));
+                });
+
+                // ISP Network carries no factors - BuildIspDimension scores it by averaging the
+                // per-hop grades, so the hops ARE its breakdown, and they sit under its heading
+                // the same way the tab renders them inside its dimension card.
+                if (dimension == report.IspAsnDimension && report.IspTargets.Count > 0)
+                {
+                    column.Item().PaddingTop(4).Element(c => ComposeIspHops(c, report));
+                    continue;
+                }
+
+                if (dimension.Factors.Count == 0)
+                {
+                    // An empty factor list is normal for ISP Network, so only a missing score
+                    // means there was genuinely nothing to grade.
+                    if (dimension.Score == null)
+                    {
+                        column.Item().PaddingTop(2).Text("No data for this dimension in the window.")
+                            .FontSize(9).FontColor(Colors.Grey.Medium);
+                    }
+                    continue;
+                }
+
+                column.Item().PaddingTop(4).Table(table =>
+                {
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.RelativeColumn(1.6f);
+                        columns.RelativeColumn(0.7f);
+                        columns.RelativeColumn(1f);
+                        columns.RelativeColumn(3f);
+                    });
+
+                    HeaderRow(table, "Factor", "Score", "Measured", "What it means");
+
+                    foreach (var factor in dimension.Factors)
+                    {
+                        Cell(table, factor.Name);
+                        Cell(table, ScoreText(factor.Score), ScoreColor(factor.Score));
+                        Cell(table, factor.ValueText ?? "--");
+                        // A transit ASN's involvement weight is the reason its factor score moves
+                        // the dimension as much or as little as it does; without it a 25%-weighted
+                        // 40 reads as a 40 that the average somehow ignored.
+                        Cell(table, Notes(factor.Description, factor.InvolvementTooltip, factor.LowReachScoreCaveat));
+                    }
+                });
+            }
+        });
+    }
+
+    /// <summary>The ISP Network dimension's per-hop breakdown, rendered under its heading in
+    /// Score Breakdown - so no heading of its own, exactly as on the tab.</summary>
+    private void ComposeIspHops(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            var hops = report.IspTargets.OrderBy(t => t.RttMs ?? double.MaxValue).ToList();
+
+            column.Item().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(2.6f);
+                    columns.RelativeColumn(0.7f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(0.9f);
+                    columns.RelativeColumn(1.3f);
+                });
+
+                HeaderRow(table, "Hop", "Score", "RTT", "P90 Jitter", "Loss", "Limiting factor");
+
+                foreach (var target in hops)
+                {
+                    var badges = new[]
+                        {
+                            target.IsGradedHop ? "lowest RTT" : null,
+                            target.NotOnTracedPath ? "not on path" : null
+                        }
+                        .Where(b => b != null);
+                    var suffix = badges.Any() ? $" ({string.Join(", ", badges)})" : "";
+                    // The row is labelled by ASN name ("Provider 1, 2, 5"), which says nothing about
+                    // which router answered - the address is what lines a printed report up against
+                    // the reader's own traceroute (#1070).
+                    CellLines(table, $"{target.Name}{suffix}", target.Address);
+                    Cell(table, ScoreText(target.OverallScore), ScoreColor(target.OverallScore));
+                    Cell(table, IspHealthPresentation.FormatRtt(target.RttMs));
+                    Cell(table, IspHealthPresentation.FormatJitter(target.ScoredJitterMs));
+                    Cell(table, IspHealthPresentation.FormatLossPct(target.LossPct));
+                    Cell(table, LimitingText(target.LatencyStabilityScore, target.CongestionScore,
+                        target.CongestionEventCount));
+                }
+            });
+
+            foreach (var target in hops.Where(t => t.JitterAssimilated))
+            {
+                NoteLine(column, target.Name,
+                    IspHealthPresentation.JitterAssimilationTooltip(target));
+            }
+        });
+    }
+
+    private void ComposeNetworksOnPath(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            SectionHeading(column, "Networks on Your Path");
+
+            var networks = report.IspAsns.Concat(report.TransitAsns).ToList();
+
+            column.Item().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(2.4f);
+                    columns.RelativeColumn(1.1f);
+                    columns.RelativeColumn(0.7f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(0.9f);
+                    columns.RelativeColumn(1.3f);
+                });
+
+                HeaderRow(table, "Network", "Role", "Score", "Mean RTT", "P90 Jitter", "Loss", "Limiting factor");
+
+                foreach (var asn in networks)
+                {
+                    var isIspAsn = report.IspAsns.Contains(asn);
+                    Cell(table, IspHealthPresentation.AsnDisplayName(asn)
+                        + (asn.AsnNumber > 0 ? $" (AS{asn.AsnNumber})" : ""));
+                    Cell(table, IspHealthPresentation.AsnRoleLabel(asn, isIspAsn));
+                    Cell(table, ScoreText(asn.OverallScore), ScoreColor(asn.OverallScore));
+                    Cell(table, IspHealthPresentation.FormatRtt(asn.MeanRttMs));
+                    Cell(table, IspHealthPresentation.FormatJitter(asn.ScoredJitterMs));
+                    Cell(table, IspHealthPresentation.FormatLossPct(asn.LossPct));
+                    Cell(table, LimitingText(asn.LatencyStabilityScore, asn.CongestionScore,
+                        asn.CongestionEventCount));
+                }
+            });
+
+            // Jitter only. Involvement and the low-reach caveat belong to the same networks a page
+            // earlier, on their Transit factor rows, and repeating them here just buried this.
+            foreach (var asn in networks.Where(a => a.JitterAssimilated))
+            {
+                NoteLine(column, IspHealthPresentation.AsnDisplayName(asn),
+                    IspHealthPresentation.JitterAssimilationTooltip(asn, report.IspAsns.Contains(asn)));
+            }
+        });
+    }
+
+    private void ComposeOutages(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            SectionHeading(column, IspHealthPresentation.OutageSectionTitle(report));
+
+            column.Item().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(1.2f);
+                    columns.RelativeColumn(1.6f);
+                    columns.RelativeColumn(0.9f);
+                    columns.RelativeColumn(1.8f);
+                    columns.RelativeColumn(2f);
+                });
+
+                HeaderRow(table, "Type", "When", "Duration", "Scope", "Score impact");
+
+                foreach (var outage in report.Outages)
+                {
+                    Cell(table, IspHealthPresentation.OutageBadgeText(outage));
+                    Cell(table, $"{outage.Start.ToLocalTime():MMM d, HH:mm:ss} - {outage.End.ToLocalTime():HH:mm:ss}");
+                    Cell(table, IspHealthPresentation.FormatDuration(outage.Duration));
+                    Cell(table, IspHealthPresentation.OutageScopeLabel(outage));
+                    Cell(table, IspHealthPresentation.OutageScoreTooltip(outage));
+                }
+            });
+
+            // The per-tier recovery shape is a bar chart on screen; in print it reads better
+            // as one line per outage naming which tiers dropped and when they came back.
+            foreach (var outage in report.Outages.Where(o => o.Tiers.Any(t => t.WentDark)))
+            {
+                var shape = string.Join(", ", outage.Tiers.Select(t =>
+                    $"{t.Name}: {IspHealthPresentation.OutageHopStatus(t)}"));
+                column.Item().PaddingTop(4)
+                    .Text($"{outage.Start.ToLocalTime():MMM d, HH:mm:ss} recovery - {shape}")
+                    .FontSize(8).FontColor(Colors.Grey.Darken1);
+            }
+        });
+    }
+
+    private void ComposeEvents(IContainer container, IspHealthReport report)
+    {
+        container.Column(column =>
+        {
+            SectionHeading(column, "Path & Congestion Events");
+
+            var timeline = IspHealthPresentation.EventTimeline(report).ToList();
+            if (timeline.Count == 0)
+            {
+                column.Item().Text("No congestion events or path shifts detected in the window.")
+                    .FontSize(9).FontColor(Colors.Grey.Medium);
+                return;
+            }
+
+            column.Item().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(1.1f);
+                    columns.RelativeColumn(5f);
+                });
+
+                HeaderRow(table, "Event", "When", "What happened");
+
+                foreach (var entry in timeline)
+                {
+                    Cell(table, entry.Badge);
+                    Cell(table, IspHealthPresentation.EventTimeLabel(entry.Time));
+                    // A grouped line's per-hop readings always print: the document has no
+                    // disclosure to open, and they are what an ISP is being handed this for.
+                    CellLines(table, entry.Text, entry.Members is { Count: > 0 }
+                        ? string.Join("\n", entry.Members)
+                        : null);
+                }
+            });
+        });
+    }
+
+    private void SectionHeading(ColumnDescriptor column, string title) =>
+        column.Item().PaddingBottom(10).Text(title)
+            .FontSize(16).Bold().FontColor(_branding.Colors.Primary);
+
+    private static void LabelledLine(ColumnDescriptor column, string label, string value) =>
+        column.Item().PaddingBottom(2).Text(text =>
+        {
+            text.Span($"{label}: ").FontSize(9).FontColor(Colors.Grey.Medium);
+            text.Span(value).FontSize(9);
+        });
+
+    private void HeaderRow(TableDescriptor table, params string[] headings)
+    {
+        var lightGray = _branding.Colors.LightGray;
+        table.Header(header =>
+        {
+            foreach (var heading in headings)
+                header.Cell().Background(lightGray).Padding(6).Text(heading).Bold().FontSize(9);
+        });
+    }
+
+    private static void Cell(TableDescriptor table, string text, string? fontColor = null)
+    {
+        var cell = table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+            .Text(text).FontSize(9);
+        if (fontColor != null) cell.FontColor(fontColor);
+    }
+
+    /// <summary>A cell with a quieter second line under its main text, dropped when empty.</summary>
+    private static void CellLines(TableDescriptor table, string text, string? sub)
+    {
+        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6).Column(cell =>
+        {
+            cell.Item().Text(text).FontSize(9);
+            if (!string.IsNullOrWhiteSpace(sub))
+                cell.Item().Text(sub).FontSize(8).FontColor(Colors.Grey.Darken1);
+        });
+    }
+
+    /// <summary>A footnote under a table, naming the row it belongs to.</summary>
+    private static void NoteLine(ColumnDescriptor column, string subject, string note) =>
+        column.Item().PaddingTop(4).Text($"{subject} - {note}").FontSize(8).FontColor(Colors.Grey.Darken1);
+
+    /// <summary>The fragments a row can carry, run together as sentences; empty when it has none.</summary>
+    private static string Notes(params string?[] parts) =>
+        string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p!.TrimEnd('.') + "."));
+
+    /// <summary>
+    /// Whichever of stability and congestion is costing this row more, as the tab picks it.
+    /// Both exist only as scores, so a row can otherwise show four healthy numbers beside a
+    /// grade that does not follow from any of them.
+    /// </summary>
+    private string LimitingText(int? stabilityScore, int? congestionScore, int congestionEvents)
+    {
+        var limit = IspHealthPresentation.LimitingAspect(stabilityScore, congestionScore, congestionEvents,
+            _options.AsnLatencyStabilityWeight, _options.AsnCongestionWeight);
+        return limit is null ? "--" : $"{limit.Value.Label}: {limit.Value.Value}";
+    }
+
+    private static string ScoreText(int? score) => score?.ToString() ?? "--";
+
+    /// <summary>
+    /// Print colours for a score, on the same 90/75/60 thresholds the tab's gauges use so a
+    /// printed score reads the same as the one on screen.
+    /// </summary>
+    private string ScoreColor(int? score) => score switch
+    {
+        null => Colors.Grey.Medium,
+        >= 90 => _branding.Colors.Success,
+        >= 75 => _branding.Colors.Success,
+        >= 60 => _branding.Colors.Warning,
+        _ => _branding.Colors.Critical
+    };
+}

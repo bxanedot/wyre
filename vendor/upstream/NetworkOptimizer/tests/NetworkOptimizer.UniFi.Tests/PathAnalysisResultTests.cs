@@ -1,0 +1,940 @@
+using FluentAssertions;
+using NetworkOptimizer.UniFi.Models;
+using Xunit;
+
+namespace NetworkOptimizer.UniFi.Tests;
+
+public class PathAnalysisResultTests
+{
+    #region Default Values Tests
+
+    [Fact]
+    public void PathAnalysisResult_DefaultValues_AreCorrect()
+    {
+        // Act
+        var result = new PathAnalysisResult();
+
+        // Assert
+        result.Path.Should().NotBeNull();
+        result.MeasuredFromDeviceMbps.Should().Be(0);
+        result.MeasuredToDeviceMbps.Should().Be(0);
+        result.FromDeviceRetransmits.Should().Be(0);
+        result.ToDeviceRetransmits.Should().Be(0);
+        result.FromDeviceBytes.Should().Be(0);
+        result.ToDeviceBytes.Should().Be(0);
+        result.FromDeviceEfficiencyPercent.Should().Be(0);
+        result.ToDeviceEfficiencyPercent.Should().Be(0);
+        result.FromDeviceGrade.Should().Be(PerformanceGrade.Excellent);  // Default enum value
+        result.ToDeviceGrade.Should().Be(PerformanceGrade.Excellent);
+        result.Insights.Should().NotBeNull().And.BeEmpty();
+        result.Recommendations.Should().NotBeNull().And.BeEmpty();
+    }
+
+    #endregion
+
+    #region CalculateEfficiency Tests
+
+    [Fact]
+    public void CalculateEfficiency_ZeroRealisticMax_DoesNotCalculate()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath { RealisticMaxMbps = 0 },
+            MeasuredFromDeviceMbps = 500,
+            MeasuredToDeviceMbps = 500
+        };
+
+        // Act
+        result.CalculateEfficiency();
+
+        // Assert - Should remain at defaults
+        result.FromDeviceEfficiencyPercent.Should().Be(0);
+        result.ToDeviceEfficiencyPercent.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData(940, 1000, 94)]   // 94% efficiency
+    [InlineData(500, 1000, 50)]   // 50% efficiency
+    [InlineData(250, 1000, 25)]   // 25% efficiency
+    [InlineData(100, 1000, 10)]   // 10% efficiency
+    public void CalculateEfficiency_CalculatesCorrectPercentage(double measured, int maxMbps, double expectedPercent)
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath { RealisticMaxMbps = maxMbps },
+            MeasuredFromDeviceMbps = measured,
+            MeasuredToDeviceMbps = measured
+        };
+
+        // Act
+        result.CalculateEfficiency();
+
+        // Assert
+        result.FromDeviceEfficiencyPercent.Should().BeApproximately(expectedPercent, 0.1);
+        result.ToDeviceEfficiencyPercent.Should().BeApproximately(expectedPercent, 0.1);
+    }
+
+    [Theory]
+    [InlineData(95, PerformanceGrade.Excellent)]
+    [InlineData(90, PerformanceGrade.Excellent)]
+    [InlineData(89, PerformanceGrade.Good)]
+    [InlineData(75, PerformanceGrade.Good)]
+    [InlineData(74, PerformanceGrade.Fair)]
+    [InlineData(50, PerformanceGrade.Fair)]
+    [InlineData(49, PerformanceGrade.Poor)]
+    [InlineData(25, PerformanceGrade.Poor)]
+    [InlineData(24, PerformanceGrade.Critical)]
+    [InlineData(10, PerformanceGrade.Critical)]
+    [InlineData(0, PerformanceGrade.Critical)]
+    public void CalculateEfficiency_AssignsCorrectGrade(double efficiencyPercent, PerformanceGrade expectedGrade)
+    {
+        // Arrange - Calculate measured speed to get desired efficiency
+        var maxMbps = 1000;
+        var measured = efficiencyPercent * maxMbps / 100.0;
+
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath { RealisticMaxMbps = maxMbps },
+            MeasuredFromDeviceMbps = measured,
+            MeasuredToDeviceMbps = measured
+        };
+
+        // Act
+        result.CalculateEfficiency();
+
+        // Assert
+        result.FromDeviceGrade.Should().Be(expectedGrade);
+        result.ToDeviceGrade.Should().Be(expectedGrade);
+    }
+
+    [Fact]
+    public void CalculateEfficiency_AsymmetricSpeeds_CalculatesBothCorrectly()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath { RealisticMaxMbps = 1000 },
+            MeasuredFromDeviceMbps = 900,  // 90% - Excellent
+            MeasuredToDeviceMbps = 500     // 50% - Fair
+        };
+
+        // Act
+        result.CalculateEfficiency();
+
+        // Assert
+        result.FromDeviceEfficiencyPercent.Should().Be(90);
+        result.FromDeviceGrade.Should().Be(PerformanceGrade.Excellent);
+        result.ToDeviceEfficiencyPercent.Should().Be(50);
+        result.ToDeviceGrade.Should().Be(PerformanceGrade.Fair);
+    }
+
+    #endregion
+
+    #region GenerateInsights Tests - Gateway Tests
+
+    [Fact]
+    public void GenerateInsights_GatewayTest_SkipsPerformanceWarnings()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TargetIsGateway = true,
+                RealisticMaxMbps = 1000
+            },
+            MeasuredFromDeviceMbps = 100,  // Would be Critical grade
+            MeasuredToDeviceMbps = 100
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Insights.Should().ContainSingle()
+            .Which.Should().Contain("Gateway speed test");
+        result.Recommendations.Should().BeEmpty();
+    }
+
+    #endregion
+
+    #region GenerateInsights Tests - AP Tests
+
+    [Fact]
+    public void GenerateInsights_ApTestPerformingWell_NotesLimitedByCpu()
+    {
+        // Arrange - AP on 10G link, measuring 4500 Mbps (below 75% of 10G = CPU-bound)
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TargetIsAccessPoint = true,
+                TheoreticalMaxMbps = 10000,
+                RealisticMaxMbps = 9400
+            },
+            MeasuredFromDeviceMbps = 4500,
+            MeasuredToDeviceMbps = 4500
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Insights.Should().ContainSingle()
+            .Which.Should().Contain("AP speed test - results limited by AP CPU");
+    }
+
+    [Fact]
+    public void GenerateInsights_ApTestBelowThreshold_GeneratesNormalInsights()
+    {
+        // Arrange - AP test below 4400 Mbps threshold
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TargetIsAccessPoint = true,
+                RealisticMaxMbps = 10000
+            },
+            MeasuredFromDeviceMbps = 3000,  // Below AP threshold
+            MeasuredToDeviceMbps = 3000
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Insights.Should().Contain(i => i.Contains("Performance below expected"));
+    }
+
+    #endregion
+
+    #region GenerateInsights Tests - Wireless Connection
+
+    [Fact]
+    public void GenerateInsights_WirelessConnection_NotesVariableSpeed()
+    {
+        // Arrange - Wireless client with IsWirelessEgress flag set
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                RealisticMaxMbps = 1000,
+                Hops = new List<NetworkHop>
+                {
+                    new() { Type = HopType.WirelessClient, IsWirelessEgress = true },
+                    new() { Type = HopType.AccessPoint, IsWirelessIngress = true }
+                }
+            },
+            MeasuredFromDeviceMbps = 900,
+            MeasuredToDeviceMbps = 900
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Insights.Should().Contain(i => i.Contains("wireless segment"));
+    }
+
+    #endregion
+
+    #region GenerateInsights Tests - Performance Issues
+
+    [Fact]
+    public void GenerateInsights_PoorPerformance_AddsCongestionWarning()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath { RealisticMaxMbps = 1000 },
+            MeasuredFromDeviceMbps = 200,  // 20% - Poor
+            MeasuredToDeviceMbps = 200
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Insights.Should().Contain(i => i.Contains("Performance below expected"));
+    }
+
+    [Fact]
+    public void GenerateInsights_FairPerformance_NotesModeratePerformance()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath { RealisticMaxMbps = 1000 },
+            MeasuredFromDeviceMbps = 600,  // 60% - Fair
+            MeasuredToDeviceMbps = 600
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Insights.Should().Contain(i => i.Contains("Performance is moderate"));
+    }
+
+    [Fact]
+    public void GenerateInsights_LargeAsymmetry_RecommendsDuplexCheck()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath { RealisticMaxMbps = 1000 },
+            MeasuredFromDeviceMbps = 200,  // 20% - Poor
+            MeasuredToDeviceMbps = 500     // 50% - Fair, >20% difference
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Recommendations.Should().Contain(r => r.Contains("asymmetry"));
+    }
+
+    #endregion
+
+    #region GenerateInsights Tests - Link Speed Recommendations
+
+    [Fact]
+    public void GenerateInsights_100MbpsLink_RecommendsUpgrade()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TheoreticalMaxMbps = 100,
+                RealisticMaxMbps = 94
+            },
+            MeasuredFromDeviceMbps = 90,
+            MeasuredToDeviceMbps = 90
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Recommendations.Should().Contain(r => r.Contains("10/100 Mbps link detected"));
+    }
+
+    [Fact]
+    public void GenerateInsights_WirelessWith100MbpsTheo_DoesNotRecommendUpgrade()
+    {
+        // Arrange - Wireless paths shouldn't trigger 10/100M wired cable warning
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TheoreticalMaxMbps = 100,
+                RealisticMaxMbps = 94,
+                Hops = new List<NetworkHop>
+                {
+                    new() { Type = HopType.WirelessClient, IsWirelessEgress = true },
+                    new() { Type = HopType.AccessPoint, IsWirelessIngress = true }
+                }
+            },
+            MeasuredFromDeviceMbps = 90,
+            MeasuredToDeviceMbps = 90
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Recommendations.Should().NotContain(r => r.Contains("10/100 Mbps link detected"));
+    }
+
+    [Fact]
+    public void GenerateInsights_MaxingOutGigabit_Recommends25GUpgrade()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TheoreticalMaxMbps = 1000,
+                RealisticMaxMbps = 940
+            },
+            MeasuredFromDeviceMbps = 900,  // 95% efficiency
+            MeasuredToDeviceMbps = 900
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Recommendations.Should().Contain(r => r.Contains("Maxing out 1 GbE"));
+    }
+
+    #endregion
+
+    #region GenerateInsights Tests - Retransmits
+
+    [Fact]
+    public void GenerateInsights_NoRetransmits_NoRetransmitInsights()
+    {
+        // Arrange
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath { RealisticMaxMbps = 1000 },
+            MeasuredFromDeviceMbps = 900,
+            MeasuredToDeviceMbps = 900,
+            FromDeviceBytes = 1_000_000_000,
+            ToDeviceBytes = 1_000_000_000,
+            FromDeviceRetransmits = 0,
+            ToDeviceRetransmits = 0
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Insights.Should().NotContain(i => i.Contains("retransmit"));
+        result.Insights.Should().NotContain(i => i.Contains("packet loss"));
+    }
+
+    [Fact]
+    public void GenerateInsights_ElevatedRetransmits_WirelessClient_RecommendsSignalCheck()
+    {
+        // Arrange - Wireless client with retransmits (IsWirelessEgress flag indicates Wi-Fi)
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                RealisticMaxMbps = 1000,
+                Hops = new List<NetworkHop>
+                {
+                    new() { Type = HopType.WirelessClient, IsWirelessEgress = true },
+                    new() { Type = HopType.AccessPoint, IsWirelessIngress = true }
+                }
+            },
+            MeasuredFromDeviceMbps = 900,
+            MeasuredToDeviceMbps = 900,
+            FromDeviceBytes = 100_000_000,  // ~66,666 packets
+            ToDeviceBytes = 100_000_000,
+            FromDeviceRetransmits = 500,    // ~0.75% - elevated
+            ToDeviceRetransmits = 500
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Recommendations.Should().Contain(r =>
+            r.Contains("Wi-Fi") && r.Contains("signal strength"));
+    }
+
+    [Fact]
+    public void GenerateInsights_ElevatedRetransmits_MeshedAp_RecommendsBackhaulCheck()
+    {
+        // Arrange - AP with wireless mesh backhaul (IsWirelessEgress indicates mesh link)
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                RealisticMaxMbps = 1000,
+                TargetIsAccessPoint = true,
+                Hops = new List<NetworkHop>
+                {
+                    new() { Type = HopType.AccessPoint, IsWirelessEgress = true },  // Target AP with mesh uplink
+                    new() { Type = HopType.AccessPoint, IsWirelessIngress = true }  // Parent AP
+                }
+            },
+            MeasuredFromDeviceMbps = 400,  // Lower due to mesh
+            MeasuredToDeviceMbps = 400,
+            FromDeviceBytes = 50_000_000,
+            ToDeviceBytes = 50_000_000,
+            FromDeviceRetransmits = 500,
+            ToDeviceRetransmits = 500
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Recommendations.Should().Contain(r =>
+            r.Contains("wireless mesh") || r.Contains("mesh backhaul"));
+    }
+
+    [Fact]
+    public void GenerateInsights_UniFiDevice_HigherRetransmitThreshold()
+    {
+        // Arrange - UniFi AP should use higher thresholds
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                RealisticMaxMbps = 1000,
+                TargetIsAccessPoint = true
+            },
+            MeasuredFromDeviceMbps = 900,
+            MeasuredToDeviceMbps = 900,
+            FromDeviceBytes = 100_000_000,  // ~66,666 packets
+            ToDeviceBytes = 100_000_000,
+            FromDeviceRetransmits = 400,    // ~0.6% - would be elevated for regular client, but OK for AP
+            ToDeviceRetransmits = 400
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert - Should NOT trigger elevated warning for UniFi device at 0.6%
+        result.Insights.Should().NotContain(i => i.Contains("Elevated packet loss"));
+    }
+
+    [Fact]
+    public void GenerateInsights_BidirectionalRetransmits_WiredPath_RecommendsCableCheck()
+    {
+        // Arrange - Wired path with bidirectional retransmits
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                RealisticMaxMbps = 1000,
+                Hops = new List<NetworkHop>
+                {
+                    new() { Type = HopType.Switch },
+                    new() { Type = HopType.Switch }
+                }
+            },
+            MeasuredFromDeviceMbps = 500,
+            MeasuredToDeviceMbps = 500,
+            FromDeviceBytes = 50_000_000,
+            ToDeviceBytes = 50_000_000,
+            FromDeviceRetransmits = 500,   // ~1.5%
+            ToDeviceRetransmits = 500
+        };
+        result.CalculateEfficiency();
+
+        // Act
+        result.GenerateInsights();
+
+        // Assert
+        result.Recommendations.Should().Contain(r =>
+            r.Contains("Bidirectional") && r.Contains("faulty cables"));
+    }
+
+    #endregion
+
+    #region Directional efficiency - wired bottleneck under a faster wireless link
+
+    // A mesh AP whose MLO backhaul (6.5 / 7.2 Gbps) outruns its parent's 2.5 GbE uplink. The
+    // path's bottleneck is the wire, so the grade must be measured against 2.5 Gbps at wired
+    // overhead, not against the backhaul at mesh overhead.
+    private static PathAnalysisResult MeshApBehindSlowerWire() => new()
+    {
+        Path = new NetworkPath
+        {
+            TargetIsAccessPoint = true,
+            HasRealBottleneck = true,
+            TheoreticalMaxMbps = 2500,
+            RealisticMaxMbps = 2390,
+            Hops =
+            [
+                new()
+                {
+                    Type = HopType.AccessPoint,
+                    IngressPortName = "wireless mesh", IngressSpeedMbps = 6533, IsWirelessIngress = true,
+                    EgressPortName = "wireless mesh", EgressSpeedMbps = 6533, IsWirelessEgress = true,
+                    WirelessTxRateMbps = 6533, WirelessRxRateMbps = 7206,
+                },
+                // The parent carries the mesh rate on its port-less ingress; only its port 3 is a wire.
+                new() { Type = HopType.AccessPoint, IngressPort = 0, IngressPortName = "Port 0", IngressSpeedMbps = 6533, EgressPort = 3, EgressSpeedMbps = 2500, IsBottleneck = true },
+                new() { Type = HopType.Switch, IngressPort = 3, IngressSpeedMbps = 2500, EgressPort = 10, EgressSpeedMbps = 10000 },
+            ],
+        },
+        MeasuredFromDeviceMbps = 1262,
+        MeasuredToDeviceMbps = 1247,
+    };
+
+    [Fact]
+    public void GetDirectionalEfficiency_WireSlowerThanBothWirelessDirections_GradesAgainstTheWire()
+    {
+        var result = MeshApBehindSlowerWire();
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        var (fromMax, toMax, fromEff, toEff, fromOverhead, toOverhead) = result.GetDirectionalEfficiency(rxKbps, txKbps);
+
+        fromMax.Should().Be(2500);
+        toMax.Should().Be(2500);
+        fromOverhead.Should().Be(6, "a wired bottleneck carries wired overhead");
+        toOverhead.Should().Be(6);
+        fromEff.Should().BeApproximately(1262 / (2500 * 0.94) * 100, 0.01);
+        toEff.Should().BeApproximately(1247 / (2500 * 0.94) * 100, 0.01);
+    }
+
+    [Fact]
+    public void GetDirectionalEfficiency_MeshOverheadStillBindsWhenItLeavesLessThanTheWire()
+    {
+        // Mesh at 4000 / 5000 Mbps PHY over a 2.5 GbE port. The wire is the slowest link, but
+        // 4000 x 0.55 = 2200 is under the wire's 2350, so the from-device direction stays mesh-
+        // bound at mesh overhead while the to-device direction (5000 x 0.55 = 2750) is wire-bound.
+        var result = MeshApBehindSlowerWire();
+        result.Path.Hops[0].WirelessTxRateMbps = 4000;
+        result.Path.Hops[0].WirelessRxRateMbps = 5000;
+        result.Path.Hops[0].IngressSpeedMbps = 4000;
+        result.Path.Hops[0].EgressSpeedMbps = 4000;
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        var (fromMax, toMax, _, _, fromOverhead, toOverhead) = result.GetDirectionalEfficiency(rxKbps, txKbps);
+
+        fromMax.Should().Be(4000);
+        fromOverhead.Should().Be(45);
+        toMax.Should().Be(2500);
+        toOverhead.Should().Be(6);
+    }
+
+    [Fact]
+    public void GetOverheadFactor_MeshApBehindSlowerWire_IsWired()
+    {
+        MeshApBehindSlowerWire().GetOverheadFactor().Should().Be(PathAnalysisResult.WiredOverheadFactor);
+    }
+
+    [Fact]
+    public void GetDirectionalEfficiency_WirelessLinkIsTheBottleneck_KeepsItsOwnDirections()
+    {
+        // A phone's Wi-Fi link (2401 / 2161) on an AP with a faster uplink: the path max is
+        // one of the two directions, so each direction keeps its own rate at Wi-Fi overhead.
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                HasRealBottleneck = true,
+                TheoreticalMaxMbps = 2161,
+                Hops =
+                [
+                    new() { Type = HopType.WirelessClient, IngressSpeedMbps = 2161, EgressSpeedMbps = 2401, IsWirelessIngress = true, IsBottleneck = true },
+                    new() { Type = HopType.AccessPoint, IngressSpeedMbps = 10000, EgressSpeedMbps = 10000 },
+                ],
+            },
+            MeasuredFromDeviceMbps = 1147,
+            MeasuredToDeviceMbps = 1190,
+        };
+
+        var (fromMax, toMax, _, _, fromOverhead, toOverhead) = result.GetDirectionalEfficiency(2401_000, 2161_000);
+
+        fromMax.Should().Be(2401);
+        toMax.Should().Be(2161);
+        fromOverhead.Should().Be(25);
+        toOverhead.Should().Be(25);
+    }
+
+    [Fact]
+    public void GetOverheadFactor_MeshApWhoseMeshIsTheBottleneck_IsMesh()
+    {
+        var result = MeshApBehindSlowerWire();
+        result.Path.TheoreticalMaxMbps = 1200;
+        result.Path.Hops[0].IngressSpeedMbps = 1200;
+        result.Path.Hops[0].EgressSpeedMbps = 1200;
+
+        result.GetOverheadFactor().Should().Be(PathAnalysisResult.MeshBackhaulOverheadFactor);
+    }
+
+    #endregion
+
+    #region PerformanceGrade Enum Tests
+
+    [Fact]
+    public void PerformanceGrade_AllValuesAreDefined()
+    {
+        // Assert
+        var values = Enum.GetValues<PerformanceGrade>();
+        values.Should().Contain(PerformanceGrade.Excellent);
+        values.Should().Contain(PerformanceGrade.Good);
+        values.Should().Contain(PerformanceGrade.Fair);
+        values.Should().Contain(PerformanceGrade.Poor);
+        values.Should().Contain(PerformanceGrade.Critical);
+    }
+
+    [Fact]
+    public void PerformanceGrade_OrderIsCorrect()
+    {
+        // Assert - Lower enum value = better grade
+        ((int)PerformanceGrade.Excellent).Should().BeLessThan((int)PerformanceGrade.Good);
+        ((int)PerformanceGrade.Good).Should().BeLessThan((int)PerformanceGrade.Fair);
+        ((int)PerformanceGrade.Fair).Should().BeLessThan((int)PerformanceGrade.Poor);
+        ((int)PerformanceGrade.Poor).Should().BeLessThan((int)PerformanceGrade.Critical);
+    }
+
+    #endregion
+
+    #region GetDirectionalRatesFromPath Tests
+
+    [Fact]
+    public void GetDirectionalRatesFromPath_MeshAp_FlipsChildPerspectiveToParent()
+    {
+        // Arrange - Mesh AP with asymmetric TX/RX rates
+        // Child TX = 800 Mbps (child sends to parent)
+        // Child RX = 600 Mbps (child receives from parent)
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TargetIsAccessPoint = true,
+                Hops = new List<NetworkHop>
+                {
+                    new()
+                    {
+                        Type = HopType.AccessPoint,
+                        WirelessTxRateMbps = 800,  // Child's TX
+                        WirelessRxRateMbps = 600,  // Child's RX
+                        IsWirelessEgress = true
+                    },
+                    new() { Type = HopType.AccessPoint, IsWirelessIngress = true }
+                }
+            }
+        };
+
+        // Act
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        // Assert - Should flip: FromDevice uses child TX, ToDevice uses child RX
+        // rxKbps = FromDevice limit = child TX = 800 Mbps
+        // txKbps = ToDevice limit = child RX = 600 Mbps
+        rxKbps.Should().Be(800_000, "FromDevice should use child's TX rate (child sends to parent)");
+        txKbps.Should().Be(600_000, "ToDevice should use child's RX rate (child receives from parent)");
+    }
+
+    [Fact]
+    public void GetDirectionalRatesFromPath_MeshAp_SymmetricRates_StillWorks()
+    {
+        // Arrange - Mesh AP with symmetric rates
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TargetIsAccessPoint = true,
+                Hops = new List<NetworkHop>
+                {
+                    new()
+                    {
+                        Type = HopType.AccessPoint,
+                        WirelessTxRateMbps = 1200,
+                        WirelessRxRateMbps = 1200,
+                        IsWirelessEgress = true
+                    },
+                    new() { Type = HopType.AccessPoint, IsWirelessIngress = true }
+                }
+            }
+        };
+
+        // Act
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        // Assert
+        rxKbps.Should().Be(1_200_000);
+        txKbps.Should().Be(1_200_000);
+    }
+
+    [Fact]
+    public void GetDirectionalRatesFromPath_WiredAp_ReturnsNull()
+    {
+        // Arrange - Wired AP (no wireless connection)
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TargetIsAccessPoint = true,
+                Hops = new List<NetworkHop>
+                {
+                    new() { Type = HopType.AccessPoint },
+                    new() { Type = HopType.Switch }
+                }
+            }
+        };
+
+        // Act
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        // Assert - No wireless connection, should return null
+        rxKbps.Should().BeNull();
+        txKbps.Should().BeNull();
+    }
+
+    [Fact]
+    public void GetDirectionalRatesFromPath_WanPath_UsesIngressEgressSpeeds()
+    {
+        // Arrange - External WAN path with asymmetric speeds
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                IsExternalPath = true,
+                Hops = new List<NetworkHop>
+                {
+                    new()
+                    {
+                        Type = HopType.Wan,
+                        IngressSpeedMbps = 500,   // Download (FromDevice)
+                        EgressSpeedMbps = 50      // Upload (ToDevice)
+                    },
+                    new() { Type = HopType.Gateway }
+                }
+            }
+        };
+
+        // Act
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        // Assert - Ingress = FromDevice, Egress = ToDevice
+        rxKbps.Should().Be(500_000, "FromDevice should use WAN download (ingress)");
+        txKbps.Should().Be(50_000, "ToDevice should use WAN upload (egress)");
+    }
+
+    [Fact]
+    public void GetDirectionalRatesFromPath_TailscalePath_UsesWanSpeeds()
+    {
+        // Arrange - Tailscale VPN path
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                IsExternalPath = true,
+                Hops = new List<NetworkHop>
+                {
+                    new()
+                    {
+                        Type = HopType.Tailscale,
+                        IngressSpeedMbps = 1000,
+                        EgressSpeedMbps = 100
+                    },
+                    new() { Type = HopType.Gateway }
+                }
+            }
+        };
+
+        // Act
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        // Assert
+        rxKbps.Should().Be(1_000_000);
+        txKbps.Should().Be(100_000);
+    }
+
+    [Fact]
+    public void GetDirectionalRatesFromPath_SymmetricWan_ReturnsNull()
+    {
+        // Arrange - WAN with symmetric speeds (no need for directional)
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                IsExternalPath = true,
+                Hops = new List<NetworkHop>
+                {
+                    new()
+                    {
+                        Type = HopType.Wan,
+                        IngressSpeedMbps = 1000,
+                        EgressSpeedMbps = 1000  // Same as ingress
+                    },
+                    new() { Type = HopType.Gateway }
+                }
+            }
+        };
+
+        // Act
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        // Assert - Symmetric speeds return null (use standard calculation)
+        rxKbps.Should().BeNull();
+        txKbps.Should().BeNull();
+    }
+
+    [Fact]
+    public void GetDirectionalRatesFromPath_WirelessClient_ReturnsNull()
+    {
+        // Arrange - Regular wireless client (not mesh AP)
+        var result = new PathAnalysisResult
+        {
+            Path = new NetworkPath
+            {
+                TargetIsAccessPoint = false,
+                Hops = new List<NetworkHop>
+                {
+                    new() { Type = HopType.WirelessClient, IsWirelessEgress = true },
+                    new() { Type = HopType.AccessPoint, IsWirelessIngress = true }
+                }
+            }
+        };
+
+        // Act
+        var (rxKbps, txKbps) = result.GetDirectionalRatesFromPath();
+
+        // Assert - Wireless clients use hop speeds directly, not this method
+        rxKbps.Should().BeNull();
+        txKbps.Should().BeNull();
+    }
+
+    #endregion
+
+    #region IsAsymmetric Tests
+
+    [Theory]
+    [InlineData(1000_000, 1000_000, false)]  // Equal
+    [InlineData(1000_000, 950_000, false)]   // 5% difference
+    [InlineData(1000_000, 910_000, false)]   // 9% difference - exactly at threshold (not >9%)
+    [InlineData(1000_000, 909_000, true)]    // 9.1% difference - just over threshold
+    [InlineData(1000_000, 900_000, true)]    // 10% difference
+    [InlineData(1000_000, 800_000, true)]    // 20% difference
+    [InlineData(1200_000, 600_000, true)]    // 50% difference
+    public void IsAsymmetric_VariousDifferences_ReturnsCorrectly(long rx, long tx, bool expected)
+    {
+        // Act
+        var result = PathAnalysisResult.IsAsymmetric(rx, tx);
+
+        // Assert
+        result.Should().Be(expected);
+    }
+
+    [Fact]
+    public void IsAsymmetric_NullRx_ReturnsFalse()
+    {
+        PathAnalysisResult.IsAsymmetric(null, 1000_000).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsAsymmetric_NullTx_ReturnsFalse()
+    {
+        PathAnalysisResult.IsAsymmetric(1000_000, null).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsAsymmetric_BothNull_ReturnsFalse()
+    {
+        PathAnalysisResult.IsAsymmetric(null, null).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsAsymmetric_ZeroRx_ReturnsFalse()
+    {
+        PathAnalysisResult.IsAsymmetric(0, 1000_000).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsAsymmetric_ZeroTx_ReturnsFalse()
+    {
+        PathAnalysisResult.IsAsymmetric(1000_000, 0).Should().BeFalse();
+    }
+
+    #endregion
+}

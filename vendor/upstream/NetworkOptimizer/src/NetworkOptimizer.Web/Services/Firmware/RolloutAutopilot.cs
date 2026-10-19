@@ -1,0 +1,512 @@
+using System.Text.Json;
+using NetworkOptimizer.Alerts.Events;
+using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Storage.Models;
+
+namespace NetworkOptimizer.Web.Services.Firmware;
+
+/// <summary>Autopilot's plan-building pass, driven by the site's executor tick.</summary>
+public interface IRolloutAutopilot
+{
+    /// <summary>
+    /// Builds and announces the next unattended rollout when the site is due one. Does nothing at
+    /// all unless the site is on autopilot, nothing is already in flight, and there is something
+    /// new to install.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The new plan's id, or null when nothing was created.</returns>
+    Task<int?> CreatePlanIfDueAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// The admin just saved or re-enabled autopilot: check on the next tick rather than at the
+    /// hour, and stop treating the last stopped unattended plan as a standing refusal.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    Task ReconsiderAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Why the last pass planned nothing, in the user's words, or null when it planned, is not
+    /// on autopilot, or has not run yet. The page shows this in place of "nothing is scheduled".
+    /// </summary>
+    string? HoldReason { get; }
+}
+
+/// <summary>
+/// One site's autopilot: hourly, it re-checks the console for updates, plans the same way the
+/// wizard does, and books the result into the next quiet window far enough out for the heads-up
+/// alert to be worth anything.
+/// <para>
+/// Two rules keep it from nagging. Nothing is ever planned while a plan is in flight, so a
+/// postponed run is not instantly replaced by a new one. And after an autopilot run is aborted, the
+/// same set of target versions is never proposed again - the site said no to it - so autopilot
+/// waits for genuinely new firmware before asking a second time.
+/// </para>
+/// </summary>
+public class RolloutAutopilot : IRolloutAutopilot
+{
+    /// <summary>Plan author for unattended runs, and the marker the abort gate looks for.</summary>
+    public const string Actor = "autopilot";
+
+    /// <summary>How often the site is considered for a new plan.</summary>
+    public static readonly TimeSpan CheckInterval = TimeSpan.FromHours(1);
+
+    private readonly IFirmwareRolloutRepositoryAccessor _repositories;
+    private readonly IRolloutPlanningScope _planning;
+    private readonly IFirmwareCommandClient _commands;
+    private readonly IReleaseMetadataSource _releases;
+    private readonly IAlertEventBus _eventBus;
+    private readonly TimeProvider _time;
+    private readonly ILogger<RolloutAutopilot> _logger;
+    private readonly Auditing.IAuditLogger? _audit;
+    private readonly NetworkOptimizer.Storage.Interfaces.ISharedFirmwareCatalogRepository _sharedCatalog;
+    private readonly UbiquitiReleaseFeedClient _feed;
+    private readonly string _siteSlug;
+    private readonly string _siteSuffix;
+
+    private DateTime _lastCheckedAt = DateTime.MinValue;
+
+    /// <summary>A save plans on the spot while the tick may be planning too; one at a time.</summary>
+    private readonly SemaphoreSlim _planLock = new(1, 1);
+
+    /// <inheritdoc />
+    public string? HoldReason { get; private set; }
+
+    /// <param name="repositories">Site-pinned rollout repository access.</param>
+    /// <param name="planning">Site-pinned planning source access.</param>
+    /// <param name="commands">Firmware command surface.</param>
+    /// <param name="releases">Publish dates for the ripeness gate.</param>
+    /// <param name="eventBus">Site-stamped alert bus.</param>
+    /// <param name="time">Clock.</param>
+    /// <param name="logger">Logger.</param>
+    /// <param name="sharedCatalog">The install-wide firmware build store (main database).</param>
+    /// <param name="feed">Ubiquiti public release feed for GA fallback.</param>
+    /// <param name="siteSlug">Site this instance plans for.</param>
+    public RolloutAutopilot(
+        IFirmwareRolloutRepositoryAccessor repositories,
+        IRolloutPlanningScope planning,
+        IFirmwareCommandClient commands,
+        IReleaseMetadataSource releases,
+        IAlertEventBus eventBus,
+        TimeProvider time,
+        ILogger<RolloutAutopilot> logger,
+        NetworkOptimizer.Storage.Interfaces.ISharedFirmwareCatalogRepository sharedCatalog,
+        UbiquitiReleaseFeedClient feed,
+        string siteSlug = SiteManagementService.DefaultSiteSlug,
+        Auditing.IAuditLogger? audit = null)
+    {
+        _audit = audit;
+        _repositories = repositories;
+        _planning = planning;
+        _commands = commands;
+        _releases = releases;
+        _eventBus = eventBus;
+        _time = time;
+        _logger = logger;
+        _sharedCatalog = sharedCatalog;
+        _feed = feed;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _siteSuffix = _siteSlug == SiteManagementService.DefaultSiteSlug ? "" : $" (site {_siteSlug})";
+    }
+
+    private DateTime Now => _time.GetUtcNow().UtcDateTime;
+
+    /// <summary>Forgets the hourly stamp and the refusal left by the last stopped unattended plan.</summary>
+    private async Task ClearRefusalAsync(CancellationToken cancellationToken)
+    {
+        _lastCheckedAt = DateTime.MinValue;
+
+        // Saving autopilot after stopping its plan is consent to be asked again, and it has to
+        // outlive a restart: the aborted plan stays the newest in history, so the mark goes on it.
+        var history = await _repositories.UseAsync((r, c) => r.GetPlanHistoryAsync(1, c), cancellationToken);
+        var last = history.FirstOrDefault();
+        if (last is not { Status: FirmwareRolloutStatus.Aborted } ||
+            !string.Equals(last.CreatedBy, Actor, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var document = ParseDocument(last);
+        if (document.RefusalCleared) return;
+        document.RefusalCleared = true;
+        last.PlanJson = JsonSerializer.Serialize(document);
+        await _repositories.UseAsync((r, c) => r.UpdatePlanAsync(last, c), cancellationToken);
+        _logger.LogInformation(
+            "Autopilot on site {Site} will propose again: its settings were saved after rollout {Id} was stopped",
+            _siteSlug, last.Id);
+    }
+
+    /// <inheritdoc />
+    public async Task ReconsiderAsync(CancellationToken cancellationToken = default)
+    {
+        await ClearRefusalAsync(cancellationToken);
+
+        // Plan now rather than on the next tick: the wizard reloads the page as soon as the save
+        // returns, and a plan that lands 30 seconds later reads as "nothing is scheduled". A failed
+        // gather is not the save failing - the tick retries it.
+        try
+        {
+            await CreatePlanIfDueAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Autopilot could not plan right after its settings were saved on site {Site}", _siteSlug);
+            HoldReason = $"Planning failed: {ex.Message} Autopilot checks again every hour.";
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<int?> CreatePlanIfDueAsync(CancellationToken cancellationToken = default)
+    {
+        await _planLock.WaitAsync(cancellationToken);
+        try
+        {
+            return await CreatePlanIfDueCoreAsync(cancellationToken);
+        }
+        finally
+        {
+            _planLock.Release();
+        }
+    }
+
+    private async Task<int?> CreatePlanIfDueCoreAsync(CancellationToken cancellationToken)
+    {
+        if (Now - _lastCheckedAt < CheckInterval)
+            return null;
+
+        var stored = await _repositories.UseAsync((r, c) => r.GetSettingsAsync(c), cancellationToken);
+        if (stored.Mode != FirmwareRolloutMode.Autopilot)
+        {
+            HoldReason = null;
+            return null;
+        }
+
+        // Plan from the standing configuration, not from the row, which any one-off rollout since
+        // has overwritten with its own scope. A site upgrading into this has no snapshot yet: the
+        // row is still faithful there, because a one-off used to turn autopilot off.
+        var settings = AutopilotSettingsSnapshot.Deserialize(stored.AutopilotSettingsJson);
+        if (settings == null)
+        {
+            settings = stored;
+            await _repositories.UseAsync(
+                (r, c) => r.SaveAutopilotSnapshotAsync(AutopilotSettingsSnapshot.Serialize(stored), c),
+                cancellationToken);
+            _logger.LogInformation(
+                "Captured the existing settings as the standing autopilot configuration for site {Site}", _siteSlug);
+        }
+
+        // Anything non-terminal owns the site: a scheduled, announced, postponed, running or
+        // soaking plan all mean autopilot has nothing to add.
+        var active = await _repositories.UseAsync((r, c) => r.GetActivePlanAsync(c), cancellationToken);
+        if (active != null)
+        {
+            _lastCheckedAt = Now;
+            HoldReason = null;
+            return null;
+        }
+
+        var timings = await _repositories.UseAsync((r, c) => r.GetModelTimingsAsync(c), cancellationToken);
+        var inputs = await _planning.UseAsync(
+            (p, c) => RolloutPlanComposer.GatherAsync(p, timings, _commands, settings, _logger, _sharedCatalog, _feed, cancellationToken: c), cancellationToken);
+
+        // Don't burn the check interval when the site wasn't reachable: the catalog and
+        // update availability are unknown, so "nothing to upgrade" is an absence of data, not
+        // an answer. Retry on the next tick once the agent tunnel is up. But devices in hand
+        // with no /api/system answer is an API-key connection, which NEVER answers /api/system:
+        // plan device-only and stamp the interval, or every reconcile tick re-runs the full
+        // gather - channel writes included - forever.
+        if (!RolloutPlanComposer.ConsoleReachable(inputs.Console) && inputs.Context.Devices.Count == 0)
+        {
+            _logger.LogDebug("Autopilot deferring on site {Site}: the console is not connected", _siteSlug);
+            HoldReason = "The UniFi Console didn't answer, so nothing could be planned yet. Autopilot tries again within a minute.";
+            return null;
+        }
+
+        _lastCheckedAt = Now;
+
+        var app = inputs.Console?.NetworkApplication;
+        _logger.LogDebug(
+            "Autopilot console state on site {Site}: version={Version}, updateAvailable={Update}, devices={Devices}",
+            _siteSlug, app?.Version ?? "null", app?.UpdateAvailable ?? "null", inputs.Context.Devices.Count);
+
+        var ripeness = await EvaluateRipenessAsync(inputs.Context.Devices, settings.MinReleaseAgeDays, cancellationToken);
+        var result = RolloutPlanComposer.Plan(inputs, settings, ripeness.UnripeMacs);
+        result.Document.TimeZoneId = inputs.Context.TimeZoneId;
+        result.Document.Notes.AddRange(ripeness.Notes);
+
+        // A console update is reason enough to run. On a Cloud Gateway the console's own UniFi OS
+        // build waits while every device reports nothing pending, so counting devices alone would
+        // leave that site behind for good.
+        var devicesToUpgrade = RolloutPlanComposer.LiveStepCount(result);
+        var consoleToUpgrade = result.Document.IncludesUniFiNetworkUpdate || result.Document.IncludesUniFiOsUpdate;
+        if (devicesToUpgrade == 0 && !consoleToUpgrade)
+        {
+            _logger.LogDebug(
+                "Autopilot found nothing to upgrade on site {Site} right now", _siteSlug);
+            HoldReason = ripeness.Notes.Count > 0
+                ? string.Join(" ", ripeness.Notes) + " Autopilot checks again every hour."
+                : "Everything is on the current firmware for its channel. Autopilot checks again every hour.";
+            return null;
+        }
+
+        await ApplyUniFiOsRipenessAsync(result.Document, settings.MinReleaseAgeDays, cancellationToken);
+
+        if (await WasAlreadyRefusedAsync(result, cancellationToken))
+        {
+            _logger.LogDebug(
+                "Autopilot is holding off on site {Site}: the last unattended rollout was stopped and nothing new has been released since",
+                _siteSlug);
+            HoldReason = "The last Autopilot plan was stopped, so it's waiting for new firmware before proposing again.";
+            return null;
+        }
+
+        var lead = TimeSpan.FromHours(Math.Max(1, settings.NotifyHoursAhead));
+        var window = await _planning.UseAsync(
+            (p, c) => p.ProposeWindowAsync(inputs.Context, result.Document.TotalEstimatedSeconds, settings, lead, c),
+            cancellationToken);
+        // The proposal already carries the instant its site-local hour names, converted through the
+        // SITE's zone. Re-deriving it here read those hours as the server's and fired a remote site
+        // off by the offset between them.
+        var startAtUtc = window.StartUtc;
+
+        await _planning.UseAsync(
+            (p, c) => p.PopulatePriorVersionsAsync(result.Document, result.Steps, c), cancellationToken);
+
+        // The executor reads the row live - channels, spacing, suppression, soak - so committing a
+        // plan built from the standing configuration has to leave the row holding it. Without this
+        // the rollout would apply whatever channel the last one-off left behind.
+        if (!ReferenceEquals(settings, stored))
+        {
+            settings.Mode = FirmwareRolloutMode.Autopilot;
+            await _repositories.UseAsync((r, c) => r.SaveSettingsAsync(settings, c), cancellationToken);
+        }
+
+        var plan = await _repositories.UseAsync((r, c) => r.CreatePlanAsync(new FirmwareRolloutPlan
+        {
+            Status = FirmwareRolloutStatus.Announced,
+            ScheduledStartAt = startAtUtc,
+            PlanJson = JsonSerializer.Serialize(result.Document),
+            CreatedBy = Actor,
+            CreatedAt = Now,
+        }, c), cancellationToken);
+
+        foreach (var step in result.Steps) step.PlanId = plan.Id;
+        await _repositories.UseAsync((r, c) => r.AddStepsAsync(result.Steps, c), cancellationToken);
+
+        await AnnounceAsync(result, window, startAtUtc, cancellationToken);
+        HoldReason = null;
+        RolloutAudit.LogSystem(_audit, NetworkOptimizer.Storage.Models.Identity.AuditActions.FirmwareRolloutScheduled, _siteSlug, plan.Id, new
+        {
+            planId = plan.Id,
+            startAt = startAtUtc,
+            devices = RolloutPlanComposer.LiveStepCount(result),
+            waves = result.Document.Waves.Count,
+            autopilot = true,
+        });
+
+        _logger.LogInformation(
+            "Autopilot scheduled firmware rollout {Id} on site {Site} for {When} ({Devices} devices, {Waves} waves)",
+            plan.Id, _siteSlug, startAtUtc, RolloutPlanComposer.LiveStepCount(result), result.Document.Waves.Count);
+
+        return plan.Id;
+    }
+
+    private async Task AnnounceAsync(
+        RolloutPlanResult result, QuietWindowProposal window, DateTime startAtUtc, CancellationToken cancellationToken)
+    {
+        var devices = RolloutPlanComposer.LiveStepCount(result);
+
+        await _eventBus.PublishAsync(new AlertEvent
+        {
+            EventType = RolloutAlerts.Upcoming,
+            Source = RolloutAlerts.Source,
+            // Warning, not Info: this is the one chance to postpone before an unattended rollout
+            // reboots the site, and it has to stand out from the run-of-the-mill notifications.
+            Severity = AlertSeverity.Warning,
+            Title = $"Firmware Rollout Scheduled{_siteSuffix}",
+            Message =
+                $"{RolloutScopeCopy.Sentence(RolloutScopeCopy.Subject(result.Document, devices))} will be upgraded starting "
+                + $"{startAtUtc.ToLocalTime():ddd MMM d, h:mm tt}{RolloutScopeCopy.SiteAside(window.TimeZoneId, startAtUtc)}, "
+                + $"{RolloutScopeCopy.StartsIn(startAtUtc - Now)} - chosen from {window.Basis}. "
+                + "Open Firmware Rollout to postpone or stop it.",
+            SourceUrl = RolloutAlerts.SourceUrl,
+        }, cancellationToken);
+    }
+
+    /// <summary>Unripe devices and the notes explaining what they are waiting for.</summary>
+    private sealed record RipenessOutcome(HashSet<string> UnripeMacs, List<string> Notes);
+
+    /// <summary>
+    /// Holds back devices whose target build is younger than the site's minimum release age. A
+    /// publish date that cannot be resolved counts as ripe: a feed outage must never stall
+    /// autopilot, and the plan records that it happened.
+    /// </summary>
+    private async Task<RipenessOutcome> EvaluateRipenessAsync(
+        IReadOnlyList<PlannerDevice> devices, int minAgeDays, CancellationToken cancellationToken)
+    {
+        var unripe = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var notes = new List<string>();
+        if (minAgeDays <= 0) return new RipenessOutcome(unripe, notes);
+
+        var unresolved = 0;
+        var groups = devices
+            .Where(d => d.Upgradable && !string.IsNullOrWhiteSpace(d.ToVersion))
+            .GroupBy(d => (d.Model, d.ToVersion), TargetComparer.Instance);
+
+        foreach (var group in groups)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            ReleaseMetadata? metadata = null;
+            try
+            {
+                metadata = await _releases.GetAsync(group.Key.Model, group.Key.ToVersion, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "Autopilot could not read the publish date for {Model} {Version}",
+                    group.Key.Model, group.Key.ToVersion);
+            }
+
+            if (metadata?.PublishedAt == null)
+            {
+                unresolved++;
+                continue;
+            }
+
+            if (ReleaseRipeness.IsRipe(metadata.PublishedAt, Now, minAgeDays))
+                continue;
+
+            var count = 0;
+            foreach (var device in group)
+            {
+                unripe.Add(device.Mac);
+                count++;
+            }
+
+            var age = ReleaseRipeness.AgeDays(metadata.PublishedAt, Now) ?? 0;
+            notes.Add(
+                $"{count} {group.Key.Model} device{(count == 1 ? " is" : "s are")} waiting for {group.Key.ToVersion} to age {minAgeDays} days; it was published {age} day{(age == 1 ? "" : "s")} ago.");
+        }
+
+        if (unresolved > 0)
+        {
+            notes.Add(
+                $"No publish date could be read for {unresolved} build{(unresolved == 1 ? "" : "s")}, so nothing was held back for age on {(unresolved == 1 ? "it" : "them")}.");
+        }
+
+        return new RipenessOutcome(unripe, notes);
+    }
+
+    /// <summary>
+    /// Drops the console's own UniFi OS step when the build on offer is too new. Its publish date
+    /// comes from the console rather than the feed - the feed does not carry Cloud Gateway OS builds
+    /// per console model. The date the plan captured wins: a target adopted from another site is
+    /// not the build the console itself is offering.
+    /// </summary>
+    private async Task ApplyUniFiOsRipenessAsync(
+        RolloutPlanDocument document, int minAgeDays, CancellationToken cancellationToken)
+    {
+        if (minAgeDays <= 0 || !document.IncludesUniFiOsUpdate)
+            return;
+
+        DateTime? created = document.UniFiOsUpdate.PublishedAt;
+        string? version = created != null ? document.UniFiOsUpdate.TargetVersion : null;
+        if (created == null)
+        {
+            try
+            {
+                var pending = await _commands.GetPendingUniFiOsUpdateAsync(cancellationToken);
+                created = pending?.Created;
+                version = pending?.Version;
+
+                if (created == null)
+                {
+                    var info = await _commands.GetConsoleSystemInfoAsync(cancellationToken);
+                    created = info?.Firmware?.Latest?.Created;
+                    version ??= info?.Firmware?.Latest?.Version;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "Autopilot could not read the console's UniFi OS publish date on site {Site}", _siteSlug);
+            }
+        }
+
+        if (ReleaseRipeness.IsRipe(created, Now, minAgeDays))
+            return;
+
+        var age = ReleaseRipeness.AgeDays(created, Now) ?? 0;
+        document.IncludesUniFiOsUpdate = false;
+        document.Notes.Add(
+            $"UniFi OS {version ?? "the pending build"} is waiting to age {minAgeDays} days; it was published {age} day{(age == 1 ? "" : "s")} ago, so the Console keeps its current build.");
+    }
+
+    /// <summary>
+    /// Whether this plan is the one the site already stopped. The comparison is the set of device
+    /// targets: anything the aborted plan did not carry is new firmware, and worth asking about.
+    /// </summary>
+    private async Task<bool> WasAlreadyRefusedAsync(RolloutPlanResult result, CancellationToken cancellationToken)
+    {
+        var history = await _repositories.UseAsync((r, c) => r.GetPlanHistoryAsync(1, c), cancellationToken);
+        var last = history.FirstOrDefault();
+        if (last is not { Status: FirmwareRolloutStatus.Aborted } ||
+            !string.Equals(last.CreatedBy, Actor, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var refusedDocument = ParseDocument(last);
+        if (refusedDocument.RefusalCleared)
+            return false;
+
+        var refused = TargetsOf(refusedDocument);
+        var proposed = TargetsOf(result.Document);
+        return proposed.Count > 0 && proposed.IsSubsetOf(refused);
+    }
+
+    private static HashSet<string> TargetsOf(RolloutPlanDocument document)
+    {
+        var targets = document.Waves
+            .SelectMany(w => w.Steps)
+            .Select(s => $"{s.Mac}|{s.ToVersion}")
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Console surfaces count as targets too: a console update the aborted plan did not carry
+        // is new firmware worth asking about. Without these, an admin who Re-planned exactly to
+        // pick one up proposed the same device set and read as a refusal - permanently.
+        if (document.IncludesUniFiNetworkUpdate)
+            targets.Add($"network-app|{document.NetworkAppUpdate.TargetVersion}");
+        if (document.IncludesUniFiOsUpdate)
+            targets.Add($"unifi-os|{document.UniFiOsUpdate.TargetVersion}");
+
+        return targets;
+    }
+
+    private static RolloutPlanDocument ParseDocument(FirmwareRolloutPlan plan)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<RolloutPlanDocument>(plan.PlanJson) ?? new RolloutPlanDocument();
+        }
+        catch (JsonException)
+        {
+            return new RolloutPlanDocument();
+        }
+    }
+
+
+    /// <summary>Groups devices by the exact build they are heading to, model included.</summary>
+    private sealed class TargetComparer : IEqualityComparer<(string Model, string? ToVersion)>
+    {
+        public static readonly TargetComparer Instance = new();
+
+        public bool Equals((string Model, string? ToVersion) x, (string Model, string? ToVersion) y) =>
+            string.Equals(x.Model, y.Model, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(x.ToVersion, y.ToVersion, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode((string Model, string? ToVersion) obj) =>
+            HashCode.Combine(
+                obj.Model?.ToLowerInvariant(),
+                obj.ToVersion?.ToLowerInvariant());
+    }
+}

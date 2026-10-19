@@ -1,0 +1,190 @@
+using System.ComponentModel.DataAnnotations;
+
+namespace NetworkOptimizer.Storage.Models;
+
+public enum SnmpVersionSetting
+{
+    V2c = 1,
+    V3 = 3
+}
+
+public enum SnmpDetectionState
+{
+    NotChecked,
+    Disabled,
+    EnabledV2c,
+    EnabledV3Only,
+    PollFailing,
+    Working
+}
+
+public enum AccessTechnology
+{
+    Unknown = 0,
+    Gpon = 1,
+    XgsPon = 2,
+    Docsis = 3,
+    PppoE = 4,
+    DirectEthernet = 5,
+    FixedWireless = 6,
+    Satellite = 7,
+    Cellular = 8,
+    Other = 9,
+    Dsl = 10
+}
+
+public class MonitoringSettings
+{
+    [Key]
+    public int Id { get; set; }
+
+    public bool Enabled { get; set; }
+
+    // InfluxDB connection
+    [MaxLength(500)]
+    public string InfluxDbUrl { get; set; } = "http://localhost:8086";
+
+    [MaxLength(500)]
+    public string? InfluxDbToken { get; set; }
+
+    [MaxLength(100)]
+    public string InfluxDbOrg { get; set; } = "network-optimizer";
+
+    [MaxLength(100)]
+    public string InfluxDbBucket { get; set; } = "network_monitoring";
+
+    [MaxLength(100)]
+    public string InfluxDbLongtermBucket { get; set; } = "network_monitoring_longterm";
+
+    // Polling intervals (seconds)
+    public int FastPollIntervalSeconds { get; set; } = 5;
+    public int MediumPollIntervalSeconds { get; set; } = 30;
+    public int SlowPollIntervalSeconds { get; set; } = 300;
+
+    // SNMP — populated by auto-detection from UniFi settings API
+    public SnmpVersionSetting SnmpVersion { get; set; } = SnmpVersionSetting.V2c;
+
+    [MaxLength(500)]
+    public string? SnmpCommunity { get; set; }
+
+    [MaxLength(200)]
+    public string? SnmpV3Username { get; set; }
+
+    [MaxLength(500)]
+    public string? SnmpV3AuthPassword { get; set; }
+
+    public SnmpDetectionState SnmpDetectionState { get; set; } = SnmpDetectionState.NotChecked;
+    public DateTime? LastSnmpDetection { get; set; }
+    public DateTime? LastSnmpSuccess { get; set; }
+
+    // Access ISP context (set by the upstream wizard, used for first-mile labelling).
+    //
+    // MOVE TO WanProfile: all three describe ONE WAN's first mile, but there is one set per site, so
+    // a second WAN cannot be described at all - a site with fiber and an LTE backup gets whichever
+    // the wizard looked at last. ISP Health and Monitoring are multi-WAN planned; WanProfile is the
+    // per-WAN home these belong in. Left here until each reader is taught to ask per WAN, so one
+    // place holds each fact rather than two disagreeing ones.
+    public AccessTechnology AccessTechnology { get; set; } = AccessTechnology.Unknown;
+
+    [MaxLength(50)]
+    public string? WanNeighborMac { get; set; }
+
+    [MaxLength(200)]
+    public string? WanNeighborOui { get; set; }
+
+    // Upstream tracer state. LastUpstreamDiscoveryAt is set on commit. The auto
+    // re-discovery scheduler re-runs discovery every 7 days and flips
+    // UpstreamDiscoveryNeedsReview = true when it finds a different set of
+    // candidates than what's currently committed. UI shows a banner; user confirms.
+    public DateTime? LastUpstreamDiscoveryAt { get; set; }
+    public bool UpstreamDiscoveryNeedsReview { get; set; }
+
+    // InfluxDB health
+    public bool? InfluxDbReachable { get; set; }
+    public DateTime? LastInfluxDbCheck { get; set; }
+
+    [MaxLength(500)]
+    public string? LastInfluxDbError { get; set; }
+
+    public bool Flex25GLatencyMigrated { get; set; }
+
+    // User-configurable high-temperature alert thresholds (Celsius). Null means
+    // use the built-in default (DeviceHealthAlertEvaluator.DefaultDeviceTempHighC).
+    // Switches and gateways are configured independently.
+    public double? SwitchTempHighC { get; set; }
+    public double? GatewayTempHighC { get; set; }
+
+    // User-configurable SFP DDM alert thresholds, per transceiver category. Null
+    // means use the built-in default (PonThresholds). PON and Active Ethernet
+    // modules have well-defined optical envelopes (RX low / TX high); generic SFP+
+    // only gets a temperature ceiling. See SfpDdmThresholds for resolution.
+    public double? PonRxPowerLowDbm { get; set; }
+    public double? PonTxPowerHighDbm { get; set; }
+    public double? PonTempHighC { get; set; }
+    public double? AeRxPowerLowDbm { get; set; }
+    public double? AeTxPowerHighDbm { get; set; }
+    public double? AeTempHighC { get; set; }
+    public double? SfpTempHighGenericC { get; set; }
+
+    /// <summary>
+    /// Ignore the SFP ONT DDM read artifact: one poll where temperature and RX power jump together
+    /// and the next returns. Off by default - it drops readings, so it is the operator's call.
+    /// </summary>
+    public bool IgnoreSfpDdmSpikes { get; set; }
+
+    /// <summary>
+    /// When more than one monitored physical source (ONT, SFP, cable modem, cellular modem)
+    /// matches the WAN's access technology, the user's chosen source for the ISP Health
+    /// Physical Link factor, as a token: "cm:3", "ont:2", "modem:1",
+    /// "sfp:aa:bb:cc:dd:ee:ff/Port 1". Null = single unambiguous match, or not yet picked.
+    /// </summary>
+    [MaxLength(120)]
+    public string? PhysicalLinkSourceKey { get; set; }
+
+    /// <summary>
+    /// Target trailing window (hours) for the auto-computed ISP Health score and the tab's default
+    /// view. This is the ceiling the compute aims for; on slower hardware where the target exceeds the
+    /// per-compute time budget it automatically falls back to a shorter window (24 h, then 16 h).
+    /// </summary>
+    public int IspHealthScoreWindowHours { get; set; } = 48;
+
+    // Per-site visibility of the optional per-hardware Monitoring stat tabs.
+    // Default true (shown), preserving the historical always-visible behavior;
+    // a user not running that hardware can hide its tab from the Monitoring nav
+    // via the matching Settings section. Only the tab button is affected - the
+    // underlying monitoring/polling is unchanged.
+    public bool ShowCmTab { get; set; } = true;
+    public bool ShowOntTab { get; set; } = true;
+    public bool ShowCellularTab { get; set; } = true;
+    public bool ShowStarlinkTab { get; set; } = true;
+
+    /// <summary>
+    /// Count the Dashboard ONT card's error counters (BIP, FEC/HEC, GEM drops) over the last 24
+    /// hours rather than since the module last rebooted. Display only: alerts and charts use per-poll deltas.
+    /// </summary>
+    public bool OntErrorCountersLast24h { get; set; } = true;
+
+    /// <summary>Same as <see cref="OntErrorCountersLast24h"/>, for the Dashboard cable modem card's codeword counts.</summary>
+    public bool CmErrorCountersLast24h { get; set; } = true;
+
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    public bool HasSnmpCredentials => !string.IsNullOrEmpty(SnmpCommunity) || !string.IsNullOrEmpty(SnmpV3Username);
+
+    /// <summary>
+    /// SNMPv3 is the only version on the console and it returned the username without the password.
+    /// UniFi strips <c>x_</c> secrets from the settings response for View Only accounts, so v3 polling cannot authenticate.
+    /// </summary>
+    public bool SnmpV3PasswordMissing =>
+        SnmpDetectionState == SnmpDetectionState.EnabledV3Only
+        && !string.IsNullOrEmpty(SnmpV3Username)
+        && string.IsNullOrEmpty(SnmpV3AuthPassword);
+
+    /// <summary>
+    /// SNMP v2c is on but the console returned no Community String. UniFi Network 11 withholds it from View accounts.
+    /// </summary>
+    public bool SnmpCommunityMissing =>
+        SnmpDetectionState == SnmpDetectionState.EnabledV2c
+        && string.IsNullOrEmpty(SnmpCommunity);
+}

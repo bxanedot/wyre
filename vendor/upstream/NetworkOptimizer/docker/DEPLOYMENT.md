@@ -1,0 +1,1453 @@
+# Deployment Guide
+
+Production deployment guide for Network Optimizer.
+
+## Deployment Options
+
+| Option | Best For | Guide |
+|--------|----------|-------|
+| Linux + Docker | Self-built servers, VMs, cloud (recommended) | [Below](#1-linux--docker-recommended) |
+| Proxmox LXC | Homelab virtualization, one-liner install | [Proxmox Guide](#2-proxmox-lxc) |
+| NAS + Docker | Synology, QNAP, Unraid | [NAS Deployment](#3-nas-deployment-docker) |
+| Home Assistant | Add-ons | [Home Assistant](#5-home-assistant) |
+| Windows Installer | Windows desktops/servers | [Download from Releases](https://github.com/Ozark-Connect/NetworkOptimizer/releases) |
+| macOS Native | Mac servers, multi-gigabit speed testing | [macOS Installation](../docs/MACOS-INSTALLATION.md) |
+| Linux Native | Maximum performance, no Docker | [Native Guide](NATIVE-DEPLOYMENT.md#linux-deployment) |
+| Multi-Site On-Site Agent | Remote sites reporting to a central server | [Agent Guide](../src/NetworkOptimizer.Agent/README.md) |
+
+---
+
+### 1. Linux + Docker (Recommended)
+
+Deploy on any Linux server using Docker Compose. This is the recommended approach for self-built NAS, home servers, VMs, and cloud instances.
+
+**Requirements:**
+- Docker 20.10+ and Docker Compose 2.0+
+- 2GB RAM minimum (4GB recommended)
+- 10 GB disk space (30 GB recommended if using InfluxDB monitoring with 90-day retention on a medium-sized network)
+- Ubuntu 20.04+, Debian 11+, RHEL/CentOS 8+, or compatible
+
+#### Quick Start
+
+```bash
+# Install Docker (if not already installed)
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+# Log out and back in for group changes
+```
+
+> **Choose a stable location:** Deploy to a permanent directory like `/opt/network-optimizer`. Avoid home directories or `/tmp` which may cause issues with permissions, cleanup, or migrations.
+
+**Option A: Pull Docker Image (Recommended)**
+
+```bash
+# Create directory in /opt (recommended)
+sudo mkdir -p /opt/network-optimizer && sudo chown $USER: /opt/network-optimizer
+cd /opt/network-optimizer
+curl -o docker-compose.yml https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/docker/docker-compose.prod.yml
+curl -O https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/docker/.env.example
+cp .env.example .env
+nano .env  # Set timezone, reverse proxy hostname, and other options
+docker compose up -d
+```
+
+**Option B: Build from Source**
+
+```bash
+cd /opt  # or your preferred stable location
+sudo git clone https://github.com/Ozark-Connect/NetworkOptimizer.git
+sudo chown -R $USER: NetworkOptimizer
+cd NetworkOptimizer/docker
+cp .env.example .env
+nano .env  # Set timezone and other options (optional)
+docker compose build
+docker compose up -d
+```
+
+**Verify Installation:**
+
+```bash
+# Check logs for the built-in admin account's auto-generated password
+docker logs network-optimizer 2>&1 | grep -A5 "AUTO-GENERATED"
+
+# Verify health
+docker compose ps
+curl http://localhost:8042/api/health
+```
+
+Access at: **http://your-server:8042**
+
+#### Network Mode Options
+
+**Host Networking (Recommended for Linux):**
+```yaml
+# docker-compose.yml uses network_mode: host by default
+# This provides best performance and accurate IP detection
+```
+
+**Bridge Networking (if host mode unavailable):**
+```bash
+# Use docker-compose.macos.yml which uses port mapping
+# IMPORTANT: Set HOST_IP in .env to your server's IP for accurate path analysis
+docker compose -f docker-compose.macos.yml up -d
+```
+
+#### Service Management
+
+```bash
+# View logs
+docker compose logs -f
+
+# Restart
+docker compose restart
+
+# Stop
+docker compose down
+
+# Update to latest
+docker compose pull
+docker compose up -d
+
+# Full rebuild (after Dockerfile changes)
+docker compose build --no-cache
+docker compose up -d
+```
+
+#### Systemd Integration (Auto-Start on Boot)
+
+```bash
+# Enable Docker to start on boot
+sudo systemctl enable docker
+
+# Docker Compose containers with restart: unless-stopped will auto-start
+```
+
+Or create a dedicated systemd service:
+
+```bash
+sudo cat > /etc/systemd/system/network-optimizer.service << 'EOF'
+[Unit]
+Description=Network Optimizer
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/network-optimizer/docker
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable network-optimizer
+```
+
+---
+
+### 2. Proxmox LXC
+
+The easiest way to deploy on Proxmox. Run this one-liner on your **Proxmox VE host**:
+
+```bash
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/proxmox/install.sh)"
+```
+
+The interactive script will:
+1. Create a privileged Debian LXC container
+2. Install Docker and Docker Compose
+3. Deploy Network Optimizer with Docker Compose
+4. Optionally deploy a [Traefik HTTPS proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) with automatic Let's Encrypt certificates (requires Cloudflare DNS)
+5. Configure auto-start on boot
+
+**Requirements:**
+- Proxmox VE 7.0 or later
+- 10 GB disk space (30 GB recommended if using InfluxDB monitoring with 90-day retention on a medium-sized network), 2GB RAM minimum
+- Internet access for downloading images
+
+**After Installation:**
+```bash
+# Get the built-in admin account's auto-generated password
+pct exec <CT_ID> -- docker logs network-optimizer 2>&1 | grep -A5 "AUTO-GENERATED"
+
+# Access the web UI
+http://<container-ip>:8042
+```
+
+**Updating:**
+```bash
+pct exec <CT_ID> -- bash -c 'cd /opt/network-optimizer && docker compose pull && docker compose up -d && docker image prune -f'
+```
+
+For advanced configuration, troubleshooting, and manual installation see the [full Proxmox guide](../scripts/proxmox/README.md).
+
+---
+
+### 3. NAS Deployment (Docker)
+
+For commercial NAS devices with container support.
+
+#### Synology NAS
+
+1. Install Container Manager from Package Center
+2. Clone or upload the repository to `/docker/network-optimizer`
+3. Copy `.env.example` to `.env` and configure
+4. Create project in Container Manager pointing to docker-compose.yml
+5. Start containers
+
+**Note:** If using bridge networking, set `HOST_IP` in `.env` to your NAS IP address.
+
+#### QNAP NAS
+
+1. Install Container Station
+2. Create shared folders
+3. Import `docker-compose.yml`
+4. Configure environment variables
+5. Deploy stack
+
+#### Unraid
+
+1. Install Community Applications plugin
+2. Search for "Network Optimizer"
+3. Deploy both network-optimizer and network-optimizer-speedtest containers
+
+Community templates maintained by [@stefan-matic](https://github.com/stefan-matic/unraid-templates).
+
+> **Important: Database storage path.** Unraid's `/mnt/user/` paths use a FUSE filesystem (shfs) that is incompatible with SQLite's WAL journal mode. Network Optimizer detects this automatically and falls back to DELETE journal mode, which prevents database corruption but may cause occasional database busy errors under heavy monitoring load. For best performance, map the `/app/data` volume to a cache drive path (e.g., `/mnt/cache/appdata/network-optimizer/data`) instead of `/mnt/user/appdata/...`. This also applies to OMV setups using mergerfs and any deployment where the data volume is on NFS, SMB, or other network/FUSE mounts. See [#706](https://github.com/Ozark-Connect/NetworkOptimizer/issues/706) and [#727](https://github.com/Ozark-Connect/NetworkOptimizer/issues/727) for details.
+>
+> If using InfluxDB for ISP Health monitoring, we recommend installing it separately (not via the community template) and ensuring its data directory is also on a cache drive or native filesystem, not a FUSE mount.
+
+---
+Or use manual Docker Compose deployment (note: cannot be managed by Unraid GUI if deployed via compose)
+
+### 4. Native Deployment (No Docker)
+
+For maximum network performance or systems without Docker, run natively on the host.
+
+**Best for:**
+- macOS systems (avoids Docker Desktop's ~1.8 Gbps network throughput limitation)
+- Systems where Docker overhead is undesirable
+- Dedicated appliances
+
+**Supported Platforms:**
+- macOS 11+ (Intel or Apple Silicon)
+- Linux (Ubuntu 20.04+, Debian 11+, RHEL 8+)
+- Windows: Use the [Windows Installer](https://github.com/Ozark-Connect/NetworkOptimizer/releases) instead
+
+See [Native Deployment Guide](NATIVE-DEPLOYMENT.md) for macOS and Linux instructions.
+
+---
+
+### 5. Home Assistant
+
+Network Optimizer can be installed as two Home Assistant add-ons. See [issue #201](https://github.com/Ozark-Connect/NetworkOptimizer/issues/201) for setup instructions and discussion.
+
+For the built-in **admin** account's initial password, check the add-on's **Log** tab instead of using the `docker logs` command.
+
+### 6. Multi-Site On-Site Agent
+
+For multi-site deployments, the recommended way to bring a remote site online is a lightweight on-site agent that dials home to your central server over a single outbound HTTPS tunnel - no inbound access, no VPN, no port-forwarding, works behind CGNAT, nothing new to deploy between sites. It proxies that site's UniFi Console, SNMP, and device SSH, hosts its probes and speed tests, and delivers the full feature set. If you already reach a site over a site-to-site VPN, you can onboard it with no agent and still get a solid floor - security audit, Wi-Fi, config, Adaptive SQM, WAN steering, and SNMP - directly; add the agent when you also want that site's monitoring and performance layer (ISP Health, path discovery, latency/loss, and speed tests).
+
+Install it with Docker, as a bare-metal systemd service, or - for monitoring-only sites - directly on the site's UniFi gateway (about 50 MB in practice, held under a memory limit as a safety backstop so it stays clear of routing). Per-site one-liners for all three are generated in the web UI under **Settings > Multi-Site > (site) > Agents > Set up agent**. See the [Agent Deployment Guide](../src/NetworkOptimizer.Agent/README.md) for the full walkthrough, all options, and reverse-proxy configuration.
+
+**Licensing:** Personal use on up to 3 sites is free and never contacts a license server - nothing phones home. Running more than 3 sites requires a license key (entered under **Settings > Application > Licensing**); activating or renewing a key makes an outbound HTTPS request from the central server to `licensing.ozarkconnect.net`. If activation reports the license server as unreachable, check that your egress firewall rules allow HTTPS (443) to that hostname. Entitlements are cached and verified locally, so a license server outage never disables your sites.
+
+**Networking:** The agent runs with host networking by default so its probes see the site's real network position and site clients can reach the LAN speed test on the agent host's address. It auto-detects that LAN IPv4; if it picks the wrong one (Docker bridge mode instead of host, or a multi-NIC host), set `NO_AGENT_LAN_IP=<ip>` in the agent's environment to override it.
+## Pre-Deployment Checklist
+
+- [ ] Docker and Docker Compose installed
+- [ ] Sufficient disk space (10 GB minimum, 30 GB if using InfluxDB monitoring)
+- [ ] Network access to UniFi Controller
+- [ ] Firewall rules configured (if applicable)
+- [ ] `.env` file configured with secure passwords
+- [ ] SSL certificates ready (if using HTTPS)
+- [ ] SSH enabled on UniFi devices (required for SQM and LAN speed testing, see below)
+
+## Installation Steps (NAS)
+
+These detailed steps are for NAS deployment. For other deployment options, see the guides above.
+
+> **Note:** If `docker compose` doesn't work on older NAS firmware, try `docker-compose` (hyphenated).
+
+> **Choose a stable location:** Deploy to a permanent directory like `/volume1/docker/network-optimizer` (Synology) or equivalent. Avoid temporary locations that may be cleaned up or have permission issues.
+
+### 1. Download Files
+
+**Option A: Pull Docker Image (Recommended)**
+
+```bash
+mkdir network-optimizer && cd network-optimizer
+curl -o docker-compose.yml https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/docker/docker-compose.prod.yml
+curl -O https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/docker/.env.example
+```
+
+**Option B: Build from Source**
+
+```bash
+git clone https://github.com/Ozark-Connect/NetworkOptimizer.git
+cd NetworkOptimizer/docker
+```
+
+### 2. Configure Environment
+
+```bash
+# Copy template
+cp .env.example .env
+
+# Edit with your settings
+nano .env
+```
+
+**Recommended changes:**
+```env
+# Set your timezone
+TZ=America/Chicago
+```
+
+If you're placing Network Optimizer behind a reverse proxy, you'll also need to configure the hostname and proxy-related variables in `.env`. See [HTTPS with Reverse Proxy](#https-with-reverse-proxy) and [`.env.example`](.env.example) for details.
+
+**Admin Account:**
+
+The built-in account is **admin**. On first run its auto-generated password is displayed in the logs.
+After logging in, go to **Settings > Admin Password** to set your own password (recommended).
+
+Password precedence: Database (Settings UI) > `APP_PASSWORD` env var > Auto-generated
+
+Optionally, set `APP_PASSWORD` in `.env` if you want to configure a password before first login.
+
+To harden the install, create your own account, give it the Admin role, and then disable **admin**
+from **Settings > Identity**. It cannot be deleted - break-glass recovery re-enables it and the boot
+seed reconciles it - but disabling takes it out of use. The last enabled Admin can never be disabled,
+so make sure your own account works before turning the built-in one off.
+
+**Break-glass recovery (`NETOPT_RECOVERY=1`):**
+
+If single sign-on is the only way in and it stops working - the provider is misconfigured, its
+certificate expired, the IdP is down - start the app once with `NETOPT_RECOVERY=1` and an Admin can
+sign in locally again:
+
+```bash
+# Docker: add to .env, then recreate
+echo "NETOPT_RECOVERY=1" >> .env
+docker compose up -d
+```
+
+It applies to that boot only. Remove the variable and restart to close it again.
+
+What it does, and only this:
+
+- The username and password form appears on the sign-in page even while **SSO-only** is turned on
+- A password or passkey sign-in is accepted under SSO-only, **for accounts holding the Admin role only**
+- The built-in `admin` account is re-enabled if it had been disabled
+
+It does **not** waive a second factor. An Admin whose role requires MFA still has to satisfy it, so
+keep recovery codes for that account somewhere you can reach without the app. Every use is written to
+the Audit Log and the sign-in page says recovery mode is active while it is.
+
+### 3. Deploy Stack
+
+```bash
+docker compose up -d
+```
+
+### 4. Verify Deployment
+
+```bash
+# Check service health
+docker compose ps
+
+# View logs
+docker compose logs -f
+
+# Test health endpoint
+curl http://localhost:8042/api/health
+```
+
+Expected output:
+```
+NAME                          STATUS
+network-optimizer             Up (healthy)
+```
+
+### 5. Access Web UI
+
+- Web UI: http://your-server:8042
+
+## Production Configuration
+
+### HTTPS with Reverse Proxy
+
+Network Optimizer works behind any reverse proxy (nginx, Caddy, Traefik, SWAG, etc.) for SSL termination. Setting up the proxy itself is only half the story though - you also need to tell the app it's being proxied so it builds the correct URLs for things like speed test result reporting and canonical redirects.
+
+#### Configuring Your .env for Reverse Proxy
+
+Open your `.env` and set these variables to match your proxy setup:
+
+```env
+# The hostname your reverse proxy serves (this is how users will access the app)
+REVERSE_PROXIED_HOST_NAME=optimizer.example.com
+
+# If you're also proxying the speed test behind a separate hostname
+OPENSPEEDTEST_HOST=speedtest.example.com
+OPENSPEEDTEST_HTTPS=true
+```
+
+`REVERSE_PROXIED_HOST_NAME` is the important one. When set, the app knows to use `https://` URLs and your proxy's hostname instead of `http://server-ip:8042`. This affects canonical URL enforcement, CORS headers, and where the speed test posts its results.
+
+If your proxy fronts the app on a port other than 443 (for example, one hostname with the app and the speed test separated by port), also set `REVERSE_PROXIED_PORT` to that port. This is supported, but host-based routing on 443 is the recommended setup: one hostname per service and no ports to remember. With local DNS on your gateway and a proxy that does DNS-01 certificates (Caddy, Traefik), there is no reason to need a non-standard port, even without exposing anything publicly.
+
+See [`.env.example`](.env.example) for the full list of variables and detailed explanations of what each one does.
+
+**If the reverse proxy is on the same host**, also add:
+```env
+BIND_LOCALHOST_ONLY=true
+```
+This binds the app to localhost only (`127.0.0.1` and `::1`) instead of all interfaces, so only the local proxy can reach it directly. Both loopback families are bound, so a proxy dialing `localhost` reaches it whichever one the host resolves first. The On-Site Agent tunnel port (8043) is the exception: it always listens on all interfaces, because agents at other sites connect to it directly rather than through the proxy.
+
+#### Traefik (Recommended for Speed Testing)
+
+If you use the browser-based speed test (OpenSpeedTest), Traefik is the recommended reverse proxy. Most proxies negotiate HTTP/2 at the TLS level, and HTTP/2 multiplexing interferes with speed test throughput measurements. Traefik's per-router TLS options let you force HTTP/1.1 for the speed test hostname while keeping HTTP/2 for the main app - all on one port 443.
+
+See [NetworkOptimizer-Proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) for a ready-to-use Docker Compose setup with automatic Let's Encrypt certificates via Cloudflare DNS-01.
+
+**Running multi-site or multi-WAN agents?** They dial home over a long-lived gRPC tunnel that needs its own proxy route. New installs ship it enabled; older ones don't, since `setup.sh` only copies the example config on first run. Add it with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer-Proxy/main/add-agent-tunnel.sh | bash
+```
+
+The server binds the tunnel on port 8043 at startup whether or not you run agents, so enabling multi-site never needs a restart. Reach it through the proxy route above rather than exposing 8043 itself; only an enrolled agent's key opens a tunnel, but the port has no other reason to be public.
+
+**Proxmox users:** The [Proxmox LXC installer](../scripts/proxmox/README.md) can set up Traefik automatically during installation.
+
+**Windows users:** Traefik is available as an optional feature in the MSI installer.
+
+#### Nginx Example
+
+```nginx
+# /etc/nginx/sites-available/network-optimizer
+server {
+    listen 80;
+    server_name network-optimizer.example.com;
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name network-optimizer.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/network-optimizer.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/network-optimizer.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    # Blazor Web UI
+    location / {
+        proxy_pass http://localhost:8042;
+        proxy_http_version 1.1;
+
+        # WebSocket support for Blazor
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeouts for long-running operations
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+Enable and restart:
+```bash
+sudo ln -s /etc/nginx/sites-available/network-optimizer /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+#### Caddy Example (Automatic HTTPS)
+
+```caddy
+# /etc/caddy/Caddyfile
+network-optimizer.example.com {
+    reverse_proxy localhost:8042
+}
+```
+
+Restart Caddy:
+```bash
+sudo systemctl reload caddy
+```
+
+### Speed Test Server Tuning
+
+Enable BBR congestion control on any host serving the speed test over the internet. The default (CUBIC) backs off hard on the small amount of loss normal to a long path, so it under-reports throughput the link can actually deliver. BBR paces on measured bandwidth and RTT instead. On a LAN-only speed test it makes little difference.
+
+Raise the TCP buffer ceiling on the same hosts. The kernel default (6 MB receive, 4 MB send) limits a single TCP stream to about buffer / RTT: roughly 225 Mbps at 100 ms. A 32 MB ceiling removes that limit for internet-facing tests. LAN tests are not affected.
+
+These are host settings, not container ones. The speed test container takes the host's values when it starts, so restart it after a change. The speed test log prints the values in effect at startup.
+
+```bash
+# BBR available? (kernel 4.9+)
+sysctl net.ipv4.tcp_available_congestion_control
+
+# Enable BBR with fair queueing and raise the TCP buffer ceiling, persisted across reboots
+cat >/etc/sysctl.d/99-speedtest.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+EOF
+sysctl --system
+
+# Verify
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+```
+
+**Synology / QNAP:** DSM and QTS do not reliably keep `/etc/sysctl.d`. Run the `sysctl -w` form of the settings above as a boot-time task instead (Synology: Control Panel - Task Scheduler - Triggered Task - Boot-up, user root), then restart the speed test container. Leave out the two BBR lines if the first command does not list `bbr`.
+
+### Firewall Configuration
+
+#### UFW (Ubuntu/Debian)
+
+```bash
+# Allow SSH
+sudo ufw allow 22/tcp
+
+# Allow HTTP/HTTPS (if using reverse proxy)
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+
+# Or allow direct access to the web UI
+sudo ufw allow 8042/tcp  # Web UI
+
+sudo ufw enable
+```
+
+#### firewalld (RHEL/CentOS)
+
+```bash
+sudo firewall-cmd --permanent --add-service=http
+sudo firewall-cmd --permanent --add-service=https
+sudo firewall-cmd --permanent --add-port=8042/tcp
+sudo firewall-cmd --reload
+```
+
+### Backup Strategy
+
+#### Automated Backups
+
+Create backup script:
+```bash
+#!/bin/bash
+# /usr/local/bin/backup-network-optimizer.sh
+
+BACKUP_DIR=/backups/network-optimizer
+DATE=$(date +%Y%m%d-%H%M%S)
+
+# Create backup directory
+mkdir -p $BACKUP_DIR
+
+# Backup SQLite data and configuration
+tar czf $BACKUP_DIR/data-$DATE.tar.gz -C /path/to/docker data/
+
+# Cleanup old backups (keep last 7 days)
+find $BACKUP_DIR -type f -mtime +7 -delete
+
+echo "Backup completed: $DATE"
+```
+
+Add to crontab:
+```bash
+# Daily backup at 2 AM
+0 2 * * * /usr/local/bin/backup-network-optimizer.sh >> /var/log/network-optimizer-backup.log 2>&1
+```
+
+#### Restore from Backup
+
+```bash
+# Stop services
+docker compose down
+
+# Restore data
+tar xzf /backups/network-optimizer/data-20240101-020000.tar.gz -C /path/to/docker/
+
+# Start services
+docker compose up -d
+```
+
+### Monitoring and Alerting
+
+#### System Monitoring
+
+Use Docker healthchecks:
+```bash
+# Check all services
+watch docker compose ps
+
+# Monitor resource usage
+docker stats
+```
+
+#### Log Monitoring
+
+Centralized logging with rsyslog or similar:
+```yaml
+# docker-compose.yml addition
+logging:
+  driver: syslog
+  options:
+    syslog-address: "udp://your-syslog-server:514"
+    tag: "network-optimizer"
+```
+
+#### Uptime Monitoring
+
+Use external monitoring:
+- UptimeRobot
+- Healthchecks.io
+- Self-hosted Uptime Kuma
+
+Configure health check endpoint:
+```bash
+# Monitor this endpoint
+http://your-server:8042/api/health
+```
+
+### Resource Limits
+
+Add resource constraints for production:
+
+```yaml
+# docker-compose.override.yml
+services:
+  network-optimizer:
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    restart: always
+```
+
+Apply with:
+```bash
+docker compose up -d
+```
+
+### Logging Configuration
+
+Control log verbosity via environment variables in `.env`:
+
+```env
+# General framework logging (Microsoft, EF Core, ASP.NET, etc.)
+LOG_LEVEL=Information
+
+# Network Optimizer application logging
+APP_LOG_LEVEL=Debug
+```
+
+**Log Levels (least to most verbose):** Critical, Error, Warning, Information, Debug, Trace
+
+**Common configurations:**
+
+| Scenario | LOG_LEVEL | APP_LOG_LEVEL |
+|----------|-----------|---------------|
+| Production (default) | Information | Information |
+| Debugging app issues | Information | Debug |
+| Full diagnostics | Debug | Debug |
+
+After changing `.env`, recreate the container to apply:
+```bash
+docker compose down && docker compose up -d
+```
+
+**Note:** `docker compose restart` does NOT reload environment variables. You must recreate the container.
+
+View logs:
+```bash
+# Follow logs
+docker compose logs -f network-optimizer
+
+# Last 100 lines
+docker compose logs --tail=100 network-optimizer
+```
+
+#### Windows Service
+
+On Windows, logs are written to `<install-dir>\logs\networkoptimizer-YYYY-MM-DD.log` (rolling daily, 7-day retention).
+
+To change log levels, set environment variables on the Windows service via the registry. This avoids modifying any config files.
+
+**Enable debug logging for Network Optimizer:**
+
+```powershell
+$regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\NetworkOptimizer"
+$existing = (Get-ItemProperty $regPath -Name Environment -ErrorAction SilentlyContinue).Environment
+$env = [string[]](@($existing | Where-Object { $_ }) + "Logging__LogLevel__NetworkOptimizer=Debug")
+Set-ItemProperty $regPath -Name Environment -Value $env
+Restart-Service NetworkOptimizer
+```
+
+**Enable debug logging for Traefik (HTTPS certificate issues):**
+
+If HTTPS isn't working after a couple minutes (certificate errors in the browser), enable Traefik debug logging to see why certificate issuance is failing. Traefik runs as a child process and its output is captured into the app log. You need both the Traefik log level (controls what Traefik emits) and the app log level (controls what gets written to the log file):
+
+```powershell
+$regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\NetworkOptimizer"
+$existing = (Get-ItemProperty $regPath -Name Environment -ErrorAction SilentlyContinue).Environment
+$env = [string[]](@($existing | Where-Object { $_ }) + "Logging__LogLevel__NetworkOptimizer=Debug")
+Set-ItemProperty $regPath -Name Environment -Value $env
+
+# Also set Traefik's own log level to DEBUG (this is separate from the app log level)
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Ozark Connect\Network Optimizer" -Name "TRAEFIK_LOG_LEVEL" -Value "DEBUG"
+
+Restart-Service NetworkOptimizer
+```
+
+**Remove debug logging when done:**
+
+```powershell
+# Remove service environment variables
+$regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\NetworkOptimizer"
+$env = [string[]]((Get-ItemProperty $regPath -Name Environment).Environment | Where-Object { $_ -notlike "Logging__*" })
+if ($env.Count -gt 0) {
+    Set-ItemProperty $regPath -Name Environment -Value $env
+} else {
+    Remove-ItemProperty $regPath -Name Environment -ErrorAction SilentlyContinue
+}
+
+# Reset Traefik log level
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Ozark Connect\Network Optimizer" -Name "TRAEFIK_LOG_LEVEL" -Value "INFO"
+
+Restart-Service NetworkOptimizer
+```
+
+**View logs:**
+
+```powershell
+# Follow the current log file
+Get-Content "<install-dir>\logs\networkoptimizer-*.log" -Tail 50 -Wait
+```
+
+## Upgrade Procedure
+
+### Option A: Using Docker Image (Recommended)
+
+If you deployed using the pre-built Docker image:
+
+```bash
+cd /path/to/network-optimizer
+docker compose pull
+docker compose up -d
+```
+
+### Option B: Building from Source
+
+If you cloned the repository and build locally:
+
+```bash
+cd /path/to/NetworkOptimizer
+git fetch origin
+git checkout main
+git pull
+cd docker && docker compose build && docker compose up -d
+```
+
+For significant updates (major version changes or Dockerfile modifications), use `--no-cache`:
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+```
+
+### Proxmox LXC
+
+If you deployed with the [Proxmox one-liner](../scripts/proxmox/README.md), the app inside the container is a normal Docker Compose stack. Update it from the **Proxmox VE host**:
+
+```bash
+pct exec <CT_ID> -- bash -c 'cd /opt/network-optimizer && docker compose pull && docker compose up -d && docker image prune -f'
+```
+
+Or enter the container first:
+
+```bash
+pct enter <CT_ID>
+cd /opt/network-optimizer
+docker compose pull && docker compose up -d && docker image prune -f
+```
+
+The `docker image prune -f` matters here: Docker never reclaims the image an upgrade replaces, and LXC root disks are usually sized tight.
+
+If you enabled the Traefik HTTPS proxy during installation, it updates separately:
+
+```bash
+pct exec <CT_ID> -- bash -c 'cd /opt/network-optimizer-proxy && docker compose pull && docker compose up -d && docker image prune -f'
+```
+
+### Windows Installer
+
+Download the latest MSI from [GitHub Releases](https://github.com/Ozark-Connect/NetworkOptimizer/releases) and run it. The installer upgrades in-place, preserving your database, settings, and encryption keys. The Network Optimizer service restarts automatically after the upgrade.
+
+### macOS Native
+
+```bash
+cd NetworkOptimizer
+git pull
+./scripts/install-macos-native.sh
+```
+
+The install script preserves your database, encryption keys, and `start.sh` configuration by backing them up before reinstalling. See the [macOS Installation Guide](../docs/MACOS-INSTALLATION.md) for details.
+
+### Linux Native (No Docker)
+
+For a bare-metal install built from source per the [Native Deployment Guide](NATIVE-DEPLOYMENT.md):
+
+```bash
+# Stop service
+sudo systemctl stop network-optimizer
+
+# Backup database (optional)
+cp ~/.local/share/NetworkOptimizer/network_optimizer.db ~/network_optimizer.db.backup
+
+# Update the .NET SDK (picks up runtime stability and security fixes)
+./dotnet-install.sh --channel 10.0
+
+# Pull latest from main and rebuild
+cd ~/NetworkOptimizer   # wherever you cloned it
+git fetch origin && git checkout main && git pull
+dotnet publish src/NetworkOptimizer.Web -c Release -r linux-x64 --self-contained -o /opt/network-optimizer
+chmod +x /opt/network-optimizer/NetworkOptimizer.Web
+
+# Rebuild the Go helpers, every update: a release can change one or add a new target
+VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
+VERSION="${VERSION#v}"
+TOOLS=/opt/network-optimizer/tools
+mkdir -p "$TOOLS"
+cd src/uwnspeedtest
+CGO_ENABLED=0 GOOS=linux GOARCH=$(go env GOHOSTARCH) go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/uwnspeedtest-linux-$(go env GOHOSTARCH)" .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/uwnspeedtest-linux-arm64" .
+cd ../wansteer
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/wansteer-linux-arm64" .
+cd ../apagent
+CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-arm" .
+CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-mipsle" .
+CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-mips" .
+cd ../..
+
+# Start service
+sudo systemctl start network-optimizer
+```
+
+On ARM64 hardware, publish with `-r linux-arm64` and prefix the command with `PROTOBUF_PROTOC=/usr/bin/protoc`, using the distro's protoc as described in the [Native Deployment Guide](NATIVE-DEPLOYMENT.md#build-from-source).
+
+Publishing over the install directory replaces the app files only: your `start.sh`, `tools/`, and `logs/` are left in place, and your database and credential key live outside it in `~/.local/share/NetworkOptimizer/`. The Go helpers in `tools/` are not part of the publish, which is why the update rebuilds them. They need [Go](https://go.dev/dl/), as in the [Native Deployment Guide](NATIVE-DEPLOYMENT.md#build-the-go-helpers).
+
+### Verify Update
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+For a native Linux install:
+
+```bash
+sudo systemctl status network-optimizer
+curl -s http://localhost:8042/api/health
+```
+
+## Joining the Preview Channel
+
+Preview builds ship early access to features before the next release. The `:preview` tag receives every preview AND every release, so you never fall behind - when a release ships, `:preview` gets it too.
+
+### Docker / Proxmox
+
+Change `:latest` to `:preview` in your `docker-compose.yml`:
+
+```yaml
+image: ghcr.io/ozark-connect/network-optimizer:preview
+image: ghcr.io/ozark-connect/speedtest:preview
+```
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+On Proxmox:
+
+```bash
+pct exec <CT_ID> -- bash -c 'cd /opt/network-optimizer && sed -i -e "s#network-optimizer:latest#network-optimizer:preview#" -e "s#speedtest:latest#speedtest:preview#" docker-compose.yml && docker compose pull && docker compose up -d && docker image prune -a -f'
+```
+
+### macOS Native
+
+Check out the `release/2.8` branch instead of `main`:
+
+```bash
+cd NetworkOptimizer && git fetch && git checkout release/2.8 && git pull && ./scripts/install-macos-native.sh
+```
+
+### Windows
+
+Download the preview MSI from [GitHub Releases](https://github.com/Ozark-Connect/NetworkOptimizer/releases) and install it over the top.
+
+### Going back
+
+Switch your Docker tag back to `:latest` (or `git checkout main` on macOS) and pull. You'll land on the latest release.
+
+## Migrating from Build-from-Source to Pre-Built Images
+
+If you've been building from source and want to switch to the pre-built Docker images:
+
+**Why migrate?** Pre-built images are faster to update (no build step), tested before release, and don't require the full git repository.
+
+**Important:** When you build locally, Docker tags your image as `ghcr.io/ozark-connect/network-optimizer:latest`. Simply running `docker compose pull` won't overwrite this because the compose file has a `build:` directive. You need to force the pull and switch to the production compose file.
+
+```bash
+cd /opt/network-optimizer  # or wherever you deployed
+
+# Stop running containers
+docker compose down
+
+# Force pull registry images (overwrites locally-built images)
+docker pull ghcr.io/ozark-connect/network-optimizer:latest
+docker pull ghcr.io/ozark-connect/speedtest:latest
+
+# Back up your current compose file (optional)
+mv docker-compose.yml docker-compose.yml.build-backup
+
+# Download the production compose file (no build directives)
+curl -o docker-compose.yml https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/docker/docker-compose.prod.yml
+
+# Start with pre-built images
+docker compose up -d
+
+# Optional: clean up old build cache to free disk space
+docker builder prune -f
+```
+
+Your `data/`, `logs/`, and `.env` files are preserved. Future updates are now just:
+```bash
+docker compose pull && docker compose up -d
+```
+
+## Troubleshooting
+
+### Reset Admin Password
+
+If you've forgotten your password or need to reset it, use the reset script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/reset-password.sh | bash
+```
+
+Or download and run it (useful inside Proxmox LXC or restricted environments):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/reset-password.sh -o reset-password.sh
+bash reset-password.sh
+```
+
+The script auto-detects your Docker container, clears the password, restarts, and displays the new temporary password.
+
+**Manual fallback** (if you prefer not to use the script):
+
+```bash
+# Clear the password from the database
+docker exec network-optimizer sqlite3 /app/data/network_optimizer.db \
+    "UPDATE AdminSettings SET Password = NULL, Enabled = 0;"
+
+# Restart to trigger auto-generated password
+docker restart network-optimizer
+
+# View the new auto-generated password
+docker logs network-optimizer 2>&1 | grep -A5 "AUTO-GENERATED"
+```
+
+### Container Won't Start
+
+```bash
+# Check logs for errors
+docker compose logs network-optimizer
+
+# Common issues:
+# - Port 8042 already in use: stop conflicting service or change port
+# - Permission denied on data directory: check ownership of mounted volumes
+# - Out of disk space: df -h
+```
+
+### Can't Connect to UniFi Controller
+
+1. Verify the controller URL is correct (include https:// and port if non-standard)
+2. Ensure you're using a **Local Access Only** account, not Ubiquiti SSO (see [UniFi Account setup](#unifi-account))
+3. Check network connectivity: `curl -k https://your-controller:443`
+4. For self-signed certificates, enable "Ignore SSL errors" in Settings
+
+### SSH Connection Failures
+
+```bash
+# Test SSH manually from the container
+docker exec -it network-optimizer ssh username@gateway-ip
+
+# Common issues:
+# - SSH not enabled on device (see UniFi SSH Configuration section)
+# - Wrong credentials
+# - Firewall blocking port 22
+# - Host key verification (container may need to accept new host keys)
+```
+
+### Blazor UI Not Loading / Disconnects
+
+Blazor Server uses WebSocket connections. If the UI shows "Reconnecting..." or won't load:
+
+1. Check that your reverse proxy supports WebSockets (see nginx/Caddy examples above)
+2. Ensure proxy timeouts are sufficient (60s+)
+3. Check browser console for connection errors
+
+### Database Issues
+
+The SQLite database is stored in the `data/` volume. If you encounter database errors:
+
+```bash
+# Check database file exists and has correct permissions
+docker exec network-optimizer ls -la /app/data/
+
+# View recent application logs
+docker compose logs --tail=100 network-optimizer
+```
+
+## Security Considerations
+
+### Protect Your Credentials
+
+The `.env` file and SQLite database contain sensitive information:
+
+```bash
+# Restrict .env file permissions
+chmod 600 .env
+
+# Data directory contains the database with stored credentials
+chmod 700 data/
+```
+
+### Credential encryption key
+
+Network Optimizer encrypts stored secrets (UniFi credentials, gateway SSH passwords and private keys, alert-channel secrets, and identity-provider client secrets) at rest with a per-install key. By default that key lives in the data directory next to the database (`data/.credential_key`), so **a copy of the data volume - including any backup - can decrypt everything.** Treat the data volume accordingly: back it up encrypted, restrict access, and don't sync it to plain cloud storage.
+
+To keep the key off the data volume, point `NO_CREDENTIAL_KEY_FILE` at a path outside it - most cleanly a Docker secret:
+
+```yaml
+# docker-compose.yml
+services:
+  network-optimizer:
+    environment:
+      - NO_CREDENTIAL_KEY_FILE=/run/secrets/credential_key
+    secrets:
+      - credential_key
+secrets:
+  credential_key:
+    file: ./credential_key   # created once, kept out of the repo and out of data backups
+```
+
+Create the key once, out of band, before first start:
+
+```bash
+head -c 64 /dev/urandom > credential_key && chmod 600 credential_key
+```
+
+With `NO_CREDENTIAL_KEY_FILE` set, the key is read and never generated: if the file is missing, unreadable, or empty, Network Optimizer **refuses to start** rather than minting a replacement. That is deliberate - a fresh key would start cleanly and leave every stored secret undecryptable. If you want the key generated for you, leave the variable unset and let it live in the data directory.
+
+Now a leak of the data volume no longer includes the key. **Migration note:** to switch an *existing* install to `NO_CREDENTIAL_KEY_FILE`, copy the current `data/.credential_key` bytes into the new location first - a fresh key cannot decrypt already-stored secrets.
+
+**Config exports are secret too.** A `.nopt` config export bundles the credential key so the imported backup can decrypt its own secrets, and its file-level encryption is light obfuscation rather than a real barrier. So treat `.nopt` files exactly like the data volume - they effectively contain your stored credentials. Store and transfer them accordingly.
+
+### Network Access
+
+Network Optimizer stores UniFi controller credentials and SSH passwords. Limit access to the web UI:
+
+- Use a reverse proxy with authentication if exposing beyond your local network
+- Consider firewall rules to restrict access to trusted IPs
+- Use HTTPS via reverse proxy (see examples above)
+
+### SSH host keys
+
+Network Optimizer does not pin or verify SSH host keys for gateways and devices. This is deliberate. The SSH hop runs from the server (or the On-Site Agent) to devices on your management network, which the Security Audit already recommends keeping on its own isolated VLAN. Anyone positioned to intercept that hop is already inside your management VLAN, and at that point host-key verification is not what stands between them and your network. UniFi devices also regenerate their host keys on firmware updates, so trust-on-first-use pinning would raise a warning on every device after every release and train you to click through it. Isolate the management VLAN and restrict who can reach it: that is the control that matters here.
+
+### UniFi Account
+
+Network Optimizer supports UniFi OS devices (UDM, UCG, UDR, Cloud Key) and self-hosted UniFi Network Server installations.
+
+Create a dedicated **Local Access Only** account on your UniFi controller for Network Optimizer. Ubiquiti SSO accounts will not work.
+
+**Quick Setup:** Create a Local Access Only account with **Super Admin** role.
+
+**Restricted Setup (recommended):**
+1. Open UniFi Network: `https://<gateway-ip>` or `https://unifi.ui.com`
+2. Click **Admin & Users** at the bottom of the side menu
+3. Click **Create New** → **Create New User**
+4. Enter a name and email for this service account
+5. Check **Admin** and **Restrict to Local Access Only**
+6. Uncheck **Use a Predefined Role** and set:
+   - **Network:** Full (Site Admin in older versions)
+   - **Protect:** View (View Only in older versions)
+   - **User & Account Management:** None
+7. Set a secure password and save
+
+Network has no role between View (View Only) and Full (Site Admin), and two features write to UniFi Network: the Wi-Fi Optimizer's on-demand RF spectrum scans and **Apply Recommended Channels**. If you won't use either, **Network: View** works for everything else.
+
+Use this username and password in Network Optimizer Settings.
+
+## Support
+
+- GitHub Issues: https://github.com/Ozark-Connect/NetworkOptimizer/issues
+- Email: tj@ozarkconnect.net
+
+## UniFi SSH Configuration
+
+SSH access is required for some features but not others. Here's what needs what:
+
+| Feature | Gateway SSH | Device SSH |
+|---------|:-----------:|:----------:|
+| Adaptive SQM | Required | - |
+| WAN Speed Test (gateway-based) | Required | - |
+| WAN Speed Test (server-based) | - | - |
+| LAN Speed Test (gateway) | Required | - |
+| LAN Speed Test (devices) | - | Required |
+| Client Speed Test | - | - |
+| Security Audit | - | - |
+| Config Optimizer | - | - |
+| Wi-Fi Optimizer | - | - |
+
+### Enabling SSH in UniFi
+
+**Important:** Both SSH settings must be configured via the UniFi Network web interface. These options are not available in the iOS or Android UniFi apps.
+
+#### Gateway SSH (Console SSH)
+
+Enables SSH access to Cloud Gateways (UCG, UDM, UDM Pro, etc.):
+
+1. Open **UniFi Network**: `https://<gateway-ip>` or `https://unifi.ui.com`
+2. Sign in to your Console
+3. Click **Settings** on the bottom portion of the side menu
+4. Navigate to **Control Plane** → **Console**
+5. Enable **SSH** and set a secure password
+
+Use `root` as the username and the password you set above.
+
+**For UXG (non-Cloud Gateway):** Enable SSH using the Device SSH steps below, but enter those credentials in Network Optimizer's Gateway SSH settings.
+
+#### Device SSH (UniFi Network 9.5+)
+
+Enables SSH access to adopted devices (switches, access points, modems):
+
+1. Open **UniFi Network**: `https://<gateway-ip>` or `https://unifi.ui.com`
+2. Sign in to your Console
+3. Click **UniFi Devices** on the side menu
+4. In the left-hand filter menu, select **Device Updates and Settings** at the bottom
+5. Expand **Device SSH Settings** at the bottom
+6. Check **Device SSH Authentication**
+7. Set a username and secure password (optionally add SSH public keys)
+8. Save
+
+**Note:** This is a separate credential from Gateway SSH.
+
+### Configuring SSH in Network Optimizer
+
+Once SSH is enabled in UniFi, enter the same credentials in Network Optimizer's **Settings** page.
+
+#### Gateway SSH
+
+1. Go to **Settings** → **Gateway SSH**
+2. Enter your gateway's IP address, username (`root`), and the SSH password you set in UniFi
+3. Click **Test SSH Connection** to verify connectivity
+4. Click **Check iperf3 Status** to confirm iperf3 is available for speed tests
+
+As an alternative to password authentication, you can provide a **Private Key Path** (e.g., `/app/ssh-keys/gateway_key`). Leave the password blank when using key-based authentication.
+
+#### Device SSH
+
+1. Go to **Settings** → **Device SSH**
+2. Enter the username and password you configured in UniFi's Device SSH Settings
+3. Click **Test SSH Connection** - it will automatically find a device on your network to test against
+
+Private key authentication is also supported. Enter the key path (e.g., `/app/ssh-keys/id_rsa`) and leave the password blank.
+
+### Per-Device SSH Overrides
+
+In **LAN Speed Test**, when you add a custom speed test device and check **Start iperf3 server before test**, you can override the global Device SSH credentials for that specific device. Override fields include username, password, and private key path. Leave any field blank to fall back to the global Device SSH settings.
+
+This is useful for non-UniFi equipment or devices with different credentials.
+
+### Troubleshooting SSH Connections
+
+If SSH connections are failing:
+
+1. **Check credentials** - Use the **Test SSH Connection** button in Settings to verify your credentials are correct
+2. **Check UniFi firewall rules** - Ensure SSH traffic is allowed between the Network Optimizer server and your gateway/devices
+3. **Check CyberSecure IDS/IPS** - If your CyberSecure Detection Mode is set to **Notify and Block**, SSH connections may be blocked by the rule **"ET SCAN Potential SSH Scan OUTBOUND"**. You can fix this three ways:
+   - **Recommended:** Look for blocked connections in **Insights → Flows**, then create a **Suppression** for this specific signature in the Logs section
+   - **Alternative:** Add the Network Optimizer server's IP as a source in **Detection Exclusions**
+   - **Alternative:** In CyberSecure settings, uncheck **Scanning Activity** under the Attacks and Reconnaissance category (this disables the entire category, so the suppression approach is preferred)
+
+## Client Speed Testing (Optional)
+
+Enable speed testing from any device on your LAN (phones, tablets, laptops, IoT devices) without requiring SSH access.
+
+### Overview
+
+Two methods are available:
+
+| Method | Best For | Port |
+|--------|----------|------|
+| **OpenSpeedTest™** | Browser-based testing from any device | 3005 (configurable) |
+| **iperf3 Server** | CLI testing with iperf3 clients | 5201 |
+
+Results from both methods are stored in Network Optimizer and visible in the Client Speed Test page.
+
+**Why separate containers?** OpenSpeedTest runs as its own container (not proxied through Network Optimizer) for performance reasons. Speed tests can push massive bandwidth (multi-gigabit to 100 Gbps on high-end networks), and routing that traffic through a reverse proxy or the .NET application would add overhead and reduce accuracy. The only data sent to Network Optimizer is the small JSON result payload after the test completes.
+
+### OpenSpeedTest™ (Browser-Based)
+
+Bundled as part of the Docker Compose stack. Access at `http://your-server:3005`.
+
+**Configuration (in `.env`):**
+
+```env
+# Main app identity (feel free to omit N/A settings)
+HOST_IP=192.168.1.100               # Optional - for path analysis if auto-detection fails
+HOST_NAME=nas                       # Optional - friendly hostname (requires DNS)
+REVERSE_PROXIED_HOST_NAME=...       # Optional - if main app is behind HTTPS proxy
+
+# SpeedTest-specific (feel free to omit N/A settings)
+OPENSPEEDTEST_PORT=3005             # Optional - change if port 3005 conflicts
+OPENSPEEDTEST_HOST=speedtest.local  # Optional - if speedtest uses different hostname than main app
+OPENSPEEDTEST_HTTPS=true            # Optional - if speedtest is behind TLS proxy (for geolocated speed test result map)
+OPENSPEEDTEST_HTTPS_PORT=443        # Optional - HTTPS port if not 443
+```
+
+See `.env.example` for full documentation on each setting.
+
+**Usage:**
+1. Open `http://your-server:3005` from any device on your network
+2. Run the speed test
+3. Results automatically appear in Network Optimizer's Client Speed Test page
+
+### HTTPS Configuration Requirements
+
+When serving OpenSpeedTest over HTTPS (`OPENSPEEDTEST_HTTPS=true`), the main Network Optimizer app **must also be accessible via HTTPS**. This is a browser security requirement - HTTPS pages cannot make requests to HTTP endpoints (mixed active content).
+
+**Valid Configurations:**
+
+| Speedtest Protocol | Main App Protocol | Configuration Required |
+|-------------------|-------------------|------------------------|
+| HTTP | HTTP | `HOST_NAME` or `HOST_IP` |
+| HTTP | HTTPS | `REVERSE_PROXIED_HOST_NAME` |
+| HTTPS | HTTPS | `OPENSPEEDTEST_HTTPS=true` + `REVERSE_PROXIED_HOST_NAME` |
+| HTTPS | HTTP | ❌ **Not supported** (browser blocks mixed content) |
+
+**Example - Both behind HTTPS reverse proxy:**
+```env
+HOST_NAME=nas
+REVERSE_PROXIED_HOST_NAME=optimizer.example.com
+OPENSPEEDTEST_HOST=speedtest.example.com
+OPENSPEEDTEST_HTTPS=true
+```
+
+**If you see this error in browser console:**
+```
+Blocked loading mixed active content "http://..."
+```
+It means your speedtest is HTTPS but trying to POST results to an HTTP endpoint. Set `REVERSE_PROXIED_HOST_NAME` to fix.
+
+### iperf3 Server Mode
+
+Run iperf3 as a server inside the Network Optimizer container for CLI-based testing.
+
+**Enable in `.env`:**
+```env
+IPERF3_SERVER_ENABLED=true
+```
+
+**Usage from client devices:**
+```bash
+# Upload test (client to server, 4 streams)
+iperf3 -c your-server -P 4
+
+# Download test (server to client, 4 streams)
+iperf3 -c your-server -P 4 -R
+
+# Bidirectional test (runs both directions simultaneously)
+iperf3 -c your-server -P 4 --bidir
+```
+
+Results are captured automatically and stored with client IP identification.
+
+### Port Conflicts
+
+**Before enabling these features, check for existing services using the same ports:**
+
+```bash
+# Check for iperf3 server already running
+sudo netstat -tlnp | grep 5201
+# or
+sudo ss -tlnp | grep 5201
+
+# Check for existing services on port 3005
+sudo netstat -tlnp | grep 3005
+docker ps | grep -E "3000|3005"
+```
+
+**Common conflicts:**
+
+| Port | Service | Resolution |
+|------|---------|------------|
+| 5201 | Existing iperf3 server | Stop: `sudo systemctl stop iperf3` |
+| 3005 | OpenSpeedTest port conflict | Set `OPENSPEEDTEST_PORT=3006` (or another free port) in `.env` |
+
+**Container name conflicts:**
+
+The bundled OpenSpeedTest uses container name `openspeedtest`. If you have an existing container with this name:
+
+```bash
+# Remove existing container
+docker stop openspeedtest && docker rm openspeedtest
+
+# Then start the Network Optimizer stack
+docker compose up -d
+```
+
+### External WAN Speed Test Server (Optional)
+
+Deploy an OpenSpeedTest instance to a remote server (VPS, cloud VM, etc.) to let clients test their **internet (WAN) speed** from any device on your network. Results are automatically posted back to your Network Optimizer instance.
+
+**How it works:** The client's browser connects to the remote speed test server. Traffic flows: client → your WAN → internet → remote server → internet → your WAN → client. The result is posted back to Network Optimizer with a server identifier, and stored as a WAN speed test result.
+
+**Requirements:**
+- A remote server with Docker (any cloud VPS works)
+- Port 3005 (or your chosen port) open on the remote server
+- **HTTPS on the external server** (strongly recommended - see note below)
+
+**Why HTTPS?** Chrome and Edge enforce [Private Network Access](https://developer.chrome.com/blog/private-network-access-update) rules. The speed test page is served from a public IP, and the browser posts results back to Network Optimizer on your LAN (a private IP). These browsers block this unless the page origin is HTTPS (a secure context). Firefox and Safari do not currently enforce this restriction, but HTTPS is still strongly recommended.
+
+**Setup:**
+
+1. In Network Optimizer, go to **Settings → External Speed Test Server**
+2. Enter the server name, hostname/IP, port, and scheme (HTTPS)
+3. Save - a **deploy command** will appear with everything pre-filled
+4. SSH to your remote server and run the deploy command
+
+The deploy command handles downloading files, building the container, and starting the server. The Server ID is automatically generated from the name you entered and links results back to this server.
+
+**Interactive deploy** (if you haven't configured Settings yet, the script will walk you through it):
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/deploy-external-speedtest.sh | bash
+```
+
+**Updating** an existing installation (re-downloads files and rebuilds the container):
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/deploy-external-speedtest.sh | bash -s -- --update
+```
+
+**Setting up HTTPS:** If you use [NetworkOptimizer-Proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) (Traefik), the WAN speed test route is already included in `config.example.yml` - just uncomment the `speedtest-wan` router and service, update the hostname and VPS address, and you're done. The config enforces HTTP/1.1 and strips compression headers automatically.
+
+If you use a different reverse proxy, add a route for the external speed test hostname pointing to your remote server on port 3005. The reverse proxy must force HTTP/1.1 for accurate speed test results (HTTP/2 multiplexing interferes with throughput measurement).
+
+Then update the external server settings in Network Optimizer to use `https` scheme and port `443`.
+
+### Disabling Optional Services
+
+To disable client speed testing components:
+
+```env
+# Disable iperf3 server (default)
+IPERF3_SERVER_ENABLED=false
+
+# To completely disable OpenSpeedTest, comment it out in docker-compose.yml
+# or use a custom override file
+```
+
+## InfluxDB for Monitoring (Optional)
+
+Network Optimizer's monitoring feature (SNMP polling, port counters, latency probes, SFP optical levels) stores time-series data in InfluxDB 2.x. You provide the InfluxDB instance - Network Optimizer's setup wizard handles bucket and token provisioning automatically.
+
+**You do not need InfluxDB for any other Network Optimizer feature.** It is only required if you want to use the Monitoring page.
+
+**Disk space:** Data grows with device and client count. A small home network (~10 devices) uses roughly 75 MB per day; a medium business network (50-100 devices, 200+ clients) can use 500 MB - 1 GB per day. With the default 90-day retention, plan accordingly - 20 GB minimum, 50-100 GB recommended for medium-sized networks.
+
+### Option A: Docker Compose (Recommended)
+
+A ready-to-use compose file is included at [`docker/influxdb/docker-compose.yml`](influxdb/docker-compose.yml):
+
+```bash
+cd /opt/network-optimizer/docker/influxdb   # or wherever you deployed
+docker compose up -d
+```
+
+InfluxDB will be available at `http://<docker-host>:8086` (the IP or hostname of the machine running Docker). Open the UI to create an admin user and an all-access API token, then go to Network Optimizer's Monitoring page to finish setup.
+
+### Option B: Proxmox LXC
+
+The [Proxmox community scripts](https://community-scripts.github.io/ProxmoxVE/scripts?id=influxdb) project has an InfluxDB LXC helper. Run on your Proxmox host:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/influxdb.sh)"
+```
+
+The script is interactive - choose **InfluxDB v2** when prompted. It creates a lightweight Debian LXC with InfluxDB pre-installed (default: 2 cores, 2 GB RAM, 8 GB disk).
+
+### Option C: macOS (Homebrew)
+
+```bash
+brew install influxdb@2
+brew services start influxdb@2
+```
+
+### Option D: Other Platforms
+
+See the [official InfluxDB 2.x install docs](https://docs.influxdata.com/influxdb/v2/install/).
+
+### After Installation
+
+1. Open InfluxDB at `http://<influxdb-host>:8086`
+2. Complete the initial setup (create admin user, org, and bucket - the bucket name doesn't matter, Network Optimizer creates its own)
+3. Create an **All Access API Token** (Load Data > API Tokens > Generate)
+4. In Network Optimizer, go to **Monitoring** and follow the setup wizard
+5. Paste your all-access token - the wizard provisions two buckets (`network_monitoring` at 90-day retention, `network_monitoring_longterm` at 365-day) and mints a least-privilege scoped token for ongoing use. Your all-access token is never stored.
+
+### Custom Dashboards (Optional)
+
+Your monitoring data sits in plain InfluxDB 2.x buckets, so you can point your own Grafana (or any InfluxDB client) at the same instance and build whatever dashboards you want. Add the instance to Grafana as a Flux data source and query the `network_monitoring` and `network_monitoring_longterm` buckets - browse the measurements there for interface counters, device health, latency, SFP optics, Wi-Fi clients, and modem / ONT signal.
+
+The schema is stable: measurement and field names only ever get added, never renamed or removed (Network Optimizer's own charts depend on them), so anything you build keeps working across upgrades.
+
+## Next Steps
+
+After deployment:
+1. Access web UI and complete initial setup
+2. Connect to UniFi Controller
+3. Configure SSH access for gateway and devices (see above)
+4. Run security audit
+5. Configure SQM settings (if applicable)
+6. Set up client speed testing (optional, see above)
+7. Set up InfluxDB for monitoring (optional, see above)
+
+See main documentation for feature guides.

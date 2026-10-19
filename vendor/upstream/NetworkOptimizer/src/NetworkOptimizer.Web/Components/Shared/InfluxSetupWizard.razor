@@ -1,0 +1,768 @@
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Storage.Services
+@using NetworkOptimizer.Web.Services
+@using Microsoft.AspNetCore.Components.Authorization
+@using NetworkOptimizer.Web.Services.Identity
+@using Microsoft.EntityFrameworkCore
+@inject IInfluxDbProvisioningService Provisioner
+@inject ISiteInfluxProvisioningService SiteProvisioner
+@inject MonitoringInfluxRegistry InfluxRegistry
+@inject ICredentialProtectionService CredentialService
+@inject SiteContextService SiteContext
+@inject SiteDbContextFactory SiteDbFactory
+@inject Microsoft.AspNetCore.Authorization.IAuthorizationService Authz
+@inject ILogger<InfluxSetupWizard> Logger
+
+@switch (_state)
+{
+    case Step.Detecting:
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">@TitlePrefix InfluxDB</h2>
+            </div>
+            <div class="card-body">
+                <div class="empty-state">
+                    @if (!_noWorkPossible)
+                    {
+                        <span class="spinner"></span>
+                        <p>Looking for InfluxDB on this network...</p>
+                    }
+                    else
+                    {
+                        @* Setting this up needs the instance-wide Admin role, which a site's own
+                           admin need not hold. Say so: nothing is going to happen for them, and a
+                           spinner that never resolves reads as the page being broken. *@
+                        <p>Setting up InfluxDB requires an administrator for this installation.</p>
+                    }
+                </div>
+            </div>
+        </div>
+        break;
+
+    case Step.UrlNotFound:
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">@TitlePrefix InfluxDB</h2>
+                <span class="status-badge status-disconnected">Not reachable</span>
+            </div>
+            <div class="card-body">
+                <p class="section-description">
+                    Network Optimizer needs InfluxDB to store time-series monitoring data
+                    (port counters, latency probes, SFP optical levels). We tried these
+                    URLs but none responded:
+                </p>
+                @if (_probe?.CandidatesTried != null)
+                {
+                    <ul style="margin: 0 0 1rem 1.25rem;">
+                        @foreach (var c in _probe.CandidatesTried) { <li><code>@c</code></li> }
+                    </ul>
+                }
+
+                <details class="setup-guide" open>
+                    <summary>Install InfluxDB</summary>
+                    <div class="setup-guide-content">
+                        <p><strong>Docker</strong> (recommended for NAS / Linux hosts, or see the <a href="https://github.com/Ozark-Connect/NetworkOptimizer/blob/main/docker/DEPLOYMENT.md#influxdb-for-monitoring-optional" target="_blank" rel="noopener">Deployment Guide</a> for a companion Docker Compose config):</p>
+                        <pre><code>docker run -d --name influxdb --restart unless-stopped \
+  -p 8086:8086 -v influxdb-data:/var/lib/influxdb2 \
+  influxdb:2</code></pre>
+                        <p><strong>macOS</strong>: <code>brew install influxdb@2 && brew services start influxdb@2</code></p>
+                        <p><strong>Other</strong>: see the <a href="https://docs.influxdata.com/influxdb/v2/install/" target="_blank" rel="noopener">InfluxDB install docs</a>.</p>
+                        <p>Once it's running, finish the initial setup at <code>http://localhost:8086</code> to create an admin user and an All Access API Token, then come back here.</p>
+                    </div>
+                </details>
+
+                <div class="form-group" style="margin-top: 1rem;">
+                    <label class="form-label">Or enter a URL manually</label>
+                    <input type="text" class="form-control" @bind="_manualUrl" placeholder="http://localhost:8086" />
+                </div>
+
+                <div class="action-buttons">
+                    <button class="btn btn-secondary" @onclick="DetectAgainAsync" disabled="@_busy">Detect again</button>
+                    <button class="btn btn-primary" @onclick="UseManualUrlAsync" disabled="@(_busy || string.IsNullOrWhiteSpace(_manualUrl))">Use this URL</button>
+                </div>
+            </div>
+        </div>
+        break;
+
+    case Step.UrlFound:
+    case Step.PickOrg:
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">@TitlePrefix InfluxDB</h2>
+                <span class="status-badge status-connected">
+                    Found at @_probe?.Url
+                    @if (!string.IsNullOrEmpty(_probe?.Version)) { <span> (@_probe.Version)</span> }
+                </span>
+            </div>
+            <div class="card-body">
+                @if (!_canProvision)
+                {
+                    @* An All Access token is an installation-wide credential, and everything this
+                       step does with it - creating the org's buckets, upgrading the shared token -
+                       is gated on the instance-wide role. Asking a site's own admin for one sends
+                       them to fetch a credential they have no authority to hold, and refuses them
+                       after they have gone and got it. Say who can do this instead. *@
+                    <p class="section-description">
+                        This site's monitoring data will live in the shared InfluxDB, in buckets
+                        named <code>@SitePrimaryBucket</code> and <code>@SiteLongtermBucket</code>.
+                        Creating them needs an administrator for this installation - the shared
+                        connection is set up once and covers every site.
+                    </p>
+                }
+                else if (_siteMode)
+                {
+                    <p class="section-description">
+                        This site will store its monitoring data in the shared InfluxDB,
+                        using site-specific buckets: <code>@SitePrimaryBucket</code> and
+                        <code>@SiteLongtermBucket</code>. Provide an
+                        <strong>All Access API Token</strong> in the
+                        <strong>@_sharedOrgName</strong> Organization so we can create those
+                        buckets and upgrade the shared connection token to cover them. If you
+                        add more Sites, the shared token will be used to provision each new
+                        Site in InfluxDB. <strong>Your All Access API Token is held in memory
+                        only for this request and discarded immediately after, it's never
+                        saved to disk.</strong>
+                    </p>
+                }
+                else
+                {
+                    <p class="section-description">
+                        Provide an <strong>All Access API Token</strong> for the InfluxDB org
+                        you want Network Optimizer's data to live in. We'll use it just for
+                        this setup, to create the two NO buckets in that org and mint a
+                        least-privilege token for ongoing use. <strong>Your All Access API
+                        Token is held in memory only for this request and discarded
+                        immediately after, it's never saved to disk.</strong>
+                    </p>
+                }
+
+                @if (_canProvision)
+                {
+                    <div class="form-group">
+                        <label class="form-label">All Access API Token</label>
+                        <input type="password" class="form-control" @bind="_adminToken" @bind:event="oninput" placeholder="Paste your InfluxDB All Access API Token" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
+                    </div>
+                }
+
+                @if (_canProvision && _state == Step.PickOrg)
+                {
+                    <div class="form-group">
+                        @if (_orgs.Count == 0)
+                        {
+                            <label class="form-label">Which org should Network Optimizer use?</label>
+                            <div class="alert alert-warning">
+                                No orgs are visible to this token. Use an All Access API Token
+                                scoped to your target org, or an operator token.
+                            </div>
+                        }
+                        else if (_orgs.Count == 1)
+                        {
+                            <label class="form-label">Network Optimizer's data will live in</label>
+                            <div class="form-value">
+                                <code>@_orgs[0].Name</code>
+                            </div>
+                            <p class="section-description" style="margin-top: 0.5rem;">
+                                NO creates two buckets in this org: <code>network_monitoring</code>
+                                (90-day retention) and <code>network_monitoring_longterm</code>
+                                (365-day). The bucket names are NO-specific so they can't
+                                collide with anything else in this org.
+                            </p>
+                        }
+                        else
+                        {
+                            <label class="form-label">Which org should Network Optimizer use?</label>
+                            <select class="form-control" @bind="_selectedOrgId" style="max-width: 320px;">
+                                <option value="">- Pick an org -</option>
+                                @foreach (var org in _orgs)
+                                {
+                                    <option value="@org.Id">@org.Name</option>
+                                }
+                            </select>
+                            <p class="section-description" style="margin-top: 0.5rem;">
+                                NO creates two buckets in this org: <code>network_monitoring</code>
+                                (90-day retention) and <code>network_monitoring_longterm</code>
+                                (365-day). The bucket names are NO-specific so they can't
+                                collide with anything else in this org.
+                            </p>
+                        }
+                    </div>
+                }
+
+                @if (!string.IsNullOrEmpty(_message))
+                {
+                    <div class="alert alert-@_messageClass">@_message</div>
+                }
+
+                @* No actions for someone who cannot complete any of them - every button here ends
+                   in an instance-wide gated call. *@
+                @if (_canProvision)
+                {
+                    <div class="action-buttons">
+                        @if (!_siteMode)
+                        {
+                            <button class="btn btn-secondary" @onclick="DetectAgainAsync" disabled="@_busy">Use a different URL</button>
+                        }
+                        <button class="btn btn-primary" @onclick="OnPrimaryActionAsync"
+                                disabled="@(_busy || !CanPrimaryAction)">
+                            @if (_busy) { <span class="spinner-sm"></span> <span>@PrimaryBusyLabel</span> }
+                            else { <span>@PrimaryLabel</span> }
+                        </button>
+                    </div>
+                }
+            </div>
+        </div>
+        break;
+
+    case Step.Done:
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">InfluxDB Ready</h2>
+                <span class="status-badge status-connected">Set up</span>
+            </div>
+            <div class="card-body">
+                <div class="alert alert-success">
+                    @if (_siteMode)
+                    {
+                        <text>This site's buckets are ready on the shared InfluxDB. You can now enable monitoring.</text>
+                        @* Only when they actually pasted one: the silent path never asks, so saying
+                           we are finished with a token they never gave would be nonsense. *@
+                        @if (_usedAllAccessToken)
+                        {
+                            <text> Network Optimizer is finished with your All Access token - future sites provision using the shared token, so you can delete it in InfluxDB if you don't need it elsewhere.</text>
+                        }
+                    }
+                    else
+                    {
+                        <text>Buckets created and a scoped token has been saved. You can now enable monitoring. Network Optimizer is finished with your All Access token - it was never written to disk, and you can delete it in InfluxDB if you don't need it elsewhere.</text>
+                    }
+                </div>
+                <div class="action-buttons">
+                    <button class="btn btn-primary" @onclick="DismissAsync">Continue</button>
+                </div>
+            </div>
+        </div>
+        break;
+}
+
+@code {
+    /// <summary>
+    /// Optional title prefix. Set to "Set up" when used standalone, or leave empty when
+    /// already embedded under a "Monitoring Setup" header.
+    /// </summary>
+    [Parameter] public string TitlePrefix { get; set; } = "Set up ";
+
+    /// <summary>Invoked once provisioning succeeds, so the host page can refresh its state.</summary>
+    [Parameter] public EventCallback OnProvisioned { get; set; }
+
+    /// <summary>Invoked when the user clicks Continue after seeing the success message.</summary>
+    [Parameter] public EventCallback OnDismissed { get; set; }
+
+    private Step _state = Step.Detecting;
+    private InfluxDbProvisioningService.UrlProbeResult? _probe;
+    private string _manualUrl = string.Empty;
+    private string _adminToken = string.Empty;
+
+    /// <summary>Whether this run actually asked for and used an All Access token - the silent
+    /// site-mode path never does, so its completion copy must not claim otherwise.</summary>
+    private bool _usedAllAccessToken;
+    private string? _authedAs;
+    private List<InfluxDbProvisioningService.InfluxOrg> _orgs = new();
+    private string? _selectedOrgId;
+    private bool _busy;
+    private string? _message;
+    private string _messageClass = "info";
+
+    // Site mode: a secondary site whose main site already has InfluxDB configured.
+    // The server, org, and token are shared with main; only the bucket names differ
+    // (slug-prefixed). On entry we try to create this site's buckets with the shared
+    // token. If it can (already org-scoped) we're done silently. If it can't (main
+    // still holds its original two-bucket token) we prompt for an all-access token,
+    // create the buckets, and upgrade the shared token to an org-scoped one.
+    private bool _siteMode;
+    private string _sharedUrl = string.Empty;
+    private string _sharedOrgName = string.Empty;
+    private string? _sharedToken;
+    private string _sharedPrimaryBase = "network_monitoring";
+    private string _sharedLongtermBase = "network_monitoring_longterm";
+
+    private string SitePrimaryBucket => $"{SiteContext.Slug}-{_sharedPrimaryBase}";
+    private string SiteLongtermBucket => $"{SiteContext.Slug}-{_sharedLongtermBase}";
+
+    // Primary action is two-stage: first press validates the token and loads orgs
+    // (the user has to see and pick one, we never auto-pick). Second press, once an
+    // org is selected, provisions the buckets and mints the scoped token.
+    private bool CanPrimaryAction
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(_adminToken)) return false;
+            if (_state != Step.PickOrg) return true; // first click: validate + list
+            return !string.IsNullOrEmpty(_selectedOrgId);
+        }
+    }
+
+    private string PrimaryLabel =>
+        _siteMode ? "Create site buckets"
+        : _state != Step.PickOrg ? "List orgs" : "Provision buckets and token";
+
+    private string PrimaryBusyLabel =>
+        _siteMode ? "Provisioning..."
+        : _state != Step.PickOrg ? "Loading orgs..." : "Provisioning...";
+
+    private async Task OnPrimaryActionAsync()
+    {
+        if (_siteMode)
+        {
+            await ProvisionSiteAsync();
+            return;
+        }
+        if (_state != Step.PickOrg)
+        {
+            await ValidateTokenAsync();
+            return;
+        }
+        await ProvisionAsync();
+    }
+
+    /// <summary>Whether this user can establish the installation's InfluxDB - orgs, tokens, the
+    /// shared connection. Instance-wide Admin, because those are installation-wide decisions.</summary>
+    private bool _canProvision;
+
+    /// <summary>Whether they can finish THIS site off an existing shared connection. Admin on this
+    /// site is enough: adding a site's own buckets decides nothing for the installation.</summary>
+    private bool _canProvisionSite;
+
+    /// <summary>No provisioning path is open to this caller, so the wizard has nothing to do.</summary>
+    private bool _noWorkPossible;
+
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Provisioning is Admin-gated at the service. Site mode opens by ATTEMPTING a silent bucket
+        // creation, so every Monitoring load on a managed site ran an Admin-only call as whoever was
+        // looking - and a Viewer got two denied audit entries per visit (prerender, then the
+        // circuit), swallowed by the catch below and therefore invisible except in the log. Ask
+        // first: someone who could not finish the wizard has no business starting it.
+        var user = AuthState is null ? null : (await AuthState).User;
+        _canProvision = user is null || (await Authz.AuthorizeAsync(user, Policies.RequireAdmin)).Succeeded;
+        _canProvisionSite = _canProvision
+            || (await Authz.AuthorizeAsync(user!, SiteContext.Slug, Policies.SiteAdmin)).Succeeded;
+
+        // Site mode only needs the site's own admin - it adds this site's buckets to a connection
+        // that already exists. The full flow establishes that connection, so it keeps the
+        // instance-wide check.
+        if (!IsDefaultSite && _canProvisionSite)
+            await TryEnterSiteModeAsync();
+        if (!_siteMode && _canProvision)
+            await DetectAgainAsync();
+
+        // Nothing above ran, so nothing will ever move off Detecting: site mode was skipped or bowed
+        // out, and the full flow needs an instance-wide Admin this caller does not have. Say so
+        // rather than spinning forever - a site's admin can land here on the default site, or on a
+        // managed site before the shared connection exists, and the spinner reads as a broken page.
+        _noWorkPossible = _state == Step.Detecting && !_siteMode && !_canProvision;
+    }
+
+    /// <summary>
+    /// Enters site mode when the main site's shared InfluxDB connection is already set
+    /// up. Server, org, and token are inherited from main; only bucket names differ.
+    /// We first try to create this site's buckets with the shared token silently; if
+    /// the shared token can't manage buckets we surface the all-access token prompt.
+    /// Falls back to the full flow (<see cref="_siteMode"/> false) when main has no
+    /// InfluxDB configured yet.
+    /// </summary>
+    private async Task TryEnterSiteModeAsync()
+    {
+        await using var mainDb = SiteDbFactory.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true);
+        var shared = await mainDb.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync();
+        if (shared == null
+            || string.IsNullOrWhiteSpace(shared.InfluxDbUrl)
+            || string.IsNullOrWhiteSpace(shared.InfluxDbOrg)
+            || string.IsNullOrWhiteSpace(shared.InfluxDbToken))
+            return;
+
+        _siteMode = true;
+        _sharedUrl = shared.InfluxDbUrl.Trim();
+        _sharedOrgName = shared.InfluxDbOrg.Trim();
+        _sharedPrimaryBase = string.IsNullOrWhiteSpace(shared.InfluxDbBucket) ? "network_monitoring" : shared.InfluxDbBucket.Trim();
+        _sharedLongtermBase = string.IsNullOrWhiteSpace(shared.InfluxDbLongtermBucket) ? "network_monitoring_longterm" : shared.InfluxDbLongtermBucket.Trim();
+        try { _sharedToken = CredentialService.Decrypt(shared.InfluxDbToken); } catch { _sharedToken = null; }
+
+        _state = Step.Detecting;
+        _busy = true;
+        StateHasChanged();
+        try
+        {
+            _probe = await Provisioner.ProbeAsync(_sharedUrl);
+            if (!_probe.Reachable)
+            {
+                _state = Step.UrlNotFound;
+                return;
+            }
+            // If the shared token can already create buckets, do it and finish with no
+            // user interaction. Otherwise fall through to the all-access token prompt.
+            if (await TrySilentProvisionAsync())
+                return;
+            _state = Step.UrlFound;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// Attempts to create this site's buckets using the shared token alone. Succeeds
+    /// only when the shared token is org-scoped (can list the org and create buckets),
+    /// which is the case once any earlier site triggered the upgrade. Returns false
+    /// when the shared token is still main's original two-bucket token.
+    /// </summary>
+    private async Task<bool> TrySilentProvisionAsync()
+    {
+        if (string.IsNullOrEmpty(_sharedToken)) return false;
+        var orgId = await SiteProvisioner.TryResolveOrgIdAsync(_sharedUrl, _sharedToken, _sharedOrgName);
+        if (string.IsNullOrEmpty(orgId)) return false;
+        try
+        {
+            await SiteProvisioner.EnsureBucketsAsync(_sharedUrl, _sharedToken, orgId, SitePrimaryBucket, SiteLongtermBucket);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Silent bucket provisioning did not go through; falling back to the token prompt");
+            return false;
+        }
+        await ReconfigureSiteClientAsync();
+        _state = Step.Done;
+        if (OnProvisioned.HasDelegate) await OnProvisioned.InvokeAsync();
+        return true;
+    }
+
+    /// <summary>
+    /// Site-mode provisioning with an all-access token: create this site's buckets,
+    /// then upgrade the shared credential - mint an org-scoped token that can create
+    /// and write every site's buckets and replace main's original two-bucket token
+    /// with it. No per-site token is stored; every site derives the shared token.
+    /// The all-access token is dropped from memory on completion.
+    /// </summary>
+    private async Task ProvisionSiteAsync()
+    {
+        if (_probe == null || string.IsNullOrEmpty(_probe.Url)) return;
+        _busy = true;
+        _message = null;
+        StateHasChanged();
+        try
+        {
+            var url = _probe.Url;
+            var adminToken = _adminToken.Trim();
+
+            var validation = await Provisioner.ValidateAdminTokenAsync(url, adminToken);
+            if (!validation.Valid)
+            {
+                _message = validation.Error ?? "Token validation failed";
+                _messageClass = "danger";
+                return;
+            }
+            _authedAs = validation.UserName;
+
+            var orgId = await Provisioner.TryResolveOrgIdAsync(url, adminToken, _sharedOrgName);
+            if (string.IsNullOrEmpty(orgId))
+            {
+                _message = $"This token can't see the shared org '{_sharedOrgName}'. Use an All Access API Token for that org.";
+                _messageClass = "danger";
+                return;
+            }
+
+            // Create this site's buckets with the all-access token.
+            await Provisioner.EnsureBucketsAsync(url, adminToken, orgId, SitePrimaryBucket, SiteLongtermBucket);
+
+            // Upgrade the shared credential and replace main's token with it. From now
+            // on main and every site use this one org-scoped token, so later sites
+            // provision silently without needing an all-access token again.
+            var orgScoped = await Provisioner.CreateOrgScopedTokenAsync(url, adminToken, orgId);
+            await using (var mainDb = SiteDbFactory.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true))
+            {
+                var mainRow = await mainDb.MonitoringSettings.FirstAsync();
+                mainRow.InfluxDbToken = CredentialService.Encrypt(orgScoped.Token);
+                mainRow.UpdatedAt = DateTime.UtcNow;
+                await mainDb.SaveChangesAsync();
+            }
+            _adminToken = string.Empty; // drop the admin token explicitly
+            _usedAllAccessToken = true;
+            _sharedToken = orgScoped.Token;
+
+            // Main and every existing site client pick up the upgraded token
+            // (site clients derive their connection from main at configure time).
+            await InfluxRegistry.ReconfigureAllAsync();
+            await ReconfigureSiteClientAsync();
+
+            _state = Step.Done;
+            if (OnProvisioned.HasDelegate) await OnProvisioned.InvokeAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "InfluxDB provisioning failed for site {Slug}", SiteContext.Slug);
+            _message = $"Provisioning failed: {ex.Message}";
+            _messageClass = "danger";
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task ReconfigureSiteClientAsync()
+    {
+        var influxClient = InfluxRegistry.GetFor(SiteContext.Slug);
+        await influxClient.ReconfigureAsync();
+        await influxClient.CheckHealthAsync();
+    }
+
+    private async Task DetectAgainAsync()
+    {
+        _state = Step.Detecting;
+        _busy = true;
+        _message = null;
+        StateHasChanged();
+        try
+        {
+            _probe = await Provisioner.AutoDetectUrlAsync();
+            _state = _probe.Reachable ? Step.UrlFound : Step.UrlNotFound;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task UseManualUrlAsync()
+    {
+        _busy = true;
+        _message = null;
+        StateHasChanged();
+        try
+        {
+            _probe = await Provisioner.ProbeAsync(_manualUrl.Trim());
+            if (_probe.Reachable)
+            {
+                _state = Step.UrlFound;
+            }
+            else
+            {
+                _message = $"Couldn't reach {_manualUrl}: {_probe.Error}";
+                _messageClass = "warning";
+            }
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task ValidateTokenAsync()
+    {
+        if (_probe == null || string.IsNullOrEmpty(_probe.Url)) return;
+        _busy = true;
+        _message = null;
+        StateHasChanged();
+        try
+        {
+            var result = await Provisioner.ValidateAdminTokenAsync(_probe.Url, _adminToken.Trim());
+            if (!result.Valid)
+            {
+                _message = result.Error ?? "Token validation failed";
+                _messageClass = "danger";
+                return;
+            }
+            _authedAs = result.UserName;
+
+            try
+            {
+                _orgs = (await Provisioner.ListOrgsAsync(_probe.Url, _adminToken.Trim())).ToList();
+            }
+            catch (Exception ex)
+            {
+                _message = $"Authenticated, but couldn't list orgs: {ex.Message}";
+                _messageClass = "warning";
+                _orgs = new();
+            }
+
+            // In current InfluxDB 2.x, an all-access token is scoped to exactly one org,
+            // so the list usually has one entry. Auto-select when there's just one (the
+            // UI shows the org name as confirmation rather than a single-item dropdown).
+            // When there are multiple (operator token / future multi-org architecture),
+            // prefer one named "network-optimizer" if present, otherwise leave blank so
+            // the user picks deliberately.
+            if (_orgs.Count == 1)
+            {
+                _selectedOrgId = _orgs[0].Id;
+            }
+            else
+            {
+                var preferred = _orgs.FirstOrDefault(o =>
+                    string.Equals(o.Name, "network-optimizer", StringComparison.OrdinalIgnoreCase));
+                _selectedOrgId = preferred?.Id;
+            }
+            _state = Step.PickOrg;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task ProvisionAsync()
+    {
+        if (_probe == null || string.IsNullOrEmpty(_selectedOrgId)) return;
+        _busy = true;
+        _message = null;
+        StateHasChanged();
+        try
+        {
+            var url = _probe.Url;
+            var adminToken = _adminToken.Trim();
+
+            var org = _orgs.First(o => o.Id == _selectedOrgId);
+            if (string.IsNullOrEmpty(org.Id))
+                throw new InvalidOperationException("Org has no ID");
+
+            // An external site reaches this full flow only when main has no shared
+            // InfluxDB yet (site mode bailed). Establish the shared connection on main
+            // first, then this site's buckets, rather than making this site self-contained.
+            if (!IsDefaultSite)
+            {
+                await ProvisionMainAndSiteAsync(url, adminToken, org);
+                return;
+            }
+
+            var settings = await GetOrCreateSettingsRowAsync();
+            // Non-default sites get slug-prefixed buckets in the shared org
+            // (decision D1) so per-site data never mixes; the default site
+            // keeps the unprefixed names existing installs already have.
+            var bucketPrefix = IsDefaultSite ? "" : $"{SiteContext.Slug}-";
+            var primaryName = string.IsNullOrWhiteSpace(settings.InfluxDbBucket) ? $"{bucketPrefix}network_monitoring" : settings.InfluxDbBucket;
+            var longtermName = string.IsNullOrWhiteSpace(settings.InfluxDbLongtermBucket) ? $"{bucketPrefix}network_monitoring_longterm" : settings.InfluxDbLongtermBucket;
+            var bucketResult = await Provisioner.EnsureBucketsAsync(url, adminToken, org.Id, primaryName, longtermName);
+
+            var scoped = await Provisioner.CreateScopedTokenAsync(url, adminToken, org.Id, bucketResult.PrimaryBucketId, bucketResult.LongtermBucketId);
+
+            await using var db = CreateSiteDb();
+            var row = await db.MonitoringSettings.FirstAsync();
+            row.InfluxDbUrl = url;
+            row.InfluxDbOrg = org.Name ?? string.Empty;
+            row.InfluxDbBucket = bucketResult.PrimaryBucketName;
+            row.InfluxDbLongtermBucket = bucketResult.LongtermBucketName;
+            row.InfluxDbToken = CredentialService.Encrypt(scoped.Token);
+            row.UpdatedAt = DateTime.UtcNow;
+            await db.SaveChangesAsync();
+            _adminToken = string.Empty; // drop the admin token explicitly
+
+            var influxClient = InfluxRegistry.GetFor(SiteContext.Slug);
+            await influxClient.ReconfigureAsync();
+            await influxClient.CheckHealthAsync();
+
+            _state = Step.Done;
+            if (OnProvisioned.HasDelegate) await OnProvisioned.InvokeAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "InfluxDB provisioning failed for site {Slug}", SiteContext.Slug);
+            _message = $"Provisioning failed: {ex.Message}";
+            _messageClass = "danger";
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// Establishes the shared InfluxDB from an external-site context when the main site
+    /// has none configured. Creates main's unprefixed buckets and an org-scoped token
+    /// written to main's row - the shared connection every site derives from - then this
+    /// site's slug-prefixed buckets. Main's buckets may go unused (main may have no
+    /// UniFi Console) but they anchor the shared model so later sites provision silently.
+    /// This site's row is left empty so it derives its connection from main.
+    /// </summary>
+    private async Task ProvisionMainAndSiteAsync(string url, string adminToken, InfluxDbProvisioningService.InfluxOrg org)
+    {
+        const string mainPrimary = "network_monitoring";
+        const string mainLongterm = "network_monitoring_longterm";
+        var sitePrimary = $"{SiteContext.Slug}-{mainPrimary}";
+        var siteLongterm = $"{SiteContext.Slug}-{mainLongterm}";
+
+        // Main's shared buckets, then this site's own buckets.
+        await Provisioner.EnsureBucketsAsync(url, adminToken, org.Id!, mainPrimary, mainLongterm);
+        await Provisioner.EnsureBucketsAsync(url, adminToken, org.Id!, sitePrimary, siteLongterm);
+
+        // Org-scoped token so the shared credential can create and write every site's
+        // buckets - this is what lets later sites provision without an all-access token.
+        var orgScoped = await Provisioner.CreateOrgScopedTokenAsync(url, adminToken, org.Id!);
+
+        await using (var mainDb = SiteDbFactory.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true))
+        {
+            var mainRow = await mainDb.MonitoringSettings.FirstOrDefaultAsync();
+            if (mainRow == null)
+            {
+                mainRow = new MonitoringSettings();
+                mainDb.MonitoringSettings.Add(mainRow);
+            }
+            mainRow.InfluxDbUrl = url;
+            mainRow.InfluxDbOrg = org.Name ?? string.Empty;
+            mainRow.InfluxDbBucket = mainPrimary;
+            mainRow.InfluxDbLongtermBucket = mainLongterm;
+            mainRow.InfluxDbToken = CredentialService.Encrypt(orgScoped.Token);
+            mainRow.UpdatedAt = DateTime.UtcNow;
+            await mainDb.SaveChangesAsync();
+        }
+        _adminToken = string.Empty; // drop the admin token explicitly
+
+        // Main and every existing site client pick up the shared connection; this
+        // site derives its buckets from it.
+        await InfluxRegistry.ReconfigureAllAsync();
+        await ReconfigureSiteClientAsync();
+
+        _state = Step.Done;
+        if (OnProvisioned.HasDelegate) await OnProvisioned.InvokeAsync();
+    }
+
+    private async Task DismissAsync()
+    {
+        if (OnDismissed.HasDelegate) await OnDismissed.InvokeAsync();
+    }
+
+    private bool IsDefaultSite => SiteContext.Slug == SiteManagementService.DefaultSiteSlug;
+
+    // The wizard configures the CURRENT site's monitoring settings: the main
+    // database for the default site, the site's own database otherwise.
+    private NetworkOptimizerDbContext CreateSiteDb() =>
+        SiteDbFactory.CreateForSite(SiteContext.Slug, IsDefaultSite);
+
+    private async Task<MonitoringSettings> GetOrCreateSettingsRowAsync()
+    {
+        await using var db = CreateSiteDb();
+        var row = await db.MonitoringSettings.FirstOrDefaultAsync();
+        if (row == null)
+        {
+            row = new MonitoringSettings();
+            db.MonitoringSettings.Add(row);
+            await db.SaveChangesAsync();
+        }
+        return row;
+    }
+
+    public enum Step
+    {
+        Detecting,
+        UrlNotFound,
+        UrlFound,
+        PickOrg,
+        Done
+    }
+}

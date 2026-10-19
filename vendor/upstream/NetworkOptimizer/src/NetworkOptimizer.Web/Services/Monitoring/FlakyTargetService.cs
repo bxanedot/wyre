@@ -1,0 +1,294 @@
+using Microsoft.EntityFrameworkCore;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Services;
+
+namespace NetworkOptimizer.Web.Services.Monitoring;
+
+/// <summary>
+/// Detects flaky WAN-path monitoring targets (issue #849): an AccessIsp / Transit / InternetService
+/// target whose packet loss is notably above the peer baseline, consistently, over the retained
+/// window - usually ICMP-deprioritized routers. Relative-to-peers so it auto-calibrates per
+/// connection (congested DOCSIS at 0.5% across the board doesn't false-positive; a transit router
+/// at 10% against a 0.2% baseline does).
+///
+/// Computed on demand (Live View banner + Network Performance panel initial loads) - never polled.
+/// Reuses the existing per-target loss query; adds no Influx measurements.
+/// Scoped per site: the injected <see cref="MonitoringInfluxClient"/> forwards to the current
+/// site's Influx client, and the target pool is read from that site's own database.
+/// </summary>
+public class FlakyTargetService
+{
+    private readonly SiteDbContextFactory _siteDbFactory;
+    private readonly SiteContextService _siteContext;
+    private readonly MonitoringInfluxClient _influx;
+    private readonly ILogger<FlakyTargetService> _logger;
+
+    public FlakyTargetService(
+        SiteDbContextFactory siteDbFactory,
+        SiteContextService siteContext,
+        MonitoringInfluxClient influx,
+        ILogger<FlakyTargetService> logger)
+    {
+        _siteDbFactory = siteDbFactory;
+        _siteContext = siteContext;
+        _influx = influx;
+        _logger = logger;
+    }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private NetworkOptimizerDbContext CreateSiteDb() => _siteDbFactory.CreateForSite(_siteContext.Slug, _siteContext.IsDefault);
+
+    /// <summary>Lookback window; we use all available data up to this, never require it.</summary>
+    private const int LookbackHours = 48;
+    /// <summary>Bin size. Fine enough (loss arrives every 10-15 s) that we can help within ~30 min of monitoring.</summary>
+    private const int BinMinutes = 10;
+    /// <summary>A target is "over" in a bin when its loss is at least this multiple of the peer median.</summary>
+    private const double LossMultiplier = 4.0;
+    /// <summary>...and at least this absolute loss, so trivial loss on a near-zero baseline isn't flagged.</summary>
+    private const double LossAbsoluteFloorPct = 3.0;
+    /// <summary>A bin is a shared-loss event (excluded) when at least this fraction of the pool loses heavily in it.</summary>
+    private const double SharedLossPoolFraction = 0.5;
+    /// <summary>Loss at or above this in a bin counts as "losing heavily" for the shared-loss test.</summary>
+    private const double SharedLossHeavyPct = 5.0;
+    /// <summary>Minimum surviving bins before we'll judge a target. 3 x 10 min = help from ~30 min in, not 6 h.</summary>
+    private const int MinTargetBins = 3;
+    /// <summary>
+    /// Recovery window: a target whose full-window metric says flaky but whose surviving bins in
+    /// this trailing slice (anchored to the pool's newest surviving bin, not wall clock) are back
+    /// under the threshold is treated as recovered and not presented. Keeps a stable-flaky-stable
+    /// excursion from nagging for the rest of the 48 h lookback, while an always-flaky target
+    /// (ICMP deprioritization is persistent) keeps failing the recent slice and stays flagged.
+    /// </summary>
+    private const int RecoveryWindowHours = 3;
+    /// <summary>
+    /// Recovery needs at least this many surviving bins (>= ~1 h of evidence) inside the window.
+    /// Fewer - the target went dark or barely reports - can't prove stability, so it stays flagged.
+    /// </summary>
+    private const int MinRecoveryBins = 6;
+    /// <summary>
+    /// A bin at or above this loss counts as hard-down (total outage) rather than the partial,
+    /// load-dependent loss that signals ICMP deprioritization.
+    /// </summary>
+    private const double HardDownLossPct = 95.0;
+    /// <summary>
+    /// Fast recovery for hard-down episodes: when the median over-threshold bin was hard-down
+    /// (median, so the partial-loss bins an aggregate window produces at the outage's edges
+    /// don't disqualify it), the episode was a binary outage, not flakiness - once the hop
+    /// answers cleanly again there's little ambiguity, so this many consecutive clean bins
+    /// (~30 min) clear the flag instead of waiting out the full recovery window.
+    /// </summary>
+    private const int HardDownRecoveryBins = 3;
+
+    /// <summary>One flagged target plus the evidence behind the call.</summary>
+    public record FlakyTarget(
+        string TargetId,
+        int Id,
+        string Name,
+        MonitoringTargetType Type,
+        double LossPct,
+        double BaselinePct,
+        int OverBins,
+        int TotalBins,
+        int? WanContextId)
+    {
+        public string Evidence => $"{LossPct:0.0}% loss vs {BaselinePct:0.0}% peer median";
+    }
+
+    /// <summary>
+    /// Returns the flaky targets, worst loss first. Empty when there isn't enough data yet,
+    /// Influx isn't configured, or nothing is flaky.
+    /// </summary>
+    public async Task<IReadOnlyList<FlakyTarget>> DetectAsync(CancellationToken ct = default)
+    {
+        List<MonitoringTarget> pool;
+        try
+        {
+            await using var db = CreateSiteDb();
+            pool = await db.MonitoringTargets.AsNoTracking()
+                .Where(t => t.Enabled && (t.TargetType == MonitoringTargetType.AccessIsp
+                    || t.TargetType == MonitoringTargetType.Transit
+                    || t.TargetType == MonitoringTargetType.InternetService))
+                .ToListAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Flaky-target detect: failed to load pool");
+            return System.Array.Empty<FlakyTarget>();
+        }
+        if (pool.Count < 2) return System.Array.Empty<FlakyTarget>();
+
+        var byId = pool.ToDictionary(t => t.TargetId, t => t);
+        var to = DateTime.UtcNow;
+        var from = to.AddHours(-LookbackHours);
+        var binSize = TimeSpan.FromMinutes(BinMinutes);
+
+        // Per-target binned loss (the aggregateWindow does the binning). Pull all three
+        // WAN-path types and keep only enabled pool targets.
+        var lossByTarget = new Dictionary<string, Dictionary<DateTime, double>>();
+        foreach (var type in new[] { MonitoringTargetType.AccessIsp, MonitoringTargetType.Transit, MonitoringTargetType.InternetService })
+        {
+            Dictionary<string, List<MonitoringInfluxClient.LatencySeriesPoint>> series;
+            try
+            {
+                series = await _influx.QueryLatencyDetailByTargetTypeAsync(type, from, to, binSize, ct: ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Flaky-target detect: loss query failed for {Type}", type);
+                return System.Array.Empty<FlakyTarget>();
+            }
+            foreach (var (targetId, points) in series)
+            {
+                if (!byId.ContainsKey(targetId)) continue;
+                var bins = lossByTarget.TryGetValue(targetId, out var existing) ? existing : lossByTarget[targetId] = new();
+                foreach (var p in points)
+                {
+                    if (!p.LossPercent.HasValue) continue;
+                    bins[FloorToBin(p.Time, binSize)] = p.LossPercent.Value;
+                }
+            }
+        }
+        if (lossByTarget.Count < 2) return System.Array.Empty<FlakyTarget>();
+
+        return Analyze(lossByTarget, byId, _logger);
+    }
+
+    /// <summary>
+    /// Pure analysis (no I/O): given per-target binned loss, flag the flaky ones. A target is flaky
+    /// when its TRIMMED-MEAN surviving-bin loss (drop the single highest + lowest bin, average the
+    /// rest) is at or above the threshold (>= <see cref="LossMultiplier"/>x the peer-median loss AND
+    /// >= <see cref="LossAbsoluteFloorPct"/>). Trimmed mean is spike-robust like a median (a single
+    /// 100% bin on an otherwise-clean target trims away) but, unlike a small-sample median, it does
+    /// not flap when one clean bin rolls in - the median of ~6 bursty bins can swing across the floor
+    /// (e.g. 2.86% -> 4.5%), the trimmed mean stays put (~4%). Bins where >= half the pool loses
+    /// heavily are excluded first as path-wide events, and a target needs <see cref="MinTargetBins"/>
+    /// surviving bins to be judged. The peer baseline still uses a plain median across the pool.
+    ///
+    /// Recovery gate: a target the full-window metric flags is dropped when its bins in the
+    /// trailing <see cref="RecoveryWindowHours"/> (>= <see cref="MinRecoveryBins"/> of them) are
+    /// back under the same threshold - a stable-flaky-stable excursion stops being presented as
+    /// soon as recent evidence says it's fine, instead of nagging until the bad bins dilute out
+    /// of the 48 h lookback. An always-flaky target keeps failing the recent slice and a target
+    /// that went dark has no recent bins to prove recovery with, so both stay flagged. Hard-down
+    /// episodes (median over-threshold bin >= <see cref="HardDownLossPct"/>) recover faster: a
+    /// binary outage that ended needs only <see cref="HardDownRecoveryBins"/> consecutive clean
+    /// bins, since down-then-up carries none of partial loss's ambiguity.
+    /// </summary>
+    internal static IReadOnlyList<FlakyTarget> Analyze(
+        Dictionary<string, Dictionary<DateTime, double>> lossByTarget,
+        IReadOnlyDictionary<string, MonitoringTarget> byId,
+        ILogger? logger = null)
+    {
+        // Shared-loss exclusion: drop bins where at least half the reporting pool is losing heavily
+        // - a path-wide event (outage/congestion), not one flaky target. Cheap proxy for the real
+        // outage detector: no dark-fraction gating, just "are most targets hurting this bin?".
+        var allBins = lossByTarget.Values.SelectMany(b => b.Keys).ToHashSet();
+        var excludedBins = new HashSet<DateTime>();
+        foreach (var bin in allBins)
+        {
+            var reporting = lossByTarget.Values.Where(b => b.ContainsKey(bin)).Select(b => b[bin]).ToList();
+            if (reporting.Count == 0) continue;
+            var heavy = reporting.Count(l => l >= SharedLossHeavyPct);
+            if ((double)heavy / reporting.Count >= SharedLossPoolFraction)
+                excludedBins.Add(bin);
+        }
+
+        var survivingBins = allBins.Count - excludedBins.Count;
+        if (survivingBins < MinTargetBins)
+        {
+            logger?.LogDebug("Flaky-target detect: only {Bins} surviving bins (< {Min}); not enough data yet", survivingBins, MinTargetBins);
+            return System.Array.Empty<FlakyTarget>();
+        }
+
+        // Peer baseline: median of every surviving (target, bin) loss value. Median, not mean, so the
+        // flaky targets we're hunting don't inflate the baseline and mask each other.
+        var allLosses = new List<double>();
+        foreach (var bins in lossByTarget.Values)
+            foreach (var (bin, loss) in bins)
+                if (!excludedBins.Contains(bin)) allLosses.Add(loss);
+        if (allLosses.Count == 0) return System.Array.Empty<FlakyTarget>();
+        var baseline = Median(allLosses);
+        var threshold = Math.Max(LossMultiplier * baseline, LossAbsoluteFloorPct);
+
+        // Anchor the recovery window to the pool's newest surviving bin rather than wall clock,
+        // so the analysis stays pure and a stale data set doesn't read as "everyone recovered".
+        var newestBin = allBins.Where(b => !excludedBins.Contains(b)).Max();
+        var recoveryCutoff = newestBin - TimeSpan.FromHours(RecoveryWindowHours);
+
+        var flaky = new List<FlakyTarget>();
+        foreach (var (targetId, bins) in lossByTarget)
+        {
+            var survivorPairs = bins.Where(kv => !excludedBins.Contains(kv.Key)).ToList();
+            if (survivorPairs.Count < MinTargetBins) continue;
+            var survivors = survivorPairs.Select(kv => kv.Value).ToList();
+            var metric = TrimmedMean(survivors);
+            if (metric < threshold) continue;
+
+            // Hard-down fast path: when the over-threshold bins were essentially total loss, the
+            // episode was a binary outage (reboot, maintenance, transient route change) rather
+            // than the partial-loss signature of ICMP deprioritization. Down-then-up is a state
+            // transition, so a short clean streak is enough evidence - no need to wait for the
+            // outage bins to dilute out of the full recovery window. Judged on the MEDIAN
+            // over-threshold bin: the aggregate bins straddling the outage's edges average to
+            // partial loss (observed 52.8% on a real recovery) and must not disqualify the
+            // episode, while genuinely mixed partial-loss flakiness pulls the median below the
+            // bar and falls through to the standard gate below.
+            var overBins = survivorPairs.Where(kv => kv.Value >= threshold).Select(kv => kv.Value).ToList();
+            if (overBins.Count > 0 && Median(overBins) >= HardDownLossPct)
+            {
+                var latest = survivorPairs.OrderByDescending(kv => kv.Key)
+                    .Take(HardDownRecoveryBins).Select(kv => kv.Value).ToList();
+                if (latest.Count >= HardDownRecoveryBins && latest.All(l => l < threshold))
+                {
+                    logger?.LogDebug("Flaky-target detect: {Target} was hard-down ({Metric:0.0}%) but its last {Bins} bins are clean; treating the outage as over",
+                        targetId, metric, HardDownRecoveryBins);
+                    continue;
+                }
+            }
+
+            // Recovery gate: historically flaky, but its recent bins are clean by the same
+            // threshold - stable again, so stop presenting it. Judged only with enough recent
+            // evidence; a target that went dark can't prove recovery and stays flagged.
+            var recent = survivorPairs.Where(kv => kv.Key > recoveryCutoff).Select(kv => kv.Value).ToList();
+            if (recent.Count >= MinRecoveryBins && TrimmedMean(recent) < threshold)
+            {
+                logger?.LogDebug("Flaky-target detect: {Target} historically flaky ({Metric:0.0}%) but stable over the last {Hours}h; treating as recovered",
+                    targetId, metric, RecoveryWindowHours);
+                continue;
+            }
+
+            if (!byId.TryGetValue(targetId, out var t)) continue;
+            var over = survivors.Count(l => l >= threshold);
+            flaky.Add(new FlakyTarget(targetId, t.Id, string.IsNullOrEmpty(t.Name) ? t.Address : t.Name,
+                t.TargetType, metric, baseline, over, survivors.Count, t.WanContextId));
+        }
+
+        logger?.LogDebug("Flaky-target detect: {Count} flagged, baseline {Base:0.00}%, threshold {Thr:0.00}%, {Bins} surviving bins",
+            flaky.Count, baseline, threshold, survivingBins);
+        return flaky.OrderByDescending(f => f.LossPct).ToList();
+    }
+
+    private static DateTime FloorToBin(DateTime t, TimeSpan bin) =>
+        new DateTime(t.Ticks - (t.Ticks % bin.Ticks), DateTimeKind.Utc);
+
+    private static double Median(List<double> values)
+    {
+        var sorted = values.OrderBy(v => v).ToList();
+        var n = sorted.Count;
+        if (n == 0) return 0;
+        return n % 2 == 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+    }
+
+    /// <summary>
+    /// Mean after dropping the single lowest and single highest value. Spike-robust (one bad bin
+    /// trims away) without the small-sample jumpiness of a median. Callers gate on Count &gt;= 3, so
+    /// at least one value always remains.
+    /// </summary>
+    private static double TrimmedMean(List<double> values)
+    {
+        var sorted = values.OrderBy(v => v).ToList();
+        if (sorted.Count < 3) return sorted.Count == 0 ? 0 : sorted.Average();
+        var core = sorted.GetRange(1, sorted.Count - 2);
+        return core.Average();
+    }
+}

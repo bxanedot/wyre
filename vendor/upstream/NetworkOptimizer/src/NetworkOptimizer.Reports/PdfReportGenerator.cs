@@ -1,0 +1,1334 @@
+using System.Reflection;
+using NetworkOptimizer.Core.Helpers;
+using QuestPDF.Fluent;
+using QuestPDF.Helpers;
+using QuestPDF.Infrastructure;
+
+namespace NetworkOptimizer.Reports;
+
+/// <summary>
+/// Professional PDF report generator using QuestPDF
+/// Generates comprehensive network audit reports with Ozark Connect branding
+/// </summary>
+public class PdfReportGenerator
+{
+    private readonly BrandingOptions _branding;
+    private byte[]? _logoBytes;
+
+    public PdfReportGenerator(BrandingOptions? branding = null)
+    {
+        _branding = branding ?? BrandingOptions.OzarkConnect();
+
+        // Configure QuestPDF license (Community license)
+        QuestPDF.Settings.License = LicenseType.Community;
+
+        // Load logo from embedded resource
+        LoadLogoFromResources();
+    }
+
+    private void LoadLogoFromResources()
+    {
+        // Shared with every other report generator; null when unavailable, and the header
+        // simply renders without it.
+        _logoBytes = ReportAssets.Logo();
+    }
+
+    /// <summary>
+    /// Determines if an audit issue belongs to a specific switch.
+    /// Uses MAC address for reliable identification when available,
+    /// falls back to name matching for backwards compatibility.
+    /// </summary>
+    private static bool MatchesSwitch(AuditIssue issue, SwitchDetail switchDevice)
+    {
+        // Prefer MAC matching when available (reliable unique identifier)
+        if (!string.IsNullOrEmpty(issue.SwitchMac) && !string.IsNullOrEmpty(switchDevice.Mac))
+        {
+            return issue.SwitchMac.Equals(switchDevice.Mac, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Fall back to name matching for backwards compatibility
+        // SwitchName may contain full device context like "Device on SwitchName"
+        return issue.SwitchName?.Contains(switchDevice.Name) ?? false;
+    }
+
+    /// <summary>
+    /// Generate PDF report and save to file
+    /// </summary>
+    public void GenerateReport(ReportData data, string outputPath)
+    {
+        Document.Create(container =>
+        {
+            container.Page(page =>
+            {
+                page.Size(PageSizes.Letter);
+                page.Margin(0.5f, Unit.Inch);
+                page.PageColor(Colors.White);
+                page.DefaultTextStyle(x => x.FontSize(9).FontColor(Colors.Black));
+
+                page.Header().Element(c => ComposeHeader(c, data));
+                page.Content().Element(c => ComposeContent(c, data));
+                page.Footer().Element(c => ComposeFooter(c, data));
+            });
+        }).GeneratePdf(outputPath);
+    }
+
+    /// <summary>
+    /// Generate PDF report and return as byte array
+    /// </summary>
+    public byte[] GenerateReportBytes(ReportData data)
+    {
+        return Document.Create(container =>
+        {
+            container.Page(page =>
+            {
+                page.Size(PageSizes.Letter);
+                page.Margin(0.5f, Unit.Inch);
+                page.PageColor(Colors.White);
+                page.DefaultTextStyle(x => x.FontSize(9).FontColor(Colors.Black));
+
+                page.Header().Element(c => ComposeHeader(c, data));
+                page.Content().Element(c => ComposeContent(c, data));
+                page.Footer().Element(c => ComposeFooter(c, data));
+            });
+        }).GeneratePdf();
+    }
+
+    private void ComposeHeader(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+
+        container.Column(column =>
+        {
+            // Logo (from embedded resource)
+            if (_logoBytes != null && _logoBytes.Length > 0)
+            {
+                column.Item().AlignLeft().MaxWidth(1.5f, Unit.Inch).Image(_logoBytes);
+                column.Item().PaddingTop(10);
+            }
+
+            // Title
+            column.Item()
+                .AlignCenter()
+                .Text($"{data.ClientName} Security Audit Report")
+                .FontSize(22)
+                .Bold()
+                .FontColor(primaryColor);
+
+            // Generated date
+            column.Item()
+                .AlignLeft()
+                .PaddingTop(6)
+                .Text($"Generated: {data.GeneratedAt:MMMM dd, yyyy}")
+                .FontSize(10)
+                .FontColor(Colors.Grey.Medium);
+
+            column.Item().PaddingBottom(10).LineHorizontal(0.5f).LineColor(Colors.Grey.Lighten2);
+        });
+    }
+
+    private void ComposeFooter(IContainer container, ReportData data)
+    {
+        container.Column(column =>
+        {
+            column.Item().LineHorizontal(0.5f).LineColor(Colors.Grey.Lighten2);
+            column.Item().PaddingTop(5);
+
+            if (!string.IsNullOrEmpty(_branding.CustomFooter))
+            {
+                column.Item()
+                    .AlignCenter()
+                    .Text(_branding.CustomFooter)
+                    .FontSize(8)
+                    .FontColor(Colors.Grey.Medium);
+            }
+            else if (_branding.ShowProductAttribution)
+            {
+                column.Item()
+                    .AlignCenter()
+                    .Text(text =>
+                    {
+                        text.Span("Generated by ").FontSize(8).FontColor(Colors.Grey.Medium);
+                        text.Span(_branding.ProductName).FontSize(8).FontColor(Colors.Grey.Medium).Bold();
+                        text.Span($" for {_branding.CompanyName}").FontSize(8).FontColor(Colors.Grey.Medium);
+                        text.Span($" | {data.GeneratedAt:yyyy-MM-dd HH:mm}").FontSize(8).FontColor(Colors.Grey.Lighten1);
+                    });
+            }
+        });
+    }
+
+    private void ComposeContent(IContainer container, ReportData data)
+    {
+        container.Column(column =>
+        {
+            // Network Reference
+            column.Item().Element(c => ComposeNetworkReference(c, data));
+
+            // DNS Security (if available)
+            if (data.DnsSecurity != null)
+            {
+                column.Item().PaddingTop(20).Element(c => ComposeDnsSecuritySection(c, data));
+            }
+
+            // Threat Intelligence Summary (if available)
+            if (data.ThreatSummary != null && data.ThreatSummary.TotalEvents > 0)
+            {
+                column.Item().PaddingTop(20).Element(c => ComposeThreatSummary(c, data));
+            }
+
+            // Executive Summary
+            column.Item().PaddingTop(20).Element(c => ComposeExecutiveSummary(c, data));
+
+            // Action Items
+            column.Item().PaddingTop(20).Element(c => ComposeActionItems(c, data));
+
+            // Page break before switch details
+            column.Item().PageBreak();
+
+            // Switch Details
+            column.Item().Element(c => ComposeSwitchDetails(c, data));
+
+            // Access Point Details (if any wireless clients)
+            if (data.AccessPoints.Any())
+            {
+                column.Item().PageBreak();
+                column.Item().Element(c => ComposeAccessPointDetails(c, data));
+            }
+
+            // Offline Clients (from history)
+            if (data.OfflineClients.Any())
+            {
+                column.Item().PageBreak();
+                column.Item().Element(c => ComposeOfflineClientsSection(c, data));
+            }
+
+            // Port Security Summary
+            column.Item().PageBreak();
+            column.Item().Element(c => ComposePortSecuritySummary(c, data));
+        });
+    }
+
+    private void ComposeNetworkReference(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var lightGray = GetColor(_branding.Colors.LightGray);
+
+        container.Column(column =>
+        {
+            column.Item()
+                .PaddingBottom(10)
+                .Text("Network Reference")
+                .FontSize(16)
+                .Bold()
+                .FontColor(primaryColor);
+
+            if (data.Networks.Any())
+            {
+                column.Item().Table(table =>
+                {
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.RelativeColumn(2.5f);
+                        columns.RelativeColumn(1f);
+                        columns.RelativeColumn(2f);
+                    });
+
+                    // Header
+                    table.Header(header =>
+                    {
+                        header.Cell().Background(lightGray).Padding(6)
+                            .Text("Network").Bold().FontSize(9);
+                        header.Cell().Background(lightGray).Padding(6)
+                            .Text("VLAN").Bold().FontSize(9);
+                        header.Cell().Background(lightGray).Padding(6)
+                            .Text("Subnet").Bold().FontSize(9);
+                    });
+
+                    // Rows
+                    var sortedNetworks = data.Networks.OrderBy(n => n.VlanId).ToList();
+                    foreach (var network in sortedNetworks)
+                    {
+                        var vlanStr = network.VlanId == 1
+                            ? $"{network.VlanId} (native)"
+                            : network.VlanId.ToString();
+
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(network.Name).FontSize(9);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(vlanStr).FontSize(9);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(network.Subnet).FontSize(9);
+                    }
+                });
+            }
+        });
+    }
+
+    private void ComposeDnsSecuritySection(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var successColor = GetColor(_branding.Colors.Success);
+        var warningColor = GetColor(_branding.Colors.Warning);
+        var lightGray = GetColor(_branding.Colors.LightGray);
+
+        var dns = data.DnsSecurity!;
+
+        container.Column(column =>
+        {
+            column.Item()
+                .PaddingBottom(10)
+                .Text("DNS Security")
+                .FontSize(16)
+                .Bold()
+                .FontColor(primaryColor);
+
+            column.Item().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(1.5f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(2.5f);
+                });
+
+                // Header
+                table.Header(header =>
+                {
+                    header.Cell().Background(lightGray).Padding(6)
+                        .Text("Configuration").Bold().FontSize(9);
+                    header.Cell().Background(lightGray).Padding(6)
+                        .Text("Status").Bold().FontSize(9);
+                    header.Cell().Background(lightGray).Padding(6)
+                        .Text("Details").Bold().FontSize(9);
+                });
+
+                // DoH Configuration row
+                var dohStatus = dns.DohEnabled ? "Enabled" : "Disabled";
+                var dohStatusColor = dns.DohEnabled ? successColor : warningColor;
+
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text("DNS-over-HTTPS (DoH)").FontSize(9);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dohStatus).FontSize(9).FontColor(dohStatusColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dns.GetDohStatusDisplay()).FontSize(9);
+
+                // DNS Leak Prevention row
+                var leakStatus = dns.DnsLeakProtection ? "Protected" : (dns.HasDns53BlockRule ? "Partial" : "Unprotected");
+                var leakStatusColor = dns.DnsLeakProtection ? successColor : warningColor;
+
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text("DNS Leak Prevention (Port 53)").FontSize(9);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(leakStatus).FontSize(9).FontColor(leakStatusColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dns.GetDnsLeakProtectionDetail()).FontSize(9);
+
+                // DoT Blocking row
+                var dotStatus = dns.DotBlocked ? (dns.DotProvidesFullCoverage ? "Blocked" : "Partially Blocked") : "Open";
+                var dotStatusColor = dns.DotBlocked && dns.DotProvidesFullCoverage ? successColor : warningColor;
+
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text("DNS-over-TLS (Port 853)").FontSize(9);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dotStatus).FontSize(9).FontColor(dotStatusColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dns.DotBlocked ? (dns.DotProvidesFullCoverage ? "DoT queries blocked" : "DoT queries partially blocked") : "Devices can use external DoT").FontSize(9);
+
+                // DoQ Blocking row
+                var doqStatus = dns.DoqBlocked ? (dns.DoqProvidesFullCoverage ? "Blocked" : "Partially Blocked") : "Open";
+                var doqStatusColor = dns.DoqBlocked && dns.DoqProvidesFullCoverage ? successColor : warningColor;
+
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text("DNS-over-QUIC (UDP 853)").FontSize(9);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(doqStatus).FontSize(9).FontColor(doqStatusColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dns.DoqBlocked ? (dns.DoqProvidesFullCoverage ? "DoQ queries blocked" : "DoQ queries partially blocked") : "Devices can use external DoQ").FontSize(9);
+
+                // DoH Bypass Blocking row
+                var bypassStatus = dns.DohBypassBlocked ? "Blocked" : "Open";
+                var bypassStatusColor = dns.DohBypassBlocked ? successColor : warningColor;
+
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text("DoH Bypass Prevention").FontSize(9);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(bypassStatus).FontSize(9).FontColor(bypassStatusColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dns.DohBypassBlocked ? "Public DoH providers blocked" : "Devices can use external DoH").FontSize(9);
+
+                // WAN DNS Configuration row
+                var neutralColor = "#666666";
+                string wanDnsStatus;
+                string wanDnsStatusColor;
+                if (!dns.WanDnsServers.Any())
+                {
+                    wanDnsStatus = "Not Configured";
+                    wanDnsStatusColor = neutralColor;
+                }
+                else if (dns.WanDnsMatchesDoH && !dns.WanDnsOrderCorrect)
+                {
+                    wanDnsStatus = "Wrong Order";
+                    wanDnsStatusColor = warningColor;
+                }
+                else if (dns.WanDnsMatchesDoH)
+                {
+                    wanDnsStatus = "Matched";
+                    wanDnsStatusColor = successColor;
+                }
+                else
+                {
+                    wanDnsStatus = "Mismatched";
+                    wanDnsStatusColor = warningColor;
+                }
+
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text("WAN DNS Configuration").FontSize(9);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(wanDnsStatus).FontSize(9).FontColor(wanDnsStatusColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dns.GetWanDnsDisplay()).FontSize(9);
+
+                // Device DNS Configuration row
+                var deviceDnsStatus = dns.TotalDevicesChecked == 0 ? "No Devices"
+                    : dns.DeviceDnsPointsToGateway ? "Correct" : "Misconfigured";
+                var deviceDnsStatusColor = dns.TotalDevicesChecked == 0 ? neutralColor
+                    : dns.DeviceDnsPointsToGateway ? successColor : warningColor;
+
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text("Device DNS Configuration").FontSize(9);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(deviceDnsStatus).FontSize(9).FontColor(deviceDnsStatusColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(dns.GetDeviceDnsDisplay()).FontSize(9);
+            });
+
+            // Overall protection status - match web page display
+            var overallStatus = dns.FullyProtected ? "Full DNS Protection" : "Partial Protection";
+            var overallColor = dns.FullyProtected ? successColor : warningColor;
+
+            column.Item()
+                .PaddingTop(8)
+                .Text(text =>
+                {
+                    text.Span("Overall: ").FontSize(9);
+                    text.Span(overallStatus).FontSize(9).Bold().FontColor(overallColor);
+                });
+        });
+    }
+
+    private void ComposeExecutiveSummary(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var successColor = GetColor(_branding.Colors.Success);
+        var warningColor = GetColor(_branding.Colors.Warning);
+        var criticalColor = GetColor(_branding.Colors.Critical);
+
+        container.Column(column =>
+        {
+            column.Item()
+                .PaddingBottom(10)
+                .Text("Summary")
+                .FontSize(16)
+                .Bold()
+                .FontColor(primaryColor);
+
+            // Security Posture Rating
+            string ratingText;
+            string ratingColor;
+
+            switch (data.SecurityScore.Rating)
+            {
+                case SecurityRating.Excellent:
+                    ratingText = "EXCELLENT";
+                    ratingColor = successColor;
+                    break;
+                case SecurityRating.Good:
+                    ratingText = "GOOD";
+                    ratingColor = successColor;
+                    break;
+                case SecurityRating.Fair:
+                    ratingText = "FAIR";
+                    ratingColor = warningColor;
+                    break;
+                case SecurityRating.NeedsWork:
+                    ratingText = "NEEDS ATTENTION";
+                    ratingColor = criticalColor;
+                    break;
+                default:
+                    ratingText = "UNKNOWN";
+                    ratingColor = Colors.Grey.Medium;
+                    break;
+            }
+
+            column.Item()
+                .PaddingBottom(10)
+                .Text($"Overall Security Posture: {ratingText}")
+                .FontSize(11)
+                .Bold()
+                .FontColor(ratingColor);
+
+            // Hardening measures
+            if (data.HardeningNotes.Any())
+            {
+                column.Item()
+                    .PaddingBottom(4)
+                    .Text("Hardening measures already in place:")
+                    .FontSize(9);
+
+                foreach (var note in data.HardeningNotes)
+                {
+                    column.Item()
+                        .PaddingLeft(10)
+                        .PaddingBottom(2)
+                        .Text($"• {note}")
+                        .FontSize(9);
+                }
+            }
+
+            // Topology notes
+            if (data.TopologyNotes.Any())
+            {
+                column.Item().PaddingTop(6);
+                foreach (var note in data.TopologyNotes)
+                {
+                    column.Item()
+                        .PaddingBottom(2)
+                        .Text($"• {note}")
+                        .FontSize(9);
+                }
+            }
+        });
+    }
+
+    private void ComposeActionItems(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var criticalColor = GetColor(_branding.Colors.Critical);
+        var warningColor = GetColor(_branding.Colors.Warning);
+        var successColor = GetColor(_branding.Colors.Success);
+
+        container.Column(column =>
+        {
+            column.Item()
+                .PaddingBottom(10)
+                .Text("Action Items")
+                .FontSize(16)
+                .Bold()
+                .FontColor(primaryColor);
+
+            if (!data.CriticalIssues.Any() && !data.RecommendedImprovements.Any())
+            {
+                column.Item()
+                    .Text("No action items - all checks passed.")
+                    .FontSize(11)
+                    .Bold()
+                    .FontColor(successColor);
+                return;
+            }
+
+            // Critical Issues
+            if (data.CriticalIssues.Any())
+            {
+                column.Item()
+                    .PaddingBottom(6)
+                    .Text($"Critical ({data.CriticalIssues.Count})")
+                    .FontSize(10)
+                    .Bold()
+                    .FontColor(criticalColor);
+
+                column.Item().Table(table =>
+                {
+                    // Uniform column widths for issue tables
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.ConstantColumn(100);   // Device
+                        columns.ConstantColumn(60);    // Port
+                        columns.RelativeColumn(2.5f);  // Issue
+                        columns.RelativeColumn(2.0f);  // Action
+                    });
+
+                    // Header
+                    var headerBg = GetColor(_branding.Colors.Primary);
+                    table.Header(header =>
+                    {
+                        header.Cell().Background(headerBg).Padding(6)
+                            .Text("Device").Bold().FontSize(8).FontColor(Colors.White);
+                        header.Cell().Background(headerBg).Padding(6)
+                            .Text("Port").Bold().FontSize(8).FontColor(Colors.White);
+                        header.Cell().Background(headerBg).Padding(6)
+                            .Text("Issue").Bold().FontSize(8).FontColor(Colors.White);
+                        header.Cell().Background(headerBg).Padding(6)
+                            .Text("Action").Bold().FontSize(8).FontColor(Colors.White);
+                    });
+
+                    // Rows
+                    foreach (var issue in data.CriticalIssues)
+                    {
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(issue.GetDeviceDisplay()).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(issue.GetPortDisplay()).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(TrimUniFiSuffix(issue.Message)).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(issue.RecommendedAction).FontSize(8);
+                    }
+                });
+
+                column.Item().PaddingBottom(10);
+            }
+
+            // Recommended Improvements
+            if (data.RecommendedImprovements.Any())
+            {
+                column.Item()
+                    .PaddingBottom(6)
+                    .Text($"Recommended ({data.RecommendedImprovements.Count})")
+                    .FontSize(10)
+                    .Bold()
+                    .FontColor(warningColor);
+
+                column.Item().Table(table =>
+                {
+                    // Uniform column widths for issue tables (same as Critical)
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.ConstantColumn(100);   // Device
+                        columns.ConstantColumn(60);    // Port
+                        columns.RelativeColumn(2.5f);  // Issue
+                        columns.RelativeColumn(2.0f);  // Status
+                    });
+
+                    // Header
+                    var headerBg = GetColor(_branding.Colors.Primary);
+                    table.Header(header =>
+                    {
+                        header.Cell().Background(headerBg).Padding(6)
+                            .Text("Device").Bold().FontSize(8).FontColor(Colors.White);
+                        header.Cell().Background(headerBg).Padding(6)
+                            .Text("Port").Bold().FontSize(8).FontColor(Colors.White);
+                        header.Cell().Background(headerBg).Padding(6)
+                            .Text("Issue").Bold().FontSize(8).FontColor(Colors.White);
+                        header.Cell().Background(headerBg).Padding(6)
+                            .Text("Status").Bold().FontSize(8).FontColor(Colors.White);
+                    });
+
+                    // Rows
+                    foreach (var issue in data.RecommendedImprovements)
+                    {
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(issue.GetDeviceDisplay()).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(issue.GetPortDisplay()).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text(TrimUniFiSuffix(issue.Message)).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                            .Text("Pending").FontSize(8);
+                    }
+                });
+            }
+        });
+    }
+
+    private void ComposeSwitchDetails(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var criticalColor = GetColor(_branding.Colors.Critical);
+        var warningColor = GetColor(_branding.Colors.Warning);
+
+        container.Column(column =>
+        {
+            foreach (var switchDevice in data.Switches)
+            {
+                // Format device name with consistent prefix
+                var formattedName = DisplayFormatters.FormatDeviceName(switchDevice.Name, switchDevice.IsGateway);
+
+                column.Item()
+                    .PaddingBottom(8)
+                    .Text($"{formattedName} ({switchDevice.ModelName})")
+                    .FontSize(12)
+                    .Bold()
+                    .FontColor(primaryColor);
+
+                // Port table - pass all issues for this switch
+                // Use MAC address for reliable switch identification when available,
+                // fall back to name matching for backwards compatibility
+                var allSwitchIssues = data.CriticalIssues
+                    .Concat(data.RecommendedImprovements)
+                    .Where(i => !i.IsWireless && MatchesSwitch(i, switchDevice))
+                    .ToList();
+                column.Item().Element(c => ComposePortTable(c, switchDevice, allSwitchIssues));
+
+                // Notes
+                var notes = new List<string>();
+
+                // MAC ACL support note
+                if (switchDevice.MaxCustomMacAcls == 0)
+                {
+                    notes.Add($"Note: {switchDevice.ModelName} doesn't support MAC ACLs (max_custom_mac_acls=0)");
+                }
+
+                // Excluded VLANs notes
+                foreach (var port in switchDevice.Ports)
+                {
+                    if (port.ExcludedNetworks.Any())
+                    {
+                        var excludedStr = string.Join(", ", port.ExcludedNetworks);
+                        notes.Add($"Port {port.PortIndex} excludes: {excludedStr}");
+                    }
+                }
+
+                foreach (var note in notes)
+                {
+                    column.Item()
+                        .PaddingTop(2)
+                        .Text(note)
+                        .FontSize(8)
+                        .Italic()
+                        .FontColor(Colors.Grey.Medium);
+                }
+
+                // Issue callouts for this switch (wired issues - both critical and warnings)
+                var switchIssues = data.CriticalIssues
+                    .Concat(data.RecommendedImprovements)
+                    .Where(i => !i.IsWireless && (i.SwitchName?.Contains(switchDevice.Name) ?? false))
+                    .ToList();
+                foreach (var issue in switchIssues)
+                {
+                    var portDisplay = issue.PortIndex.HasValue
+                        ? $"Port {issue.PortIndex} ({issue.PortName})"
+                        : issue.PortName;
+                    var issueColor = issue.Severity == IssueSeverity.Critical ? criticalColor : warningColor;
+
+                    column.Item()
+                        .PaddingTop(2)
+                        .Text($"> {portDisplay}: {issue.RecommendedAction}")
+                        .FontSize(8)
+                        .Bold()
+                        .FontColor(issueColor);
+                }
+
+                column.Item().PaddingBottom(15);
+            }
+        });
+    }
+
+    private void ComposeAccessPointDetails(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var criticalColor = GetColor(_branding.Colors.Critical);
+        var warningColor = GetColor(_branding.Colors.Warning);
+        var lightGray = GetColor(_branding.Colors.LightGray);
+
+        container.Column(column =>
+        {
+            column.Item()
+                .PaddingBottom(10)
+                .Text("Wireless Clients by Access Point")
+                .FontSize(16)
+                .Bold()
+                .FontColor(primaryColor);
+
+            foreach (var ap in data.AccessPoints)
+            {
+                var iotCount = ap.Clients.Count(c => c.IsIoT);
+                var cameraCount = ap.Clients.Count(c => c.IsCamera);
+                var issueCount = ap.Clients.Count(c => c.HasIssue);
+
+                // Format AP header like switches: [AP] Name (Model)
+                var cleanApName = DisplayFormatters.StripDevicePrefix(ap.Name);
+                var modelDisplay = !string.IsNullOrEmpty(ap.ModelName) ? ap.ModelName : ap.Model ?? "";
+                var headerText = !string.IsNullOrEmpty(modelDisplay)
+                    ? $"[AP] {cleanApName} ({modelDisplay})"
+                    : $"[AP] {cleanApName}";
+
+                column.Item()
+                    .PaddingBottom(6)
+                    .Text(headerText)
+                    .FontSize(12)
+                    .Bold()
+                    .FontColor(primaryColor);
+
+                // Client table
+                column.Item().Table(table =>
+                {
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.RelativeColumn(2.0f);  // Name
+                        columns.RelativeColumn(1.5f);  // Category
+                        columns.RelativeColumn(2.0f);  // Network (with VLAN)
+                        columns.RelativeColumn(1.5f);  // Status
+                    });
+
+                    // Header
+                    table.Header(header =>
+                    {
+                        void HeaderCell(string text)
+                        {
+                            header.Cell().Background(primaryColor).Padding(4)
+                                .Text(text).Bold().FontSize(7).FontColor(Colors.White);
+                        }
+
+                        HeaderCell("Client");
+                        HeaderCell("Type");
+                        HeaderCell("Network");
+                        HeaderCell("Status");
+                    });
+
+                    // Rows
+                    var warningBg = Color.FromRGB(255, 248, 220);   // Light yellow
+                    int rowIndex = 0;
+                    foreach (var client in ap.Clients.OrderBy(c => c.DisplayName))
+                    {
+                        var rowBg = client.HasIssue ? warningBg
+                            : rowIndex % 2 == 0 ? lightGray
+                            : Colors.White;
+
+                        var status = client.HasIssue ? (client.IssueTitle ?? "Issue") : "OK";
+                        var networkDisplay = DisplayFormatters.FormatNetworkWithVlan(client.Network, client.VlanId);
+
+                        void DataCell(string text)
+                        {
+                            table.Cell().Background(rowBg).Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                                .AlignLeft().Text(text).FontSize(7);
+                        }
+
+                        DataCell(client.DisplayName);
+                        DataCell(client.DeviceCategory);
+                        DataCell(networkDisplay);
+
+                        // Status cell with conditional color
+                        if (client.HasIssue)
+                        {
+                            table.Cell().Background(rowBg).Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                                .AlignCenter().Text(status).FontSize(7).FontColor(warningColor);
+                        }
+                        else
+                        {
+                            table.Cell().Background(rowBg).Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                                .AlignCenter().Text(status).FontSize(7);
+                        }
+
+                        rowIndex++;
+                    }
+                });
+
+                // Summary notes for AP
+                if (iotCount > 0 || cameraCount > 0)
+                {
+                    var summary = new List<string>();
+                    if (iotCount > 0) summary.Add($"{iotCount} IoT");
+                    if (cameraCount > 0) summary.Add($"{cameraCount} cameras");
+
+                    column.Item()
+                        .PaddingTop(2)
+                        .Text($"Detected: {string.Join(", ", summary)}")
+                        .FontSize(8)
+                        .Italic()
+                        .FontColor(Colors.Grey.Medium);
+                }
+
+                // Issue callouts for this AP
+                var apIssues = data.CriticalIssues
+                    .Concat(data.RecommendedImprovements)
+                    .Where(i => i.IsWireless && i.AccessPoint == ap.Name)
+                    .ToList();
+
+                foreach (var issue in apIssues)
+                {
+                    var issueColor = issue.Severity == IssueSeverity.Critical ? criticalColor : warningColor;
+                    column.Item()
+                        .PaddingTop(2)
+                        .Text($"> {issue.ClientName}: {issue.RecommendedAction}")
+                        .FontSize(8)
+                        .Bold()
+                        .FontColor(issueColor);
+                }
+
+                column.Item().PaddingBottom(12);
+            }
+        });
+    }
+
+    private void ComposeOfflineClientsSection(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var lightGray = GetColor(_branding.Colors.LightGray);
+        var warningColor = GetColor(_branding.Colors.Warning);
+        var criticalColor = GetColor(_branding.Colors.Critical);
+
+        container.Column(column =>
+        {
+            column.Item()
+                .PaddingBottom(10)
+                .Text("Offline Wireless Clients (Last 30 Days)")
+                .FontSize(16)
+                .Bold()
+                .FontColor(primaryColor);
+
+            // Group by last uplink (AP name)
+            var groups = data.OfflineClients
+                .GroupBy(c => c.LastUplinkName ?? "Unknown")
+                .OrderBy(g => g.Key);
+
+            foreach (var group in groups)
+            {
+                var iotCount = group.Count(c => c.IsIoT);
+                var cameraCount = group.Count(c => c.IsCamera);
+                var issueCount = group.Count(c => c.HasIssue);
+
+                column.Item()
+                    .PaddingBottom(6)
+                    .Text($"{group.Key} ({group.Count()} clients)")
+                    .FontSize(12)
+                    .Bold()
+                    .FontColor(primaryColor);
+
+                // Client table
+                column.Item().Table(table =>
+                {
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.RelativeColumn(2.0f);  // Name
+                        columns.RelativeColumn(1.5f);  // Category
+                        columns.RelativeColumn(2.0f);  // Network
+                        columns.RelativeColumn(1.2f);  // Last Seen
+                        columns.RelativeColumn(1.5f);  // Status
+                    });
+
+                    // Header
+                    table.Header(header =>
+                    {
+                        void HeaderCell(string text)
+                        {
+                            header.Cell().Background(primaryColor).Padding(4)
+                                .Text(text).Bold().FontSize(7).FontColor(Colors.White);
+                        }
+
+                        HeaderCell("Client");
+                        HeaderCell("Type");
+                        HeaderCell("Network");
+                        HeaderCell("Last Seen");
+                        HeaderCell("Status");
+                    });
+
+                    // Rows
+                    var warningBg = Color.FromRGB(255, 248, 220);   // Light yellow
+                    var criticalBg = Color.FromRGB(255, 230, 230); // Light red
+                    int rowIndex = 0;
+                    foreach (var client in group.OrderBy(c => c.DisplayName))
+                    {
+                        var isCritical = client.HasIssue && client.IssueSeverity == "Critical";
+                        var rowBg = isCritical ? criticalBg
+                            : client.HasIssue ? warningBg
+                            : rowIndex % 2 == 0 ? lightGray
+                            : Colors.White;
+
+                        var status = client.HasIssue ? (client.IssueTitle ?? "Issue") : "OK";
+                        var networkDisplay = DisplayFormatters.FormatNetworkWithVlan(client.Network, client.VlanId);
+                        var lastSeenText = client.IsRecentlyActive
+                            ? client.LastSeenDisplay
+                            : $"{client.LastSeenDisplay} (stale)";
+
+                        void DataCell(string text)
+                        {
+                            table.Cell().Background(rowBg).Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                                .AlignLeft().Text(text).FontSize(7);
+                        }
+
+                        DataCell(client.DisplayName);
+                        DataCell(client.DeviceCategory);
+                        DataCell(networkDisplay);
+                        DataCell(lastSeenText);
+
+                        // Status cell with conditional color
+                        var statusColor = isCritical ? criticalColor
+                            : client.HasIssue ? warningColor
+                            : Colors.Black;
+                        table.Cell().Background(rowBg).Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .AlignCenter().Text(status).FontSize(7).FontColor(statusColor);
+
+                        rowIndex++;
+                    }
+                });
+
+                column.Item().PaddingBottom(12);
+            }
+        });
+    }
+
+    private void ComposePortTable(IContainer container, SwitchDetail switchDevice, List<AuditIssue> portIssues)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var lightGray = GetColor(_branding.Colors.LightGray);
+        var criticalBg = Color.FromRGB(255, 230, 230);  // Light red
+        var warningBg = Color.FromRGB(255, 248, 220);   // Light yellow
+
+        var hasIsolation = switchDevice.Ports.Any(p => p.Isolation);
+
+        container.Table(table =>
+        {
+            if (hasIsolation)
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.ConstantColumn(30);  // Port
+                    columns.RelativeColumn(1.2f);  // Name
+                    columns.ConstantColumn(50);  // Link
+                    columns.ConstantColumn(40);  // PoE
+                    columns.ConstantColumn(50);  // Port Sec
+                    columns.ConstantColumn(45);  // Forward
+                    columns.RelativeColumn(2.0f);  // Native VLAN (wider)
+                    columns.ConstantColumn(45);  // Isolation
+                    columns.ConstantColumn(85);  // Status (wider for "Possible Wrong VLAN")
+                });
+            }
+            else
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.ConstantColumn(30);  // Port
+                    columns.RelativeColumn(1.3f);  // Name
+                    columns.ConstantColumn(55);  // Link
+                    columns.ConstantColumn(45);  // PoE
+                    columns.ConstantColumn(55);  // Port Sec
+                    columns.ConstantColumn(50);  // Forward
+                    columns.RelativeColumn(2.2f);  // Native VLAN (wider)
+                    columns.ConstantColumn(85);  // Status (wider for "Possible Wrong VLAN")
+                });
+            }
+
+            // Header
+            table.Header(header =>
+            {
+                void HeaderCell(string text)
+                {
+                    header.Cell().Background(primaryColor).Padding(4)
+                        .Text(text).Bold().FontSize(7).FontColor(Colors.White);
+                }
+
+                HeaderCell("Port");
+                HeaderCell("Name");
+                HeaderCell("Link");
+                HeaderCell("PoE");
+                HeaderCell("Port Sec");
+                HeaderCell("Forward");
+                HeaderCell("Native VLAN");
+                if (hasIsolation)
+                    HeaderCell("Isolation");
+                HeaderCell("Status");
+            });
+
+            // Rows
+            int rowIndex = 0;
+            foreach (var port in switchDevice.Ports)
+            {
+                // Check if there's an issue for this port from the audit engine
+                var portIssue = portIssues.FirstOrDefault(i => i.PortIndex == port.PortIndex);
+
+                string status;
+                PortStatusType statusType;
+                if (portIssue != null)
+                {
+                    // Use issue from audit engine (more accurate detection)
+                    status = portIssue.Severity == IssueSeverity.Critical ? "Wrong VLAN" : "Wrong VLAN";
+                    statusType = portIssue.Severity == IssueSeverity.Critical ? PortStatusType.Critical : PortStatusType.Warning;
+                }
+                else
+                {
+                    // Fall back to port's built-in status check
+                    (status, statusType) = port.GetStatus(switchDevice.MaxCustomMacAcls > 0);
+                }
+
+                var rowBg = statusType == PortStatusType.Critical ? criticalBg
+                    : statusType == PortStatusType.Warning ? warningBg
+                    : rowIndex % 2 == 0 ? lightGray
+                    : Colors.White;
+
+                var nativeVlan = port.NativeVlan.HasValue && !string.IsNullOrEmpty(port.NativeNetwork)
+                    ? $"{port.NativeNetwork} ({port.NativeVlan})"
+                    : port.Forward == "disabled" ? "-" : "";
+
+                void DataCell(string text)
+                {
+                    table.Cell().Background(rowBg).Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                        .AlignCenter().Text(text).FontSize(7);
+                }
+
+                void DataCellLeft(string text)
+                {
+                    // No truncation - let text wrap or shrink naturally
+                    table.Cell().Background(rowBg).Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                        .AlignLeft().Text(text).FontSize(7);
+                }
+
+                DataCell(port.PortIndex.ToString());
+                DataCellLeft(port.Name);
+                DataCell(port.GetLinkStatus());
+                DataCell(port.GetPoeStatus());
+                DataCell(port.GetPortSecurityStatus());
+                DataCell(port.Forward == "customize" ? "custom" : port.Forward);
+                DataCellLeft(nativeVlan);
+                if (hasIsolation)
+                    DataCell(port.GetIsolationStatus());
+                DataCell(status);
+
+                rowIndex++;
+            }
+        });
+    }
+
+    private void ComposeThreatSummary(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+        var successColor = GetColor(_branding.Colors.Success);
+        var warningColor = GetColor(_branding.Colors.Warning);
+        var criticalColor = GetColor(_branding.Colors.Critical);
+        var lightGray = GetColor(_branding.Colors.LightGray);
+
+        var threat = data.ThreatSummary!;
+
+        container.Column(column =>
+        {
+            column.Item()
+                .PaddingBottom(10)
+                .Text("Threat Intelligence")
+                .FontSize(16)
+                .Bold()
+                .FontColor(primaryColor);
+
+            column.Item()
+                .PaddingBottom(6)
+                .Text($"Period: {threat.TimeRange}")
+                .FontSize(9)
+                .FontColor(Colors.Grey.Medium);
+
+            // Summary stats table
+            column.Item().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(1f);
+                    columns.RelativeColumn(1f);
+                });
+
+                table.Header(header =>
+                {
+                    header.Cell().Background(lightGray).Padding(6)
+                        .Text("Total Events").Bold().FontSize(9);
+                    header.Cell().Background(lightGray).Padding(6)
+                        .Text("Blocked").Bold().FontSize(9);
+                    header.Cell().Background(lightGray).Padding(6)
+                        .Text("Detected").Bold().FontSize(9);
+                    header.Cell().Background(lightGray).Padding(6)
+                        .Text("Unique Sources").Bold().FontSize(9);
+                });
+
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(threat.TotalEvents.ToString("N0")).FontSize(9);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(threat.TotalBlocked.ToString("N0")).FontSize(9).FontColor(successColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(threat.TotalDetected.ToString("N0")).FontSize(9).FontColor(threat.TotalDetected > 0 ? warningColor : successColor);
+                table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                    .Text(threat.UniqueSourceIps.ToString("N0")).FontSize(9);
+            });
+
+            // Kill chain distribution (text bar)
+            if (threat.ByKillChain.Any())
+            {
+                column.Item()
+                    .PaddingTop(10)
+                    .PaddingBottom(4)
+                    .Text("Kill Chain Distribution")
+                    .FontSize(10)
+                    .Bold()
+                    .FontColor(primaryColor);
+
+                foreach (var stage in threat.ByKillChain.OrderByDescending(k => k.Value))
+                {
+                    var pct = threat.TotalEvents > 0 ? (double)stage.Value / threat.TotalEvents * 100 : 0;
+                    column.Item()
+                        .PaddingBottom(2)
+                        .Text($"  {stage.Key}: {stage.Value:N0} ({pct:F0}%)")
+                        .FontSize(9);
+                }
+            }
+
+            // Top sources
+            if (threat.TopSources.Any())
+            {
+                column.Item()
+                    .PaddingTop(10)
+                    .PaddingBottom(4)
+                    .Text("Top Threat Sources")
+                    .FontSize(10)
+                    .Bold()
+                    .FontColor(primaryColor);
+
+                column.Item().Table(table =>
+                {
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.RelativeColumn(2f);
+                        columns.RelativeColumn(1f);
+                        columns.RelativeColumn(2f);
+                        columns.RelativeColumn(1f);
+                    });
+
+                    table.Header(header =>
+                    {
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("IP Address").Bold().FontSize(8);
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("Country").Bold().FontSize(8);
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("ASN").Bold().FontSize(8);
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("Events").Bold().FontSize(8);
+                    });
+
+                    foreach (var source in threat.TopSources.Take(5))
+                    {
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(source.Ip).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(source.CountryCode ?? "-").FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(source.AsnOrg ?? "-").FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(source.EventCount.ToString("N0")).FontSize(8);
+                    }
+                });
+            }
+
+            // Exposed services
+            if (threat.ExposedServices.Any())
+            {
+                column.Item()
+                    .PaddingTop(10)
+                    .PaddingBottom(4)
+                    .Text("Exposed Services Under Attack")
+                    .FontSize(10)
+                    .Bold()
+                    .FontColor(criticalColor);
+
+                column.Item().Table(table =>
+                {
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.RelativeColumn(1f);
+                        columns.RelativeColumn(1.5f);
+                        columns.RelativeColumn(1.5f);
+                        columns.RelativeColumn(1f);
+                        columns.RelativeColumn(1f);
+                    });
+
+                    table.Header(header =>
+                    {
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("Port").Bold().FontSize(8);
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("Service").Bold().FontSize(8);
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("Forward To").Bold().FontSize(8);
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("Threats").Bold().FontSize(8);
+                        header.Cell().Background(lightGray).Padding(4)
+                            .Text("Sources").Bold().FontSize(8);
+                    });
+
+                    foreach (var svc in threat.ExposedServices)
+                    {
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(svc.Port.ToString()).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(svc.ServiceName).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(svc.ForwardTarget).FontSize(8);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(svc.ThreatCount.ToString("N0")).FontSize(8).FontColor(criticalColor);
+                        table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(4)
+                            .Text(svc.UniqueSourceIps.ToString("N0")).FontSize(8);
+                    }
+                });
+            }
+        });
+    }
+
+    private void ComposePortSecuritySummary(IContainer container, ReportData data)
+    {
+        var primaryColor = GetColor(_branding.Colors.Primary);
+
+        container.Column(column =>
+        {
+            column.Item()
+                .PaddingBottom(10)
+                .Text("Port Security Coverage Summary")
+                .FontSize(16)
+                .Bold()
+                .FontColor(primaryColor);
+
+            column.Item().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(2.2f);
+                    columns.ConstantColumn(70);
+                    columns.ConstantColumn(80);
+                    columns.RelativeColumn(1.3f);
+                    columns.RelativeColumn(1.3f);
+                });
+
+                // Header
+                var headerBg = GetColor(_branding.Colors.Primary);
+                table.Header(header =>
+                {
+                    header.Cell().Background(headerBg).Padding(6)
+                        .Text("Device").Bold().FontSize(9).FontColor(Colors.White);
+                    header.Cell().Background(headerBg).Padding(6)
+                        .Text("Total").Bold().FontSize(9).FontColor(Colors.White);
+                    header.Cell().Background(headerBg).Padding(6)
+                        .Text("Disabled").Bold().FontSize(9).FontColor(Colors.White);
+                    header.Cell().Background(headerBg).Padding(6)
+                        .Text("MAC Restricted").Bold().FontSize(9).FontColor(Colors.White);
+                    header.Cell().Background(headerBg).Padding(6)
+                        .Text("Unprotected Active").Bold().FontSize(9).FontColor(Colors.White);
+                });
+
+                // Rows
+                foreach (var switchDevice in data.Switches)
+                {
+                    var macStr = switchDevice.MaxCustomMacAcls > 0
+                        ? switchDevice.MacRestrictedPorts.ToString()
+                        : "0 (no ACL support)";
+
+                    // Format device name with consistent prefix
+                    var formattedName = DisplayFormatters.FormatDeviceName(switchDevice.Name, switchDevice.IsGateway);
+
+                    table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                        .AlignLeft().Text(formattedName).FontSize(9);
+                    table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                        .AlignCenter().Text(switchDevice.TotalPorts.ToString()).FontSize(9);
+                    table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                        .AlignCenter().Text(switchDevice.DisabledPorts.ToString()).FontSize(9);
+                    table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                        .AlignCenter().Text(macStr).FontSize(9);
+                    table.Cell().Border(0.5f).BorderColor(Colors.Grey.Lighten2).Padding(6)
+                        .AlignCenter().Text(switchDevice.UnprotectedActivePorts.ToString()).FontSize(9);
+                }
+            });
+        });
+    }
+
+    private static string TrimUniFiSuffix(string message) =>
+        message.Replace(" in UniFi Network", "");
+
+    private string GetColor(string hexColor)
+    {
+        // QuestPDF uses hex colors directly
+        return hexColor;
+    }
+}

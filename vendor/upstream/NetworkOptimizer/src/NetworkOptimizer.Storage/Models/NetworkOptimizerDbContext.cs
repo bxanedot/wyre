@@ -1,0 +1,787 @@
+﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using NetworkOptimizer.Alerts.Models;
+using NetworkOptimizer.Threats.Models;
+
+namespace NetworkOptimizer.Storage.Models;
+
+/// <summary>
+/// Entity Framework DbContext for NetworkOptimizer local storage
+/// </summary>
+public class NetworkOptimizerDbContext : DbContext
+{
+    public NetworkOptimizerDbContext(DbContextOptions<NetworkOptimizerDbContext> options)
+        : base(options)
+    {
+    }
+
+    /// <summary>
+    /// Every settings table this app reads with a bare FirstOrDefault holds exactly one row by
+    /// construction, so EF's warning about the missing order has nothing to choose between and
+    /// only fills the log. Set here rather than on the options: five call sites build this
+    /// context, and three of them assemble their own options.
+    /// </summary>
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        optionsBuilder.ConfigureWarnings(w => w.Ignore(CoreEventId.FirstWithoutOrderByAndFilterWarning));
+    }
+
+    public DbSet<AuditResult> AuditResults { get; set; }
+    public DbSet<SqmBaseline> SqmBaselines { get; set; }
+    public DbSet<LicenseInfo> Licenses { get; set; }
+    public DbSet<ModemConfiguration> ModemConfigurations { get; set; }
+    public DbSet<DeviceSshConfiguration> DeviceSshConfigurations { get; set; }
+    public DbSet<Iperf3Result> Iperf3Results { get; set; }
+    public DbSet<UniFiSshSettings> UniFiSshSettings { get; set; }
+    public DbSet<GatewaySshSettings> GatewaySshSettings { get; set; }
+    public DbSet<SshKey> SshKeys { get; set; }
+    public DbSet<DismissedIssue> DismissedIssues { get; set; }
+    public DbSet<OutageAcknowledgement> OutageAcknowledgements { get; set; }
+    public DbSet<SystemSetting> SystemSettings { get; set; }
+    public DbSet<HogRowBaseline> HogRowBaselines { get; set; }
+    public DbSet<WiFiIssueAcknowledgment> WiFiIssueAcknowledgments { get; set; }
+    public DbSet<WiFiRadioPreference> WiFiRadioPreferences { get; set; }
+    public DbSet<UniFiConnectionSettings> UniFiConnectionSettings { get; set; }
+    public DbSet<SqmWanConfiguration> SqmWanConfigurations { get; set; }
+    public DbSet<SqmCongestionProfile> SqmCongestionProfiles { get; set; }
+    public DbSet<SqmLearningSample> SqmLearningSamples { get; set; }
+    public DbSet<AdminSettings> AdminSettings { get; set; }
+    public DbSet<UpnpNote> UpnpNotes { get; set; }
+    public DbSet<ApLocation> ApLocations { get; set; }
+    public DbSet<Building> Buildings { get; set; }
+    public DbSet<FloorPlan> FloorPlans { get; set; }
+    public DbSet<PlannedAp> PlannedAps { get; set; }
+    public DbSet<FloorPlanImage> FloorPlanImages { get; set; }
+    public DbSet<ClientSignalLog> ClientSignalLogs { get; set; }
+    public DbSet<AlertRule> AlertRules { get; set; }
+    public DbSet<SeededAlertRule> SeededAlertRules { get; set; }
+    public DbSet<DeliveryChannel> DeliveryChannels { get; set; }
+    public DbSet<AlertHistoryEntry> AlertHistory { get; set; }
+    public DbSet<AlertIncident> AlertIncidents { get; set; }
+    public DbSet<ThreatEvent> ThreatEvents { get; set; }
+    public DbSet<ThreatPattern> ThreatPatterns { get; set; }
+    public DbSet<CrowdSecReputation> CrowdSecReputations { get; set; }
+    public DbSet<ThreatNoiseFilter> ThreatNoiseFilters { get; set; }
+    public DbSet<ScheduledTask> ScheduledTasks { get; set; }
+    public DbSet<WanDataUsageConfig> WanDataUsageConfigs { get; set; }
+    public DbSet<WanDataUsageSnapshot> WanDataUsageSnapshots { get; set; }
+    public DbSet<WanDataUsageHistory> WanDataUsageHistory { get; set; }
+    public DbSet<WanSteerTrafficClass> WanSteerTrafficClasses { get; set; }
+    public DbSet<ExternalSpeedTestServer> ExternalSpeedTestServers { get; set; }
+    public DbSet<PerfTweakSetting> PerfTweakSettings { get; set; }
+    public DbSet<MonitoringSettings> MonitoringSettings { get; set; }
+    public DbSet<MonitoringTarget> MonitoringTargets { get; set; }
+    public DbSet<WanDiscoveryContext> WanDiscoveryContexts { get; set; }
+    public DbSet<InterfaceNameMap> InterfaceNameMaps { get; set; }
+    public DbSet<UpstreamDiscovery> UpstreamDiscoveries { get; set; }
+    public DbSet<MonitoredSfp> MonitoredSfps { get; set; }
+    public DbSet<OuiVendor> OuiVendors { get; set; }
+    public DbSet<CmConfiguration> CmConfigurations { get; set; }
+    public DbSet<OntConfiguration> OntConfigurations { get; set; }
+    public DbSet<StarlinkConfiguration> StarlinkConfigurations { get; set; }
+    public DbSet<MonitoringInterface> MonitoringInterfaces { get; set; }
+    public DbSet<CustomOidConfiguration> CustomOidConfigurations { get; set; }
+    public DbSet<HealthCheckDefinition> HealthCheckDefinitions { get; set; }
+    public DbSet<ApAgentDeployment> ApAgentDeployments { get; set; }
+    public DbSet<ApAgentEventCursor> ApAgentEventCursors { get; set; }
+    public DbSet<DeviceSshRoute> DeviceSshRoutes { get; set; }
+    public DbSet<ApRoamRecord> ApRoamRecords { get; set; }
+    public DbSet<ApRadioHealthSample> ApRadioHealthSamples { get; set; }
+    public DbSet<ApChannelOutcome> ApChannelOutcomes { get; set; }
+    public DbSet<ApChannelChange> ApChannelChanges { get; set; }
+    public DbSet<ApNeighborSighting> ApNeighborSightings { get; set; }
+    public DbSet<Site> Sites { get; set; }
+    public DbSet<WanContext> WanContexts { get; set; }
+
+    /// <summary>
+    /// What we have determined per WAN, starting with the expected ISP speeds read from the console.
+    /// The site's first per-WAN table: AccessTechnology and the WAN neighbor fields still sit on
+    /// MonitoringSettings, one set per site. ISP Health and Monitoring are multi-WAN planned, so a
+    /// new per-WAN fact belongs here rather than as another single-WAN field on the settings row.
+    /// </summary>
+    public DbSet<WanProfile> WanProfiles { get; set; }
+    public DbSet<SiteAgent> SiteAgents { get; set; }
+    public DbSet<LicenseKeyRecord> LicenseKeyRecords { get; set; }
+    public DbSet<SiteLicenseAssignment> SiteLicenseAssignments { get; set; }
+    public DbSet<TourState> TourStates { get; set; }
+    public DbSet<FirmwareRolloutSettings> FirmwareRolloutSettings { get; set; }
+    public DbSet<FirmwareRolloutPlan> FirmwareRolloutPlans { get; set; }
+    public DbSet<FirmwareRolloutStep> FirmwareRolloutSteps { get; set; }
+    public DbSet<FirmwareModelTiming> FirmwareModelTimings { get; set; }
+
+    /// <summary>
+    /// The install-wide firmware catalog. Meaningful only in the MAIN database - per-site
+    /// databases carry the empty tables because every database shares this model.
+    /// </summary>
+    public DbSet<SharedFirmwareBuild> SharedFirmwareBuilds { get; set; }
+
+    /// <inheritdoc cref="SharedFirmwareBuilds"/>
+    public DbSet<SharedNetworkAppBuild> SharedNetworkAppBuilds { get; set; }
+
+    /// <inheritdoc cref="SharedNetworkAppPackage"/>
+    public DbSet<SharedNetworkAppPackage> SharedNetworkAppPackages { get; set; }
+
+    /// <inheritdoc cref="SharedFirmwareBuilds"/>
+    public DbSet<SharedUniFiOsBuild> SharedUniFiOsBuilds { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+
+        modelBuilder.Entity<Site>(entity =>
+        {
+            entity.ToTable("Sites");
+            entity.HasIndex(e => e.Slug).IsUnique();
+        });
+
+        modelBuilder.Entity<TourState>(entity =>
+        {
+            entity.ToTable("TourStates");
+            entity.HasIndex(e => e.Subject).IsUnique();
+        });
+
+        modelBuilder.Entity<SiteAgent>(entity =>
+        {
+            entity.ToTable("SiteAgents");
+            entity.HasIndex(e => e.SiteId);
+            entity.HasIndex(e => e.EnrollmentTokenHash);
+            entity.HasIndex(e => e.AgentKeyHash);
+        });
+
+        modelBuilder.Entity<LicenseKeyRecord>(entity =>
+        {
+            entity.ToTable("LicenseKeyRecords");
+            entity.HasIndex(e => e.LicenseKey).IsUnique();
+            entity.HasIndex(e => e.Status);
+            entity.HasIndex(e => e.NextCheckAt);
+        });
+
+        modelBuilder.Entity<SiteLicenseAssignment>(entity =>
+        {
+            entity.ToTable("SiteLicenseAssignments");
+            entity.HasIndex(e => e.SiteId).IsUnique();
+            entity.HasIndex(e => e.LicenseKeyRecordId);
+            entity.HasOne<LicenseKeyRecord>()
+                .WithMany()
+                .HasForeignKey(e => e.LicenseKeyRecordId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne<Site>()
+                .WithMany()
+                .HasForeignKey(e => e.SiteId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // AuditResult configuration
+        modelBuilder.Entity<AuditResult>(entity =>
+        {
+            entity.ToTable("AuditResults");
+            entity.HasIndex(e => e.DeviceId);
+            entity.HasIndex(e => e.AuditDate);
+            entity.HasIndex(e => new { e.DeviceId, e.AuditDate });
+        });
+
+        // SqmBaseline configuration
+        modelBuilder.Entity<SqmBaseline>(entity =>
+        {
+            entity.ToTable("SqmBaselines");
+            entity.HasIndex(e => e.DeviceId);
+            entity.HasIndex(e => e.InterfaceId);
+            entity.HasIndex(e => new { e.DeviceId, e.InterfaceId }).IsUnique();
+            entity.HasIndex(e => e.BaselineStart);
+        });
+
+        // LicenseInfo configuration
+        modelBuilder.Entity<LicenseInfo>(entity =>
+        {
+            entity.ToTable("Licenses");
+            entity.HasIndex(e => e.LicenseKey).IsUnique();
+            entity.HasIndex(e => e.IsActive);
+            entity.HasIndex(e => e.ExpirationDate);
+        });
+
+        // ModemConfiguration configuration
+        modelBuilder.Entity<ModemConfiguration>(entity =>
+        {
+            entity.ToTable("ModemConfigurations");
+            entity.HasIndex(e => e.Host);
+            entity.HasIndex(e => e.Enabled);
+        });
+
+        // CmConfiguration configuration
+        modelBuilder.Entity<CmConfiguration>(entity =>
+        {
+            entity.ToTable("CmConfigurations");
+            entity.HasIndex(e => e.Host);
+            entity.HasIndex(e => e.Enabled);
+        });
+
+        // OntConfiguration configuration
+        modelBuilder.Entity<OntConfiguration>(entity =>
+        {
+            entity.ToTable("OntConfigurations");
+            entity.HasIndex(e => e.Host);
+            entity.HasIndex(e => e.Enabled);
+        });
+
+        // ApAgentDeployment configuration. One row per access point; the MAC is the natural key
+        // the deployment service looks every AP up by.
+        modelBuilder.Entity<ApAgentDeployment>(entity =>
+        {
+            entity.ToTable("ApAgentDeployments");
+            entity.HasIndex(e => e.DeviceMac).IsUnique();
+            entity.HasIndex(e => e.Enabled);
+        });
+
+        // One cursor per access point, looked up by MAC on every event poll.
+        modelBuilder.Entity<ApAgentEventCursor>(entity =>
+        {
+            entity.ToTable("ApAgentEventCursors");
+            entity.HasIndex(e => e.DeviceMac).IsUnique();
+        });
+
+        modelBuilder.Entity<DeviceSshRoute>(entity =>
+        {
+            entity.ToTable("DeviceSshRoutes");
+            entity.HasIndex(e => e.DeviceMac).IsUnique();
+        });
+
+        // Roam records are read newest-first for a site and per client, so both are indexed.
+        modelBuilder.Entity<ApRoamRecord>(entity =>
+        {
+            entity.ToTable("ApRoamRecords");
+            entity.HasIndex(e => e.RoamedAt);
+            entity.HasIndex(e => new { e.ClientMac, e.RoamedAt });
+            entity.HasIndex(e => new { e.ToApMac, e.RoamedAt });
+        });
+
+        // Radio health is read per access point over a window, and pruned by age.
+        modelBuilder.Entity<ApRadioHealthSample>(entity =>
+        {
+            entity.ToTable("ApRadioHealthSamples");
+            entity.HasIndex(e => e.SampleAt);
+            entity.HasIndex(e => new { e.ApMac, e.Radio, e.SampleAt });
+        });
+
+        // StarlinkConfiguration configuration
+        modelBuilder.Entity<StarlinkConfiguration>(entity =>
+        {
+            entity.ToTable("StarlinkConfigurations");
+            entity.HasIndex(e => e.Host);
+            entity.HasIndex(e => e.Enabled);
+        });
+
+        // MonitoringInterface configuration (one row per ONT/modem access route). TargetIp
+        // is intentionally NOT unique - two rows sharing a TargetIp, distinguished by
+        // AliasIp, is exactly the duplicate-IP-WAN scenario this feature exists for. The
+        // uniqueness that actually matters (effective polled IP, cross-column disjointness)
+        // can't be expressed as simple column indexes and is enforced transactionally in
+        // MonitoringInterfaceRepository.SaveMonitoringInterfaceAsync instead. AliasIp,
+        // GatewayLocalIp, and Name each still get a simple per-column unique index as
+        // belt-and-braces (SQLite allows multiple NULLs under a unique index, so rows
+        // without an alias don't collide on AliasIp being null).
+        modelBuilder.Entity<MonitoringInterface>(entity =>
+        {
+            entity.ToTable("MonitoringInterfaces");
+            entity.HasIndex(e => e.TargetIp);
+            entity.HasIndex(e => e.Name).IsUnique();
+            entity.HasIndex(e => e.AliasIp).IsUnique();
+            entity.HasIndex(e => e.GatewayLocalIp).IsUnique();
+        });
+
+        // DeviceSshConfiguration configuration
+        modelBuilder.Entity<DeviceSshConfiguration>(entity =>
+        {
+            entity.ToTable("DeviceSshConfigurations");
+            entity.HasIndex(e => e.Host);
+            entity.HasIndex(e => e.Enabled);
+            // Store DeviceType enum as string for backwards compatibility
+            entity.Property(e => e.DeviceType)
+                .HasConversion<string>()
+                .HasMaxLength(50);
+        });
+
+        // Iperf3Result configuration
+        modelBuilder.Entity<Iperf3Result>(entity =>
+        {
+            entity.ToTable("Iperf3Results");
+            entity.HasIndex(e => e.DeviceHost);
+            entity.HasIndex(e => e.TestTime);
+            entity.HasIndex(e => e.Direction);
+            entity.HasIndex(e => new { e.DeviceHost, e.TestTime });
+            entity.Property(e => e.Direction).HasConversion<int>();
+        });
+
+        // UniFiSshSettings configuration (singleton - only one row)
+        modelBuilder.Entity<UniFiSshSettings>(entity =>
+        {
+            entity.ToTable("UniFiSshSettings");
+        });
+
+        // GatewaySshSettings configuration (singleton - only one row)
+        modelBuilder.Entity<GatewaySshSettings>(entity =>
+        {
+            entity.ToTable("GatewaySshSettings");
+        });
+
+        // DismissedIssue configuration
+        modelBuilder.Entity<DismissedIssue>(entity =>
+        {
+            entity.ToTable("DismissedIssues");
+            entity.HasIndex(e => e.IssueKey).IsUnique();
+        });
+
+        // Wi-Fi Optimizer acknowledgments and per-radio preferences (Keep)
+        modelBuilder.Entity<WiFiIssueAcknowledgment>(entity =>
+        {
+            entity.ToTable("WiFiIssueAcknowledgments");
+            entity.HasIndex(e => e.IssueKey).IsUnique();
+        });
+        modelBuilder.Entity<WiFiRadioPreference>(entity =>
+        {
+            entity.ToTable("WiFiRadioPreferences");
+            entity.HasIndex(e => new { e.ApMac, e.Band }).IsUnique();
+        });
+
+        // OutageAcknowledgement configuration ("that was me" on ISP Health outages)
+        modelBuilder.Entity<OutageAcknowledgement>(entity =>
+        {
+            entity.ToTable("OutageAcknowledgements");
+            entity.HasIndex(e => e.OutageStartUtc);
+        });
+
+        // SystemSetting configuration (key-value store)
+        modelBuilder.Entity<SystemSetting>(entity =>
+        {
+            entity.ToTable("SystemSettings");
+            entity.HasKey(e => e.Key);
+        });
+
+        // ExternalSpeedTestServer configuration
+        modelBuilder.Entity<ExternalSpeedTestServer>(entity =>
+        {
+            entity.ToTable("ExternalSpeedTestServers");
+            entity.HasIndex(e => e.ServerId).IsUnique();
+        });
+
+        // PerfTweakSetting configuration (tracks manually-deployed tweaks)
+        modelBuilder.Entity<PerfTweakSetting>(entity =>
+        {
+            entity.ToTable("PerfTweakSettings");
+            entity.HasIndex(e => e.TweakId).IsUnique();
+        });
+
+        // UniFiConnectionSettings configuration (singleton - only one row)
+        modelBuilder.Entity<UniFiConnectionSettings>(entity =>
+        {
+            entity.ToTable("UniFiConnectionSettings");
+        });
+
+        // SqmWanConfiguration configuration (one row per WAN)
+        modelBuilder.Entity<SqmWanConfiguration>(entity =>
+        {
+            entity.ToTable("SqmWanConfigurations");
+            entity.HasIndex(e => e.WanNumber).IsUnique();
+        });
+
+        // Adaptive SQM learned congestion profile (one row per WAN) and its raw samples
+        modelBuilder.Entity<SqmCongestionProfile>(entity =>
+        {
+            entity.ToTable("SqmCongestionProfiles");
+            entity.HasIndex(e => e.WanNumber).IsUnique();
+        });
+
+        modelBuilder.Entity<SqmLearningSample>(entity =>
+        {
+            entity.ToTable("SqmLearningSamples");
+            entity.HasIndex(e => new { e.WanNumber, e.SampledAt });
+        });
+
+        // AdminSettings configuration (singleton - only one row)
+        modelBuilder.Entity<AdminSettings>(entity =>
+        {
+            entity.ToTable("AdminSettings");
+        });
+
+        // MonitoringSettings configuration (singleton - only one row)
+        modelBuilder.Entity<MonitoringSettings>(entity =>
+        {
+            entity.ToTable("MonitoringSettings");
+            entity.Property(e => e.SnmpVersion).HasConversion<int>();
+            entity.Property(e => e.SnmpDetectionState).HasConversion<int>();
+            entity.Property(e => e.AccessTechnology).HasConversion<int>();
+        });
+
+        // MonitoringTarget configuration
+        modelBuilder.Entity<MonitoringTarget>(entity =>
+        {
+            entity.ToTable("MonitoringTargets");
+            entity.HasIndex(e => e.TargetId).IsUnique();
+            entity.HasIndex(e => e.TargetType);
+            entity.HasIndex(e => e.Enabled);
+            entity.HasIndex(e => e.WanInterface);
+            entity.Property(e => e.ProbeMode).HasConversion<int>();
+            entity.Property(e => e.TargetType).HasConversion<int>();
+            entity.Property(e => e.DiscoveryMethod).HasConversion<int>();
+        });
+
+        // WanDiscoveryContext configuration — one row per WAN with the per-WAN tracer state.
+        modelBuilder.Entity<WanDiscoveryContext>(entity =>
+        {
+            entity.ToTable("WanDiscoveryContexts");
+            entity.HasKey(e => e.WanInterface);
+            entity.Property(e => e.AccessTechnology).HasConversion<int>();
+        });
+
+        // InterfaceNameMap configuration
+        modelBuilder.Entity<InterfaceNameMap>(entity =>
+        {
+            entity.ToTable("InterfaceNameMaps");
+            entity.HasIndex(e => new { e.DeviceMac, e.IfName }).IsUnique();
+            entity.HasIndex(e => e.DeviceMac);
+            entity.Property(e => e.Direction).HasConversion<int>();
+        });
+
+        // UpstreamDiscovery configuration
+        modelBuilder.Entity<UpstreamDiscovery>(entity =>
+        {
+            entity.ToTable("UpstreamDiscoveries");
+            entity.HasIndex(e => e.AsnNumber);
+            entity.HasIndex(e => e.IsActive);
+            entity.HasIndex(e => e.MonitoringTargetId);
+            entity.Property(e => e.Role).HasConversion<int>();
+        });
+
+        // MonitoredSfp configuration
+        modelBuilder.Entity<MonitoredSfp>(entity =>
+        {
+            entity.ToTable("MonitoredSfps");
+            entity.HasIndex(e => new { e.DeviceMac, e.PortName }).IsUnique();
+            entity.HasIndex(e => e.IsMonitoredOnt);
+            entity.Property(e => e.Category).HasConversion<int>();
+            entity.Ignore(e => e.IsPon);
+            entity.Ignore(e => e.IsActiveEthernet);
+            entity.Ignore(e => e.IsOpticalLink);
+        });
+
+        // OuiVendor configuration (lookup cache, primary key on OUI prefix)
+        modelBuilder.Entity<OuiVendor>(entity =>
+        {
+            entity.ToTable("OuiVendors");
+            entity.HasKey(e => e.OuiPrefix);
+        });
+
+        // UpnpNote configuration
+        modelBuilder.Entity<UpnpNote>(entity =>
+        {
+            entity.ToTable("UpnpNotes");
+            entity.HasIndex(e => new { e.HostIp, e.Port, e.Protocol }).IsUnique();
+        });
+
+        // ApLocation configuration (one per AP MAC)
+        modelBuilder.Entity<ApLocation>(entity =>
+        {
+            entity.ToTable("ApLocations");
+            entity.HasIndex(e => e.ApMac).IsUnique();
+        });
+
+        // Building configuration
+        modelBuilder.Entity<Building>(entity =>
+        {
+            entity.ToTable("Buildings");
+            entity.HasMany(e => e.Floors)
+                .WithOne(e => e.Building)
+                .HasForeignKey(e => e.BuildingId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // FloorPlan configuration
+        modelBuilder.Entity<FloorPlan>(entity =>
+        {
+            entity.ToTable("FloorPlans");
+            entity.HasIndex(e => e.BuildingId);
+            entity.HasMany(e => e.Images)
+                .WithOne(e => e.FloorPlan)
+                .HasForeignKey(e => e.FloorPlanId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // FloorPlanImage configuration
+        modelBuilder.Entity<FloorPlanImage>(entity =>
+        {
+            entity.ToTable("FloorPlanImages");
+            entity.HasIndex(e => e.FloorPlanId);
+        });
+
+        // PlannedAp configuration
+        modelBuilder.Entity<PlannedAp>(entity =>
+        {
+            entity.ToTable("PlannedAps");
+        });
+
+        // ClientSignalLog configuration
+        modelBuilder.Entity<ClientSignalLog>(entity =>
+        {
+            entity.ToTable("ClientSignalLogs");
+            entity.HasIndex(e => new { e.ClientMac, e.Timestamp });
+            entity.HasIndex(e => e.TraceHash);
+        });
+
+        // AlertRule configuration
+        modelBuilder.Entity<AlertRule>(entity =>
+        {
+            entity.ToTable("AlertRules");
+            entity.Property(e => e.MinSeverity).HasConversion<int>();
+            entity.Property(e => e.EscalationSeverity).HasConversion<int>();
+        });
+
+        // SeededAlertRule configuration
+        modelBuilder.Entity<SeededAlertRule>(entity =>
+        {
+            entity.ToTable("SeededAlertRules");
+            entity.Property(e => e.EventTypePattern).HasMaxLength(200);
+            entity.HasIndex(e => e.EventTypePattern).IsUnique();
+        });
+
+        // DeliveryChannel configuration
+        modelBuilder.Entity<DeliveryChannel>(entity =>
+        {
+            entity.ToTable("DeliveryChannels");
+            entity.Property(e => e.ChannelType).HasConversion<int>();
+            entity.Property(e => e.MinSeverity).HasConversion<int>();
+        });
+
+        // AlertHistoryEntry configuration
+        modelBuilder.Entity<AlertHistoryEntry>(entity =>
+        {
+            entity.ToTable("AlertHistory");
+            entity.HasIndex(e => e.TriggeredAt);
+            entity.HasIndex(e => new { e.Source, e.TriggeredAt });
+            entity.HasIndex(e => e.Status);
+            entity.HasIndex(e => e.RuleId);
+            entity.HasIndex(e => e.IncidentId);
+            entity.Property(e => e.Severity).HasConversion<int>();
+            entity.Property(e => e.Status).HasConversion<int>();
+        });
+
+        // AlertIncident configuration
+        modelBuilder.Entity<AlertIncident>(entity =>
+        {
+            entity.ToTable("AlertIncidents");
+            entity.HasIndex(e => e.CorrelationKey);
+            entity.HasIndex(e => e.Status);
+            entity.Property(e => e.Severity).HasConversion<int>();
+            entity.Property(e => e.Status).HasConversion<int>();
+        });
+
+        // ThreatEvent configuration
+        modelBuilder.Entity<ThreatEvent>(entity =>
+        {
+            entity.ToTable("ThreatEvents");
+            entity.HasIndex(e => e.Timestamp);
+            entity.HasIndex(e => new { e.SourceIp, e.Timestamp });
+            entity.HasIndex(e => new { e.DestPort, e.Timestamp });
+            entity.HasIndex(e => e.KillChainStage);
+            entity.HasIndex(e => e.InnerAlertId).IsUnique();
+            entity.HasIndex(e => e.EventSource);
+            entity.Property(e => e.Action).HasConversion<int>();
+            entity.Property(e => e.KillChainStage).HasConversion<int>();
+            entity.Property(e => e.EventSource).HasConversion<int>();
+            entity.HasOne(e => e.Pattern)
+                .WithMany(p => p.Events)
+                .HasForeignKey(e => e.PatternId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ThreatPattern configuration
+        modelBuilder.Entity<ThreatPattern>(entity =>
+        {
+            entity.ToTable("ThreatPatterns");
+            entity.HasIndex(e => new { e.PatternType, e.DetectedAt });
+            entity.Property(e => e.PatternType).HasConversion<int>();
+        });
+
+        // CrowdSecReputation configuration
+        modelBuilder.Entity<CrowdSecReputation>(entity =>
+        {
+            entity.ToTable("CrowdSecReputations");
+            entity.HasKey(e => e.Ip);
+            entity.HasIndex(e => e.ExpiresAt);
+        });
+
+        // ThreatNoiseFilter configuration
+        modelBuilder.Entity<ThreatNoiseFilter>(entity =>
+        {
+            entity.ToTable("ThreatNoiseFilters");
+        });
+
+        // ScheduledTask configuration
+        modelBuilder.Entity<ScheduledTask>(entity =>
+        {
+            entity.ToTable("ScheduledTasks");
+            entity.HasIndex(e => e.TaskType);
+            entity.HasIndex(e => e.Enabled);
+            entity.HasIndex(e => e.NextRunAt);
+        });
+
+        // WanDataUsageConfig configuration (one per WAN interface)
+        modelBuilder.Entity<WanDataUsageConfig>(entity =>
+        {
+            entity.ToTable("WanDataUsageConfigs");
+            entity.HasIndex(e => e.WanKey).IsUnique();
+        });
+
+        // WanDataUsageSnapshot configuration
+        modelBuilder.Entity<WanDataUsageSnapshot>(entity =>
+        {
+            entity.ToTable("WanDataUsageSnapshots");
+            entity.HasIndex(e => new { e.WanKey, e.Timestamp });
+        });
+
+        // WanDataUsageHistory configuration (one row per completed billing cycle, kept indefinitely)
+        modelBuilder.Entity<WanDataUsageHistory>(entity =>
+        {
+            entity.ToTable("WanDataUsageHistory");
+            entity.HasIndex(e => new { e.WanKey, e.CycleStart }).IsUnique();
+        });
+
+        // WanSteerTrafficClass configuration
+        modelBuilder.Entity<WanSteerTrafficClass>(entity =>
+        {
+            entity.ToTable("WanSteerTrafficClasses");
+            entity.HasIndex(e => e.SortOrder);
+        });
+
+        // CustomOidConfiguration configuration
+        modelBuilder.Entity<CustomOidConfiguration>(entity =>
+        {
+            entity.ToTable("CustomOidConfigurations");
+            entity.HasIndex(e => e.DeviceMac);
+            entity.HasIndex(e => new { e.DeviceMac, e.Oid }).IsUnique();
+        });
+
+        modelBuilder.Entity<HealthCheckDefinition>(entity =>
+        {
+            entity.ToTable("HealthCheckDefinitions");
+            entity.HasIndex(e => e.DeviceMac);
+            entity.HasIndex(e => new { e.DeviceMac, e.FieldName }).IsUnique();
+        });
+
+        // ApChannelOutcome configuration (channel recommendation outcome memory)
+        modelBuilder.Entity<ApChannelOutcome>(entity =>
+        {
+            entity.ToTable("ApChannelOutcomes");
+            entity.HasIndex(e => new { e.ApMac, e.Band, e.Channel, e.WidthMhz, e.BucketDate }).IsUnique();
+            entity.HasIndex(e => e.BucketDate);
+        });
+
+        // ApChannelChange configuration (persisted channel-change log)
+        modelBuilder.Entity<ApChannelChange>(entity =>
+        {
+            entity.ToTable("ApChannelChanges");
+            entity.HasIndex(e => new { e.ApMac, e.Band, e.ChangedAtUtc });
+            entity.HasIndex(e => e.ChangedAtUtc);
+        });
+
+        // ApNeighborSighting configuration (long-term neighbor memory)
+        modelBuilder.Entity<ApNeighborSighting>(entity =>
+        {
+            entity.ToTable("ApNeighborSightings");
+            entity.HasIndex(e => new { e.ApMac, e.Band, e.Bssid, e.Channel }).IsUnique();
+            entity.HasIndex(e => e.LastSeenUtc);
+        });
+
+        modelBuilder.Entity<WanProfile>(entity =>
+        {
+            // One row per WAN: the console's own WAN group is the identity that survives a rename.
+            entity.HasIndex(e => e.WanNetworkgroup).IsUnique();
+        });
+
+        // FirmwareRolloutSettings configuration (singleton - only one row)
+        modelBuilder.Entity<FirmwareRolloutSettings>(entity =>
+        {
+            entity.ToTable("FirmwareRolloutSettings");
+            entity.Property(e => e.Mode).HasConversion<int>();
+            entity.Property(e => e.SpacingProfile).HasConversion<int>();
+            entity.Property(e => e.AutopilotWindowMode).HasConversion<int>();
+        });
+
+        // FirmwareRolloutPlan configuration
+        modelBuilder.Entity<FirmwareRolloutPlan>(entity =>
+        {
+            entity.ToTable("FirmwareRolloutPlans");
+            entity.HasIndex(e => e.Status);
+            entity.HasIndex(e => e.CreatedAt);
+            entity.HasIndex(e => e.ScheduledStartAt);
+            entity.Property(e => e.Status).HasConversion<int>();
+        });
+
+        // FirmwareRolloutStep configuration
+        modelBuilder.Entity<FirmwareRolloutStep>(entity =>
+        {
+            entity.ToTable("FirmwareRolloutSteps");
+            entity.HasIndex(e => new { e.PlanId, e.Wave });
+            entity.HasIndex(e => e.DeviceMac);
+            entity.Property(e => e.State).HasConversion<int>();
+            entity.HasOne<FirmwareRolloutPlan>()
+                .WithMany()
+                .HasForeignKey(e => e.PlanId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // FirmwareModelTiming configuration (one row per model, the self-learning store)
+        modelBuilder.Entity<FirmwareModelTiming>(entity =>
+        {
+            entity.ToTable("FirmwareModelTimings");
+            entity.HasIndex(e => e.Model).IsUnique();
+        });
+
+        // Shared firmware catalog (main database only; one row per build seen anywhere)
+        modelBuilder.Entity<SharedFirmwareBuild>(entity =>
+        {
+            entity.ToTable("SharedFirmwareBuilds");
+            entity.HasKey(e => new { e.Model, e.Channel, e.Version });
+        });
+
+        modelBuilder.Entity<SharedNetworkAppBuild>(entity =>
+        {
+            entity.ToTable("SharedNetworkAppBuilds");
+            entity.HasKey(e => new { e.Channel, e.Version });
+        });
+
+        modelBuilder.Entity<SharedNetworkAppPackage>(entity =>
+        {
+            entity.ToTable("SharedNetworkAppPackages");
+            entity.HasKey(e => new { e.Platform, e.Version });
+        });
+
+        modelBuilder.Entity<SharedUniFiOsBuild>(entity =>
+        {
+            entity.ToTable("SharedUniFiOsBuilds");
+            entity.HasKey(e => new { e.Platform, e.Channel, e.Version });
+        });
+    }
+}
+
+/// <summary>
+/// Custom DbContext factory for singleton services that need database access.
+/// </summary>
+/// <remarks>
+/// This exists to work around a DI lifetime conflict: AddDbContext registers DbContextOptions
+/// as Scoped, but AddDbContextFactory needs Singleton options. Using both causes validation
+/// errors in Development mode. This factory owns its own options instance, avoiding the conflict.
+/// See Program.cs registration for details.
+/// </remarks>
+public class NetworkOptimizerDbContextFactory : IDbContextFactory<NetworkOptimizerDbContext>
+{
+    private readonly DbContextOptions<NetworkOptimizerDbContext> _options;
+
+    public NetworkOptimizerDbContextFactory(DbContextOptions<NetworkOptimizerDbContext> options)
+    {
+        _options = options;
+    }
+
+    public NetworkOptimizerDbContext CreateDbContext()
+    {
+        return new NetworkOptimizerDbContext(_options);
+    }
+}

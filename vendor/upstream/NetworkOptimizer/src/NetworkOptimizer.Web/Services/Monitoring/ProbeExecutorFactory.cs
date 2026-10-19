@@ -1,0 +1,168 @@
+using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Monitoring.Probes;
+using NetworkOptimizer.Storage.Services;
+using NetworkOptimizer.Web.Services.Ssh;
+
+namespace NetworkOptimizer.Web.Services.Monitoring;
+
+/// <summary>
+/// Resolves the appropriate <see cref="IProbeExecutor"/> for a chosen vantage point. The
+/// server vantage is the singleton <see cref="LocalProbeExecutor"/>; device vantages are
+/// constructed on demand from the device's IP + the user's UniFi SSH credentials.
+///
+/// Device executors aren't cached because the credentials, the device IP, and the
+/// connectivity to it can all change between requests, and a stale cached executor would
+/// hide that. Construction is cheap; it's just an object that holds an
+/// <see cref="SshConnectionInfo"/>.
+/// </summary>
+public class ProbeExecutorFactory
+{
+    private readonly LocalProbeExecutor _local;
+    private readonly DeviceSshRouterRegistry _sshRouters;
+    private readonly IGatewaySshService _gatewaySsh;
+    private readonly SshClientService _sshClient;
+    private readonly ICredentialProtectionService _credentialProtection;
+    private readonly UniFiConnectionService _connection;
+    private readonly AgentProbeService _agentProbe;
+    private readonly SiteContextService _siteContext;
+    private readonly SiteTunnelRouting _tunnelRouting;
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly SiteAgentCoverage _agentCoverage;
+    private readonly ILogger<ProbeExecutorFactory> _logger;
+
+    public ProbeExecutorFactory(
+        LocalProbeExecutor local,
+        DeviceSshRouterRegistry sshRouters,
+        IGatewaySshService gatewaySsh,
+        SshClientService sshClient,
+        ICredentialProtectionService credentialProtection,
+        UniFiConnectionService connection,
+        AgentProbeService agentProbe,
+        SiteContextService siteContext,
+        SiteTunnelRouting tunnelRouting,
+        SiteAgentCoverage agentCoverage,
+        ILoggerFactory loggerFactory,
+        ILogger<ProbeExecutorFactory> logger)
+    {
+        _local = local;
+        _sshRouters = sshRouters;
+        _gatewaySsh = gatewaySsh;
+        _sshClient = sshClient;
+        _credentialProtection = credentialProtection;
+        _connection = connection;
+        _agentProbe = agentProbe;
+        _siteContext = siteContext;
+        _tunnelRouting = tunnelRouting;
+        _agentCoverage = agentCoverage;
+        _loggerFactory = loggerFactory;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// The "server" vantage. On a secondary site with an online agent that's the on-site
+    /// agent host (the central server can't reach the site's network) - it runs the
+    /// identical LocalProbeExecutor over the tunnel. The default site resolves the same way
+    /// once it is configured for its agent to cover it; otherwise, and whenever no agent is
+    /// online, this is the local server.
+    /// </summary>
+    public IProbeExecutor GetServer()
+    {
+        if (ServerVantageIsAgent)
+            return new AgentProbeExecutor(_agentProbe, _siteContext.Slug,
+                _loggerFactory.CreateLogger<AgentProbeExecutor>());
+        return _local;
+    }
+
+    /// <summary>Whether the "server" vantage resolves to the on-site agent for the current site.</summary>
+    public bool ServerVantageIsAgent =>
+        _agentCoverage.AgentOwnsPathMeasurement(_siteContext.Slug);
+
+    /// <summary>
+    /// An executor that runs on ONE named agent of the current site, rather than on whichever
+    /// agent the site's "server" vantage happens to resolve to. A site can have several agents,
+    /// each behind a different WAN, so a caller that picked one means that one: this never
+    /// substitutes another.
+    /// </summary>
+    /// <param name="agentId">Registry id of the agent to run on.</param>
+    public IProbeExecutor ForAgent(int agentId) =>
+        new AgentProbeExecutor(_agentProbe, _siteContext.Slug,
+            _loggerFactory.CreateLogger<AgentProbeExecutor>(), agentId);
+
+    /// <summary>
+    /// Build an executor that runs probes from the chosen UniFi device via SSH. Returns
+    /// null if SSH isn't configured for this device or its IP can't be resolved from the
+    /// current topology.
+    /// </summary>
+    public async Task<IProbeExecutor?> ForDeviceAsync(string deviceMac, CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(deviceMac)) return null;
+
+        try
+        {
+            if (!_connection.IsConnected) return null;
+            var devices = await _connection.GetDiscoveredDevicesAsync(ct);
+            var device = devices?.FirstOrDefault(d =>
+                !string.IsNullOrEmpty(d.Mac) &&
+                string.Equals(d.Mac.Replace('-', ':').ToLowerInvariant(),
+                              deviceMac.Replace('-', ':').ToLowerInvariant()));
+            if (device == null || string.IsNullOrEmpty(device.DisplayIpAddress)) return null;
+
+            SshConnectionInfo connection;
+
+            if (device.Type == DeviceType.Gateway)
+            {
+                var gwSettings = await _gatewaySsh.GetSettingsAsync();
+                if (string.IsNullOrEmpty(gwSettings.Username)
+                    || (string.IsNullOrEmpty(gwSettings.Password) && string.IsNullOrEmpty(gwSettings.PrivateKeyPath)))
+                {
+                    _logger.LogDebug("Gateway SSH credentials not configured; cannot build gateway vantage for {Mac}", deviceMac);
+                    return null;
+                }
+
+                string? decryptedPassword = null;
+                if (!string.IsNullOrEmpty(gwSettings.Password))
+                    decryptedPassword = _credentialProtection.Decrypt(gwSettings.Password);
+
+                connection = SshConnectionInfo.FromGatewaySettings(gwSettings, decryptedPassword);
+            }
+            else
+            {
+                // The router picks the device's credentials, so an Express (UX, UX7) adopted as an AP falls
+                // back to Gateway SSH when it refuses Device SSH. Settled first: this builds a
+                // connection rather than running a command. The router also tunnel-routes it.
+                var router = _sshRouters.GetFor(_siteContext.Slug);
+                var target = DeviceSshTarget.From(device);
+                await router.SettleAsync(target, ct);
+                var routed = await router.GetConnectionAsync(target, ct);
+                if (routed == null)
+                {
+                    _logger.LogDebug("UniFi SSH credentials not configured; cannot build device vantage for {Mac}", deviceMac);
+                    return null;
+                }
+                return new SshProbeExecutor(
+                    _sshClient,
+                    routed,
+                    vantageId: $"device:{deviceMac}",
+                    _loggerFactory.CreateLogger<SshProbeExecutor>());
+            }
+
+            // Route the gateway SSH through the agent tunnel on secondary sites: the
+            // gateway's LAN IP is unreachable from the central server, so rewrite host:port
+            // to the site agent's loopback proxy (the same routing gateway/device SSH use
+            // via GatewaySshService.MaybeRouteViaAgentAsync). No-op on the default site.
+            (connection.Host, connection.Port) = await _tunnelRouting.RouteAsync(
+                _siteContext.Slug, connection.Host, connection.Port);
+
+            return new SshProbeExecutor(
+                _sshClient,
+                connection,
+                vantageId: $"device:{deviceMac}",
+                _loggerFactory.CreateLogger<SshProbeExecutor>());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to construct SSH probe executor for {Mac}", deviceMac);
+            return null;
+        }
+    }
+}

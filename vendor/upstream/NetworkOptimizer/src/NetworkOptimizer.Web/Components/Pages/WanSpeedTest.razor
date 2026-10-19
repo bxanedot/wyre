@@ -1,0 +1,2538 @@
+@page "/wan-speedtest"
+@attribute [Authorize(Policy = Policies.RequireViewer)]
+@rendermode InteractiveServer
+@implements IDisposable
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Storage.Helpers
+@using NetworkOptimizer.UniFi.Models
+@using NetworkOptimizer.Web.Components.Shared
+@using NetworkOptimizer.Web.Services.Ssh
+@using NetworkOptimizer.UniFi
+@using NetworkOptimizer.Core.Helpers
+@using NetworkOptimizer.Web.Services.Monitoring.IspHealth
+@inject IUwnSpeedTestService WanSpeedTestService
+@inject IGatewayWanSpeedTestService GatewayWanTestService
+@inject ISqmService SqmService
+@inject IGatewaySshService GatewaySshService
+@inject SpeedTestServiceRegistry SpeedTestRegistry
+@inject SiteContextService SiteContext
+@inject SiteAgentCoverage AgentCoverage
+@inject MonitoringReadinessService Readiness
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteTunnelRouting TunnelRouting
+@inject AgentOnGatewayDetector OnGatewayDetector
+@inject AgentWanTestVantageResolver AgentVantages
+@inject UniFiConnectionService ConnectionService
+@inject IJSRuntime JS
+@inject SystemSettingsService SettingsService
+@inject PullToRefreshState PtrState
+@inject IspHealthService IspHealthService
+@inject NavigationManager NavigationManager
+
+<PageTitle>WAN Speed Test - Network Optimizer</PageTitle>
+
+<div class="speedtest-container wan-speedtest">
+    <div class="page-header wan-speedtest-header">
+        <div class="wan-header-titles">
+            <PageBackButton />
+            <h1>WAN Speed Test</h1>
+            <p class="page-description">Measures your internet speed using distributed HTTP servers with multiple concurrent connections.</p>
+        </div>
+        @{ var ispHealth = IspHealthService.GetCachedScore(); }
+        <div class="monitoring-stat-card clickable-stat-card isp-health-tile wan-header-isp-tile @ispHealth.TileCssClass" data-tooltip="@ispHealth.TileTooltip" data-tooltip-hover-only @onclick="@(() => NavigationManager.NavigateTo($"/monitoring?tab=isp-health&wan={NetworkOptimizer.Web.Services.Monitoring.LiveWanScope.PrimaryWanToken}"))">
+            <div class="stat-value isp-tile-score">@ispHealth.TileText</div>
+            <div class="stat-label">ISP Health</div>
+            @if (ispHealth.Status == IspHealthStatus.Ready && ispHealth.Score.HasValue)
+            {
+                <div class="isp-tile-bar"><div class="isp-tile-bar-fill" style="width: @(ispHealth.Score)%"></div></div>
+            }
+        </div>
+    </div>
+
+    <RestrictedSiteNotice />
+
+    @if (!_wanScheduleBannerDismissed)
+    {
+        <div class="alert alert-info" style="margin-bottom:1rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-info">i</span>
+                <div class="banner-text" style="flex:1;">
+                    @if (SiteContext.IsDefault)
+                    {
+                        <text>Schedule recurring WAN speed tests to track performance over time.</text>
+                    }
+                    else
+                    {
+                        <text>Scheduled speed tests are per site. Schedule recurring WAN tests for this site to track its performance over time.</text>
+                    }
+                </div>
+                <div class="banner-actions">
+                    <a href="/alerts" class="btn btn-sm btn-primary">Set up schedule</a>
+                    <button class="btn btn-sm btn-tertiary" @onclick="DismissWanScheduleBanner">Dismiss</button>
+                </div>
+            </div>
+        </div>
+    }
+
+    @* Run Test Card *@
+    @* Every control in this card is Operator-only, so a Viewer was shown a WAN selector, a Max Load
+       toggle and no way to start anything. Hide the card rather than present a dead one. *@
+    <SiteOperatorOnly>
+    <div class="card" id="wan-run-test">
+        <div class="card-header">
+            <h2 class="card-title">Run a Speed Test</h2>
+        </div>
+        <div class="card-body">
+            @* The two options draw only once the agent/gateway availability has settled: the
+               resolve is in-memory and DB reads (milliseconds), while drawing first paints
+               "Unavailable" defaults that flip a beat later. A failed resolve still draws -
+               _vantageResolved is set in a finally. *@
+            @if (!_vantageResolved)
+            {
+                <div class="loading-container"><div class="spinner spinner-sm"></div></div>
+            }
+            else
+            {
+            <div class="wan-test-options">
+                @* Gateway (Direct) Option - Primary *@
+                <div class="wan-test-option @(_gatewayAvailable ? "" : "wan-test-option-unavailable")">
+                    <div class="wan-test-option-header">
+                        <span class="wan-test-option-label">Gateway (Direct)</span>
+                        @if (!_gatewayAvailable && !_isRunning)
+                        {
+                            <span class="wan-test-option-badge" data-tooltip="@_gatewayUnavailableReason">Unavailable</span>
+                        }
+                    </div>
+                    <div class="wan-test-option-controls">
+                        @if (_wanSelectorOptions.Count > 1)
+                        {
+                            <div class="wan-select-row">
+                                <select class="wan-reassign-select"
+                                        @bind="_selectedWanOption"
+                                        @bind:after="OnWanSelectionChanged"
+                                        disabled="@(_isRunning)">
+                                    @foreach (var opt in _wanSelectorOptions)
+                                    {
+                                        if (opt.IsSeparator)
+                                        {
+                                            <option disabled value="">──────────</option>
+                                        }
+                                        else
+                                        {
+                                            <option value="@opt.Value">@opt.Label</option>
+                                        }
+                                    }
+                                </select>
+                            </div>
+                        }
+                        <label class="toggle-switch" data-tooltip="Normal: 4 servers, 20 streams, 8 s. Max Load: 6 servers, 24 streams, 8 s for saturating high-bandwidth or congested links." data-tooltip-hover-only>
+                            <input type="checkbox" @bind="_gatewayMaxMode" disabled="@_isRunning" />
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">Max Load</span>
+                        </label>
+                        <SiteOperatorOnly>
+                            <button class="btn btn-primary test-button wan-test-button"
+                                @onclick="RunGatewayTest"
+                                disabled="@(_isRunning || !_gatewayAvailable || IsLicenseRestricted)">
+                            @if (_isRunning && _activeTestType == "gateway")
+                            {
+                                <div class="test-progress">
+                                    <div class="progress-bar" style="width: @(_progressPercent)%"></div>
+                                </div>
+                                <span class="test-phase">@_progressPhase...</span>
+                            }
+                            else
+                            {
+                                <span>Run Test from Gateway</span>
+                            }
+                        </button>
+                        </SiteOperatorOnly>
+                        @if (!string.IsNullOrEmpty(_gatewayStatus))
+                        {
+                            <code class="wan-result-summary">@_gatewayStatus</code>
+                        }
+                    </div>
+                    <div class="wan-test-option-hint">
+                        Deploys a speed test binary to the gateway and runs it directly. Most accurate WAN measurement - no LAN overhead.@if (_serverOptionVisible)
+                        {<text> For multi-gig connections, @(RunsOnAgent ? "an Agent-based" : "a Server-based") test may be best.</text>}
+                    </div>
+                    @if (!_gatewayAvailable && !_isRunning && !string.IsNullOrEmpty(_gatewayUnavailableReason))
+                    {
+                        var linked = MessageLinker.Split(
+                            _gatewayUnavailableReason, _gatewaySettingsLinkText, _gatewaySettingsHref);
+                        <div class="alert alert-warning">
+                            @if (linked.HasLink)
+                            {
+                                @linked.Before<a href="@linked.Href">@linked.LinkText</a>@linked.After
+                            }
+                            else
+                            {
+                                @linked.Before
+                            }
+                        </div>
+                    }
+                </div>
+
+                @* Server Option - Secondary. Hidden entirely when no agent at the site can run
+                   the test - on a gateway agent the run would happen ON the gateway, which is
+                   what the Gateway option already does properly. *@
+                @if (_serverOptionVisible)
+                {
+                <div class="wan-test-option @(_serverAvailable ? "" : "wan-test-option-unavailable")">
+                    <div class="wan-test-option-header">
+                        <span class="wan-test-option-label">@(RunsOnAgent ? "On-Site Agent" : "Server")</span>
+                        @if (!_serverAvailable && !_isRunning)
+                        {
+                            <span class="wan-test-option-badge" data-tooltip="@_serverUnavailableReason">Unavailable</span>
+                        }
+                    </div>
+                    <div class="wan-test-option-controls">
+                        @if (_agentVantages.Count > 0)
+                        {
+                            <div class="wan-selector">
+                                <select class="form-control wan-select"
+                                        @bind="_selectedAgentVantage"
+                                        @bind:after="OnAgentVantageChanged"
+                                        disabled="@(_isRunning)">
+                                    @foreach (var vantage in _agentVantages)
+                                    {
+                                        <option value="@(vantage.ContextId?.ToString() ?? "")">@vantage.Label</option>
+                                    }
+                                </select>
+                            </div>
+                        }
+                        <label class="toggle-switch" data-tooltip="Normal: 4 servers, 20 connections, 8 s. Max Load: up to 12 servers, 48 connections, 8 s for saturating high-bandwidth or congested links." data-tooltip-hover-only>
+                            <input type="checkbox" @bind="_maxMode" disabled="@_isRunning" />
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">Max Load</span>
+                        </label>
+                        <SiteOperatorOnly>
+                            <button class="btn btn-primary test-button wan-test-button"
+                                @onclick="RunServerTest"
+                                disabled="@(_isRunning || !_serverAvailable || IsLicenseRestricted)">
+                            @if (_isRunning && _activeTestType == "server")
+                            {
+                                <div class="test-progress">
+                                    <div class="progress-bar" style="width: @(_progressPercent)%"></div>
+                                </div>
+                                <span class="test-phase">@_progressPhase...</span>
+                            }
+                            else
+                            {
+                                <span>Run Test from @(RunsOnAgent ? "Agent" : "Server")</span>
+                            }
+                        </button>
+                        </SiteOperatorOnly>
+                        @if (!string.IsNullOrEmpty(_serverStatus))
+                        {
+                            <code class="wan-result-summary">@_serverStatus</code>
+                        }
+                    </div>
+                    <div class="wan-test-option-hint">
+                        @if (_hasMultipleWans)
+                        {
+                            <text>Tests from @(RunsOnAgent ? "the On-Site Agent" : "this server") through the LAN. Traffic may be load-balanced across WAN interfaces.</text>
+                        }
+                        else
+                        {
+                            <text>Tests from @(RunsOnAgent ? "the On-Site Agent" : "this server") through the LAN. Includes LAN traversal overhead.</text>
+                        }
+                    </div>
+                </div>
+                }
+            </div>
+            }
+
+            @if (!string.IsNullOrEmpty(_errorMessage))
+            {
+                <div class="alert alert-danger">@_errorMessage</div>
+            }
+
+            @if (_metadata != null)
+            {
+                <div class="wan-metadata">
+                    <div class="metadata-item">
+                        <span class="metadata-label">@(_metadata.ServerInfo?.Contains(" | ") == true ? "Test Servers" : "Test Server")</span>
+                        <span class="metadata-value">@_metadata.ServerInfo</span>
+                    </div>
+                    @if (!string.IsNullOrEmpty(_metadata.Location) && !_hideWanIdentity)
+                    {
+                        <div class="metadata-item">
+                            <span class="metadata-label">ISP</span>
+                            <span class="metadata-value">@_metadata.Location</span>
+                        </div>
+                    }
+                    @if (!string.IsNullOrEmpty(_metadata.WanIp) && !_hideWanIdentity)
+                    {
+                        <div class="metadata-item">
+                            <span class="metadata-label">WAN IP</span>
+                            <span class="metadata-value">@_metadata.WanIp</span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+    </div>
+    </SiteOperatorOnly>
+
+    @* Latest Result *@
+    @if (_latestResult != null && _latestResult.Success)
+    {
+        <div class="card" id="latest-result">
+            <div class="card-header">
+                <h2 class="card-title">Latest Result</h2>
+            </div>
+            <div class="card-body">
+                <SpeedTestDetails Result="_latestResult"
+                                  Perspective="SpeedPerspective.Wan"
+                                  OnTestAgain="HandleTestAgain"
+                                  OnNotesChanged="HandleNotesChanged"
+                                  AvailableWans="_availableWans"
+                                  OnWanReassigned="HandleWanReassigned"
+                                  ShowLiveViewLink="_liveViewLinkEnabled" />
+            </div>
+        </div>
+    }
+
+    @* WAN History (tabbed charts + filters + table) *@
+    <div class="card" id="speed-history-card">
+        <div class="card-header history-card-header">
+            <div class="header-title-row">
+                <h2 class="card-title">WAN History</h2>
+                <div class="header-actions">
+                    <button class="btn btn-sm btn-secondary" @onclick="() => LoadHistory(true)" disabled="@_loadingHistory">
+                        @if (_loadingHistory)
+                        {
+                            <span class="spinner-sm"></span>
+                        }
+                        else
+                        {
+                            <span>Refresh</span>
+                        }
+                    </button>
+                </div>
+            </div>
+            <div class="wan-history-tabs">
+                <button class="wan-history-tab @(_activeHistoryTab == "speed" ? "active" : "")" @onclick='() => SwitchHistoryTab("speed")'>Speed</button>
+                <button class="wan-history-tab @(_activeHistoryTab == "latency" ? "active" : "")" @onclick='() => SwitchHistoryTab("latency")'>Latency</button>
+                <button class="wan-history-tab @(_activeHistoryTab == "loaded-latency" ? "active" : "")" @onclick='() => SwitchHistoryTab("loaded-latency")'>Loaded Latency</button>
+                <button class="wan-history-tab @(_activeHistoryTab == "jitter" ? "active" : "")" @onclick='() => SwitchHistoryTab("jitter")'>Jitter</button>
+            </div>
+        </div>
+        <div class="card-body">
+            @if (_testHistory.Count > 0)
+            {
+                @* Speed Chart *@
+                @if (_activeHistoryTab == "speed")
+                {
+                    <div class="wan-chart-container">
+                        <ApexChart @ref="_chart" TItem="WanChartDataPoint"
+                                   Options="_chartOptions"
+                                   Height="@("250px")"
+                                   OnClick="OnChartClicked">
+                            @foreach (var wan in _wanSeries)
+                            {
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.DownloadData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName} ↓")"
+                                                 SeriesType="SeriesType.Area"
+                                                 XValue="e => e.Timestamp"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.UploadData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName} ↑")"
+                                                 SeriesType="SeriesType.Area"
+                                                 XValue="e => e.Timestamp"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                            }
+                        </ApexChart>
+                    </div>
+                }
+
+                @* Latency Chart *@
+                @if (_activeHistoryTab == "latency")
+                {
+                    <div class="wan-chart-container">
+                        <ApexChart @ref="_latencyChart" TItem="WanChartDataPoint"
+                                   Options="_latencyChartOptions"
+                                   Height="@("250px")">
+                            @foreach (var wan in _wanSeries)
+                            {
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.LatencyData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName}")"
+                                                 SeriesType="SeriesType.Line"
+                                                 XValue="e => e.Timestamp"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                            }
+                        </ApexChart>
+                    </div>
+                }
+
+                @* Loaded Latency Chart *@
+                @if (_activeHistoryTab == "loaded-latency")
+                {
+                    <div class="wan-chart-container loaded-latency-chart-wrapper">
+                        <div class="loaded-latency-legend">
+                            <span class="loaded-latency-legend-item">
+                                <svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="var(--text-secondary)" stroke-width="2" /></svg> Base
+                            </span>
+                            <span class="loaded-latency-legend-item">
+                                <svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="var(--text-secondary)" stroke-width="2" stroke-dasharray="5,3" /></svg> Loaded ↓
+                            </span>
+                            <span class="loaded-latency-legend-item">
+                                <svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="var(--text-secondary)" stroke-width="2" stroke-dasharray="2,2" /></svg> Loaded ↑
+                            </span>
+                        </div>
+                        <ApexChart @ref="_loadedLatencyChart" TItem="WanChartDataPoint"
+                                   Options="_loadedLatencyChartOptions"
+                                   Height="@("250px")">
+                            @foreach (var wan in _wanSeries)
+                            {
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.LoadedLatencyBaseData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName} Base")"
+                                                 SeriesType="SeriesType.Line"
+                                                 XValue="e => e.Timestamp"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.LoadedLatencyDownData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName} Loaded ↓")"
+                                                 SeriesType="SeriesType.Line"
+                                                 XValue="e => e.Timestamp"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.LoadedLatencyUpData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName} Loaded ↑")"
+                                                 SeriesType="SeriesType.Line"
+                                                 XValue="e => e.Timestamp"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                            }
+                        </ApexChart>
+                    </div>
+                }
+
+                @* Jitter Chart *@
+                @if (_activeHistoryTab == "jitter")
+                {
+                    <div class="wan-chart-container">
+                        <ApexChart @ref="_jitterChart" TItem="WanChartDataPoint"
+                                   Options="_jitterChartOptions"
+                                   Height="@("250px")">
+                            @foreach (var wan in _wanSeries)
+                            {
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.JitterData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName}")"
+                                                 SeriesType="SeriesType.Line"
+                                                 XValue="e => e.Timestamp"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                            }
+                        </ApexChart>
+                    </div>
+                }
+
+                @* Time Slider *@
+                <div class="wan-time-slider">
+                    <input type="range" min="0" max="10" step="1" @bind="_sliderValue" @bind:after="OnSliderChanged" />
+                    <span class="time-label">@GetTimeLabel()</span>
+                </div>
+
+                @* WAN Filter Badges *@
+                @if (_wanSeries.Count > 1)
+                {
+                    <div class="wan-filter-badges">
+                        @foreach (var wan in _wanSeries)
+                        {
+                            <button class="wan-filter-badge @(wan.IsSelected ? "active" : "inactive")"
+                                    @onclick="@((e) => ToggleWanFilter(wan.Key, e))">
+                                <span class="wan-badge-dot" style="background-color: @wan.Color"></span>
+                                @wan.DisplayName
+                            </button>
+                        }
+                    </div>
+                }
+
+                @* History Table *@
+                <div class="table-responsive wan-history-table" id="history-table">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th class="col-time">Time</th>
+                                @if (_wanSeries.Count > 1)
+                                {
+                                    <th>WAN</th>
+                                }
+                                <th>Test Server</th>
+                                <th class="hide-mobile">
+                                    <span class="tooltip-wrapper tooltip-bottom">
+                                        ↓ Mbps
+                                        <span class="tooltip-icon">?</span>
+                                        <span class="tooltip-content">
+                                            <strong>Download</strong><br />
+                                            Data received from the internet.
+                                        </span>
+                                    </span>
+                                </th>
+                                <th class="hide-mobile">
+                                    <span class="tooltip-wrapper tooltip-bottom">
+                                        ↑ Mbps
+                                        <span class="tooltip-icon">?</span>
+                                        <span class="tooltip-content">
+                                            <strong>Upload</strong><br />
+                                            Data sent to the internet.
+                                        </span>
+                                    </span>
+                                </th>
+                                <th class="show-mobile">Mbps</th>
+                                <th class="hide-mobile">Latency</th>
+                                <th class="hide-mobile">Status</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @if (!_pagedHistory.Any())
+                            {
+                                var emptyColSpan = _wanSeries.Count > 1 ? 9 : 8;
+                                <tr>
+                                    <td colspan="@emptyColSpan" style="text-align: center; padding: 2rem; color: var(--text-muted);">
+                                        @if (_testHistory.Count == 0)
+                                        {
+                                            <span>No WAN speed test results yet. Run a test above to get started.</span>
+                                        }
+                                        else
+                                        {
+                                            <span>No results match the current filters.</span>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                            @foreach (var result in _pagedHistory)
+                            {
+                                var isExpanded = _expandedHistoryId == result.Id || _collapsingHistoryId == result.Id;
+                                var colSpan = _wanSeries.Count > 1 ? 9 : 8;
+                                <tr id="result-@result.Id"
+                                    class="@(result.Success ? "history-row-clickable" : "error-row") @(isExpanded ? "history-row-expanded" : "")"
+                                    @onclick="@(async () => { if (result.Success) await ToggleHistoryExpand(result.Id); })">
+                                    <td>@result.TestTime.ToLocalTime().ToString("MMM dd HH:mm")</td>
+                                    @if (_wanSeries.Count > 1)
+                                    {
+                                        <td>
+                                            @{
+                                                var wanKey = GetWanKey(result);
+                                                var wanInfo = _wanSeries.FirstOrDefault(w => w.Key == wanKey);
+                                            }
+                                            @if (wanInfo != null)
+                                            {
+                                                <span class="wan-badge-dot-inline" style="background-color: @wanInfo.Color"></span>
+                                            }
+                                            @GetWanDisplayName(result)
+                                        </td>
+                                    }
+                                    @{
+                                        var fullName = result.DeviceName ?? "WAN";
+                                        var truncated = TruncateServerList(fullName);
+                                    }
+                                    <td data-tooltip="@(truncated != fullName ? fullName : null)" data-tooltip-hover-only>@truncated</td>
+                                    <td class="hide-mobile">@(result.Success ? result.DownloadMbps.ToString("F1") : "-")</td>
+                                    <td class="hide-mobile">@(result.Success ? result.UploadMbps.ToString("F1") : "-")</td>
+                                    <td class="show-mobile">
+                                        @if (result.Success)
+                                        {
+                                            <span>↓@result.DownloadMbps.ToString("F0") ↑@result.UploadMbps.ToString("F0")</span>
+                                        }
+                                        else
+                                        {
+                                            <span>-</span>
+                                        }
+                                    </td>
+                                    <td class="hide-mobile">
+                                        @if (result.PingMs.HasValue)
+                                        {
+                                            <span>@(result.PingMs.Value.ToString("F1")) ms</span>
+                                        }
+                                        else
+                                        {
+                                            <span>-</span>
+                                        }
+                                    </td>
+                                    <td class="hide-mobile">
+                                        @if (result.Success)
+                                        {
+                                            <span class="status-badge status-connected">OK</span>
+                                        }
+                                        else
+                                        {
+                                            <span class="status-badge status-disconnected">Failed</span>
+                                            <span class="tooltip-icon tooltip-icon-sm" data-tooltip="@result.ErrorMessage">?</span>
+                                        }
+                                    </td>
+                                    <td class="expand-chevron">
+                                        @if (result.Success)
+                                        {
+                                            <span>@(isExpanded ? "▲" : "▼")</span>
+                                        }
+                                    </td>
+                                </tr>
+                                @if (result.Success)
+                                {
+                                    <tr class="history-details-row">
+                                        <td colspan="@colSpan">
+                                            <div class="expand-wrapper @(isExpanded ? "expanded" : "")">
+                                                <div class="expand-content">
+                                                    <div class="history-details">
+                                                        @{
+                                                            var pathAnalysis = _historyPathAnalysis.GetValueOrDefault(result.Id) ?? result.PathAnalysis;
+                                                        }
+                                                        <SpeedTestDetails Result="result"
+                                                                          PathAnalysis="pathAnalysis"
+                                                                          Perspective="SpeedPerspective.Wan"
+                                                                          OnTestAgain="HandleTestAgain"
+                                                                          OnDelete="HandleDeleteResult"
+                                                                          OnNotesChanged="HandleNotesChanged"
+                                                                          AvailableWans="_availableWans"
+                                                                          OnWanReassigned="HandleWanReassigned"
+                                                                          IsInTableRow="true"
+                                                                          ShowLiveViewLink="_liveViewLinkEnabled" />
+
+                                                        @if (pathAnalysis == null && ConnectionService.IsConnected)
+                                                        {
+                                                            <div class="analyze-path-action">
+                                                                <button class="btn btn-sm btn-secondary"
+                                                                        @onclick="() => AnalyzeHistoricalPath(result)"
+                                                                        @onclick:stopPropagation="true"
+                                                                        disabled="@(_analyzingResultId == result.Id)">
+                                                                    @if (_analyzingResultId == result.Id)
+                                                                    {
+                                                                        <span>Analyzing...</span>
+                                                                    }
+                                                                    else
+                                                                    {
+                                                                        <span>Analyze Path</span>
+                                                                    }
+                                                                </button>
+                                                                <span class="analyze-hint">Calculate network path and grade performance</span>
+                                                            </div>
+                                                        }
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                }
+                            }
+                        </tbody>
+                    </table>
+                </div>
+
+                @if (_historyTotalPages > 1)
+                {
+                    <div class="pagination" id="wan-history-pagination">
+                        <button class="btn btn-sm btn-secondary" disabled="@(_historyPage <= 1)" @onclick="() => ChangePage(-1)"><span class="pag-arrow">←</span> Prev</button>
+                        <span class="pagination-info">
+                            Page @_historyPage of @_historyTotalPages (@_filteredHistory.Count total)
+                        </span>
+                        <button class="btn btn-sm btn-secondary" disabled="@(_historyPage >= _historyTotalPages)" @onclick="() => ChangePage(1)">Next <span class="pag-arrow">→</span></button>
+                    </div>
+                }
+            }
+            else if (!_loadingHistory)
+            {
+                <div class="empty-state">
+                    <p>No WAN speed tests recorded yet.</p>
+                    <p class="form-help">Click "Run Test from Gateway" or "Run Test from @(RunsOnAgent ? "Agent" : "Server")" above to measure your internet connection speed.</p>
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+<style>
+    .page-header.wan-speedtest-header {
+        align-items: flex-start;
+        justify-content: space-between;
+        flex-wrap: nowrap;
+    }
+    .wan-speedtest-header .wan-header-titles {
+        flex: 1 1 auto;
+        min-width: 0;
+    }
+    .wan-speedtest-header .monitoring-stat-card.wan-header-isp-tile {
+        flex: 0 0 auto;
+        align-self: center;
+        min-width: 100px;
+        min-height: 0;
+        padding: 0.5rem 0.5rem;
+    }
+</style>
+
+@code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
+    // Resolve the current site's path analyzer (not the main-pinned singleton) so historical
+    // path re-computes trace against this site's topology.
+    private INetworkPathAnalyzer PathAnalyzer => SpeedTestRegistry.GetFor(SiteContext.Slug).PathAnalyzer;
+
+    // Test state
+    private bool _isRunning;
+    private bool _maxMode;
+    private bool _gatewayMaxMode;
+    private bool _hideWanIdentity; // captured at test start: max mode + multi-WAN
+    private string _activeTestType = ""; // "gateway" or "server"
+    private string _progressPhase = "";
+    private int _progressPercent;
+    private string? _gatewayStatus;
+    private string? _serverStatus;
+    private string? _errorMessage;
+    private WanTestMetadata? _metadata;
+    private Iperf3Result? _latestResult;
+    private bool _hasMultipleWans;
+    private List<WanOption> _availableWans = new();
+
+    // Gateway test state
+    private List<WanInterfaceInfo> _wanInterfaces = new();
+    private string _selectedWanOption = "0"; // index, "i+j" for combo, "all" for all WANs
+    private List<WanSelectorOption> _wanSelectorOptions = new();
+    private bool _gatewayAvailable;
+    private string? _gatewayUnavailableReason;
+    private bool _gatewaySshConfigured;      // gateway SSH host+creds present and enabled
+    private string? _gatewaySshUnavailableReason;
+    private string? _gatewaySettingsHref;     // where the unavailable reason's link goes, when it has one
+    private string? _gatewaySettingsLinkText; // the phrase in that reason to turn into the link
+    private bool _consoleDataLoaded;         // WAN list/interfaces loaded from a connected console
+
+    // Agent-backed secondary site whose on-site agent isn't currently connected.
+    // Both WAN tests run through that agent, so they can't run until it reconnects.
+    private bool _siteAgentOffline;
+
+    // Whether any connected agent at this site can run the test. A gateway agent cannot (it carries
+    // no speed test binary), which is why the option hides rather than offering a run that fails.
+    private bool _hasCapableAgent;
+    private bool _serverOptionVisible = true;
+
+    // Selectable WAN vantages for the agent run. Empty on a site with no WAN contexts, which is
+    // every single-WAN site: nothing to choose between, so no selector.
+    private List<AgentWanVantage> _agentVantages = new();
+
+    // Null until something is chosen. Not "", because that is Default path's own value - starting
+    // there made the keep-the-selection check below match it and never reach the first WAN.
+    private string? _selectedAgentVantage;
+
+    // Availability the site as a whole allows, which the chosen WAN can only narrow.
+    private bool _serverAvailableForSite = true;
+    private string? _serverUnavailableReasonForSite;
+
+    /// <summary>
+    /// Whether the non-gateway run happens on the site's agent rather than on this server, which is
+    /// what the option is called and described as. Matches the actual execution path
+    /// (<see cref="SiteAgentCoverage.AgentOwnsPathMeasurement"/>, the same predicate
+    /// UwnSpeedTestService runs on): the agent runs the binary itself, so this does not depend on
+    /// devices.via_agent, which only routes device endpoints. An agent that runs ON the gateway is
+    /// not this case: that option is hidden entirely, because the Gateway option already runs there.
+    /// </summary>
+    private bool _runsOnAgent;
+    private bool RunsOnAgent => _vantageResolved
+        ? _runsOnAgent
+        : !SiteContext.IsDefault;
+    private bool _vantageResolved;
+    private bool _serverAvailable = true;
+    private string? _serverUnavailableReason;
+    private System.Threading.Timer? _agentStatusTimer;
+
+    private const string AgentOfflineReason =
+        "This site connects through its On-Site Agent, which isn't online. WAN speed tests can resume when it reconnects.";
+
+    private const string NoAgentReason =
+        "WAN speed tests on a managed site run from its On-Site Agent, and this site has none online. " +
+        "Set up the site's Agent under Settings > Multi-Site to enable them.";
+
+    // Progress interpolation for smooth bar during long phases
+    private DateTime _interpStart;
+    private string _interpPhase = "";
+    private int _interpFrom;
+    private int _interpTo;
+
+    // History state
+    private List<Iperf3Result> _testHistory = new();
+    private bool _loadingHistory;
+
+    // Filtered history - governed by time slider + WAN badges
+    private List<Iperf3Result> _filteredHistory = new();
+
+    private int _historyPage = 1;
+    private const int HistoryPageSize = 10;
+    private int _historyTotalPages => (int)Math.Ceiling(_filteredHistory.Count / (double)HistoryPageSize);
+    private IEnumerable<Iperf3Result> _pagedHistory => _filteredHistory.Skip((_historyPage - 1) * HistoryPageSize).Take(HistoryPageSize);
+
+    // Expand state
+    private int? _expandedHistoryId;
+    private int? _collapsingHistoryId;
+
+    // Path analysis state
+    private Dictionary<int, PathAnalysisResult?> _historyPathAnalysis = new();
+    private int? _analyzingResultId;
+
+    // Schedule banner
+    private bool _wanScheduleBannerDismissed = true; // default hidden until loaded
+
+    // Poll timer for tracking in-progress test state
+    private System.Threading.Timer? _pollTimer;
+    private System.Threading.Timer? _ispHealthRefreshTimer;
+
+    // Chart state
+    private ApexChart<WanChartDataPoint>? _chart;
+    private ApexChartOptions<WanChartDataPoint> _chartOptions = new();
+    private ApexChart<WanChartDataPoint>? _latencyChart;
+    private ApexChartOptions<WanChartDataPoint> _latencyChartOptions = new();
+    private ApexChart<WanChartDataPoint>? _loadedLatencyChart;
+    private ApexChartOptions<WanChartDataPoint> _loadedLatencyChartOptions = new();
+    private ApexChart<WanChartDataPoint>? _jitterChart;
+    private ApexChartOptions<WanChartDataPoint> _jitterChartOptions = new();
+    private List<WanSeriesInfo> _wanSeries = new();
+    private List<WanChartDataPoint> _hiddenChartData = new();
+
+    // History tab state
+    private string _activeHistoryTab = "speed";
+
+    // Time slider
+    private int _sliderValue = 6; // Default to 30 days
+    private static readonly (int hours, string label)[] TimeBreakpoints = new[]
+    {
+        (1, "1 hr"),         // 0
+        (4, "4 hrs"),        // 1
+        (24, "24 hrs"),      // 2
+        (72, "3 days"),      // 3
+        (168, "1 week"),     // 4
+        (336, "2 weeks"),    // 5
+        (720, "30 days"),    // 6
+        (2160, "90 days"),   // 7
+        (4320, "6 months"),  // 8
+        (8760, "1 year"),    // 9
+        (0, "All time")      // 10
+    };
+
+    // Chart downsampling: max points per series when time range > 4 hrs
+    private const int MaxChartPoints = 20;
+
+    private static readonly string[] WanColors = ChartPalette.Colors;
+
+    private class WanChartDataPoint
+    {
+        public DateTime Timestamp { get; set; }
+        public decimal Value { get; set; }
+        public int ResultId { get; set; }
+        public long X => new DateTimeOffset(Timestamp, TimeSpan.Zero).ToUnixTimeMilliseconds();
+
+        // A padding point at the chart's edge: no result behind it, drawn as nothing.
+        public bool IsGap { get; init; }
+        public decimal? Y => IsGap ? null : Value;
+
+        public WanChartDataPoint(DateTime timestamp, double value, int resultId)
+        {
+            Timestamp = DateTime.SpecifyKind(timestamp, DateTimeKind.Utc);
+            Value = (decimal)value;
+            ResultId = resultId;
+        }
+
+        public static WanChartDataPoint Gap(DateTime timestamp) => new(timestamp, 0, 0) { IsGap = true };
+    }
+
+    // Every series on a chart must start and end at the same x, or ApexCharts hit-tests the hover in
+    // two dimensions (nearest point by pixel distance, any series) instead of by x alone, and on
+    // sparse test points the tooltip jumps and drops. Null edge points draw nothing, take no hover
+    // dot and get no tooltip row, so the padding is invisible. Empty series get both points too.
+    private static void PadToCommonSpan(IEnumerable<List<WanChartDataPoint>> seriesLists)
+    {
+        var lists = seriesLists.ToList();
+        var points = lists.SelectMany(l => l).Where(p => !p.IsGap).ToList();
+        if (points.Count == 0) return;
+        var min = points.Min(p => p.Timestamp);
+        var max = points.Max(p => p.Timestamp);
+        foreach (var list in lists)
+        {
+            if (list.Count == 0 || list[0].Timestamp > min) list.Insert(0, WanChartDataPoint.Gap(min));
+            if (list[^1].Timestamp < max) list.Add(WanChartDataPoint.Gap(max));
+        }
+    }
+
+    private class WanSeriesInfo
+    {
+        public string Key { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+        public string Color { get; set; } = "";
+        public List<WanChartDataPoint> DownloadData { get; set; } = new();
+        public List<WanChartDataPoint> UploadData { get; set; } = new();
+        public List<WanChartDataPoint> LatencyData { get; set; } = new();
+        public List<WanChartDataPoint> LoadedLatencyBaseData { get; set; } = new();
+        public List<WanChartDataPoint> LoadedLatencyDownData { get; set; } = new();
+        public List<WanChartDataPoint> LoadedLatencyUpData { get; set; } = new();
+        public List<WanChartDataPoint> JitterData { get; set; } = new();
+        public bool IsSelected { get; set; }
+    }
+
+    private class WanSelectorOption
+    {
+        public string Value { get; set; } = ""; // e.g. "0", "0+2", "all"
+        public string Label { get; set; } = "";
+        public bool IsSeparator { get; set; }
+        public int[] Indices { get; set; } = [];
+    }
+
+    private bool IsWanVisible(WanSeriesInfo wan) => wan.IsSelected;
+
+    private bool _liveViewLinkEnabled;
+
+    protected override async Task OnInitializedAsync()
+    {
+        PtrState.RefreshCallback = () => LoadHistory();
+        PtrState.NotifyStateChanged = StateHasChanged;
+
+        _liveViewLinkEnabled = await Readiness.IsHistoricPlaybackAvailableAsync();
+
+        _wanScheduleBannerDismissed = await SettingsService.GetAsync("banner.wan_schedule_dismissed") != null;
+        InitializeChartOptions();
+        InitializeLatencyChartOptions();
+        InitializeLoadedLatencyChartOptions();
+        InitializeJitterChartOptions();
+
+        // Load WAN list, gateway status, and history in parallel
+        var historyTask = LoadHistory(resetPage: true);
+        Task? wanTask = null;
+
+        if (ConnectionService.IsConnected)
+        {
+            wanTask = LoadWanDataAsync();
+        }
+
+        // Gateway SSH availability is a DB read - determine it even when the console
+        // (and, on an agent-backed site, the agent) is offline, so the Gateway (Direct)
+        // option recovers on its own when the agent reconnects rather than needing a reload.
+        //
+        // Availability resolves BEFORE the slow history/WAN loads are awaited: it is
+        // in-memory and DB reads, and the run-test cards hold their spinner until it lands
+        // (see the _vantageResolved gate). The finally guarantees they draw even when the
+        // resolve throws - with the same defaults an early draw showed before the gate.
+        try
+        {
+            await RefreshGatewaySshConfigAsync();
+            await RefreshAgentAvailabilityAsync();
+        }
+        finally
+        {
+            _vantageResolved = true;
+        }
+        StartAgentStatusPolling();
+        StateHasChanged();
+
+        await historyTask;
+        if (wanTask != null) await wanTask;
+
+        BuildWanSelectorOptions();
+
+        if (_testHistory.Count > 0)
+        {
+            _latestResult = _testHistory.FirstOrDefault(r => r.Success);
+        }
+
+        // If a test is already running (user navigated away and back), start polling
+        if (await WanSpeedTestService.IsRunningAsync())
+        {
+            _isRunning = true;
+            _activeTestType = "server";
+            await SyncProgressFromService();
+            StartPolling();
+        }
+        else if (await GatewayWanTestService.IsRunningAsync())
+        {
+            _isRunning = true;
+            _activeTestType = "gateway";
+            await SyncGatewayProgressFromService();
+            StartPolling();
+        }
+
+        // Subscribe to path analysis completion to refresh UI
+        WanSpeedTestService.OnPathAnalysisComplete += OnPathAnalysisComplete;
+        GatewayWanTestService.OnPathAnalysisComplete += OnPathAnalysisComplete;
+
+        StartIspHealthRefresh();
+    }
+
+    // The header ISP Health tile computes its score in the background; poll until it lands so
+    // the value appears without navigating away and back. Only polls while a compute is in
+    // flight - other states (Ready, awaiting the console connection, setup funnels) won't
+    // resolve on their own here; the console-up hook re-arms it once the connection lands.
+    private void StartIspHealthRefresh()
+    {
+        var snapshot = IspHealthService.GetCachedScore();
+        if (snapshot.Status != IspHealthStatus.Computing)
+            return;
+
+        var lastText = snapshot.TileText;
+        var attempts = 0;
+        _ispHealthRefreshTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                var current = IspHealthService.GetCachedScore();
+                if (current.TileText != lastText)
+                {
+                    lastText = current.TileText;
+                    await InvokeAsync(StateHasChanged);
+                }
+                if (++attempts >= 30 || current.Status == IspHealthStatus.Ready)
+                {
+                    _ispHealthRefreshTimer?.Dispose();
+                    _ispHealthRefreshTimer = null;
+                }
+            }
+            catch { }
+        }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
+    }
+
+    /// <summary>
+    /// Reads gateway SSH availability from settings (a DB read, no console/agent
+    /// required) so the Gateway (Direct) option can be gated even before the console
+    /// connects, and recovers on its own once an offline agent reconnects.
+    /// </summary>
+    private async Task RefreshGatewaySshConfigAsync()
+    {
+        try
+        {
+            var gwSettings = await GatewaySshService.GetSettingsAsync();
+            _gatewaySshConfigured = !string.IsNullOrEmpty(gwSettings.Host) && gwSettings.HasCredentials && gwSettings.Enabled;
+            _gatewaySshUnavailableReason = _gatewaySshConfigured
+                ? null
+                : "Gateway SSH not configured. Set it up in Settings, under the Connection tab.";
+        }
+        catch
+        {
+            _gatewaySshConfigured = false;
+            _gatewaySshUnavailableReason = "Could not check gateway status";
+        }
+    }
+
+    /// <summary>
+    /// Recomputes whether this site's on-site agent is offline and folds that into
+    /// both WAN test options. For an agent-backed secondary site, the Server (UWN)
+    /// and Gateway (Direct) tests both run through the agent, so an offline agent
+    /// makes them unavailable; <see cref="StartAgentStatusPolling"/> re-enables them
+    /// when it reconnects. The default site never routes via agent.
+    /// </summary>
+    private async Task RefreshAgentAvailabilityAsync()
+    {
+        // A managed (non-default) site's WAN tests run FROM its on-site agent -
+        // running them from this central server would measure the central
+        // network's WAN and file the result under the managed site. So both
+        // options require a live agent on non-default sites, full stop: a site
+        // that is via-agent configured but momentarily disconnected gets the
+        // "resumes when it reconnects" message, a site with no agent set up at
+        // all gets pointed at agent setup instead of a runnable-but-wrong test.
+        var agentOnline = TunnelRouting.IsAgentOnline(SiteContext.Slug);
+        _siteAgentOffline = !SiteContext.IsDefault
+            && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug)
+            && !agentOnline;
+
+        // An agent on the gateway itself (monitoring-only) has no WAN test binary, and a "from the
+        // server through the LAN" run makes no sense when the agent IS the gateway - the Server
+        // option is hidden and the Gateway test is the one to use. Keyed off whether any agent here
+        // CAN run the test rather than where one sits, so a site pairing a gateway agent with a
+        // bare-metal one keeps the option the bare-metal agent can serve.
+        _hasCapableAgent = agentOnline && await AgentVantages.HasCapableAgentAsync(SiteContext.Slug);
+        _runsOnAgent = _hasCapableAgent
+            && AgentCoverage.AgentOwnsPathMeasurement(SiteContext.Slug);
+        // The option stays visible for a site this server tests itself; it is only the agent-run
+        // case that needs an agent able to run it.
+        _serverOptionVisible = _hasCapableAgent || !AgentCoverage.AgentOwnsPathMeasurement(SiteContext.Slug);
+        // Before the vantage list, which reads RunsOnAgent - and that answers from a fallback until
+        // this is set, so loading ahead of it asks the wrong question on a covered default site.
+        _vantageResolved = true;
+        await LoadAgentVantagesAsync();
+        var agentRequired = !SiteContext.IsDefault && !agentOnline;
+        var agentReason = _siteAgentOffline ? AgentOfflineReason : NoAgentReason;
+
+        // What the SITE allows, before the chosen WAN narrows it. Kept apart because changing the
+        // selector re-derives availability without re-running any of the above.
+        _serverAvailableForSite = !agentRequired;
+        _serverUnavailableReasonForSite = agentRequired ? agentReason : null;
+        ApplyAgentVantageAvailability();
+
+        if (agentRequired)
+        {
+            _gatewayAvailable = false;
+            _gatewayUnavailableReason = agentReason;
+            // Only the "no agent set up" reason points at a settings page; the
+            // "agent offline, resumes when it reconnects" reason is not actionable.
+            _gatewaySettingsHref = _siteAgentOffline
+                ? null
+                : $"/settings?tab=multisite&configure={SiteContext.Slug}";
+            _gatewaySettingsLinkText = _siteAgentOffline ? null : "Settings > Multi-Site";
+        }
+        else
+        {
+            _gatewayAvailable = _gatewaySshConfigured;
+            _gatewayUnavailableReason = _gatewaySshConfigured ? null : _gatewaySshUnavailableReason;
+            _gatewaySettingsHref = "/settings#gateway-ssh";
+            _gatewaySettingsLinkText = "Settings, under the Connection tab";
+        }
+    }
+
+    /// <summary>
+    /// Loads the WAN vantages the agent run can be pointed at, keeping the current selection when
+    /// it survives the refresh. A run on this server has no vantage to choose, so the list is
+    /// dropped entirely there rather than offering a choice that would not be honored.
+    /// </summary>
+    private async Task LoadAgentVantagesAsync()
+    {
+        _agentVantages = RunsOnAgent
+            ? await AgentVantages.ListVantagesAsync(SiteContext.Slug)
+            : new List<AgentWanVantage>();
+
+        if (_agentVantages.Count == 0)
+        {
+            _selectedAgentVantage = null;
+            return;
+        }
+        if (_selectedAgentVantage == null
+            || !_agentVantages.Any(v => (v.ContextId?.ToString() ?? "") == _selectedAgentVantage))
+            _selectedAgentVantage = _agentVantages[0].ContextId?.ToString() ?? "";
+    }
+
+    /// <summary>
+    /// Reports up front whether the chosen WAN can be tested, rather than leaving the operator to
+    /// press the button and read a failure. Always derived from what the site allows, so it only
+    /// ever narrows: a site already unavailable (no agent, offline agent) keeps its own reason.
+    /// </summary>
+    private void ApplyAgentVantageAvailability()
+    {
+        _serverAvailable = _serverAvailableForSite;
+        _serverUnavailableReason = _serverUnavailableReasonForSite;
+        if (!_serverAvailable) return;
+
+        var selected = _agentVantages.FirstOrDefault(v => (v.ContextId?.ToString() ?? "") == _selectedAgentVantage);
+        if (selected is { Runnable: false })
+        {
+            _serverAvailable = false;
+            _serverUnavailableReason = selected.Reason;
+        }
+    }
+
+    private void OnAgentVantageChanged() => ApplyAgentVantageAvailability();
+
+    /// <summary>The WAN context the agent run measures, or null for the site's default path.</summary>
+    private int? SelectedWanContextId =>
+        int.TryParse(_selectedAgentVantage, out var id) ? id : null;
+
+    /// <summary>
+    /// Polls the site's agent tunnel status so the WAN test options re-enable on
+    /// their own once the agent reconnects. Only agent-backed secondary sites can
+    /// go offline, so the default site skips the timer entirely.
+    /// </summary>
+    private void StartAgentStatusPolling()
+    {
+        if (SiteContext.IsDefault) return;
+        _agentStatusTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    // Compare on the rendered availability, not just the offline flag:
+                    // a site with no via-agent flag that gains its first agent flips
+                    // _serverAvailable without ever changing _siteAgentOffline.
+                    var before = (_siteAgentOffline, _serverAvailable, _gatewayAvailable, _serverOptionVisible);
+                    await RefreshAgentAvailabilityAsync();
+                    var changed = before != (_siteAgentOffline, _serverAvailable, _gatewayAvailable, _serverOptionVisible);
+
+                    // The console comes back a moment after the agent tunnel does; once it's
+                    // connected, load the WAN data the Gateway (Direct) test needs so the
+                    // button works on the first click without a manual page refresh.
+                    if (!_consoleDataLoaded && ConnectionService.IsConnected)
+                    {
+                        await LoadWanDataAsync();
+                        BuildWanSelectorOptions();
+                        // Expected ISP speeds are now readable, so the tile can compute a
+                        // Speed vs Plan score; kick its background load and value poll.
+                        StartIspHealthRefresh();
+                        changed = true;
+                    }
+
+                    if (changed)
+                        StateHasChanged();
+                });
+            }
+            catch { /* keep the timer alive */ }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>
+    /// Loads the WAN list and per-interface details from the connected console. These
+    /// feed the Gateway (Direct) selector and are required for a gateway test to run
+    /// (<see cref="RunGatewayTest"/> no-ops with no interfaces). On an agent-backed site
+    /// the console is offline until the agent connects, so this is retried from the poll.
+    /// </summary>
+    private async Task LoadWanDataAsync()
+    {
+        try
+        {
+            var networks = await ConnectionService.GetNetworksAsync();
+            var wanNetworks = networks.Where(n => n.IsWan && n.Enabled).ToList();
+            _availableWans = wanNetworks
+                .Select(n => new WanOption(
+                    n.WanNetworkgroup ?? "WAN",
+                    !string.IsNullOrEmpty(n.Name) ? n.Name : DisplayFormatters.NormalizeWanDisplay(n.WanNetworkgroup ?? "WAN")))
+                .ToList();
+
+            // Load WAN interfaces with physical names for gateway test
+            _wanInterfaces = await SqmService.GetWanInterfacesFromControllerAsync();
+
+            // Whether traffic can actually be spread across WANs, from the gateway's real
+            // interfaces rather than the console's network list. A WAN network can be enabled with
+            // nothing attached to it, and counting those claimed load balancing on sites that have
+            // one working uplink. This is the same list the Gateway selector is built from, and the
+            // same source Adaptive SQM uses.
+            _hasMultipleWans = _wanInterfaces.Count > 1;
+            _consoleDataLoaded = true;
+        }
+        catch { /* Non-critical */ }
+    }
+
+    private void BuildWanSelectorOptions()
+    {
+        _wanSelectorOptions.Clear();
+        if (_wanInterfaces.Count == 0) return;
+
+        // Singles
+        for (var i = 0; i < _wanInterfaces.Count; i++)
+        {
+            _wanSelectorOptions.Add(new WanSelectorOption
+            {
+                Value = i.ToString(),
+                Label = $"{_wanInterfaces[i].Name} ({_wanInterfaces[i].Interface})",
+                Indices = [i]
+            });
+        }
+
+        if (_wanInterfaces.Count < 2) return;
+
+        // Separator before combos
+        _wanSelectorOptions.Add(new WanSelectorOption { IsSeparator = true });
+
+        // Generate all combos of size 2 through N-1
+        for (var size = 2; size < _wanInterfaces.Count; size++)
+        {
+            foreach (var combo in GetCombinations(Enumerable.Range(0, _wanInterfaces.Count).ToArray(), size))
+            {
+                var indices = combo.ToArray();
+                var value = string.Join("+", indices);
+                var label = string.Join(" + ", indices.Select(idx => _wanInterfaces[idx].Name));
+                _wanSelectorOptions.Add(new WanSelectorOption
+                {
+                    Value = value,
+                    Label = label,
+                    Indices = indices
+                });
+            }
+        }
+
+        // "All WAN Links" only if 3+ WANs (with 2, the single pair already covers "all")
+        if (_wanInterfaces.Count >= 3)
+        {
+            _wanSelectorOptions.Add(new WanSelectorOption { IsSeparator = true });
+            _wanSelectorOptions.Add(new WanSelectorOption
+            {
+                Value = "all",
+                Label = "All WAN Links",
+                Indices = Enumerable.Range(0, _wanInterfaces.Count).ToArray()
+            });
+        }
+    }
+
+    private static IEnumerable<List<int>> GetCombinations(int[] items, int size)
+    {
+        if (size == 0) { yield return new List<int>(); yield break; }
+        for (var i = 0; i <= items.Length - size; i++)
+        {
+            foreach (var tail in GetCombinations(items[(i + 1)..], size - 1))
+            {
+                tail.Insert(0, items[i]);
+                yield return tail;
+            }
+        }
+    }
+
+    private async Task DismissWanScheduleBanner()
+    {
+        _wanScheduleBannerDismissed = true;
+        await SettingsService.SetAsync("banner.wan_schedule_dismissed", "true");
+    }
+
+    private void InitializeChartOptions()
+    {
+        _chartOptions = new ApexChartOptions<WanChartDataPoint>
+        {
+            Chart = new Chart
+            {
+                Background = "transparent",
+                Toolbar = new Toolbar { Show = false },
+                Zoom = new Zoom { Enabled = false },
+                RedrawOnParentResize = true,
+                RedrawOnWindowResize = true,
+                Animations = new Animations
+                {
+                    Enabled = true,
+                    Speed = 300,
+                    AnimateGradually = new AnimateGradually { Enabled = false }
+                }
+            },
+            Xaxis = new XAxis
+            {
+                Type = XAxisType.Datetime,
+                Labels = new XAxisLabels
+                {
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                    DatetimeUTC = false,
+                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                },
+                AxisBorder = new AxisBorder { Show = false },
+                AxisTicks = new AxisTicks { Show = false }
+            },
+            Yaxis = new List<YAxis>
+            {
+                new YAxis
+                {
+                    Min = 0,
+                    Labels = new YAxisLabels
+                    {
+                        Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                        Formatter = @"function(val) { return val != null ? val.toFixed(0) + ' Mbps' : ''; }"
+                    }
+                }
+            },
+            Grid = new Grid
+            {
+                BorderColor = "#374151",
+                StrokeDashArray = 3
+            },
+            Stroke = new Stroke
+            {
+                Curve = Curve.Smooth,
+                Width = 2
+            },
+            Legend = new Legend { Show = false },
+            Tooltip = new Tooltip
+            {
+                Theme = Mode.Dark,
+                Intersect = false,
+                Shared = true,
+                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                // The shared Monitoring tooltip, via its window hook (a serialized function string
+                // cannot import the module): rows ordered as the lines sit, and a dot on every one.
+                Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(1) + ' Mbps'; }, omitSeconds: true }) : ''; }"
+            },
+            Markers = new Markers
+            {
+                Size = 0,
+                Hover = new MarkersHover { SizeOffset = 5 }
+            },
+            Fill = new Fill
+            {
+                Type = new List<FillType> { FillType.Gradient },
+                Gradient = new FillGradient
+                {
+                    ShadeIntensity = 0.3,
+                    OpacityFrom = 0.4,
+                    OpacityTo = 0.05
+                }
+            }
+        };
+    }
+
+    private ApexChartOptions<WanChartDataPoint> CreateMsChartOptions(string unit)
+    {
+        return new ApexChartOptions<WanChartDataPoint>
+        {
+            Chart = new Chart
+            {
+                Background = "transparent",
+                Toolbar = new Toolbar { Show = false },
+                Zoom = new Zoom { Enabled = false },
+                RedrawOnParentResize = true,
+                RedrawOnWindowResize = true,
+                Animations = new Animations
+                {
+                    Enabled = true,
+                    Speed = 300,
+                    AnimateGradually = new AnimateGradually { Enabled = false }
+                }
+            },
+            Xaxis = new XAxis
+            {
+                Type = XAxisType.Datetime,
+                Labels = new XAxisLabels
+                {
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                    DatetimeUTC = false,
+                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                },
+                AxisBorder = new AxisBorder { Show = false },
+                AxisTicks = new AxisTicks { Show = false }
+            },
+            Yaxis = new List<YAxis>
+            {
+                new YAxis
+                {
+                    Min = 0,
+                    Labels = new YAxisLabels
+                    {
+                        Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                        Formatter = @"function(val) { return val != null ? val.toFixed(1) + ' " + unit + @"' : ''; }"
+                    }
+                }
+            },
+            Grid = new Grid
+            {
+                BorderColor = "#374151",
+                StrokeDashArray = 3
+            },
+            Stroke = new Stroke
+            {
+                Curve = Curve.Smooth,
+                Width = 2
+            },
+            Legend = new Legend { Show = false },
+            Tooltip = new Tooltip
+            {
+                Theme = Mode.Dark,
+                Intersect = false,
+                Shared = true,
+                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(1) + ' " + unit + @"'; }, omitSeconds: true }) : ''; }"
+            },
+            Markers = new Markers
+            {
+                Size = 0,
+                Hover = new MarkersHover { SizeOffset = 5 }
+            }
+        };
+    }
+
+    private void InitializeLatencyChartOptions()
+    {
+        _latencyChartOptions = CreateMsChartOptions("ms");
+    }
+
+    private void InitializeLoadedLatencyChartOptions()
+    {
+        _loadedLatencyChartOptions = CreateMsChartOptions("ms");
+    }
+
+    private void InitializeJitterChartOptions()
+    {
+        _jitterChartOptions = CreateMsChartOptions("ms");
+    }
+
+    private void UpdateChartOptions()
+    {
+        // Rebuild Colors, DashArray, and Fill to match current series order (2 series per WAN: download + upload)
+        var colors = new List<string>();
+        var dashArray = new List<int>();
+        var fillTypes = new List<FillType>();
+        foreach (var wan in _wanSeries)
+        {
+            colors.Add(wan.Color);   // download
+            colors.Add(wan.Color);   // upload
+            dashArray.Add(0);        // download = solid
+            dashArray.Add(5);        // upload = dashed
+            fillTypes.Add(FillType.Gradient); // download area fill
+            fillTypes.Add(FillType.Gradient); // upload area fill
+        }
+        _chartOptions.Colors = colors;
+        if (_chartOptions.Stroke != null)
+            _chartOptions.Stroke.DashArray = dashArray;
+        _chartOptions.Fill = new Fill
+        {
+            Type = fillTypes,
+            Gradient = new FillGradient
+            {
+                ShadeIntensity = 0.3,
+                OpacityFrom = 0.4,
+                OpacityTo = 0.05
+            }
+        };
+    }
+
+    private void UpdateLatencyChartOptions()
+    {
+        var colors = _wanSeries.Select(w => w.Color).ToList();
+        _latencyChartOptions.Colors = colors;
+        if (_latencyChartOptions.Stroke != null)
+            _latencyChartOptions.Stroke.DashArray = colors.Select(_ => 0).ToList();
+    }
+
+    private void UpdateLoadedLatencyChartOptions()
+    {
+        // 3 series per WAN: base (solid), loaded down (dashed), loaded up (dotted)
+        var colors = new List<string>();
+        var dashArray = new List<int>();
+        foreach (var wan in _wanSeries)
+        {
+            colors.Add(wan.Color); // base
+            colors.Add(wan.Color); // loaded down
+            colors.Add(wan.Color); // loaded up
+            dashArray.Add(0);  // solid
+            dashArray.Add(5);  // dashed
+            dashArray.Add(2);  // dotted (short dash)
+        }
+        _loadedLatencyChartOptions.Colors = colors;
+        if (_loadedLatencyChartOptions.Stroke != null)
+            _loadedLatencyChartOptions.Stroke.DashArray = dashArray;
+    }
+
+    private void UpdateJitterChartOptions()
+    {
+        var colors = _wanSeries.Select(w => w.Color).ToList();
+        _jitterChartOptions.Colors = colors;
+        if (_jitterChartOptions.Stroke != null)
+            _jitterChartOptions.Stroke.DashArray = colors.Select(_ => 0).ToList();
+    }
+
+    private void TransformChartData()
+    {
+        // Discover distinct WANs from ALL history (not just time-filtered)
+        var allWanKeys = _testHistory
+            .Where(r => r.Success)
+            .Select(r => GetWanKey(r))
+            .Distinct()
+            .OrderBy(k => k)
+            .ToList();
+
+        // Preserve selection state from previous series
+        var previousSelection = _wanSeries.ToDictionary(w => w.Key, w => w.IsSelected);
+
+        _wanSeries = allWanKeys.Select((key, i) => new WanSeriesInfo
+        {
+            Key = key,
+            DisplayName = GetWanDisplayNameForKey(key),
+            Color = WanColors[i % WanColors.Length],
+            IsSelected = !previousSelection.TryGetValue(key, out var selected) || selected,
+            DownloadData = new(),
+            UploadData = new()
+        }).ToList();
+
+        // Ensure at least one WAN series exists for single-WAN users
+        if (_wanSeries.Count == 0 && _testHistory.Any(r => r.Success))
+        {
+            _wanSeries.Add(new WanSeriesInfo
+            {
+                Key = "WAN",
+                DisplayName = "WAN1",
+                Color = WanColors[0],
+                DownloadData = new(),
+                UploadData = new()
+            });
+        }
+
+        UpdateChartOptions();
+        UpdateLatencyChartOptions();
+        UpdateLoadedLatencyChartOptions();
+        UpdateJitterChartOptions();
+    }
+
+    private List<Iperf3Result> GetTimeFilteredResults()
+    {
+        var clampedIndex = Math.Clamp(_sliderValue, 0, TimeBreakpoints.Length - 1);
+        var hours = TimeBreakpoints[clampedIndex].hours;
+        if (hours <= 0)
+            return _testHistory;
+
+        var cutoff = DateTime.UtcNow.AddHours(-hours);
+        return _testHistory.Where(r => r.TestTime >= cutoff).ToList();
+    }
+
+    /// <summary>
+    /// Collapse dense clusters of similar values into representative points.
+    /// Only collapses points that are close in BOTH value AND time - points
+    /// spread far apart in time are kept even if similar values (they show stability).
+    /// </summary>
+    private static List<WanChartDataPoint> CollapseClusters(List<WanChartDataPoint> data)
+    {
+        if (data.Count <= 3)
+            return data;
+
+        var range = (double)(data.Max(d => d.Value) - data.Min(d => d.Value));
+        if (range < 1) return data;
+        var valueThreshold = range * 0.15; // 15% of range to count as "different"
+        var timeThreshold = TimeSpan.FromHours(2); // Points >2 hrs apart are always kept
+
+        var result = new List<WanChartDataPoint> { data[0] };
+
+        for (int i = 1; i < data.Count - 1; i++)
+        {
+            var lastKept = result[^1];
+            var curr = data[i];
+            var timeSinceLastKept = curr.Timestamp - lastKept.Timestamp;
+
+            // Always keep if enough time has passed (shows stability over time)
+            if (timeSinceLastKept >= timeThreshold)
+            {
+                result.Add(curr);
+                continue;
+            }
+
+            // Within a time cluster: only keep if value changed significantly
+            if (Math.Abs((double)curr.Value - (double)lastKept.Value) > valueThreshold)
+                result.Add(curr);
+        }
+
+        result.Add(data[^1]);
+        return result;
+    }
+
+    /// <summary>
+    /// Largest-Triangle-Three-Buckets downsampling. Selects real data points
+    /// that best preserve the visual shape of the time series.
+    /// Data must be sorted by Timestamp ascending.
+    /// </summary>
+    private static List<WanChartDataPoint> DownsampleLttb(List<WanChartDataPoint> data, int targetCount)
+    {
+        if (data.Count <= targetCount || targetCount < 3)
+            return data;
+
+        var result = new List<WanChartDataPoint>(targetCount);
+        result.Add(data[0]);
+
+        double bucketSize = (double)(data.Count - 2) / (targetCount - 2);
+        int prevSelectedIndex = 0;
+
+        for (int bucket = 0; bucket < targetCount - 2; bucket++)
+        {
+            int currStart = (int)Math.Floor(bucket * bucketSize) + 1;
+            int currEnd = (int)Math.Floor((bucket + 1) * bucketSize) + 1;
+            currEnd = Math.Min(currEnd, data.Count - 1);
+
+            double avgX, avgY;
+            if (bucket == targetCount - 3)
+            {
+                avgX = data[^1].X;
+                avgY = (double)data[^1].Value;
+            }
+            else
+            {
+                int nextStart = currEnd;
+                int nextEnd = (int)Math.Floor((bucket + 2) * bucketSize) + 1;
+                nextEnd = Math.Min(nextEnd, data.Count - 1);
+
+                avgX = 0; avgY = 0;
+                int count = 0;
+                for (int j = nextStart; j < nextEnd; j++)
+                {
+                    avgX += data[j].X;
+                    avgY += (double)data[j].Value;
+                    count++;
+                }
+                if (count > 0) { avgX /= count; avgY /= count; }
+                else { avgX = data[nextStart].X; avgY = (double)data[nextStart].Value; }
+            }
+
+            double maxArea = -1;
+            int bestIndex = currStart;
+            double prevX = data[prevSelectedIndex].X;
+            double prevY = (double)data[prevSelectedIndex].Value;
+
+            for (int j = currStart; j < currEnd; j++)
+            {
+                double area = Math.Abs(
+                    (prevX - avgX) * ((double)data[j].Value - prevY) -
+                    (prevX - data[j].X) * (avgY - prevY)
+                );
+                if (area > maxArea)
+                {
+                    maxArea = area;
+                    bestIndex = j;
+                }
+            }
+
+            result.Add(data[bestIndex]);
+            prevSelectedIndex = bestIndex;
+        }
+
+        result.Add(data[^1]);
+        return result;
+    }
+
+    private void ApplyFilters()
+    {
+        var timeFiltered = GetTimeFilteredResults();
+
+        // Apply WAN badge filter (none selected or no series = show all)
+        var visibleWanKeys = _wanSeries.Where(w => IsWanVisible(w)).Select(w => w.Key).ToHashSet();
+        _filteredHistory = visibleWanKeys.Count == 0
+            ? timeFiltered.ToList()
+            : timeFiltered
+                .Where(r =>
+                {
+                    // Failed results without WAN metadata: only show when no filter is active
+                    if (!r.Success && string.IsNullOrEmpty(r.WanNetworkGroup))
+                        return false;
+                    // Everything else (successful or failed with WAN metadata): filter by connection
+                    return visibleWanKeys.Contains(GetWanKey(r));
+                })
+                .ToList();
+
+        // Update chart data for the active time window
+        var clampedIndex = Math.Clamp(_sliderValue, 0, TimeBreakpoints.Length - 1);
+        var shouldDownsample = TimeBreakpoints[clampedIndex].hours is 0 or > 4;
+
+        foreach (var wan in _wanSeries)
+        {
+            var wanResults = timeFiltered
+                .Where(r => r.Success && GetWanKey(r) == wan.Key)
+                .OrderBy(r => r.TestTime)
+                .ToList();
+
+            // Speed chart data
+            var downloadRaw = wanResults
+                .Select(r => new WanChartDataPoint(r.TestTime, r.DownloadMbps, r.Id))
+                .ToList();
+            var uploadRaw = wanResults
+                .Select(r => new WanChartDataPoint(r.TestTime, r.UploadMbps, r.Id))
+                .ToList();
+
+            if (shouldDownsample)
+            {
+                // Downsample download, then sync upload to the same timestamps
+                // so shared tooltips can pair both values at each point
+                wan.DownloadData = DownsampleLttb(CollapseClusters(downloadRaw), MaxChartPoints);
+                var keptResultIds = wan.DownloadData.Select(d => d.ResultId).ToHashSet();
+                wan.UploadData = uploadRaw.Where(u => keptResultIds.Contains(u.ResultId)).ToList();
+            }
+            else
+            {
+                wan.DownloadData = downloadRaw;
+                wan.UploadData = uploadRaw;
+            }
+
+            // Latency chart data (unloaded ping)
+            var latencyRaw = wanResults
+                .Where(r => r.PingMs.HasValue)
+                .Select(r => new WanChartDataPoint(r.TestTime, r.PingMs!.Value, r.Id))
+                .ToList();
+            wan.LatencyData = shouldDownsample
+                ? DownsampleLttb(CollapseClusters(latencyRaw), MaxChartPoints)
+                : latencyRaw;
+
+            // Loaded latency chart data (base + loaded down + loaded up)
+            // Only include results that have all three values for consistent tooltip alignment
+            var loadedResults = wanResults
+                .Where(r => r.PingMs.HasValue && r.DownloadLatencyMs.HasValue && r.UploadLatencyMs.HasValue)
+                .ToList();
+            var loadedBaseRaw = loadedResults
+                .Select(r => new WanChartDataPoint(r.TestTime, r.PingMs!.Value, r.Id))
+                .ToList();
+            var loadedDownRaw = loadedResults
+                .Select(r => new WanChartDataPoint(r.TestTime, r.DownloadLatencyMs!.Value, r.Id))
+                .ToList();
+            var loadedUpRaw = loadedResults
+                .Select(r => new WanChartDataPoint(r.TestTime, r.UploadLatencyMs!.Value, r.Id))
+                .ToList();
+
+            if (shouldDownsample)
+            {
+                // Downsample base as anchor, sync loaded down & up to same result IDs
+                var baseDownsampled = DownsampleLttb(CollapseClusters(loadedBaseRaw), MaxChartPoints);
+                var keptIds = baseDownsampled.Select(d => d.ResultId).ToHashSet();
+                wan.LoadedLatencyBaseData = baseDownsampled;
+                wan.LoadedLatencyDownData = loadedDownRaw.Where(p => keptIds.Contains(p.ResultId)).ToList();
+                wan.LoadedLatencyUpData = loadedUpRaw.Where(p => keptIds.Contains(p.ResultId)).ToList();
+            }
+            else
+            {
+                wan.LoadedLatencyBaseData = loadedBaseRaw;
+                wan.LoadedLatencyDownData = loadedDownRaw;
+                wan.LoadedLatencyUpData = loadedUpRaw;
+            }
+
+            // Jitter chart data (unloaded jitter)
+            var jitterRaw = wanResults
+                .Where(r => r.JitterMs.HasValue)
+                .Select(r => new WanChartDataPoint(r.TestTime, r.JitterMs!.Value, r.Id))
+                .ToList();
+            wan.JitterData = shouldDownsample
+                ? DownsampleLttb(CollapseClusters(jitterRaw), MaxChartPoints)
+                : jitterRaw;
+        }
+
+        // One span for every chart on the page, so a hidden WAN's stand-in series fits all of them.
+        var allSeries = _wanSeries.SelectMany(w => new[]
+        {
+            w.DownloadData, w.UploadData, w.LatencyData,
+            w.LoadedLatencyBaseData, w.LoadedLatencyDownData, w.LoadedLatencyUpData, w.JitterData
+        }).ToList();
+        PadToCommonSpan(allSeries);
+        _hiddenChartData = allSeries.FirstOrDefault(s => s.Count > 0) is { } spanned
+            ? new List<WanChartDataPoint> { WanChartDataPoint.Gap(spanned[0].Timestamp), WanChartDataPoint.Gap(spanned[^1].Timestamp) }
+            : new List<WanChartDataPoint>();
+    }
+
+    private static string GetWanKey(Iperf3Result result)
+    {
+        // Group by WAN name alone when the name is custom (user-provided like "Fiber Link"),
+        // so results stay grouped even if the WAN group changes (e.g., WAN -> WAN4).
+        // For generic names (WAN, WAN2, Internet), include the group to distinguish interfaces.
+        var group = !string.IsNullOrEmpty(result.WanNetworkGroup) ? result.WanNetworkGroup : "WAN";
+        var name = !string.IsNullOrEmpty(result.WanName) ? result.WanName : null;
+
+        if (name != null && name.Contains(" + "))
+        {
+            // Combo test: sort parts for consistent keying
+            var nameParts = name.Split(" + ").Order().ToArray();
+            var sortedName = string.Join(" + ", nameParts);
+
+            // If all parts are custom names, key by name only
+            if (nameParts.All(p => !DisplayFormatters.IsGenericWanName(p)))
+                return sortedName;
+
+            // Any generic name: include group to distinguish
+            var sortedGroup = string.Join("+", group.Split('+').Order());
+            return $"{sortedGroup}|{sortedName}";
+        }
+
+        if (name != null && !DisplayFormatters.IsGenericWanName(name))
+            return name; // Custom name: key by name alone
+
+        return name != null ? $"{group}|{name}" : group;
+    }
+
+
+
+    private static string GetWanDisplayName(Iperf3Result result)
+    {
+        if (!string.IsNullOrEmpty(result.WanName))
+        {
+            if (result.WanName.Contains(" + "))
+                return string.Join(" + ", result.WanName.Split(" + ").Order());
+            return result.WanName;
+        }
+        if (!string.IsNullOrEmpty(result.WanNetworkGroup))
+            return DisplayFormatters.NormalizeWanDisplay(result.WanNetworkGroup);
+        return "WAN1";
+    }
+
+    private static string GetWanDisplayNameForKey(string key)
+    {
+        // Key format: "GROUP|Name" (generic), just "Name" (custom), or "GROUP" (legacy)
+        if (key.Contains('|'))
+            return key.Split('|')[1];
+        if (string.Equals(key, "ALL_WAN", StringComparison.OrdinalIgnoreCase))
+            return "All WAN Links";
+        // If it's not a generic WAN name, it's a custom name key - return as-is
+        if (!DisplayFormatters.IsGenericWanName(key))
+            return key;
+        return DisplayFormatters.NormalizeWanDisplay(key);
+    }
+
+    private static string TruncateServerList(string? serverList, int max = 4)
+    {
+        if (string.IsNullOrEmpty(serverList)) return "WAN";
+        var parts = serverList.Split(" | ");
+        if (parts.Length <= max) return serverList;
+        return string.Join(" | ", parts.Take(max)) + $" + {parts.Length - max} more";
+    }
+
+    private string GetTimeLabel() => TimeBreakpoints[_sliderValue].label;
+
+    private async Task OnSliderChanged()
+    {
+        await LockCardHeight();
+        _historyPage = 1;
+        _expandedHistoryId = null;
+        ApplyFilters();
+        await RenderChartAsync();
+        await ReleaseCardHeight();
+    }
+
+    /// <summary>
+    /// The WAN named by a <c>?wan=</c> query parameter, as an interface key ("wan4"). Sent by the
+    /// ISP Health hero, which reads a WAN's own report and links to the speeds behind it.
+    /// </summary>
+    [SupplyParameterFromQuery(Name = "wan")]
+    public string? WanParam { get; set; }
+
+    private bool _linkWanApplied;
+    private bool _scrollToHistoryPending;
+
+    /// <summary>
+    /// The history series a linked WAN belongs to. Resolved through the data rather than by
+    /// matching key strings: a series is keyed by the WAN's group OR its custom name, so the group
+    /// the link names is only recognizable on the results themselves.
+    /// </summary>
+    private string? LinkedSeriesKey()
+    {
+        if (string.IsNullOrWhiteSpace(WanParam)) return null;
+        var index = NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(WanParam.Trim());
+        if (index <= 0) return null;
+
+        var group = NetworkOptimizer.UniFi.GatewayWanHelper.WanNetworkGroup(index);
+        return _testHistory
+            .Where(r => r.Success && string.Equals(r.WanNetworkGroup, group, StringComparison.OrdinalIgnoreCase))
+            .Select(GetWanKey)
+            .FirstOrDefault();
+    }
+
+    /// <summary>
+    /// Shows only the linked WAN's history and scrolls to it. Once per visit, and only ever from
+    /// the URL - the selection is in-memory, so nothing here outlives the page or reaches a badge
+    /// the user clicks afterwards.
+    /// </summary>
+    /// <summary>Id of a result an alert link wants opened.</summary>
+    [SupplyParameterFromQuery(Name = "result")]
+    public int? ResultParam { get; set; }
+
+    private bool _linkedResultOpened;
+
+    /// <summary>
+    /// Opens the result an alert's ?result= names: turns to the page holding it and expands it,
+    /// rather than leaving the reader to find one row among pages of them.
+    /// <para>
+    /// A query parameter, not the #result-N fragment those links used to carry: a browser never
+    /// sends a fragment to the server, so Blazor cannot see one without asking the page for it
+    /// through JS. The row still carries the id in its markup, for the scroll.
+    /// </para>
+    /// </summary>
+    private void OpenLinkedResult()
+    {
+        if (_linkedResultOpened || ResultParam is not { } id) return;
+
+        var index = _filteredHistory.FindIndex(r => r.Id == id);
+        if (index < 0) return;
+
+        _linkedResultOpened = true;
+        _historyPage = (index / HistoryPageSize) + 1;
+        _expandedHistoryId = id;
+        _scrollToLinkedResultId = id;
+    }
+
+    private int? _scrollToLinkedResultId;
+
+    private async Task ApplyLinkWanFilterAsync()
+    {
+        if (_linkWanApplied || _wanSeries.Count <= 1) return;
+        if (LinkedSeriesKey() is not { } key) return;
+
+        _linkWanApplied = true;
+        foreach (var series in _wanSeries)
+            series.IsSelected = series.Key == key;
+
+        _historyPage = 1;
+        _expandedHistoryId = null;
+        ApplyFilters();
+        await RenderChartAsync();
+        // Scrolled after a render rather than here: this runs while history is still loading, so
+        // the card it aims at has not been drawn yet and the scroll went nowhere.
+        _scrollToHistoryPending = true;
+        StateHasChanged();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_scrollToLinkedResultId is { } linkedId)
+        {
+            _scrollToLinkedResultId = null;
+            // Tinted rather than ringed: an offset ring around a table row collides with the rows
+            // either side. Ringed at all because a link brought the reader here.
+            try { await JS.InvokeVoidAsync("noHighlightRow", $"result-{linkedId}"); }
+            catch { /* helper not loaded - the row is still open, which is the point */ }
+        }
+
+        if (!_scrollToHistoryPending) return;
+        _scrollToHistoryPending = false;
+        // The chart renders asynchronously behind this and the card grows as it does, so a scroll
+        // fired the instant the element exists lands on a position that then moves under it.
+        await Task.Delay(350);
+        try { await JS.InvokeVoidAsync("noHighlightTarget", "speed-history-card"); }
+        catch { /* helper not loaded - the filter still applied, which is the point */ }
+    }
+
+    private async Task ToggleWanFilter(string wanKey, MouseEventArgs e)
+    {
+        var wan = _wanSeries.FirstOrDefault(w => w.Key == wanKey);
+        if (wan == null) return;
+
+        if (e.CtrlKey || e.MetaKey)
+        {
+            wan.IsSelected = !wan.IsSelected;
+        }
+        else
+        {
+            var allVis = _wanSeries.All(w => w.IsSelected);
+            var onlyThis = wan.IsSelected && _wanSeries.Where(w => w.Key != wanKey).All(w => !w.IsSelected);
+
+            if (onlyThis)
+                foreach (var w in _wanSeries) w.IsSelected = true;
+            else if (allVis)
+                foreach (var w in _wanSeries) w.IsSelected = w.Key == wanKey;
+            else
+                wan.IsSelected = !wan.IsSelected;
+        }
+
+        await LockCardHeight();
+        _historyPage = 1;
+        _expandedHistoryId = null;
+        ApplyFilters();
+        await RenderChartAsync();
+        await ReleaseCardHeight();
+    }
+
+    private async Task LockCardHeight()
+    {
+        // Pin the card's current height so the content area can't shrink during filter transition
+        await JS.InvokeVoidAsync("eval",
+            "var el = document.getElementById('speed-history-card'); if(el) el.style.minHeight = el.offsetHeight + 'px'");
+    }
+
+    private async Task ReleaseCardHeight()
+    {
+        StateHasChanged();
+        await Task.Delay(150);
+        await JS.InvokeVoidAsync("eval",
+            "var el = document.getElementById('speed-history-card'); if(el) el.style.minHeight = ''");
+    }
+
+    private async Task RenderChartAsync()
+    {
+        StateHasChanged();
+        try
+        {
+            var activeChart = _activeHistoryTab switch
+            {
+                "latency" => _latencyChart,
+                "loaded-latency" => _loadedLatencyChart,
+                "jitter" => _jitterChart,
+                _ => _chart
+            };
+            if (activeChart != null)
+                await activeChart.RenderAsync();
+        }
+        catch { /* Chart may not be mounted yet */ }
+    }
+
+    private async Task SwitchHistoryTab(string tab)
+    {
+        if (_activeHistoryTab == tab) return;
+        _activeHistoryTab = tab;
+        StateHasChanged();
+        // Allow the new chart to mount before rendering
+        await Task.Delay(50);
+        await RenderChartAsync();
+    }
+
+    private async Task OnChartClicked(SelectedData<WanChartDataPoint> data)
+    {
+        if (data?.DataPoint?.Items?.FirstOrDefault() is WanChartDataPoint { IsGap: false } point)
+        {
+            await ScrollToResult(point.ResultId);
+        }
+    }
+
+    private async Task ScrollToResult(int resultId)
+    {
+        // Find which page the result is on
+        var index = _filteredHistory.FindIndex(r => r.Id == resultId);
+        if (index >= 0)
+        {
+            var targetPage = (index / HistoryPageSize) + 1;
+            if (_historyPage != targetPage)
+            {
+                _historyPage = targetPage;
+            }
+        }
+
+        // Expand the result
+        _expandedHistoryId = resultId;
+        StateHasChanged();
+
+        // Give time for the DOM to update, then scroll
+        await Task.Delay(100);
+        await JS.InvokeVoidAsync("noHighlightRow", $"result-{resultId}");
+    }
+
+    private static string FormatResultSummary(Iperf3Result result)
+    {
+        var down = result.DownloadBitsPerSecond / 1_000_000.0;
+        var up = result.UploadBitsPerSecond / 1_000_000.0;
+        return $"Down: {down:F1} / Up: {up:F1} Mbps";
+    }
+
+    private void OnWanSelectionChanged()
+    {
+        // No-op - just triggers @bind update
+    }
+
+    private async Task HandleTestAgain(Iperf3Result result)
+    {
+        if (_isRunning) return;
+
+        await JS.InvokeVoidAsync("eval", "document.getElementById('wan-run-test')?.scrollIntoView({ behavior: 'smooth', block: 'start' })");
+
+        // Restore max mode from stream count (normal uses <= 20 streams)
+        var wasMaxMode = result.ParallelStreams > 20;
+
+        var isGateway = result.Direction is SpeedTestDirection.CloudflareWanGateway
+            or SpeedTestDirection.UwnWanGateway;
+
+        if (isGateway && !string.IsNullOrEmpty(result.WanNetworkGroup))
+        {
+            _gatewayMaxMode = wasMaxMode;
+
+            // Select the matching WAN option before re-running
+            var targetGroups = result.WanNetworkGroup.Split('+').OrderBy(g => g).ToArray();
+            var match = _wanSelectorOptions.FirstOrDefault(o =>
+                !o.IsSeparator && o.Indices.Length > 0 &&
+                o.Indices.Select(i => _wanInterfaces[i].NetworkGroup)
+                    .OrderBy(g => g)
+                    .SequenceEqual(targetGroups));
+            if (match != null)
+                _selectedWanOption = match.Value;
+
+            await RunGatewayTest();
+        }
+        else
+        {
+            _maxMode = wasMaxMode;
+            await RunServerTest();
+        }
+    }
+
+    private async Task RunGatewayTest()
+    {
+        if (_isRunning) return;
+
+        // The WAN list comes from the console, and a gateway test cannot pick an interface without
+        // it. Returning silently here left the button looking broken - it is the one control on
+        // this page that depends on the console, so it is also the one that has to say so.
+        if (_wanInterfaces.Count == 0)
+        {
+            _errorMessage = ConnectionService.IsAwaitingAgent
+                ? "Waiting for the On-Site Agent to connect. The Gateway test needs the WAN interface list from this site's UniFi Console, which is reached through its Agent."
+                : "The UniFi Console is unreachable, so the WAN interface list isn't available for a gateway test.";
+            StateHasChanged();
+            return;
+        }
+
+        // Resolve the selected option into interface list and WAN metadata
+        var selected = _wanSelectorOptions.FirstOrDefault(o => o.Value == _selectedWanOption);
+        if (selected == null || selected.IsSeparator) return;
+
+        var selectedInterfaces = selected.Indices.Select(i => _wanInterfaces[i]).ToList();
+        var isMulti = selectedInterfaces.Count > 1;
+
+        string interfaceName;
+        string? wanGroup;
+        string? wanName;
+
+        if (isMulti)
+        {
+            interfaceName = "";
+            var groups = selectedInterfaces
+                .Select(w => w.NetworkGroup ?? "WAN")
+                .Distinct().OrderBy(g => g);
+            wanGroup = string.Join("+", groups);
+            wanName = string.Join(" + ", selectedInterfaces
+                .Select(w => !string.IsNullOrEmpty(w.Name) ? w.Name : w.NetworkGroup ?? "WAN")
+                .Distinct().OrderBy(n => n));
+        }
+        else
+        {
+            interfaceName = selectedInterfaces[0].Interface;
+            wanGroup = selectedInterfaces[0].NetworkGroup;
+            wanName = selectedInterfaces[0].Name;
+        }
+
+        _isRunning = true;
+        _activeTestType = "gateway";
+        _hideWanIdentity = _maxMode && _hasMultipleWans;
+        _errorMessage = null;
+        _metadata = null;
+        _progressPhase = "Starting";
+        _progressPercent = 0;
+        _gatewayStatus = null;
+        StateHasChanged();
+
+        StartPolling();
+
+        var result = await GatewayWanTestService.RunTestAsync(
+            interfaceName,
+            wanGroup,
+            wanName,
+            progress =>
+            {
+                _progressPhase = progress.Phase;
+                _progressPercent = progress.Percent;
+                InvokeAsync(StateHasChanged);
+            },
+            allInterfaces: isMulti ? selectedInterfaces : null,
+            maxMode: _gatewayMaxMode);
+
+        StopPolling();
+        _isRunning = false;
+        _activeTestType = "";
+
+        if (result != null)
+        {
+            if (result.Success)
+            {
+                _latestResult = result;
+                _gatewayStatus = FormatResultSummary(result);
+            }
+            else
+            {
+                _errorMessage = result.ErrorMessage ?? "Test failed";
+                _gatewayStatus = null;
+            }
+        }
+        else
+        {
+            _errorMessage = "Test was cancelled or could not start";
+            _gatewayStatus = null;
+        }
+
+        await LoadHistory(resetPage: true);
+        StateHasChanged();
+    }
+
+    private async Task RunServerTest()
+    {
+        if (_isRunning) return;
+
+        _isRunning = true;
+        _activeTestType = "server";
+        _hideWanIdentity = _maxMode && _hasMultipleWans;
+        _errorMessage = null;
+        _metadata = null;
+        _progressPhase = "Starting";
+        _progressPercent = 0;
+        _serverStatus = null;
+        StateHasChanged();
+
+        StartPolling();
+
+        var result = await WanSpeedTestService.RunTestAsync(
+            progress =>
+            {
+                _progressPhase = progress.Phase;
+                _progressPercent = progress.Percent;
+                if (progress.Status != null)
+                    _serverStatus = progress.Status;
+                // Metadata is picked up by the 500 ms poll (SyncProgressFromService) rather than
+                // here: reading it is now an awaitable call and this callback is a synchronous
+                // Action, so fetching it would mean async-void. It is set once early in the test, so
+                // arriving up to one poll late is not visible.
+                InvokeAsync(StateHasChanged);
+            },
+            maxMode: _maxMode,
+            wanContextId: SelectedWanContextId);
+
+        StopPolling();
+        _isRunning = false;
+        _activeTestType = "";
+
+        if (result != null)
+        {
+            if (result.Success)
+            {
+                _latestResult = result;
+                _serverStatus = FormatResultSummary(result);
+            }
+            else
+            {
+                _errorMessage = result.ErrorMessage ?? "Test failed";
+                _serverStatus = null;
+            }
+        }
+        else
+        {
+            _errorMessage = "Test was cancelled or could not start";
+            _serverStatus = null;
+        }
+
+        await LoadHistory(resetPage: true);
+        StateHasChanged();
+    }
+
+    private void StartPolling()
+    {
+        StopPolling();
+        _pollTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                var serverRunning = await WanSpeedTestService.IsRunningAsync();
+                var gatewayRunning = await GatewayWanTestService.IsRunningAsync();
+
+                if (!serverRunning && !gatewayRunning)
+                {
+                    StopPolling();
+                    var testType = _activeTestType;
+                    _isRunning = false;
+                    _activeTestType = "";
+
+                    var serverResult = await WanSpeedTestService.GetLastCompletedResultAsync();
+                    var gatewayResult = await GatewayWanTestService.GetLastCompletedResultAsync();
+                    var lastResult = testType == "gateway" ? gatewayResult : serverResult;
+                    _latestResult = lastResult ?? serverResult ?? gatewayResult;
+
+                    await InvokeAsync(async () =>
+                    {
+                        await LoadHistory(resetPage: true);
+                        StateHasChanged();
+                    });
+                    return;
+                }
+
+                if (_activeTestType == "gateway")
+                    await SyncGatewayProgressFromService();
+                else
+                    await SyncProgressFromService();
+
+                await InvokeAsync(StateHasChanged);
+            }
+            catch { /* prevent timer death */ }
+        }, null, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(500));
+    }
+
+    private void StopPolling()
+    {
+        _pollTimer?.Dispose();
+        _pollTimer = null;
+    }
+
+    private async Task SyncProgressFromService()
+    {
+        var (phase, percent, status) = await WanSpeedTestService.GetCurrentProgressAsync();
+        _progressPhase = phase;
+        if (status != null)
+            _serverStatus = status;
+        _metadata = await WanSpeedTestService.GetLastMetadataAsync();
+
+        // Detect phase transitions - set up interpolation for long phases
+        if (phase != _interpPhase)
+        {
+            _interpPhase = phase;
+            _interpStart = DateTime.UtcNow;
+            _interpFrom = percent;
+            _interpTo = phase switch
+            {
+                "Testing download" => 55,
+                "Testing upload" => 95,
+                _ => 0 // no interpolation
+            };
+        }
+
+        // Smoothly advance during download (20→55) and upload (60→95) over ~10s
+        if (_interpTo > _interpFrom)
+        {
+            var elapsed = (DateTime.UtcNow - _interpStart).TotalSeconds;
+            var fraction = Math.Min(elapsed / 10.0, 0.95);
+            _progressPercent = _interpFrom + (int)((_interpTo - _interpFrom) * fraction);
+        }
+        else
+        {
+            _progressPercent = percent;
+        }
+    }
+
+    private async Task SyncGatewayProgressFromService()
+    {
+        var (phase, percent, status) = await GatewayWanTestService.GetCurrentProgressAsync();
+        _progressPhase = phase;
+        _progressPercent = percent;
+    }
+
+    private async Task LoadHistory(bool resetPage = false)
+    {
+        _loadingHistory = true;
+        if (resetPage)
+        {
+            _historyPage = 1;
+            _expandedHistoryId = null;
+        }
+
+        try
+        {
+            // Load results from both server and gateway WAN tests
+            var serverResults = await WanSpeedTestService.GetResultsAsync(count: 0);
+            var gatewayResults = await GatewayWanTestService.GetResultsAsync(count: 0);
+            _testHistory = serverResults.Concat(gatewayResults)
+                .OrderByDescending(r => r.TestTime)
+                .ToList();
+            TransformChartData();
+            ApplyFilters();
+            await RenderChartAsync();
+            await ApplyLinkWanFilterAsync();
+            OpenLinkedResult();
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = $"Failed to load history: {ex.Message}";
+        }
+        finally
+        {
+            _loadingHistory = false;
+        }
+    }
+
+    private async Task ToggleHistoryExpand(int resultId)
+    {
+        if (_expandedHistoryId == resultId)
+        {
+            _expandedHistoryId = null;
+        }
+        else if (_expandedHistoryId.HasValue)
+        {
+            _collapsingHistoryId = _expandedHistoryId;
+            _expandedHistoryId = resultId;
+            StateHasChanged();
+
+            await Task.Delay(50);
+            _collapsingHistoryId = null;
+        }
+        else
+        {
+            _expandedHistoryId = resultId;
+        }
+    }
+
+    private void ChangePage(int delta)
+    {
+        _historyPage += delta;
+        _expandedHistoryId = null;
+    }
+
+    private async Task HandleDeleteResult(int resultId)
+    {
+        var result = _testHistory.FirstOrDefault(r => r.Id == resultId);
+        var isGateway = result?.Direction is SpeedTestDirection.CloudflareWanGateway or SpeedTestDirection.UwnWanGateway;
+        var deleted = isGateway
+            ? await GatewayWanTestService.DeleteResultAsync(resultId)
+            : await WanSpeedTestService.DeleteResultAsync(resultId);
+        if (deleted)
+        {
+            _testHistory.RemoveAll(r => r.Id == resultId);
+            TransformChartData();
+            ApplyFilters();
+            if (_latestResult?.Id == resultId)
+            {
+                _latestResult = _testHistory.FirstOrDefault(r => r.Success);
+            }
+            if (_expandedHistoryId == resultId)
+                _expandedHistoryId = null;
+            _historyPathAnalysis.Remove(resultId);
+            await RenderChartAsync();
+        }
+    }
+
+    private async Task HandleNotesChanged((int Id, string? Notes) args)
+    {
+        var result = _testHistory.FirstOrDefault(r => r.Id == args.Id);
+        var isGateway = result?.Direction is SpeedTestDirection.CloudflareWanGateway or SpeedTestDirection.UwnWanGateway;
+        if (isGateway)
+            await GatewayWanTestService.UpdateNotesAsync(args.Id, args.Notes);
+        else
+            await WanSpeedTestService.UpdateNotesAsync(args.Id, args.Notes);
+    }
+
+    private async Task HandleWanReassigned((int Id, string NetworkGroup, string? Name) args)
+    {
+        var result = _testHistory.FirstOrDefault(r => r.Id == args.Id);
+        var isGateway = result?.Direction is SpeedTestDirection.CloudflareWanGateway or SpeedTestDirection.UwnWanGateway;
+        if (isGateway)
+            await GatewayWanTestService.UpdateWanAssignmentAsync(args.Id, args.NetworkGroup, args.Name);
+        else
+            await WanSpeedTestService.UpdateWanAssignmentAsync(args.Id, args.NetworkGroup, args.Name);
+
+        // Update local result state so the table/chart reflect the change immediately
+        if (result != null)
+        {
+            result.WanNetworkGroup = args.NetworkGroup;
+            result.WanName = args.Name;
+            result.PathAnalysisJson = null;
+        }
+
+        // Clear cached path analysis (will be repopulated by background analysis)
+        _historyPathAnalysis.Remove(args.Id);
+
+        // Refresh chart data (result may have moved to a different WAN series)
+        TransformChartData();
+        ApplyFilters();
+        await RenderChartAsync();
+    }
+
+    private async Task AnalyzeHistoricalPath(Iperf3Result result)
+    {
+        if (_analyzingResultId != null)
+            return;
+
+        _analyzingResultId = result.Id;
+        StateHasChanged();
+
+        try
+        {
+            var isGateway = result.Direction is SpeedTestDirection.CloudflareWanGateway or SpeedTestDirection.UwnWanGateway;
+            var path = isGateway
+                ? await PathAnalyzer.CalculateGatewayDirectPathAsync(resolvedWanGroup: result.WanNetworkGroup)
+                : await PathAnalyzer.CalculatePathAsync(result.DeviceHost, result.LocalIp, resolvedWanGroup: result.WanNetworkGroup);
+            var analysis = PathAnalyzer.AnalyzeSpeedTest(
+                path,
+                result.DownloadMbps,
+                result.UploadMbps,
+                result.DownloadRetransmits,
+                result.UploadRetransmits,
+                result.DownloadBytes,
+                result.UploadBytes);
+            _historyPathAnalysis[result.Id] = analysis;
+        }
+        catch
+        {
+            _historyPathAnalysis[result.Id] = null;
+        }
+        finally
+        {
+            _analyzingResultId = null;
+            StateHasChanged();
+        }
+    }
+
+    private void OnPathAnalysisComplete(int resultId)
+    {
+        InvokeAsync(async () =>
+        {
+            await LoadHistory(resetPage: false);
+
+            if (_latestResult?.Id == resultId)
+            {
+                _latestResult = _testHistory.FirstOrDefault(r => r.Id == resultId) ?? _latestResult;
+            }
+
+            StateHasChanged();
+        });
+    }
+
+    public void Dispose()
+    {
+        StopPolling();
+        _agentStatusTimer?.Dispose();
+        _agentStatusTimer = null;
+        _ispHealthRefreshTimer?.Dispose();
+        _ispHealthRefreshTimer = null;
+        WanSpeedTestService.OnPathAnalysisComplete -= OnPathAnalysisComplete;
+        GatewayWanTestService.OnPathAnalysisComplete -= OnPathAnalysisComplete;
+    }
+}

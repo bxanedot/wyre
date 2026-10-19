@@ -1,0 +1,181 @@
+using Microsoft.EntityFrameworkCore;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Models.Identity;
+using NetworkOptimizer.Web.Services.Gates;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// CRUD service for planned (hypothetical) APs used in coverage planning.
+/// </summary>
+/// <summary>
+/// Adding and adjusting planned (hypothetical) APs used for coverage planning (design doc 06, gate 9).
+///
+/// GetAllAsync is deliberately not here - planned APs are drawn on the same maps a Viewer is meant to
+/// read in full. Site Operator for the rest: a planned AP exists only in our coverage model and
+/// corresponds to no hardware, so the worst a wrong one does is mislead a plan.
+/// </summary>
+[MutatingService(SiteScoped = true)]
+public interface IPlannedApAdminService
+{
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task<PlannedAp> CreateAsync(PlannedAp ap);
+
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task<bool> DeleteAsync(int id);
+
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task UpdateLocationAsync(int id, double lat, double lng);
+
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task UpdateFloorAsync(int id, int floor);
+
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task UpdateOrientationAsync(int id, int deg);
+
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task UpdateMountTypeAsync(int id, string mountType);
+
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task UpdateTxPowerAsync(int id, string band, int? txPower);
+
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task UpdateAntennaModeAsync(int id, string? mode);
+
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "planned_ap")]
+    Task UpdateNameAsync(int id, string name);
+}
+
+public class PlannedApService : IPlannedApAdminService
+{
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
+    private readonly SiteContextService _siteContext;
+    private readonly ILogger<PlannedApService> _logger;
+
+    public PlannedApService(
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+        SiteContextService siteContext,
+        ILogger<PlannedApService> logger)
+    {
+        _siteDbFactory = siteDbFactory;
+        _siteContext = siteContext;
+        _logger = logger;
+    }
+
+    /// <summary>Context for the current site's database (planned APs are per-site rows).</summary>
+    private NetworkOptimizerDbContext CreateSiteDb() =>
+        _siteDbFactory.CreateForSite(_siteContext.Slug, _siteContext.IsDefault);
+
+    public async Task<List<PlannedAp>> GetAllAsync()
+    {
+        using var db = CreateSiteDb();
+        return await db.PlannedAps.OrderBy(a => a.CreatedAt).ToListAsync();
+    }
+
+    public async Task<PlannedAp> CreateAsync(PlannedAp ap)
+    {
+        using var db = CreateSiteDb();
+        ap.CreatedAt = DateTime.UtcNow;
+        ap.UpdatedAt = DateTime.UtcNow;
+        db.PlannedAps.Add(ap);
+        await db.SaveChangesAsync();
+        _logger.LogInformation("Created planned AP {Id} ({Model}) at ({Lat}, {Lng})", ap.Id, ap.Model, ap.Latitude, ap.Longitude);
+        return ap;
+    }
+
+    public async Task<bool> DeleteAsync(int id)
+    {
+        using var db = CreateSiteDb();
+        var ap = await db.PlannedAps.FindAsync(id);
+        if (ap == null) return false;
+        db.PlannedAps.Remove(ap);
+        await db.SaveChangesAsync();
+        _logger.LogInformation("Deleted planned AP {Id}", id);
+        return true;
+    }
+
+    public async Task UpdateLocationAsync(int id, double lat, double lng)
+    {
+        using var db = CreateSiteDb();
+        var ap = await db.PlannedAps.FindAsync(id);
+        if (ap == null) return;
+        ap.Latitude = lat;
+        ap.Longitude = lng;
+        ap.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+    }
+
+    public async Task UpdateFloorAsync(int id, int floor)
+    {
+        using var db = CreateSiteDb();
+        var ap = await db.PlannedAps.FindAsync(id);
+        if (ap == null) return;
+        ap.Floor = floor;
+        ap.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+    }
+
+    public async Task UpdateOrientationAsync(int id, int deg)
+    {
+        using var db = CreateSiteDb();
+        var ap = await db.PlannedAps.FindAsync(id);
+        if (ap == null) return;
+        ap.OrientationDeg = deg;
+        ap.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+    }
+
+    public async Task UpdateMountTypeAsync(int id, string mountType)
+    {
+        using var db = CreateSiteDb();
+        var ap = await db.PlannedAps.FindAsync(id);
+        if (ap == null) return;
+        ap.MountType = mountType;
+        ap.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+    }
+
+    public async Task UpdateTxPowerAsync(int id, string band, int? txPower)
+    {
+        using var db = CreateSiteDb();
+        var ap = await db.PlannedAps.FindAsync(id);
+        if (ap == null) return;
+        switch (band)
+        {
+            case "2.4": ap.TxPower24Dbm = txPower; break;
+            case "5": ap.TxPower5Dbm = txPower; break;
+            case "6": ap.TxPower6Dbm = txPower; break;
+        }
+        ap.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+    }
+
+    public async Task UpdateAntennaModeAsync(int id, string? mode)
+    {
+        using var db = CreateSiteDb();
+        var ap = await db.PlannedAps.FindAsync(id);
+        if (ap == null) return;
+        ap.AntennaMode = mode;
+        ap.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+    }
+
+    public async Task UpdateNameAsync(int id, string name)
+    {
+        using var db = CreateSiteDb();
+        var ap = await db.PlannedAps.FindAsync(id);
+        if (ap == null) return;
+        ap.Name = name;
+        ap.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+    }
+}

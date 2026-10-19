@@ -1,0 +1,1223 @@
+@using System.Net
+@using NetworkOptimizer.Storage.Interfaces
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.UniFi
+@using NetworkOptimizer.Web.Services
+@using Microsoft.AspNetCore.Authorization
+@using Microsoft.AspNetCore.Components.Authorization
+@using NetworkOptimizer.Web.Services.Authorization
+@inject IAuthorizationService Authz
+@inject SiteContextService SiteCtx
+@inject IMonitoringInterfaceRepository Repo
+@inject IMonitoringInterfaceDeploymentService Deploy
+@inject ISqmService SqmService
+@inject Microsoft.JSInterop.IJSRuntime JS
+@inject ILogger<MonitoringInterfacesCard> Logger
+
+<div class="card" id="monitoring-interfaces">
+    <div class="card-header card-header-collapsible" @onclick="ToggleCollapse">
+        <div class="card-title-group">
+            <h2 class="card-title">Monitoring Interfaces</h2>
+        </div>
+        <div class="card-header-badges">
+            <span class="status-badge status-active" @onclick:stopPropagation="true">@SummaryLabel()</span>
+            <span class="issue-type-chevron">@(_collapsed ? "▼" : "▲")</span>
+        </div>
+    </div>
+    <div class="expand-wrapper @(!_collapsed && _stateLoaded ? "expanded" : "")" style="@(!_stateLoaded ? "display:none" : "")">
+        <div class="expand-content">
+            <div class="card-body">
+        <p class="section-description">
+            Can't reach your modem or ONT behind the WAN? A monitoring interface adds a small,
+            reboot-safe route on the gateway so the device is reachable from the LAN. Two WAN
+            devices sharing the same management IP? Give one an Alias IP and monitor both.
+        </p>
+
+        <div class="info-tip">
+            <strong>Try a native static route first.</strong>
+            In UniFi Network, add a <strong>Static Route</strong> (<strong>Settings → Policy Engine →
+            Policy Table</strong>) for the device's IP (e.g. <code>192.168.100.1/32</code>) out the WAN
+            interface it sits behind - no scripts, nothing to maintain. If it's still unreachable, or
+            two WAN devices share the IP, add a monitoring interface below.
+        </div>
+
+        @if (_interfaces.Count == 0)
+        {
+            @* "Add one below" is only true for whoever can see the form. *@
+            <p class="empty-state">
+                @if (_canConfigure)
+                {
+                    <text>
+                        No monitoring interfaces configured. Add one below if a modem/ONT management IP
+                        isn't reachable for polling.
+                    </text>
+                }
+                else
+                {
+                    <text>
+                        No monitoring interfaces configured. These are set up by a site administrator
+                        when a modem/ONT management IP isn't reachable for polling.
+                    </text>
+                }
+            </p>
+        }
+        else
+        {
+            <div class="table-responsive">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Modem/ONT IP</th>
+                            <th>WAN</th>
+                            <th>Gateway-local IP</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var mi in _interfaces)
+                        {
+                            <tr>
+                                <td><code>@mi.Name</code></td>
+                                <td>
+                                    <code>@mi.TargetIp</code>
+                                    @if (!string.IsNullOrEmpty(mi.AliasIp))
+                                    {
+                                        <br /><span class="text-muted">polled as <code>@mi.AliasIp</code></span>
+                                    }
+                                </td>
+                                <td>@WanLabelFor(mi)</td>
+                                <td><code>@mi.GatewayLocalIp/@mi.SubnetPrefix</code></td>
+                                <td>@StatusBadge(mi)</td>
+                                <td>
+                                    <div class="btn-group-wrap mi-row-actions">
+                                        <button class="btn btn-secondary btn-sm" @onclick="() => EditInterface(mi)" disabled="@(_busyId != null)">@(_canConfigure ? "Edit" : "View")</button>
+                                        @if (mi.Disabled)
+                                        {
+                                            @* Disabled rows expose exactly one forward action - Enable - in the primary
+                                               slot (it redeploys), so Deploy/Re-apply (which would just hit the disabled
+                                               guard) and the separate Disable toggle are both omitted here. *@
+                                            <SiteAdminOnly>
+                                                <button class="btn btn-primary btn-sm" @onclick="() => ToggleDisable(mi)" disabled="@(_busyId != null)">
+                                                    @if (_busyId == mi.Id && _busyAction == "enable")
+                                                    {
+                                                        <span class="spinner spinner-sm"></span>
+                                                        <span>Enabling...</span>
+                                                    }
+                                                    else
+                                                    {
+                                                        <span>Enable</span>
+                                                    }
+                                                </button>
+                                            </SiteAdminOnly>
+                                        }
+                                        else
+                                        {
+                                            <SiteAdminOnly>
+                                                <button class="btn btn-primary btn-sm" @onclick="() => DeployInterface(mi)" disabled="@(_busyId != null)">
+                                                    @if (_busyId == mi.Id && _busyAction == "deploy")
+                                                    {
+                                                        <span class="spinner spinner-sm"></span>
+                                                        <span>Deploying...</span>
+                                                    }
+                                                    else
+                                                    {
+                                                        <span>@(IsApplied(mi) ? "Re-apply" : "Deploy")</span>
+                                                    }
+                                                </button>
+                                            </SiteAdminOnly>
+                                        }
+                                        <button class="btn btn-secondary btn-sm" @onclick="() => CheckStatus(mi)" disabled="@(_busyId != null)">Check status</button>
+                                        @if (ShowDisableToggle(mi) && !mi.Disabled)
+                                        {
+                                            <SiteAdminOnly>
+                                                <button class="btn btn-outline-primary btn-sm" @onclick="() => ToggleDisable(mi)" disabled="@(_busyId != null)">
+                                                    @if (_busyId == mi.Id && _busyAction == "disable")
+                                                    {
+                                                        <span class="spinner spinner-sm"></span>
+                                                        <span>Disabling...</span>
+                                                    }
+                                                    else
+                                                    {
+                                                        <span>Disable</span>
+                                                    }
+                                                </button>
+                                            </SiteAdminOnly>
+                                        }
+                                        <SiteAdminOnly>
+                                            <button class="btn btn-danger btn-sm" @onclick="() => RemoveInterface(mi)" disabled="@(_busyId != null)">
+                                                @if (_busyId == mi.Id && _busyAction == "remove")
+                                                {
+                                                    <span class="spinner spinner-sm"></span>
+                                                    <span>Removing...</span>
+                                                }
+                                                else
+                                                {
+                                                    <span>@(_forceRemoveArmed.Contains(mi.Id) ? "Remove anyway" : "Remove")</span>
+                                                }
+                                            </button>
+                                        </SiteAdminOnly>
+                                    </div>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+
+        @if (!string.IsNullOrEmpty(_message))
+        {
+            <div class="alert @(_messageSuccess ? "alert-success" : "alert-danger")" style="margin-top: 1rem;">@_message</div>
+        }
+
+                @if (_deploySteps.Count > 0)
+                {
+                    <div class="mi-deploy-log">
+                        <h4>Deployment progress</h4>
+                        <ul class="mi-step-list">
+                            @foreach (var step in _deploySteps)
+                            {
+                                <li>@step</li>
+                            }
+                        </ul>
+                    </div>
+                }
+
+                @if (_canConfigure || _editing.Id > 0)
+                {
+                <div class="mi-add-section">
+                    <h3>@(!_canConfigure ? "Monitoring interface" : _editing.Id > 0 ? "Edit monitoring interface" : "Add a monitoring interface")</h3>
+                    @* Below Site Admin this form is the only way to READ the record, so it stays open and
+                       becomes a viewer. A fieldset rather than an attribute per input: the fields must not
+                       invite edits that Save would never accept, and one wrapper cannot be forgotten the
+                       next time a field is added here. *@
+                    <fieldset class="mi-form-fields" disabled="@(!_canConfigure)">
+                    <div class="form-row">
+                        <div class="form-group mi-grow-2">
+                            <label class="form-label">Modem/ONT IP</label>
+                            <input type="text" class="form-control" @bind="_editing.TargetIp" @bind:event="oninput" @bind:after="OnTargetChanged" placeholder="192.168.100.1" />
+                            <small class="form-help">The management IP you're trying to reach (e.g. your modem or ONT status page).</small>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group mi-grow-2">
+                            <label class="form-label">WAN interface</label>
+                            <select class="form-control" @bind="_editing.WanIfName" @bind:after="OnWanChanged">
+                                <option value="">Select WAN...</option>
+                                @foreach (var w in _wans)
+                                {
+                                    @if (string.IsNullOrEmpty(w.PhysicalIfName))
+                                    {
+                                        <option value="" disabled>@WanOptionLabel(w) - no physical port</option>
+                                    }
+                                    else
+                                    {
+                                        <option value="@w.PhysicalIfName">@WanOptionLabel(w)</option>
+                                    }
+                                }
+                            </select>
+                            <small class="form-help">The WAN your modem/ONT sits behind. The interface rides this port.</small>
+                        </div>
+                        <div class="form-group mi-grow-2">
+                            <label class="form-label">Management VLAN</label>
+                            <div class="mi-vlan">
+                                <label class="checkbox-label mi-vlan-toggle">
+                                    <input type="checkbox" @bind="_vlanEnabled" @bind:after="OnVlanToggled" />
+                                    <span>Tagged</span>
+                                </label>
+                                <input type="number" class="form-control mi-vlan-id" @bind="_editing.WanVlanId" @bind:event="oninput" min="1" max="4094" placeholder="100" disabled="@(!_vlanEnabled)" />
+                            </div>
+                            <small class="form-help">Rarely needed. Only when your modem or ONT's management interface sits on a tagged VLAN - enter that VLAN ID so the interface can reach it.</small>
+                        </div>
+                    </div>
+
+                    @if (ShowStarlinkAdvisory)
+                    {
+                        <div class="info-tip">
+                            <strong>@SelectedWanDisplayName is a Starlink connection - no Monitoring Interface needed for the dish.</strong>
+                            Network Optimizer monitors it natively on the
+                            <a href="/monitoring?tab=starlink">Starlink Stats</a> tab (set up in
+                            <a href="/settings#starlink">Settings - Starlink Monitoring</a>).
+                            <ul>
+                                <li>
+                                    With more than one WAN, add a UniFi Network <strong>Static Route</strong>
+                                    for the dish's IP out the Starlink WAN (see the static route tip above)
+                                    so polling routes correctly from your LAN through the gateway.
+                                </li>
+                                <li>
+                                    Use Monitoring Interfaces for your other WAN devices instead; alias
+                                    any that share the dish's IP (192.168.100.1 is a common default).
+                                </li>
+                            </ul>
+                        </div>
+                    }
+
+                    <details class="setup-guide mi-advanced" open="@_advancedOpen" @ontoggle="@(() => { if (_suppressNextAdvancedToggle) { _suppressNextAdvancedToggle = false; } else { _advancedOpen = !_advancedOpen; } })">
+                        <summary>Advanced</summary>
+                        <div class="setup-guide-content">
+                            <div class="form-row">
+                                <div class="form-group mi-grow-2">
+                                    <label class="form-label">Gateway-local IP</label>
+                                    <input type="text" class="form-control" @bind="_editing.GatewayLocalIp" @bind:event="oninput" @bind:after="OnLocalIpEdited" placeholder="192.168.100.2" />
+                                    <small class="form-help">The gateway's address on the modem's subnet. Auto-suggested; must be free and on the same subnet.</small>
+                                </div>
+                                <div class="form-group mi-grow-1">
+                                    <label class="form-label">Subnet prefix</label>
+                                    <input type="number" class="form-control" @bind="_editing.SubnetPrefix" @bind:event="oninput" min="8" max="30" />
+                                </div>
+                                <div class="form-group mi-grow-1">
+                                    <label class="form-label">Interface name</label>
+                                    <input type="text" class="form-control" @bind="_editing.Name" @bind:event="oninput" placeholder="modem0" />
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group mi-grow-2">
+                                    <label class="form-label">Alias IP (for duplicate-IP WANs)</label>
+                                    <input type="text" class="form-control" @bind="_editing.AliasIp" @bind:event="oninput" placeholder="192.168.101.1" />
+                                    <small class="form-help">
+                                        Only needed when another device on a different WAN already answers at this
+                                        same management IP. The LAN polls this address instead; the gateway
+                                        translates it back to the real device.
+                                    </small>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group mi-grow-1">
+                                    <label class="form-label">Watchdog interval (min)</label>
+                                    <input type="number" class="form-control" @bind="_editing.WatchdogIntervalMinutes" @bind:event="oninput" min="1" max="60" />
+                                    <small class="form-help">How often the gateway re-applies the route so it survives reprovisioning.</small>
+                                </div>
+                                <div class="form-group mi-grow-2">
+                                    <label class="checkbox-label">
+                                        <input type="checkbox" @bind="_editing.SnatEnabled" />
+                                        <span>Allow LAN clients to reach the device (SNAT)</span>
+                                    </label>
+                                    <small class="form-help">Required for the Network Optimizer server and browsers to reach the device. Leave on unless you only need gateway-local access.</small>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    </fieldset>
+
+                    <div class="action-buttons">
+                        <SiteAdminOnly>
+                            <button class="btn btn-primary" @onclick="SaveAndDeploy" disabled="@(_busyId != null || _saving)">
+                                @if (_saving)
+                                {
+                                    <span class="spinner spinner-sm"></span>
+                                    <span>Working...</span>
+                                }
+                                else
+                                {
+                                    <span>Save &amp; Deploy</span>
+                                }
+                            </button>
+                        </SiteAdminOnly>
+                        <SiteAdminOnly>
+                            <button class="btn btn-secondary" @onclick="SaveOnly" disabled="@(_busyId != null || _saving)">Save without deploying</button>
+                        </SiteAdminOnly>
+                        @if (!_canConfigure)
+                        {
+                            <button class="btn btn-secondary" @onclick="CancelEdit" disabled="@_saving">Close</button>
+                        }
+                        else if (_editing.Id > 0)
+                        {
+                            <button class="btn btn-secondary" @onclick="CancelEdit" disabled="@_saving">Cancel edit</button>
+                        }
+                    </div>
+                </div>
+                }
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .mi-deploy-log {
+        margin-top: 1rem;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--border-radius-lg);
+        padding: 1rem;
+    }
+
+    .mi-deploy-log h4 {
+        margin: 0 0 0.5rem 0;
+        font-size: 0.9rem;
+        color: var(--text-primary);
+    }
+
+    .mi-step-list {
+        margin: 0;
+        padding-left: 1.25rem;
+        font-family: var(--font-mono);
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+    }
+
+    .mi-step-list li {
+        margin: 0.25rem 0;
+    }
+
+    .mi-add-section {
+        margin-top: 1.5rem;
+        border: 1px solid var(--border-color);
+        border-radius: var(--border-radius-lg);
+        background: var(--bg-tertiary);
+        padding: 1rem 1.25rem 1.25rem 1.25rem;
+    }
+
+    .mi-add-section h3 {
+        margin: 0 0 1rem 0;
+        font-size: 1rem;
+        color: var(--text-primary);
+    }
+
+    .mi-advanced {
+        margin-bottom: 1rem;
+    }
+
+    .mi-advanced .setup-guide-content {
+        margin-top: 0.5rem;
+    }
+
+    .mi-grow-1 {
+        flex: 1;
+    }
+
+    .mi-grow-2 {
+        flex: 2;
+    }
+
+    .mi-vlan {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+
+    .mi-vlan-toggle {
+        white-space: nowrap;
+    }
+
+    .mi-vlan-id {
+        max-width: 6rem;
+    }
+</style>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>
+    /// Whether this caller may change an interface. The editor is the only place a row's full
+    /// configuration can be read, so it stays reachable and simply stops offering to save.
+    /// </summary>
+    private bool _canConfigure;
+
+    /// <summary>
+    /// Optional modem/ONT IP to pre-fill into a new interface, used by the deep-links from
+    /// the CM/ONT/Cellular monitor forms ("can't reach it? set up an interface").
+    /// </summary>
+    [Parameter] public string? PrefillTargetIp { get; set; }
+
+    /// <summary>
+    /// Source type of the deep-link (cm/wmodem/ont) used to choose a sensible default
+    /// interface name (cmodem0, wmodem0, ont0), incremented past any existing ones.
+    /// </summary>
+    [Parameter] public string? PrefillSourceType { get; set; }
+
+    private List<MonitoringInterface> _interfaces = new();
+    private List<WanInterfaceInfo> _wans = new();
+    private readonly Dictionary<int, MonitoringInterfaceDeploymentService.InterfaceStatus> _statuses = new();
+
+    private MonitoringInterface _editing = NewInterface();
+    private MonitoringInterface? _editingOriginal;
+    private bool _vlanEnabled;
+
+    // True while GatewayLocalIp holds an auto-suggested value (not user-entered), so the
+    // suggestion keeps tracking the target as it's typed. Cleared once the user edits the
+    // gateway-local field themselves.
+    private bool _localIpAutoSuggested;
+    private bool _collapsed = true;
+    private bool _stateLoaded;
+    private const string CollapseKey = "monitoring-interfaces-collapsed";
+    private bool _saving;
+    private int? _busyId;
+    private string? _busyAction;
+    private string? _message;
+    private bool _messageSuccess;
+    private List<string> _deploySteps = new();
+
+    // Ids of rows where a Remove attempt already failed to fully clean up the gateway and a
+    // second click is armed to delete the row anyway. Deliberately in-memory only (not
+    // persisted) - it must reset on refresh. It's a transient "you just saw this error" flag,
+    // not scoped to the row you're currently looking at - so ANY edit/deploy/status-check
+    // interaction, even on a completely different row, invalidates it everywhere (see
+    // DisarmAllForceRemove): the user has moved on, and stale armed state left on some other
+    // row could otherwise force-delete it much later on what looks like a single click.
+    internal readonly HashSet<int> _forceRemoveArmed = new();
+
+    /// <summary>
+    /// Test-visible (internal, see NetworkOptimizer.Web.csproj InternalsVisibleTo) so
+    /// MonitoringInterfacesCardTests can verify this without a Blazor component-test harness.
+    /// </summary>
+    internal void DisarmAllForceRemove() => _forceRemoveArmed.Clear();
+
+    private string? _appliedPrefill;
+
+    private bool _advancedOpen;
+    private bool _suppressNextAdvancedToggle;
+
+    private static MonitoringInterface NewInterface() => new() { Name = "modem0", SubnetPrefix = 24, SnatEnabled = true, WatchdogIntervalMinutes = 5 };
+
+    /// <summary>
+    /// Whether the form is holding work the user would lose - an edit of an existing interface, or a
+    /// new one they have started filling in. The page checks this before adopting a polled status
+    /// change that would re-render this card away.
+    /// </summary>
+    public bool HasUnsavedEdit =>
+        !_collapsed && (_editingOriginal != null || !string.IsNullOrWhiteSpace(_editing.TargetIp) || _saving);
+
+    /// <summary>
+    /// Test-visible (internal, see NetworkOptimizer.Web.csproj InternalsVisibleTo) so the
+    /// Disabled-copy can be verified without a Blazor component-test harness.
+    /// </summary>
+    internal static MonitoringInterface Snapshot(MonitoringInterface mi) => new()
+    {
+        Id = mi.Id,
+        Name = mi.Name,
+        WanIfName = mi.WanIfName,
+        WanVlanId = mi.WanVlanId,
+        WanKey = mi.WanKey,
+        TargetIp = mi.TargetIp,
+        SubnetPrefix = mi.SubnetPrefix,
+        GatewayLocalIp = mi.GatewayLocalIp,
+        AliasIp = mi.AliasIp,
+        SnatEnabled = mi.SnatEnabled,
+        WatchdogIntervalMinutes = mi.WatchdogIntervalMinutes,
+        IsManuallyDeployed = mi.IsManuallyDeployed,
+        Disabled = mi.Disabled
+    };
+
+    // A gateway re-teardown is needed when an edit changes anything the boot script bakes
+    // into the macvlan name, route, SNAT rule, alias/DNAT rules, or script filename -
+    // otherwise the old artifacts (interface, route, SNAT, alias mark/DNAT, cron,
+    // /data/on_boot.d file) are orphaned.
+    private static bool NeedsOldTeardown(MonitoringInterface a, MonitoringInterface b)
+        => a.Name != b.Name || a.WanIfName != b.WanIfName || a.WanVlanId != b.WanVlanId
+            || a.TargetIp != b.TargetIp
+            || a.GatewayLocalIp != b.GatewayLocalIp || a.SubnetPrefix != b.SubnetPrefix
+            || a.SnatEnabled != b.SnatEnabled || a.AliasIp != b.AliasIp;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _canConfigure = AuthState is null
+            || (await Authz.AuthorizeAsync((await AuthState).User, SiteCtx.Slug, Policies.SiteAdmin)).Succeeded;
+
+        await LoadAsync();
+        // NOTE: collapse state is decided once in OnAfterRenderAsync (saved preference, else
+        // count-based default). Don't set _collapsed here - this runs after an await and can
+        // land after OnAfterRenderAsync, clobbering the loaded localStorage preference.
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+            return;
+
+        // Decide collapse state once, deterministically: a saved preference wins; with none,
+        // default to expanded when nothing is configured (discoverable) and collapsed once
+        // interfaces exist. A funnel deep-link (PrefillTargetIp OR PrefillSourceType) forces
+        // the card open in OnParametersSet, so skip this for it.
+        if (string.IsNullOrWhiteSpace(PrefillTargetIp) && string.IsNullOrWhiteSpace(PrefillSourceType))
+        {
+            string? val = null;
+            try { val = await JS.InvokeAsync<string>("localStorage.getItem", CollapseKey); }
+            catch { }
+
+            if (val == "true") _collapsed = true;
+            else if (val == "false") _collapsed = false;
+            else _collapsed = _interfaces.Count > 0;
+        }
+
+        _stateLoaded = true;
+        StateHasChanged();
+    }
+
+    protected override void OnParametersSet()
+    {
+        // A funnel deep-link from the monitor forms carries the source type (cm/wmodem/ont)
+        // and optionally the IP - the Host field may be empty, which is a valid use case.
+        // Absorb whatever's present, default a sensible name, and force the card open.
+        if (string.IsNullOrWhiteSpace(PrefillTargetIp) && string.IsNullOrWhiteSpace(PrefillSourceType))
+            return;
+
+        var prefillKey = $"{PrefillTargetIp}|{PrefillSourceType}";
+        if (prefillKey == _appliedPrefill)
+            return;
+        _appliedPrefill = prefillKey;
+
+        var existing = string.IsNullOrWhiteSpace(PrefillTargetIp)
+            ? null
+            : _interfaces.FirstOrDefault(i => (i.AliasIp ?? i.TargetIp) == PrefillTargetIp);
+        if (existing != null)
+        {
+            EditInterface(existing);
+        }
+        else
+        {
+            _editing = NewInterface();
+            _editingOriginal = null;
+            if (!string.IsNullOrWhiteSpace(PrefillTargetIp))
+            {
+                _editing.TargetIp = PrefillTargetIp!.Trim();
+                OnTargetChanged();
+            }
+            if (!string.IsNullOrWhiteSpace(PrefillSourceType))
+                _editing.Name = NextFreeName(PrefixForType(PrefillSourceType));
+        }
+        _collapsed = false;
+    }
+
+    private static string PrefixForType(string? type) => type switch
+    {
+        "cm" => "cmodem",
+        "wmodem" => "wmodem",
+        "ont" => "ont",
+        "starlink" => "starlink",
+        _ => "modem"
+    };
+
+    /// <summary>Lowest free "{prefix}{n}" name (n from 0) not already used by an interface.</summary>
+    private string NextFreeName(string prefix)
+    {
+        var used = new HashSet<string>(_interfaces.Select(i => i.Name), StringComparer.OrdinalIgnoreCase);
+        for (var n = 0; ; n++)
+        {
+            var candidate = $"{prefix}{n}";
+            if (!used.Contains(candidate))
+                return candidate;
+        }
+    }
+
+    private async Task ToggleCollapse()
+    {
+        _collapsed = !_collapsed;
+        try { await JS.InvokeVoidAsync("localStorage.setItem", CollapseKey, _collapsed ? "true" : "false"); }
+        catch { }
+    }
+
+    /// <summary>Expand the card from outside (e.g. when a deep-link or banner jumps here).</summary>
+    public void Expand()
+    {
+        _collapsed = false;
+        _stateLoaded = true;
+        StateHasChanged();
+    }
+
+    private string SummaryLabel()
+    {
+        if (_interfaces.Count == 0)
+            return "None configured";
+        var paused = _interfaces.Count(i => i.Disabled);
+        return paused > 0
+            ? $"{_interfaces.Count} configured, {paused} paused"
+            : $"{_interfaces.Count} configured";
+    }
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            _interfaces = await Repo.GetMonitoringInterfacesAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load monitoring interfaces");
+            _interfaces = new();
+        }
+
+        try
+        {
+            _wans = await SqmService.GetWanInterfacesFromControllerAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to load WAN interfaces for monitoring interface picker");
+            _wans = new();
+        }
+    }
+
+    private void EditInterface(MonitoringInterface mi)
+    {
+        _editing = Snapshot(mi);
+        _editingOriginal = Snapshot(mi);
+        _vlanEnabled = mi.WanVlanId.HasValue;
+        _localIpAutoSuggested = false;
+        _collapsed = false;
+        _message = null;
+        _deploySteps.Clear();
+        DisarmAllForceRemove();
+    }
+
+    private void CancelEdit()
+    {
+        _editing = NewInterface();
+        _editingOriginal = null;
+        _vlanEnabled = false;
+        _localIpAutoSuggested = false;
+        _message = null;
+    }
+
+    // When VLAN tagging is turned off, drop the stored VLAN so we deploy on the raw port.
+    private void OnVlanToggled()
+    {
+        if (!_vlanEnabled)
+            _editing.WanVlanId = null;
+    }
+
+    private void OnTargetChanged()
+    {
+        // Keep the suggested gateway-local IP tracking the target until the user edits it
+        // themselves. With per-keystroke (oninput) binding, a one-shot "suggest only when
+        // empty" would lock onto a transient prefix - typing 10.10.10.100 passes through
+        // 10.10.10.1, suggesting .2 and then freezing. Re-suggesting while auto-suggested
+        // lets it follow through to the final octet.
+        if (string.IsNullOrWhiteSpace(_editing.GatewayLocalIp) || _localIpAutoSuggested)
+        {
+            var suggested = SuggestLocalIp(_editing.TargetIp);
+            _editing.GatewayLocalIp = suggested;
+            _localIpAutoSuggested = !string.IsNullOrEmpty(suggested);
+        }
+    }
+
+    // The user edited the gateway-local IP by hand: stop auto-suggesting so we don't
+    // overwrite their value when the target changes.
+    private void OnLocalIpEdited() => _localIpAutoSuggested = false;
+
+    private void OnWanChanged()
+    {
+        var w = _wans.FirstOrDefault(x => x.PhysicalIfName == _editing.WanIfName);
+        _editing.WanKey = w != null && w.WanIndex > 0 ? $"wan{w.WanIndex}" : null;
+    }
+
+    // Advisory (non-blocking): the selected WAN is a Starlink connection, which Network
+    // Optimizer already monitors natively via the dish's API - a Monitoring Interface for
+    // the dish adds nothing and just complicates the WAN's routing. Live purely off current
+    // form state so it appears/disappears as the user edits.
+    private WanInterfaceInfo? SelectedWan =>
+        _wans.FirstOrDefault(x => x.PhysicalIfName == _editing.WanIfName);
+
+    private string? SelectedWanName => SelectedWan?.Name;
+
+    private string SelectedWanDisplayName =>
+        string.IsNullOrWhiteSpace(SelectedWanName) ? "This WAN" : SelectedWanName;
+
+    private bool ShowStarlinkAdvisory =>
+        !string.IsNullOrEmpty(_editing.WanIfName)
+        && StarlinkWanDetector.IsStarlinkWan(SelectedWanName, SelectedWan?.IspName);
+
+    private async Task SaveOnly()
+    {
+        // Same pre-edit capture as SaveAndDeploy: without a teardown here, an edit that
+        // changes gateway-affecting fields leaves the old artifacts behind, and for an
+        // aliased row the stale mangle/DNAT rules (same mark, old alias/target text) make
+        // the next per-row Deploy's mark-range preflight misclassify them as FOREIGN and
+        // block the deploy with no path forward short of Remove-then-Deploy.
+        var original = _editingOriginal;
+
+        if (!await ValidateAndSaveAsync())
+            return;
+
+        var tornDown = false;
+        var teardownFailed = false;
+        if (original != null && NeedsOldTeardown(original, _editing))
+        {
+            tornDown = true;
+            try
+            {
+                var (removed, _) = await Deploy.RemoveAsync(original);
+                teardownFailed = !removed;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Failed to tear down previous monitoring interface config after save");
+                teardownFailed = true;
+            }
+        }
+
+        CancelEdit();
+        // After CancelEdit - it clears _message.
+        _message = teardownFailed
+            ? "Saved, but removing the previous gateway config failed - use Remove, then Deploy, once the gateway is reachable."
+            : tornDown
+                ? "Saved and previous gateway config removed. The new config won't take effect until you deploy."
+                : "Saved. It won't take effect until you deploy.";
+        _messageSuccess = !teardownFailed;
+        await LoadAsync();
+    }
+
+    private async Task SaveAndDeploy()
+    {
+        // Capture the pre-edit config before save/reset so we can tear down any orphaned
+        // gateway state (renamed interface, changed WAN/target, disabled SNAT, etc.).
+        var original = _editingOriginal;
+        var editingId = _editing.Id;
+
+        if (!await ValidateAndSaveAsync())
+            return;
+
+        // Reload so we have the persisted Id, then deploy that row. Looked up by Id, not
+        // TargetIp+WanIfName - TargetIp is no longer unique across rows (two WANs can
+        // legitimately share it, distinguished by AliasIp), so matching on it risked
+        // finding the wrong row and deploying/tearing down the wrong interface.
+        await LoadAsync();
+        var saved = editingId > 0
+            ? _interfaces.FirstOrDefault(i => i.Id == editingId)
+            : _interfaces.FirstOrDefault(i => i.TargetIp == _editing.TargetIp
+                && i.WanIfName == _editing.WanIfName && i.AliasIp == _editing.AliasIp);
+        _editing = NewInterface();
+        _editingOriginal = null;
+        _vlanEnabled = false;
+        _localIpAutoSuggested = false;
+
+        // Editing changed gateway-affecting fields: remove the old config first so we don't
+        // leave a stale macvlan/route/SNAT/alias/cron/boot-script behind.
+        if (original != null && saved != null && NeedsOldTeardown(original, saved))
+        {
+            try
+            {
+                await Deploy.RemoveAsync(original);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Failed to tear down previous monitoring interface config before re-deploy");
+            }
+        }
+
+        if (saved == null)
+        {
+            _message = "Saved, but couldn't find the row to deploy - reload the page and click Deploy manually.";
+            _messageSuccess = false;
+            return;
+        }
+
+        // A disabled row that's edited and re-saved should come back enabled: route through
+        // Enable so the paused flag and gateway marker are cleared before redeploying.
+        var deployResult = saved.Disabled
+            ? await EnableInterfaceReturningResult(saved)
+            : await DeployInterfaceReturningResult(saved);
+
+        // On a Gate 2 collision, re-enter edit mode on the row we just saved so the user can
+        // see and fill in the suggested Alias IP - SaveAndDeploy would otherwise leave the
+        // form empty with no row to attach the suggestion to.
+        if (!deployResult.Success && deployResult.Block == MonitoringInterfaceDeploymentService.PreflightBlock.AlreadyReachable
+            && saved.AliasIp == null)
+        {
+            EditInterface(saved);
+            var suggestion = SuggestAliasIp(saved.TargetIp);
+            if (!string.IsNullOrEmpty(suggestion))
+                _editing.AliasIp = suggestion;
+            _suppressNextAdvancedToggle = true;
+            _advancedOpen = true;
+        }
+    }
+
+    private async Task<bool> ValidateAndSaveAsync()
+    {
+        _message = null;
+        _deploySteps.Clear();
+
+        // A blank Alias IP means "no alias". An empty text input binds string? to "", not
+        // null - normalize it back so it doesn't trip the alias validation path and so a
+        // non-aliased row keeps AliasIp null (the unique AliasIp index treats null, not "",
+        // as "not participating"; two blank-alias rows must not collide).
+        if (string.IsNullOrWhiteSpace(_editing.AliasIp))
+            _editing.AliasIp = null;
+
+        // "Tagged" is checked but no VLAN ID entered: the placeholder can read like a
+        // set value, so require an explicit ID rather than silently deploying untagged.
+        if (_vlanEnabled && _editing.WanVlanId is null)
+        {
+            _message = "Enter a VLAN ID, or uncheck Tagged.";
+            _messageSuccess = false;
+            return false;
+        }
+
+        var error = MonitoringInterfaceDeploymentService.Validate(_editing);
+        if (error != null)
+        {
+            _message = error;
+            _messageSuccess = false;
+            return false;
+        }
+
+        _saving = true;
+        try
+        {
+            await Repo.SaveMonitoringInterfaceAsync(_editing);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to save monitoring interface");
+            _message = $"Save failed: {ex.Message}";
+            _messageSuccess = false;
+            return false;
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private Task<MonitoringInterfaceDeploymentService.DeployResult> DeployInterfaceReturningResult(MonitoringInterface mi)
+        => RunDeployAsync(mi, "deploy", () => Deploy.DeployAsync(mi));
+
+    // "Save & Deploy" on a disabled row means "Save & Enable": Enable clears the paused flag and
+    // marker first, then redeploys - going through DeployAsync directly would hit its disabled
+    // guard and Skip.
+    private Task<MonitoringInterfaceDeploymentService.DeployResult> EnableInterfaceReturningResult(MonitoringInterface mi)
+        => RunDeployAsync(mi, "enable", () => Deploy.EnableAsync(mi));
+
+    private async Task<MonitoringInterfaceDeploymentService.DeployResult> RunDeployAsync(
+        MonitoringInterface mi, string action, Func<Task<MonitoringInterfaceDeploymentService.DeployResult>> operation)
+    {
+        _busyId = mi.Id;
+        _busyAction = action;
+        _message = null;
+        _deploySteps.Clear();
+        DisarmAllForceRemove();
+        StateHasChanged();
+        try
+        {
+            var result = await operation();
+            _deploySteps = result.Steps;
+            _message = result.Message;
+            _messageSuccess = result.Success;
+            if (result.Success)
+            {
+                mi.LastError = null;
+                await CheckStatus(mi, silent: true);
+            }
+            else
+            {
+                mi.LastError = result.Message;
+            }
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "{Action} failed for monitoring interface {Id}", action, mi.Id);
+            _message = $"{char.ToUpper(action[0]) + action[1..]} failed: {ex.Message}";
+            _messageSuccess = false;
+            return new MonitoringInterfaceDeploymentService.DeployResult(
+                false, MonitoringInterfaceDeploymentService.PreflightBlock.GatewayUnreachable, _message, _deploySteps);
+        }
+        finally
+        {
+            _busyId = null;
+            _busyAction = null;
+            StateHasChanged();
+        }
+    }
+
+    private Task DeployInterface(MonitoringInterface mi) => DeployInterfaceReturningResult(mi);
+
+    /// <summary>
+    /// Toggle a row between disabled (torn down on the gateway, config kept) and enabled
+    /// (redeployed). Mirrors the deploy/remove busy pattern so the button spins and every other
+    /// action is disabled while it runs, then reloads to reflect the new persisted flag.
+    /// </summary>
+    private async Task ToggleDisable(MonitoringInterface mi)
+    {
+        _busyId = mi.Id;
+        _busyAction = mi.Disabled ? "enable" : "disable";
+        _message = null;
+        _deploySteps.Clear();
+        DisarmAllForceRemove();
+        StateHasChanged();
+        try
+        {
+            var enabledOk = false;
+            if (mi.Disabled)
+            {
+                var result = await Deploy.EnableAsync(mi);
+                _deploySteps = result.Steps;
+                _message = result.Message;
+                _messageSuccess = result.Success;
+                enabledOk = result.Success;
+            }
+            else
+            {
+                var (success, steps) = await Deploy.DisableAsync(mi);
+                _deploySteps = steps;
+                _message = success
+                    ? $"Monitoring interface {mi.Name} disabled. Its config is kept - click Enable to redeploy it."
+                    : $"Couldn't disable {mi.Name}. {(steps.Count > 0 ? steps[^1] : "")}".Trim();
+                _messageSuccess = success;
+            }
+            _statuses.Remove(mi.Id);
+            await LoadAsync();
+            // A successful Enable just (re)deployed the interface, so refresh its status silently -
+            // otherwise the badge sits at "Unknown" until a manual Check status, even though the
+            // deploy succeeded (mirrors the Deploy button's post-deploy refresh). After a Disable
+            // the badge reads "Disabled" straight from the flag and needs no probe.
+            if (enabledOk)
+                await CheckStatus(mi, silent: true);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Disable/Enable toggle failed for monitoring interface {Id}", mi.Id);
+            _message = $"Action failed: {ex.Message}";
+            _messageSuccess = false;
+        }
+        finally
+        {
+            _busyId = null;
+            _busyAction = null;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// What a Remove click should do, given whether this row already had a failed attempt
+    /// armed for force-delete and whether this attempt's gateway cleanup succeeded. Split out
+    /// as a pure function so the retry/force-delete decision is unit-testable without a
+    /// Blazor component test harness (this project has none - see
+    /// MonitoringInterfacesCardTests for the coverage this stands in for).
+    /// </summary>
+    internal readonly record struct RemoveOutcome(bool DeleteRow, bool Arm, string Message, bool Success);
+
+    internal static RemoveOutcome DecideRemoveOutcome(bool wasArmed, bool cleanupSucceeded, string name)
+    {
+        if (cleanupSucceeded)
+            return new RemoveOutcome(true, false, $"Removed monitoring interface {name}.", true);
+
+        if (wasArmed)
+            return new RemoveOutcome(true, false,
+                $"Removed {name} from the list, but gateway cleanup failed again - gateway state " +
+                "(macvlan, route, alias rules, or the cron watchdog) may remain. See the emergency-rollback " +
+                "runbook for manual cleanup on the gateway.", false);
+
+        return new RemoveOutcome(false, true,
+            $"Couldn't fully remove {name} from the gateway - the configuration was kept so you can retry. " +
+            "Click Remove again to delete it anyway (gateway state may remain; see the emergency-rollback " +
+            "runbook for manual cleanup on the gateway).", false);
+    }
+
+    private async Task RemoveInterface(MonitoringInterface mi)
+    {
+        _busyId = mi.Id;
+        _busyAction = "remove";
+        _message = null;
+        _deploySteps.Clear();
+        StateHasChanged();
+        try
+        {
+            var wasArmed = _forceRemoveArmed.Remove(mi.Id);
+            var (success, steps) = await Deploy.RemoveAsync(mi);
+            _deploySteps = steps;
+
+            var outcome = DecideRemoveOutcome(wasArmed, success, mi.Name);
+            if (outcome.Arm)
+                _forceRemoveArmed.Add(mi.Id);
+
+            if (outcome.DeleteRow)
+            {
+                await Repo.DeleteMonitoringInterfaceAsync(mi.Id);
+                _statuses.Remove(mi.Id);
+
+                // If we were editing the interface we just removed, drop back to the add form.
+                if (_editing.Id == mi.Id)
+                {
+                    _editing = NewInterface();
+                    _editingOriginal = null;
+                }
+                await LoadAsync();
+            }
+
+            _message = outcome.Message;
+            _messageSuccess = outcome.Success;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Remove failed for monitoring interface {Id}", mi.Id);
+            // The attempt never reached a decision - don't strand an armed state on a click
+            // that threw before RemoveAsync could even report back.
+            _forceRemoveArmed.Remove(mi.Id);
+            _message = $"Remove failed: {ex.Message}";
+            _messageSuccess = false;
+        }
+        finally
+        {
+            _busyId = null;
+            _busyAction = null;
+            StateHasChanged();
+        }
+    }
+
+    private async Task CheckStatus(MonitoringInterface mi, bool silent = false)
+    {
+        DisarmAllForceRemove();
+        if (!silent)
+        {
+            _busyId = mi.Id;
+            _busyAction = "status";
+            StateHasChanged();
+        }
+        try
+        {
+            _statuses[mi.Id] = await Deploy.CheckStatusAsync(mi);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Status check failed for monitoring interface {Id}", mi.Id);
+        }
+        finally
+        {
+            if (!silent)
+            {
+                _busyId = null;
+                _busyAction = null;
+            }
+            StateHasChanged();
+        }
+    }
+
+    private bool IsApplied(MonitoringInterface mi)
+        => _statuses.TryGetValue(mi.Id, out var s) && s.IsFullyApplied(mi);
+
+    private RenderFragment StatusBadge(MonitoringInterface mi) => builder =>
+    {
+        var (cls, text) = StatusBadgeContent(mi, _statuses.TryGetValue(mi.Id, out var s) ? s : null);
+        builder.OpenElement(0, "span");
+        builder.AddAttribute(1, "class", $"status-badge {cls}");
+        builder.AddContent(2, text);
+        builder.CloseElement();
+    };
+
+    /// <summary>
+    /// Pure badge decision (class + label) for a row given its last live status (null when never
+    /// probed). Extracted as internal (see NetworkOptimizer.Web.csproj InternalsVisibleTo) so it
+    /// can be unit-tested without a Blazor renderer, mirroring DecideRemoveOutcome. A disabled
+    /// row reads "Disabled" regardless of any stale status - it's paused by the user's choice.
+    /// </summary>
+    internal static (string cls, string text) StatusBadgeContent(
+        MonitoringInterface mi, MonitoringInterfaceDeploymentService.InterfaceStatus? s)
+    {
+        if (mi.Disabled)
+            return ("status-disconnected", "Disabled");
+        if (s == null)
+            return ("status-disconnected", "Unknown");
+        if (!s.GatewayReachable)
+            return ("status-disconnected", "Gateway unreachable");
+        if (s.IsFullyApplied(mi))
+            return ("status-connected", "Active");
+        if (s.InterfaceExists || s.BootScriptPresent)
+            return ("status-disconnected", "Needs re-apply");
+        return ("status-disconnected", "Not deployed");
+    }
+
+    /// <summary>
+    /// Whether the Disable/Enable toggle is shown for a row. Hidden for manually-deployed rows:
+    /// Disable/Enable operate on gateway artifacts this app deploys, not a hand-built config.
+    /// </summary>
+    internal static bool ShowDisableToggle(MonitoringInterface mi) => !mi.IsManuallyDeployed;
+
+    private string WanLabelFor(MonitoringInterface mi)
+    {
+        var w = _wans.FirstOrDefault(x => x.PhysicalIfName == mi.WanIfName);
+        if (w != null)
+            return GatewayWanHelper.FormatWanLabel(w.Name, w.WanIndex, w.PhysicalIfName, w.PortLabel);
+        // WAN not currently reported (down/absent) - fall back to the stored identifiers.
+        var index = ParseWanIndex(mi.WanKey);
+        return GatewayWanHelper.FormatWanLabel(null, index, mi.WanIfName, null);
+    }
+
+    private static string WanOptionLabel(WanInterfaceInfo w)
+        => GatewayWanHelper.FormatWanLabel(w.Name, w.WanIndex, w.PhysicalIfName, w.PortLabel);
+
+    private static int ParseWanIndex(string? wanKey)
+        => !string.IsNullOrEmpty(wanKey) && int.TryParse(wanKey.Replace("wan", ""), out var i) ? i : 0;
+
+    /// <summary>
+    /// Suggest a gateway-local IP on the modem's subnet: the target host +/-1, avoiding
+    /// .0/.255, the target itself, and any value already used by another row (the new
+    /// GatewayLocalIp uniqueness gate would otherwise reject the first suggested value for
+    /// a second duplicate-IP interface). Editable by the user.
+    /// </summary>
+    private string SuggestLocalIp(string? targetIp)
+    {
+        if (targetIp is null || targetIp.Split('.').Length != 4 ||
+            !IPAddress.TryParse(targetIp, out var ip) ||
+            ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            return "";
+
+        var used = new HashSet<string>(
+            _interfaces.Where(i => i.Id != _editing.Id).Select(i => i.GatewayLocalIp));
+        var bytes = ip.GetAddressBytes();
+        int target = bytes[3];
+
+        for (var delta = 1; delta < 250; delta++)
+        {
+            foreach (var candidate in new[] { target + delta, target - delta })
+            {
+                if (candidate <= 0 || candidate >= 255 || candidate == target)
+                    continue;
+                bytes[3] = (byte)candidate;
+                var s = new IPAddress(bytes).ToString();
+                if (!used.Contains(s))
+                    return s;
+            }
+        }
+        return ""; // exhausted the /24 - user must enter one manually
+    }
+
+    /// <summary>
+    /// Suggest an Alias IP for the duplicate-IP case: target's third octet + 1 (matches the
+    /// documented shape, e.g. 192.168.100.1 -> 192.168.101.1 - memorable and debuggable),
+    /// scanning further octets if taken, falling back to RFC 2544 benchmark space
+    /// (198.18.0.0/15 - never internet-routed, essentially never present on a home LAN) if
+    /// the local /24 space is exhausted. Deliberately avoids CGNAT space (100.64.0.0/10,
+    /// RFC 6598) since Starlink itself hands out CGNAT addresses there.
+    /// </summary>
+    private string SuggestAliasIp(string? targetIp)
+    {
+        if (targetIp is null || targetIp.Split('.').Length != 4 ||
+            !IPAddress.TryParse(targetIp, out var ip) ||
+            ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            return "";
+
+        var used = new HashSet<string>(
+            _interfaces.Where(i => i.Id != _editing.Id)
+                .SelectMany(i => new[] { i.TargetIp, i.GatewayLocalIp, i.AliasIp })
+                .Where(s => s != null)!);
+
+        var bytes = ip.GetAddressBytes();
+        for (var delta = 1; delta < 250; delta++)
+        {
+            var third = bytes[2] + delta;
+            if (third > 255) break;
+            var candidate = new IPAddress(new[] { bytes[0], bytes[1], (byte)third, (byte)1 }).ToString();
+            if (!used.Contains(candidate))
+                return candidate;
+        }
+
+        // Local /24 space exhausted - fall back to RFC 2544 benchmark space (198.18.0.0/15,
+        // i.e. second octet 18 or 19 - never internet-routed, essentially never present on
+        // a home LAN). host enumerates every address in that /15 (2^17 addresses).
+        for (var host = 1; host < 1 << 17; host++)
+        {
+            var secondOctet = 18 + (host >> 16);
+            var thirdOctet = (host >> 8) & 0xFF;
+            var fourthOctet = host & 0xFF;
+            var candidate = $"198.{secondOctet}.{thirdOctet}.{fourthOctet}";
+            if (!used.Contains(candidate))
+                return candidate;
+        }
+        return "";
+    }
+}

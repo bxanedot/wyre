@@ -1,0 +1,406 @@
+<p align="center">
+  <img src="docs/images/app-logo-v2.png" alt="Network Optimizer" width="300">
+</p>
+
+# Network Optimizer for UniFi
+
+[![GitHub Release](https://img.shields.io/github/v/release/Ozark-Connect/NetworkOptimizer)](https://github.com/Ozark-Connect/NetworkOptimizer/releases)
+[![Docker Pulls](https://img.shields.io/badge/docker_pulls-697k-blue?logo=docker)](https://github.com/orgs/Ozark-Connect/packages?repo_name=NetworkOptimizer)
+[![Windows Downloads](https://img.shields.io/github/downloads/Ozark-Connect/NetworkOptimizer/total?label=windows%20downloads)](https://github.com/Ozark-Connect/NetworkOptimizer/releases)
+[![GitHub last commit](https://img.shields.io/github/last-commit/Ozark-Connect/NetworkOptimizer)](https://github.com/Ozark-Connect/NetworkOptimizer/commits)
+[![GitHub Stars](https://img.shields.io/github/stars/Ozark-Connect/NetworkOptimizer)](https://github.com/Ozark-Connect/NetworkOptimizer/stargazers)
+[![License](https://img.shields.io/badge/license-BSL_1.1-green)](https://github.com/Ozark-Connect/NetworkOptimizer/blob/main/LICENSE)
+
+**[Website](https://ozarkconnect.net/network-optimizer)** • **[Everything It Can Do](FEATURES.md)** • **[Quick Start](#quick-start-linux-docker)** • **[Deployment Guide](docker/DEPLOYMENT.md)** • **[Releases](https://github.com/Ozark-Connect/NetworkOptimizer/releases)**
+
+## THANK YOU to all of my Sponsors
+
+Genuinely, thank you so much to everybody for taking the time to use Network Optimizer and have it find a place on your network(s). It really means a lot to receive all of the bug reports, feature requests, feedback, support, and donations from everybody. Totally a whole new experience from writing code in a dayjob, and it greatly motivates me to keep on going!
+
+## Coming Soon: Integrated WAF + Centralized Firewall Blocking + New Security Features
+
+Available on Preview now: the companion Traefik proxy repo is getting a custom wrapper around the Coraza Web Application Firewall (WAF) running the OWASP Core Rule Set, with a management plane implemented in Network Optimizer that pulls in free block lists (Spamhaus DROP by default, plus CINS Army, DShield, blocklist.de, IPsum, and more if you want them), IPS events, establishes an allow list based upon a matrix of your managed sites' public IPs, and more. WAF events land in Threat Intelligence and your alerts right alongside your IPS events, and you can clear a false positive straight from the event (no restart). It starts out in Detection Only, so you can let it run for a week before you flip it to blocking.
+
+On the UniFi Network side, we are introducing automatically managed Network Lists based upon said lists of site public IPs, Cloudflare's IP set, and IPs of your own choosing. These lists can be used in UniFi Firewall and Port Forwarding rules so you don't have to keep managing them manually, and they follow your sites' WAN IPs as they change.
+
+Your UniFi Gateway also gets optional auto-block functionality based upon both the public block lists (supplements CyberSecure / Suricata) and live WAF attack detections, so blocking for already-identified direct / non-Cloudflare traffic occurs right at the firewall level before it even hits Traefik. Cloudflare-proxied hosts can get the same blocks at Cloudflare's edge. Blocks are shared across your sites: an attacker caught at one site is blocked at all of them. With the On-Site Agent running on your gateway, blocks land in seconds through its own ipsets without reprovisioning the gateway, and the Network Lists in UniFi Network catch up overnight. The public block lists can block outbound too, so an infected device can't reach its botnet's command server, and any device on your network that reaches (or tries to reach) a listed address raises an alert.
+
+Also on the Gateway, we've got WAN flood mitigation support now, see engineering details here: https://github.com/Ozark-Connect/NetworkOptimizer/pull/1290
+
+If you haven't already checked out [our Traefik based reverse proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) it's definitely worth setting up with this coming soon.
+
+## Coming Soon: Hosted Network Optimizer
+
+For people who don't have a home server or don't want to set up the infrastructure, a fully hosted Network Optimizer is coming soon: $15/month for up to 3 sites, with a 14 day free trial and enterprise-grade security. The commercial hosted plan is $25/month per site, adding full management and consulting - see [pricing and licensing](https://ozarkconnect.net/network-optimizer/licensing). The [on-site agent](src/NetworkOptimizer.Agent/README.md) runs on your gateway, so the only thing you give up is LAN speed testing. WAN speed testing is included, with some data limits.
+
+## Multi-Site Support
+
+Whether you run an MSP with a book of client networks, a few business locations, or your own place plus a handful you keep an eye on, you can now manage all of them from one Network Optimizer. The recommended way to bring a site online is a [lightweight on-site agent](src/NetworkOptimizer.Agent/README.md) that dials home to your self-hosted server over a single outbound HTTPS tunnel: no inbound access to the site, nothing to port-forward, works fine behind CGNAT, and nothing new to stand up between your locations. It delivers the full feature set - ISP Health scoring and path analysis, security audits, Wi-Fi and channel optimization, Adaptive SQM, performance tweaks, and LAN, WAN, and client speed tests - proxying that site's probing, SNMP, UniFi Console, and device SSH over the tunnel, with each site's data kept its own. Each site can have its own access controls: grant a client Viewer access to only their site, or give a field tech Operator on the three sites they manage.
+
+Already run a site-to-site VPN to a location? Onboard it with no agent at all and still get a solid floor: security audits, Wi-Fi and channel optimization, performance tweaks, Adaptive SQM, WAN steering, and SNMP device health, straight over the VPN. Deploy the agent when you also want that site's monitoring and performance layer - ISP Health, path discovery, latency and loss, and speed tests - or for any site the VPN doesn't reach. It's light enough (~50 MB in practice) to run directly on the site's UniFi gateway, so a site doesn't even need a separate box. The [agent guide](src/NetworkOptimizer.Agent/README.md) walks through installing one.
+
+**Licensing and firewalls:** Personal, non-commercial use on up to 3 sites is free - no key, nothing phones home. Commercial use or more than 3 sites requires a license key (Settings > Application > Licensing); see [licensing details and pricing](https://ozarkconnect.net/network-optimizer/licensing), then contact tj@ozarkconnect.net for a license or trial key. Activating a key makes an outbound HTTPS request to `licensing.ozarkconnect.net`, so allow HTTPS (443) to that hostname if you run strict egress rules. A license server outage never disables your sites - entitlements are cached and verified locally.
+
+## New: AP Telemetry
+
+Until now, everything Network Optimizer knew about your Wi-Fi came through the UniFi Console, which only tells you so much: client stats on its own schedule, roams after the fact, and nothing about traffic that never left the LAN. AP Telemetry gets it from the access points themselves, with a small agent pushed to each AP over SSH. It runs in memory, comes back on its own after a reboot or firmware update, and is removed everywhere when you turn the feature off. It's opt-in, and it supports U6 and U7 access points.
+
+Client Performance is the first place you'll notice. Signal and rates update twice a second, and the page follows a device through a roam instead of stalling until the Console catches up. A Roam button moves the client to another access point or band, so on a walk test you can put the phone on the AP you're actually testing. And a laptop copying files to a NAS finally shows its real throughput, where UniFi Network called it idle because nothing crossed the gateway.
+
+The Wi-Fi Optimizer grades its Health Issues on those measurements instead of inferring them from the Console. A raised noise floor is judged against the radio's own history. High utilization says whether the airtime is yours or somebody else's. Sticky clients are the ones parked on a weak AP for hours with a better one in range, and good signal with bad latency points at a congested channel, not a bad link. Set a channel or TX power deliberately and it gets noted instead of flagged, and any issue can be acknowledged the way you would in Security Audit: hidden from the list, still in the score.
+
+Channel Recommendation uses it too. Pin a radio and the plan works around it. Width is part of the recommendation now: narrower when no client has used more than half of it in the past week, wider when they could and the channel is quiet, and worked out on the 320 MHz block the radio is actually on rather than one guessed from the channel number. After a move it keeps measuring, and the card shows interference before and after. RF Environment gets each AP's own neighbor and spectrum scans, seconds old rather than the Console's minutes.
+
+## New: Firmware Rollout
+
+Firmware day on a site of any size is the same ritual: click Upgrade, wait, check it came back, click the next one, and hope nobody's on a call when their AP reboots. Firmware Rollout does the whole site, and it picks the moment from your own traffic history so the reboots land in the quietest window your network actually has. One device per model goes first; the rest wait until it's back on the new firmware with CPU, memory, and health looking like they did before. You can hold one model on Official, push another to Early Access, or leave a device out entirely. Autopilot runs it every time new firmware lands, with a heads-up before it starts and a way to stop it.
+
+## New: Bandwidth Hogs
+
+Somebody's eating the internet. Who? Bandwidth Hogs puts the answer on Live View, right above the map: who's on the WAN right now, and who used the most of it today, this week, or this month, biggest first, each one a click away from its Client Performance page. Scrub the maps back through history and the list goes with you. With the On-Site Agent on your gateway, the numbers are measured there rather than estimated. Counting bytes per client is all it does: no destinations, no ports, no flow records leave the box. It costs under 1% CPU on a UXG-Fiber or UCG-Fiber.
+
+## New: Starlink Monitoring
+
+Native health monitoring for Starlink dishes, built on what only the dish itself can tell you. Starlink's terminal exposes a local gRPC API (192.168.100.1:9200) that needs no authentication from the LAN side, so Network Optimizer polls it directly - no Starlink account, nothing in the cloud. Latency and throughput are deliberately left out, since Monitoring already measures RTT and WAN speed with better fidelity; this tracks the signals only the dish knows.
+
+A live dashboard card and a dedicated Monitoring tab both center on an obstruction sky map rendered from the dish's own 123x123 SNR grid, so blockages show up exactly where they sit in the sky. Alongside it: sky-obstruction percentage, dish-side packet loss, power draw, negotiated Ethernet speed, uptime, GPS fix, last outage, and any active dish alerts - all charted as time-series with the same InfluxDB history as the rest of your monitoring, and it handles multiple dishes. Set a WAN's access technology to Satellite and ISP Health scores it on sky obstruction, dish-to-ground packet loss, and outage burden, with caps for thermal shutdown, tilt, water intrusion, and persistently low SNR. Like the rest of Monitoring, it works at external sites over the on-site agent tunnel.
+
+![Starlink Stats card with obstruction sky map and dish health readings](docs/images/starlink-stats.png)
+
+## New: ISP Health
+
+All that monitoring data has to add up to something. ISP Health is the part of Monitoring that takes everything Network Optimizer is already collecting - SNMP device health, the latency and packet loss probes, WAN throughput, and the hops your Upstream Path Discovery mapped - and brings it full circle into a single honest score for how well your internet connection is actually performing. No new agents and no extra probes: it's the same data you're already storing, read back over a trailing 48-hour window and graded.
+
+Here's what makes the score mean something: it's technology-aware. A 9 ms idle latency is perfectly healthy on DOCSIS and a red flag on GPON, so ISP Health anchors its thresholds to the access technology you picked during Upstream Discovery (GPON, XGS-PON, DOCSIS, DSL, fixed wireless, cellular, Starlink, and more). The score splits into equal thirds: your Access Layer (idle and loaded latency, packet loss, and demonstrated speed against the plan you've configured in UniFi Network), your ISP's own network, and the Transit networks your traffic crosses to reach the rest of the internet. Every factor shows its own contribution, so a low score tells you exactly where the problem lives instead of just that one exists.
+
+![ISP Health score and per-dimension breakdown](docs/images/isp-health-score.png)
+
+The transit grading is where it gets useful. ISP Health grades each ASN in your path on its own - latency stability, jitter, loss, and congestion - and it watches for two things UniFi will never surface. Congestion events are sustained latency and jitter under load, the classic signature of an oversubscribed link choking up in the evenings. Path shifts are a sustained step in your RTT that means your traffic got rerouted onto different infrastructure; those are flagged as informational, since a BGP change isn't necessarily a problem you need to chase. And when loaded latency (AKA bufferbloat) or packet loss crosses the line for your connection type, it'll point you at Smart Queues, or recommend Adaptive SQM when it spots a recurring time-of-day congestion pattern.
+
+![Networks on your path with congestion events and per-network RTT](docs/images/isp-health-path.png)
+
+Multi-WAN is here. Give each connection a Vantage, which is either an on-site agent or a Policy-Routed source address bound to that WAN, and it gets its own score, its own path discovery, its own latency and loss. Without one, that WAN's probes ride the default route and ISP Health tells you so instead of quietly grading the wrong connection.
+
+## New: Access Network Monitoring
+
+Track signal quality on your cable modem, fiber ONT, and cellular modems over time - the same InfluxDB time-series charting as the rest of your network monitoring data. Instead of logging into each device's admin page to spot-check levels, everything is polled automatically and charted with the same time range controls, filter badges, and dashboard panels as your LAN and WAN metrics.
+
+**Cable Modem (DOCSIS)** - Downstream/upstream power levels, SNR, and FEC error rates (correctable and uncorrectable) with per-channel charting.
+
+- **Netgear CM** - CM600, CM700, CM1000, CM1200, CM2050V
+- **ARRIS Surfboard** - SB8200, SB6183, T25, S33, S34
+- **Motorola** - MB8611, MB8600, MB7621
+- **Xfinity / Cox / Comcast Business** - XB8, XB10 (Sercomm), CGM4981, CGA4332 (Technicolor)
+- **Technicolor CGA series** - CGA437A, CGA4233VOO, CGA4322DE, CGA6444VF (shipped by VOO and Vodafone)
+- **Vodafone Station** - ARRIS TG3442DE
+- **Sagemcom** - F3896LG (Virgin Media Hub 5, Ziggo SmartWifi)
+
+![Cable Modem Stats card with downstream SNR gauge, channel counts, power levels and FEC error counts](docs/images/cable-modem-stats.png)
+
+**Fiber ONT** - RX/TX optical power, temperature, voltage, and bias current for external and SFP ONTs.
+
+- **AT&T residential gateways** - BGW320 (500 / 505), BGW210
+- **Quantum Fiber** - Q1000K SmartNID (CenturyLink)
+- **Nokia** - XS-010X-Q (Alcatel-Lucent, ALCL). GPON siblings (G-010S-P, G-010G-Q) may share the same GponForm API - untested, reports welcome
+- **Deutsche Telekom** - Glasfaser-Modem 2 (FTTH bridge mode)
+- **Realtek-based GPON sticks** (RTL960x) - ODI DFP-34X-2C2, V-SOL V2801F, T&W TWCGPON657
+- **Zyxel GPON stick** - PMG3000-D20B (MaxLinear / T&W based)
+- **8311 community firmware XGS-PON sticks** - WAS-110 (MaxLinear PRX126), X-ONU-SFPP, WT-ONU-STICK, and other sticks running 8311
+
+SFP-based ONT monitoring (modules plugged into your gateway that expose DDM optical data) is part of the Network Monitoring feature below and also has a custom ONT stats augmentation API you can code to.
+
+![ONT Stats card with RX optical power gauge, PON status and link rate, and SFP temperature, voltage and bias readings](docs/images/ont-stats.png)
+
+**Cellular Modems** - RSRP, RSRQ, SNR, and Signal Quality charted over time with per-band, per-device series and filter badges.
+
+- **Ubiquiti** - U-LTE, U5G-Max, U5G-Backup
+- **Netgear Nighthawk** - modems and hotspots
+- **GL-iNet / Quectel** - modems and routers
+- **Inseego** - FX4100 5G gateway
+- **Zyxel** - NR7101, NR7102, NR7301, NR7302, NR7303, NR5103E, NR5103 v2, NR5307, FWA505, FWA510, FWA710, LTE3202, LTE5398, LTE7490
+
+Dual-connectivity mode tracks LTE and NR5G bands separately for NSA setups.
+
+## New: Self-Hosted Network Monitoring
+
+Full time-series network monitoring that runs entirely on your hardware. SNMP polling feeds InfluxDB for interface counters, device health (CPU, memory, temperature, uptime), latency probes, SFP optical levels, and WiFi client stats. Everything is stored locally with configurable retention, and a setup wizard handles InfluxDB bucket and token provisioning so you're not hand-editing config files. And since it's plain InfluxDB under the hood, you can bring your own Grafana for custom dashboards if you want to go further.
+
+The Live View gives you two real-time topology maps. The 3D map is a Three.js visualization with bi-directional particle-flow traffic for all LAN traffic (not just WAN-bound traffic like in UniFi Network), WASD camera navigation, and double-click on any client to jump to their performance dashboard. The 2D map is a hierarchical flow diagram that's easier to read at a glance, showing the same live throughput rates, device health badges, and client connections on a canvas you can pan and zoom. Both support historic playback: scrub backward through your monitoring data to see what your network looked like at any point, with full playback controls and adjustable speed.
+
+Latency and packet loss charting covers four target categories (LAN fabric, ISP access, transit, and internet services) with per-target filter badges, time range presets from 15 minutes to 30 days, and sub-15ms query performance. Device health charts track temperature, CPU, and memory for all your devices on one screen; in UniFi Network those stats only exist in each device's individual Insights view, with no single pane of glass for hardware health. SFP/ONT optical monitoring shows live RX/TX power, temperature, voltage, and bias current for PON modules, with automatic GPON vs XGS-PON detection.
+
+Upstream Path Discovery uses automated traceroute (ICMP and UDP probes) to map your ISP's access infrastructure, transit networks, and internet service endpoints. It identifies your OLT/CMTS, ISP edge routers, and transit ASNs with full latency and loss charting per hop category. Both maps include a WAN node for each internet connection showing live RTT, current throughput, latest speed test results, and ISP expected speeds.
+
+### How readings are measured
+
+Where Network Optimizer and UniFi Network show different numbers, it's because we read the raw sensors and count the standard way:
+
+- **CPU temperature** is the SoC die sensor read directly over SNMP (LM-SENSORS `temp-cpu`). It responds within seconds to load. UniFi Network appears to report a damped board probe used for fan control, which reads several degrees lower and lags behind load changes.
+- **Memory** is real used memory excluding Linux page cache, the same number `htop` shows. Linux deliberately fills idle RAM with cache, so counting cache as "used" (as UniFi Network does on some models) makes a healthy gateway look like it's leaking memory.
+- **Switch temperatures** fall back to the UniFi API where the SNMP tree exposes no thermal data.
+
+For the full changelog, see the [v1.17.0 release notes](https://github.com/Ozark-Connect/NetworkOptimizer/releases/tag/v1.17.0) and subsequent patch releases.
+
+![3D LAN Flow Map](docs/images/monitoring-3d-map.png)
+
+![2D LAN Topology Flow Map](docs/images/monitoring-2d-map.png)
+
+---
+
+You've set up VLANs, configured firewall rules, maybe even deployed a Pi-hole for DNS filtering. The UniFi controller gives you all this power, but it never actually tells you whether your configuration is any good. Are your firewall rules doing what you think they're doing? Is that IoT VLAN actually isolated, or did you miss something? When a device bypasses your DNS settings and phones home directly, would you even know?
+
+Network Optimizer answers those questions. It connects to your UniFi controller, analyzes your configuration, and tells you what's working, what's broken, and what you should fix. No more guessing.
+
+## Main Features
+
+These are the highlights. For the complete list, organized the way the app is navigated, see [Everything It Can Do](FEATURES.md).
+
+### Wi-Fi Optimizer & Signal Map
+
+Site health scoring, RF environment analysis, client stats, roaming tracking, band steering, and airtime fairness across twelve analysis tabs. Most channel pickers count nearby networks. Channel Recommendation models your RF physically: propagation from your floor plan, walls, and antenna patterns, each AP's real transmit power, and contention judged at the CCA threshold where radios actually defer. Add measured airtime, noise floor, triangulated neighbors, and months of how your own channels performed, and it solves for the least-interference plan across the whole site. Every move must clear its own improvement bar and never lands on a channel that measures worse, and mesh, DFS, and pins are respected. Apply Recommended Channels writes the plan to UniFi Network in waves, so a client always has a neighbor to roam to.
+
+On the client side, you get a sortable, searchable table view with online/offline filtering, per-client signal and roaming history, and band-segmented Wi-Fi generation breakdowns showing exactly where your airtime is going. Environmental correlation heatmaps surface interference patterns by time of day and day of week, and every recommendation includes the specific UniFi Network UI navigation path to apply the change.
+
+Drill into any single client with the Client Performance dashboard: live signal monitoring, speed test history with download/upload trends, latency and jitter charts, a network path visualization showing every hop and bottleneck link, and a connection timeline tracking AP roams and disconnects, split across Speed, Signal, and Connection tabs. Walk around with the page open on your phone (over HTTPS) and it builds a GPS-based signal heatmap of your actual coverage.
+
+Signal Map lets you draw your building layout, place APs, and see a real-time RF propagation heatmap. Supports wall materials (drywall, concrete, glass, etc.), multi-floor buildings with cross-floor signal propagation, and per-AP antenna patterns pulled from your controller. Simulate TX power and antenna mode changes to see how they’d affect coverage before touching your actual config. Add planned APs to simulate coverage before buying or mounting hardware.
+
+### Security Auditing
+
+The audit engine runs 83 security checks across five categories and scores your network 0-100. This isn't a checkbox audit that just confirms you have a firewall; it actually analyzes what your rules do and whether they're doing it correctly.
+
+Firewall analysis catches the subtle stuff: rules that shadow each other, allow rules that subvert your deny rules, allow rules that punch holes through your network isolation. VLAN security checks whether your IoT devices and cameras are actually on the networks you intended (using UniFi fingerprints, MAC OUI lookup, and port naming patterns). DNS security validates your DoH configuration, checks for bypass routes (including DoT, DoQ, and HTTP/3 DoH bypass), and verifies that your WAN interface DNS settings match what you configured. Port security looks at MAC restrictions, port isolation, and whether you've left unused ports enabled. UPnP analysis flags enabled UPnP, exposed privileged ports, and static port forwards you may have forgotten about.
+
+You get a score, a breakdown by severity (critical, recommended, informational), and specific recommendations for each issue. Dismiss false positives if your setup is intentional, export PDF reports for documentation, track your score over time.
+
+### Threat Intelligence
+
+Your gateway's IPS is blocking threats all day long, but the UniFi Console buries the evidence in a flat event log with no context. Threat Intelligence pulls those events and analyzes them: who's attacking you, where they're coming from, and whether it's random noise or a coordinated effort. It cross-references your port forwards against actual threat data, so you can see which of your exposed services are getting hammered and from where, and it watches for a single source IP progressing through kill chain stages rather than just drive-by scanning. CrowdSec CTI integration adds reputation scoring and MITRE ATT&CK classification per source IP.
+
+### WAN Steering
+
+UniFi's WAN Failover keeps secondary connections idle until your primary goes down. Load Balancing splits everything across all WANs but gives you no control over what goes where. Policy-Based Routes pick traffic by source device or network and destination IP or domain, not by protocol or port. WAN Steering fills the gaps: keep your primary WAN as the default for latency-sensitive traffic, and selectively load balance bulk traffic across your secondary connections with full port and protocol matching.
+
+Define traffic classes by source, destination, port, or protocol, assign them to specific WANs or load balance across multiple WANs with configurable weight. A lightweight Go binary on your gateway inserts rules above UniFi's routing table, watches for WAN state changes and reprovisioning events, and recovers automatically. Health-check failover still works as expected - if a WAN goes down, traffic redistributes to healthy links.
+
+### Adaptive SQM
+
+If you're on cable, DSL, or cellular, you know bufferbloat. That lag spike when someone starts a download or joins a video call. SQM fixes it, but setting the bandwidth limits correctly is a guessing game; too high and SQM can't shape traffic effectively, too low and you're leaving speed on the table.
+
+Network Optimizer handles this automatically. It supports dual-WAN with independent configuration per interface, connection profiles tuned for DOCSIS, fiber, wireless, Starlink, and cellular (each has different characteristics that matter). Scheduled speedtests adjust your rates based on actual measured performance. Latency monitoring backs off when congestion appears. One-click deployment pushes the configuration to your UDM or UCG gateway with persistence through reboots.
+
+### WAN Speed Testing
+
+Test your internet connection speed directly from the server. Measures download, upload, latency, loaded latency (bufferbloat detection), and jitter with full history and per-WAN connection tracking. Results are plotted in time-series charts filterable by connection, so you can compare providers and track performance over time across multi-WAN setups.
+
+Also includes a standalone OpenSpeedTest server you can host on a VPS or remote machine, so you can run WAN speed tests against your own private infrastructure instead of relying on third-party speed test services. Configure it in Settings and get a ready-to-copy deploy command - see [External WAN Speed Test Server](docker/DEPLOYMENT.md#external-wan-speed-test-server-optional) in the deployment guide. If you're that kind of nerd.
+
+### LAN Speed Testing
+
+Ever wonder if that new switch is actually delivering 10 gigabit speeds? Or whether the cable run to the shop is the bottleneck?
+
+Network Optimizer runs iperf3 tests between your gateway and network devices, auto-discovers UniFi equipment from your controller, supports custom devices with per-device SSH credentials, auto indexes iperf3 results from tests initiated by other devices against the built in server (if enabled), and correlates results with hop count and infrastructure path, with detailed Wi-Fi stats and link speeds recorded along with UniFi firmware versions.
+
+Test history lets you track performance over time with these relevant data in order to identify and characterize any changes to performance.
+
+![LAN Speed Test](docs/images/lan-speed-test.png)
+
+### Client Speed Testing
+
+Test LAN speeds from any device without SSH access. Open a browser on your phone, tablet, or laptop and run a speed test; results are automatically recorded with device identification. For CLI users, the bundled iperf3 server accepts client connections and logs results. See [Client Speed Testing](docker/DEPLOYMENT.md#client-speed-testing-optional) in the deployment guide.
+
+![Client Speed Test with Network Path](docs/images/client-speed-test-trace.png)
+
+With HTTPS enabled, browser tests can collect location data (with permission) to build a Speed / Coverage Map showing real-world performance across your property or campus.
+
+![Speed / Coverage Map](docs/images/speed-coverage-map.png)
+
+### Cellular Modem Monitoring
+
+If you're running a U-LTE or U5G-Max for backup (or primary) connectivity, you can monitor signal quality from the dashboard: RSRP, RSRQ, SNR, cell tower info, and connection status. Supports multiple modems with easy navigation between them.
+
+![Cellular Stats Demo](docs/images/cellular-stats.gif)
+
+### UPnP Inspector
+
+Ever wonder what ports your network is actually exposing to the internet? Your Xbox, Plex server, and smart home devices are all punching holes through your firewall via UPnP, and UniFi doesn't make it easy to see what's going on.
+
+The UPnP Inspector puts it all in one place: every dynamic UPnP mapping and static port forward, grouped by device, with color-coded status so you can see at a glance what's active, what's idle, and what's about to expire. Add notes to remember what each mapping is for (because you will forget). Search and filter when you're hunting for that one port that's causing problems.
+
+### Alerts & Scheduling
+
+Run speed tests and security audits on a schedule, and get told when something goes wrong. Alert rules watch for audit score drops, WAN speed degradation, LAN speed regression against recent baselines, IPS attack chains reaching active exploitation, and scheduled task failures, each with its own severity thresholds and cooldown periods. Delivery goes to email (SMTP with STARTTLS), Discord, Slack, Microsoft Teams, and generic webhooks, and low-priority alerts can be set to digest-only so they bundle into a daily summary instead of pinging you every time your neighbor microwaves lunch and your 2.4 GHz channel gets congested.
+
+## Requirements
+
+- UniFi Console (aka Controller) - UDM, UCG, UDR, UniFi Express, EFG, CloudKey, or self-hosted UniFi OS Server (or the legacy UniFi Network Server)
+- Network access to your UniFi Console API (HTTPS)
+- A box (bare metal, container(s), VM/LXC) to host Network Optimizer, see Installation section below for options. [Deployment Guide](docker/DEPLOYMENT.md) lists general hardware requirements. Do not attempt to install NO on the UniFi Gateway or Console itself unless it's UDM-Beast, EFG, or EF-Core class.
+- A box to host InfluxDB if you want to run Time-Series Monitoring features. This is the one that needs a little more horsepower, so I recommend putting it on your most capable local server.
+
+Most features work with just API access. SSH is only needed for speed testing and Adaptive SQM:
+
+| Feature | SSH needed? |
+|---------|------------|
+| Security Audit | No |
+| Config Optimizer | No, but Gateway SSH required for upcoming features |
+| Wi-Fi Optimizer | No |
+| Threat Intelligence | No |
+| Alerts & Scheduling | No (schedules speed tests that may require SSH) |
+| Client Speed Test | No |
+| WAN Speed Test | No, but gateway-based requires Gateway SSH |
+| LAN Speed Test | Yes - Gateway SSH and/or Device SSH |
+| WAN Steering | Yes - Gateway SSH |
+| Adaptive SQM | Yes - Gateway SSH |
+
+To enable SSH, see [SSH Configuration](docker/DEPLOYMENT.md#unifi-ssh-configuration) in the Deployment Guide. SSH must be configured via the UniFi web interface (not the mobile app).
+
+## Installation
+
+| Platform | Method | Guide |
+|----------|--------|-------|
+| Linux Server | Docker (recommended) | [Deployment Guide](docker/DEPLOYMENT.md#1-linux--docker-recommended) |
+| Proxmox VE | LXC one-liner | [Proxmox Guide](scripts/proxmox/README.md) |
+| Synology/QNAP/Unraid | Docker | [NAS Deployment](docker/DEPLOYMENT.md#3-nas-deployment-docker) |
+| Home Assistant | Add-ons | [Home Assistant](docker/DEPLOYMENT.md#5-home-assistant) |
+| Windows | Installer (recommended) | [Download from Releases](https://github.com/Ozark-Connect/NetworkOptimizer/releases) |
+| macOS | Native (best performance) | [macOS Installation](docs/MACOS-INSTALLATION.md) |
+| Linux | Native (no Docker) | [Linux Native](docker/NATIVE-DEPLOYMENT.md#linux-deployment) |
+
+Docker Desktop on macOS and Windows limits network throughput for speed testing. For accurate multi-gigabit measurements, use native deployment.
+
+> ### Run it behind HTTPS
+>
+> Getting a reverse proxy in front of this is the part of setup that trips people up, so there's a ready-made one. [NetworkOptimizer-Proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) is a Traefik setup with automatic Let's Encrypt certificates that forces HTTP/1.1 for speed tests (HTTP/2 multiplexing skews the results) while keeping HTTP/2 for the app itself. On Proxmox LXC and the Windows installer it's a checkbox during install.
+>
+> Do it up front if you can. Browsers only hand out location over HTTPS, so it's also what turns on GPS tagging for your Speed Test and Signal walk test data.
+
+### Quick Start (Linux Docker)
+
+**Option A: Pull Docker Image (Recommended)**
+
+```bash
+mkdir network-optimizer && cd network-optimizer
+curl -o docker-compose.yml https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/docker/docker-compose.prod.yml
+curl -O https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/docker/.env.example
+cp .env.example .env
+docker compose up -d
+
+# Check logs for the auto-generated admin password
+docker logs network-optimizer 2>&1 | grep -A5 "AUTO-GENERATED"
+```
+
+**Option B: Build from Source**
+
+```bash
+git clone https://github.com/Ozark-Connect/NetworkOptimizer.git
+cd NetworkOptimizer/docker
+cp .env.example .env
+docker compose build
+docker compose up -d
+
+# Check logs for the auto-generated admin password
+docker logs network-optimizer 2>&1 | grep -A5 "AUTO-GENERATED"
+```
+
+Open http://localhost:8042 and sign in as **admin** with that password.
+
+### Quick Start (Proxmox)
+
+```bash
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/proxmox/install.sh)"
+```
+
+### First Run
+
+1. Go to Settings and enter your UniFi controller URL
+2. Create a **Local Access Only** account on your controller (Ubiquiti SSO won't work):
+   - Quick: Super Admin role
+   - Restricted: Network Full (Site Admin in older versions), Protect View (View Only in older versions), User Management None (Network View also works if you won't run RF spectrum scans or apply channel plans)
+   - See the in-app setup guide or [detailed instructions](docker/DEPLOYMENT.md#unifi-account)
+3. Click Connect to authenticate
+4. Navigate to Audit to run your first security scan
+5. Optionally, set up named accounts in **Settings - Identity** with Admin, Operator, or Viewer roles (globally or per site), connect an SSO provider, or require MFA - see the [Deployment Guide](docker/DEPLOYMENT.md#admin-account) for details
+
+## Project Structure
+
+```
+src/
+├── NetworkOptimizer.Web         # Blazor web UI
+├── NetworkOptimizer.Alerts      # Alerts & Scheduling engine
+├── NetworkOptimizer.Audit       # Security Audit
+├── NetworkOptimizer.Core        # Shared helpers and utilities
+├── NetworkOptimizer.Diagnostics # Config Optimizer
+├── NetworkOptimizer.Monitoring  # SNMP/SSH polling
+├── NetworkOptimizer.Reports     # PDF/Markdown report generation
+├── NetworkOptimizer.Sqm         # Adaptive SQM
+├── NetworkOptimizer.Storage     # SQLite database
+├── NetworkOptimizer.Threats     # Threat Intelligence
+├── NetworkOptimizer.UniFi       # UniFi API client
+├── NetworkOptimizer.WiFi        # Wi-Fi Optimizer
+├── cfspeedtest/                 # WAN Speed Test (binary for gateway)
+└── OpenSpeedTest/               # Client Speed Test
+```
+
+## Tech Stack
+
+.NET 10, Blazor Server, SQLite, iperf3, SSH.NET, QuestPDF, OpenSpeedTest™, Go (WAN speed test binary)
+
+## Password Reset
+
+The built-in **admin** account works out of the box for homelabs and single-user installs. If you want named accounts, per-site roles, SSO, or MFA, set those up in **Settings - Identity**. If you forget the built-in admin password, use the reset script for your platform:
+
+**Docker / macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/reset-password.sh | bash
+```
+
+**Windows (PowerShell as Administrator):**
+```powershell
+irm https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/reset-password.ps1 -OutFile reset-password.ps1
+.\reset-password.ps1
+```
+
+The script stops the service, clears the password, restarts, and shows you the new temporary password.
+
+## Agentic Tool and Coding Standards
+
+See [CODING_STANDARDS.md](CODING_STANDARDS.md) for how AI tooling is used (and not used) in this project, code review practices, and quality standards.
+
+## Contributing
+
+If you find issues, report them via GitHub Issues. Include your UniFi device models and controller version. Sanitize credentials and IPs before attaching logs.
+
+## License
+
+Business Source License 1.1
+
+**Licensor:** Ozark Connect
+
+**Licensed Work:** Network Optimizer for UniFi
+
+**Personal Use:** You may use the Licensed Work for personal, non-commercial purposes on up to three sites.
+
+**Commercial Use:** Use by managed service providers (MSPs), network installers, IT consultants, or any entity using this software in the delivery of paid services requires a commercial license.
+
+**Change Date:** January 1, 2028
+
+**Change License:** Apache License 2.0
+
+For commercial licensing inquiries, contact tj@ozarkconnect.net.
+
+© 2026 Ozark Connect
+
+## Support
+
+- Issues: [GitHub Issues](https://github.com/Ozark-Connect/NetworkOptimizer/issues)
+- Documentation: See component READMEs in `src/` and `docker/`
+
+## Other Projects
+
+- [UniFi Lightshow](https://github.com/Ozark-Connect/unifi-lightshow) - Custom RGB light show controller for UniFi Etherlighting LEDs. Turn your switch rack into a spatial light canvas with SignalRGB integration, seasonal effects, and multi-switch support.
+- [UNVR NAS Backup](https://github.com/Ozark-Connect/unvr-nas-backup) - Automated Protect camera backup from UniFi NVR to NAS storage.
+
+---
+
+<sub>Network Optimizer for UniFi is an independent project by Ozark Connect and is not affiliated with, endorsed by, or sponsored by Ubiquiti, Inc. Ubiquiti, UniFi, UDM, and Cloud Key are trademarks or registered trademarks of Ubiquiti, Inc. ARRIS and Surfboard are trademarks of CommScope Technologies LLC. Xfinity is a trademark of Comcast Corporation. Netgear and Nighthawk are trademarks of NETGEAR, Inc. All other trademarks mentioned are the property of their respective owners.</sub>

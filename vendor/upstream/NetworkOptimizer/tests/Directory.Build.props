@@ -1,0 +1,17 @@
+<Project>
+  <!-- Include shared FluentAssertions license initializer in all test projects -->
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)FluentAssertionsLicense.cs" Link="FluentAssertionsLicense.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Mirrors the root Directory.Build.props (which this file shadows, not merges):
+         System.Security.Cryptography.Xml 10.0.7, pulled in by ITfoxtec.Identity.Saml2 4.20.1 and
+         pruned on net10.0 as a framework-provided assembly, so the flagged package never ships.
+         REMOVE when ITfoxtec.Identity.Saml2 bumps its dependency past 10.0.7. -->
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-23rf-6693-g89p" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-8q5v-6pqq-x66h" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-cvvh-rhrc-wg4q" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g8r8-53c2-pm3f" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-mmjf-rqrv-855v" />
+  </ItemGroup>
+</Project>

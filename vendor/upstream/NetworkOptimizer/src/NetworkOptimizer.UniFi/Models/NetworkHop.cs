@@ -1,0 +1,195 @@
+namespace NetworkOptimizer.UniFi.Models;
+
+/// <summary>
+/// Represents a single hop in the network path between two endpoints
+/// </summary>
+public class NetworkHop
+{
+    /// <summary>Order in the path (0 = closest to source)</summary>
+    public int Order { get; set; }
+
+    /// <summary>Type of device at this hop</summary>
+    public HopType Type { get; set; }
+
+    /// <summary>MAC address of the device</summary>
+    public string DeviceMac { get; set; } = "";
+
+    /// <summary>Friendly name of the device</summary>
+    public string DeviceName { get; set; } = "";
+
+    /// <summary>Model of the device</summary>
+    public string DeviceModel { get; set; } = "";
+
+    /// <summary>Firmware version of the device at test time</summary>
+    public string? DeviceFirmware { get; set; }
+
+    /// <summary>
+    /// Whether MLO (Multi-Link Operation) is enabled on any SSID served by this AP.
+    /// Only populated for AccessPoint hop types.
+    /// </summary>
+    public bool? MloEnabled { get; set; }
+
+    /// <summary>Whether jumbo frames are enabled on this device at test time</summary>
+    public bool? JumboFramesEnabled { get; set; }
+
+    /// <summary>Whether hardware acceleration (packet offload) is enabled. Only on gateways.</summary>
+    public bool? HardwareAccelerationEnabled { get; set; }
+
+    /// <summary>Whether flow control is enabled on this device at test time</summary>
+    public bool? FlowControlEnabled { get; set; }
+
+    /// <summary>Whether Smart Queues (SQM) is enabled on the WAN connection. Only on WAN hops.</summary>
+    public bool? SmartQueueEnabled { get; set; }
+
+    /// <summary>IP address of the device</summary>
+    public string DeviceIp { get; set; } = "";
+
+    /// <summary>Port number where traffic enters this device</summary>
+    public int? IngressPort { get; set; }
+
+    /// <summary>Name of the ingress port</summary>
+    public string? IngressPortName { get; set; }
+
+    /// <summary>Link speed on ingress port (Mbps)</summary>
+    public int IngressSpeedMbps { get; set; }
+
+    /// <summary>Device that owns the ingress port (null = this device)</summary>
+    public string? IngressPortDeviceName { get; set; }
+
+    /// <summary>Port number where traffic exits this device</summary>
+    public int? EgressPort { get; set; }
+
+    /// <summary>Name of the egress port</summary>
+    public string? EgressPortName { get; set; }
+
+    /// <summary>Link speed on egress port (Mbps)</summary>
+    public int EgressSpeedMbps { get; set; }
+
+    /// <summary>Device that owns the egress port (null = this device)</summary>
+    public string? EgressPortDeviceName { get; set; }
+
+    /// <summary>Whether this hop contains the path bottleneck</summary>
+    public bool IsBottleneck { get; set; }
+
+    /// <summary>Whether the ingress link is a wireless mesh uplink</summary>
+    public bool IsWirelessIngress { get; set; }
+
+    /// <summary>Whether the egress link is a wireless mesh uplink</summary>
+    public bool IsWirelessEgress { get; set; }
+
+    /// <summary>Radio band for wireless ingress (ng=2.4GHz, na=5GHz, 6e=6GHz)</summary>
+    public string? WirelessIngressBand { get; set; }
+
+    /// <summary>Radio band for wireless egress (ng=2.4GHz, na=5GHz, 6e=6GHz)</summary>
+    public string? WirelessEgressBand { get; set; }
+
+    /// <summary>Channel for wireless link</summary>
+    public int? WirelessChannel { get; set; }
+
+    /// <summary>Signal strength in dBm for wireless link</summary>
+    public int? WirelessSignalDbm { get; set; }
+
+    /// <summary>Noise floor in dBm for wireless link</summary>
+    public int? WirelessNoiseDbm { get; set; }
+
+    /// <summary>TX rate in Mbps for wireless link (from device to uplink)</summary>
+    public int? WirelessTxRateMbps { get; set; }
+
+    /// <summary>RX rate in Mbps for wireless link (from uplink to device)</summary>
+    public int? WirelessRxRateMbps { get; set; }
+
+    /// <summary>
+    /// Whether the wireless mesh backhaul at this hop is an MLO (Wi-Fi 7 multi-link) pairing.
+    /// The Wireless*RateMbps fields then carry the AGGREGATE across links (STR runs them
+    /// concurrently), and <see cref="MeshMloLinks"/> carries the per-link breakdown.
+    /// </summary>
+    public bool IsMloMeshBackhaul { get; set; }
+
+    /// <summary>
+    /// Per-link detail of an MLO mesh backhaul, child AP's perspective (TX toward the parent).
+    /// From the child's own uplink.mlo_links when it reports them, else the parent's
+    /// downlink_table flipped.
+    /// </summary>
+    public List<MeshBackhaulLink>? MeshMloLinks { get; set; }
+
+    /// <summary>Whether the ingress port is part of a Link Aggregation Group</summary>
+    public bool IsLagIngress { get; set; }
+
+    /// <summary>Whether the egress port is part of a Link Aggregation Group</summary>
+    public bool IsLagEgress { get; set; }
+
+    /// <summary>Number of member ports in the LAG group (ingress side). Null if not LAG.</summary>
+    public int? LagIngressMemberCount { get; set; }
+
+    /// <summary>Number of member ports in the LAG group (egress side). Null if not LAG.</summary>
+    public int? LagEgressMemberCount { get; set; }
+
+    /// <summary>Per-member speed in the LAG group (ingress side, Mbps). Null if not LAG.</summary>
+    public int? LagIngressMemberSpeedMbps { get; set; }
+
+    /// <summary>Per-member speed in the LAG group (egress side, Mbps). Null if not LAG.</summary>
+    public int? LagEgressMemberSpeedMbps { get; set; }
+
+    /// <summary>Additional notes (e.g., "L3 routing", "Wireless uplink")</summary>
+    public string? Notes { get; set; }
+}
+
+/// <summary>
+/// One radio link of an MLO mesh backhaul on a <see cref="NetworkHop"/>, child AP's perspective
+/// (TX toward the parent). Signal is the child's own reading when it reports its links
+/// (uplink.mlo_links), else the parent's.
+/// </summary>
+public class MeshBackhaulLink
+{
+    /// <summary>Radio band (ng=2.4GHz, na=5GHz, 6e=6GHz), matching Wireless*Band conventions</summary>
+    public string? Band { get; set; }
+
+    public int? Channel { get; set; }
+
+    /// <summary>Channel width in MHz, from the parent's radio for this band</summary>
+    public int? WidthMhz { get; set; }
+
+    public int? SignalDbm { get; set; }
+
+    /// <summary>Link rate in Mbps, child toward parent</summary>
+    public int? TxRateMbps { get; set; }
+
+    /// <summary>Link rate in Mbps, parent toward child</summary>
+    public int? RxRateMbps { get; set; }
+}
+
+/// <summary>
+/// Type of network hop
+/// </summary>
+public enum HopType
+{
+    /// <summary>Wired client endpoint (desktop)</summary>
+    Client,
+
+    /// <summary>L2 switch</summary>
+    Switch,
+
+    /// <summary>Wireless access point</summary>
+    AccessPoint,
+
+    /// <summary>Gateway/router (L3 routing)</summary>
+    Gateway,
+
+    /// <summary>The iperf3/speed test server (this application)</summary>
+    Server,
+
+    /// <summary>Wireless client endpoint (laptop)</summary>
+    WirelessClient,
+
+    /// <summary>Teleport VPN gateway (external VPN)</summary>
+    Teleport,
+
+    /// <summary>Tailscale VPN (CGNAT mesh)</summary>
+    Tailscale,
+
+    /// <summary>WAN/Internet (external IP not in local network)</summary>
+    Wan,
+
+    /// <summary>Generic VPN (UniFi remote-user-vpn network)</summary>
+    Vpn
+}

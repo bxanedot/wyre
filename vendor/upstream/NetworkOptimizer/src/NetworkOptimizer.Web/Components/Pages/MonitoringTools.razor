@@ -1,0 +1,1574 @@
+@page "/network-tools"
+@attribute [Authorize(Policy = Policies.RequireViewer)]
+@rendermode InteractiveServer
+@implements IDisposable
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Web.Services.Monitoring
+@using NetworkOptimizer.Monitoring.Probes
+@using NetworkOptimizer.Core.Enums
+@using NetworkOptimizer.UniFi
+@using NetworkOptimizer.UniFi.Models
+@using Microsoft.AspNetCore.Authorization
+@using Microsoft.AspNetCore.Components.Authorization
+@using NetworkOptimizer.Web.Services.Authorization
+@using Microsoft.EntityFrameworkCore
+@using NetworkOptimizer.Storage.Models
+@inject IAuthorizationService Authz
+@inject IJSRuntime JS
+@inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject IDbContextFactory<NetworkOptimizerDbContext> MainDbFactory
+@inject AgentTunnelRegistry TunnelRegistry
+@inject AgentOnGatewayDetector OnGatewayDetector
+@inject MonitoringPathView PathView
+@inject NetworkOptimizer.Monitoring.Probes.LocalProbeExecutor LocalProbe
+@inject ProbeExecutorFactory ExecutorFactory
+@inject UniFiConnectionService ConnectionService
+@inject ISqmService SqmService
+@inject SiteContextService SiteContext
+@inject SiteTunnelRouting TunnelRouting
+@inject GatewayDiagnosticsService GatewayDiagnostics
+@inject DmesgDiagnosticsService DmesgDiagnostics
+@inject ISupportFileService SupportFile
+@inject NetworkOptimizer.Web.Services.Ssh.IGatewaySshService GatewaySsh
+
+<PageTitle>Network Tools - Network Optimizer</PageTitle>
+
+<div class="page-header">
+    <PageBackButton />
+    <h1>Network Tools</h1>
+    <p class="page-description">
+        Run ping or traceroute from any vantage to any target. Picking a UniFi device
+        as the source runs the probe over SSH on that device, which lets you isolate
+        whether a problem is on the server's path or on a specific link of your LAN.
+        You can also read an interface straight off the gateway - addresses and DHCP
+        lease, SFP module diagnostics, and resolved neighbors.
+    </p>
+</div>
+
+@if (_siteAgentOffline)
+{
+    <div class="alert alert-warning">
+        This site's probes run through its On-Site Agent, which isn't connected right now.
+        Ping, traceroute, and reading a Gateway interface can resume when the Agent reconnects.
+    </div>
+}
+
+<div class="card">
+    <div class="card-header">
+        <h2 class="card-title">Run a Probe</h2>
+    </div>
+    <div class="card-body">
+        <div class="form-group">
+            <label class="form-label">From (vantage)</label>
+            @* Selection rides on each option's selected flag: a value attribute on a select is
+               inert, so a vantage applied after first render never reached the control. *@
+            <select class="form-control" @onchange="OnVantageChanged">
+                @if (_probeVantages.Count > 0)
+                {
+                    @foreach (var vantage in _probeVantages)
+                    {
+                        <option value="@vantage.Key" selected="@(vantage.Key == _fromKey)">@vantage.Label</option>
+                    }
+                }
+                else
+                {
+                    <option value="server" selected="@(_fromKey == "server")">@(ExecutorFactory.ServerVantageIsAgent ? "On-Site Agent" : "Network Optimizer server")</option>
+                }
+                @foreach (var d in _devices)
+                {
+                    <option value="@($"device:{d.Mac}")" selected="@(_fromKey == $"device:{d.Mac}")">@LabelForDevice(d)</option>
+                }
+            </select>
+            @if (_probeVantages.Any(v => v.SourceBind != null))
+            {
+                <p class="form-help">
+                    A probe from a WAN vantage should go out that WAN: its first hops are
+                    that WAN's own gateway and upstream. If they aren't, the policy-based route or the
+                    interface bind isn't sending traffic where it was meant to.
+                </p>
+            }
+            @if (_fromKey == "server")
+            {
+                <p class="page-description" style="margin-top: 0.5rem;">
+                    @if (ExecutorFactory.ServerVantageIsAgent)
+                    {
+                        @:Probes run from this site's On-Site Agent (on the site's own network), not the central server.
+                    }
+                    else
+                    {
+                        @:Probes from this server. Capabilities: @_localCapabilities.
+                    }
+                </p>
+            }
+            else if (_sshCredentialsMissing)
+            {
+                <div class="alert alert-warning">
+                    Network Optimizer doesn't have working SSH credentials for this device yet.
+                    @if (_canConfigure)
+                    {
+                        <text>Configure them in <a href="/settings#device-ssh">Settings &gt; Device SSH</a> to run probes from this vantage.</text>
+                    }
+                    else
+                    {
+                        <text>A site administrator sets those up before probes can run from this vantage.</text>
+                    }
+                </div>
+            }
+        </div>
+
+        @if (_isGatewaySelected && _wanInterfaces.Count > 1)
+        {
+            <div class="form-group">
+                <label class="form-label">WAN interface</label>
+                <select class="form-control" style="max-width: 360px;" @bind="_selectedWanInterface">
+                    <option value="">Auto (OS routing table)</option>
+                    @foreach (var wan in _wanInterfaces)
+                    {
+                        var wanLabel = !string.IsNullOrEmpty(wan.NetworkGroup)
+                            ? $"{wan.Name} ({wan.NetworkGroup}) - {wan.Interface}"
+                            : $"{wan.Name} - {wan.Interface}";
+                        <option value="@wan.Interface">@wanLabel</option>
+                    }
+                </select>
+                <p class="form-help">Bind the probe to a specific WAN link. Useful on multi-WAN gateways.</p>
+            </div>
+        }
+
+        <div class="form-group">
+            <label class="form-label">To (target)</label>
+            <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+                <select class="form-control" style="max-width: 320px;"
+                        @onchange="OnTargetPresetChange">
+                    <option value="">Custom address</option>
+                    <optgroup label="External">
+                        <option value="ext:1.1.1.1">Cloudflare DNS (1.1.1.1)</option>
+                        <option value="ext:8.8.8.8">Google DNS (8.8.8.8)</option>
+                    </optgroup>
+                    @if (_devices.Any())
+                    {
+                        <optgroup label="Infrastructure">
+                            @foreach (var d in _devices)
+                            {
+                                <option value="@($"dev:{d.Mac}")">@LabelForDevice(d)</option>
+                            }
+                        </optgroup>
+                    }
+                </select>
+                <input type="text" class="form-control" @bind="_targetAddress"
+                       placeholder="hostname or IP" style="flex: 1; min-width: 180px;" />
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Probe Mode</label>
+            <select class="form-control" @bind="_probeMode">
+                <option value="@ProbeMode.Icmp">ICMP</option>
+                <option value="@ProbeMode.Tcp">TCP</option>
+                <option value="@ProbeMode.Udp">UDP (traceroute only)</option>
+            </select>
+        </div>
+
+        @if (_probeMode == ProbeMode.Tcp)
+        {
+            <div class="form-group">
+                <label class="form-label">TCP Port</label>
+                <input type="number" class="form-control" @bind="_port" min="1" max="65535" />
+            </div>
+        }
+
+        @if (!string.IsNullOrEmpty(_runError))
+        {
+            <div class="alert alert-danger">@_runError</div>
+        }
+
+        <div class="action-buttons" style="margin-top: 1rem;" data-tour="dns-lookup">
+            <button class="btn btn-primary" @onclick="RunPing" disabled="@(_running || !CanPing)"
+                    data-tooltip="@(_probeMode == ProbeMode.Udp ? "Ping runs over ICMP or TCP - UDP is traceroute-only." : null)">
+                @if (_running && _runningKind == "ping") { <span class="spinner-sm"></span> <span>Pinging...</span> }
+                else { <span>Ping</span> }
+            </button>
+            <button class="btn btn-secondary" @onclick="RunTraceroute" disabled="@(_running || !CanTraceroute)">
+                @if (_running && _runningKind == "trace") { <span class="spinner-sm"></span> <span>Tracing...</span> }
+                else { <span>Traceroute</span> }
+            </button>
+            <button class="btn btn-secondary" @onclick="RunLookup" disabled="@_running"
+                    data-tooltip="Resolves the target using this vantage's own DNS server.">
+                @if (_running && _runningKind == "dns") { <span class="spinner-sm"></span> <span>Looking up...</span> }
+                else { <span>DNS Lookup</span> }
+            </button>
+        </div>
+    </div>
+</div>
+
+@if (_pingResult != null)
+{
+    <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header">
+            <h2 class="card-title">Ping Result</h2>
+            <span class="status-badge @(_pingResult.Success ? "status-connected" : "status-error")">
+                @($"{_pingResult.Received}/{_pingResult.Sent}")
+                · @($"{_pingResult.LossPercent:0.#}% loss")
+            </span>
+        </div>
+        <div class="card-body">
+            <div class="form-group">
+                <label class="form-label">From</label>
+                <div class="form-value">@VantageLabel(_pingResult.Vantage.Id)</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Target</label>
+                <div class="form-value">
+                    @_pingResult.Target
+                    @if (!string.IsNullOrEmpty(_pingResult.ResolvedAddress))
+                    {
+                        <span>(@_pingResult.ResolvedAddress)</span>
+                    }
+                </div>
+            </div>
+            @if (_pingResult.RttAvgMs.HasValue)
+            {
+                <div class="form-group">
+                    <label class="form-label">RTT min / avg / max / jitter</label>
+                    <div class="form-value">
+                        @($"{_pingResult.RttMinMs:0.000}") / @($"{_pingResult.RttAvgMs:0.000}") /
+                        @($"{_pingResult.RttMaxMs:0.000}") /
+                        @(_pingResult.JitterMs.HasValue ? $"{_pingResult.JitterMs:0.000}" : "-") ms
+                    </div>
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(_pingResult.ErrorMessage))
+            {
+                <div class="alert alert-warning">@_pingResult.ErrorMessage</div>
+            }
+        </div>
+    </div>
+}
+
+@if (_dnsResult != null)
+{
+    <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header">
+            <h2 class="card-title">DNS Result</h2>
+            <span class="status-badge @(_dnsResult.Success ? "status-connected" : "status-error")">
+                @(_dnsResult.Success
+                    ? (_dnsResult.Addresses.Count > 0 ? $"{_dnsResult.Addresses.Count} address(es)" : "Name found")
+                    : _dnsResult.NotFound ? "Name not found" : "No answer")
+            </span>
+        </div>
+        <div class="card-body">
+            <div class="form-group">
+                <label class="form-label">From</label>
+                <div class="form-value">@VantageLabel(_dnsResult.Vantage.Id)</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Target</label>
+                <div class="form-value">@_dnsResult.Target.Address</div>
+            </div>
+            @* Several device classes name no resolver at all, so the row is omitted rather
+               than shown empty or filled with a guess. *@
+            @if (!string.IsNullOrEmpty(_dnsResult.Resolver))
+            {
+                <div class="form-group">
+                    <label class="form-label">Resolver</label>
+                    <div class="form-value">@_dnsResult.Resolver</div>
+                </div>
+            }
+            @if (_dnsResult.Addresses.Count > 0)
+            {
+                <div class="form-group">
+                    <label class="form-label">Resolves to</label>
+                    <div class="form-value">
+                        @foreach (var address in _dnsResult.Addresses)
+                        {
+                            <div>@address</div>
+                        }
+                    </div>
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(_dnsResult.CanonicalName))
+            {
+                <div class="form-group">
+                    <label class="form-label">Name</label>
+                    <div class="form-value">@_dnsResult.CanonicalName</div>
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(_dnsResult.ErrorMessage))
+            {
+                <div class="alert alert-warning">@_dnsResult.ErrorMessage</div>
+            }
+        </div>
+    </div>
+}
+
+@if (_traceResult != null)
+{
+    <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header">
+            <h2 class="card-title">Traceroute Result</h2>
+            <span class="status-badge @(_traceResult.Reached ? "status-connected" : "status-error")">
+                @(_traceResult.Reached ? "Target reached" : "Did not reach target")
+                · @_traceResult.ModeUsed.ToString().ToUpperInvariant()
+            </span>
+        </div>
+        <div class="card-body">
+            <div class="form-group">
+                <label class="form-label">From</label>
+                <div class="form-value">@VantageLabel(_traceResult.Vantage.Id)</div>
+            </div>
+            <div class="table-responsive">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Hop</th>
+                        <th>Address</th>
+                        <th>RTT avg (ms)</th>
+                        <th>Responses</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var hop in _traceResult.Hops)
+                    {
+                        <tr>
+                            <td>@hop.HopNumber</td>
+                            <td>
+                                @if (hop.Responded)
+                                {
+                                    @if (!string.IsNullOrEmpty(hop.Hostname))
+                                    { <span>@hop.Hostname (@hop.Address)</span> }
+                                    else
+                                    { <span>@hop.Address</span> }
+                                }
+                                else
+                                {
+                                    <span class="text-muted">* * *</span>
+                                }
+                            </td>
+                            <td>@(hop.RttAvgMs.HasValue ? $"{hop.RttAvgMs:0.0}" : "-")</td>
+                            <td>@hop.Responses / @hop.Probes</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            </div>
+            @if (!string.IsNullOrEmpty(_traceResult.ErrorMessage))
+            {
+                <div class="alert alert-warning">@_traceResult.ErrorMessage</div>
+            }
+        </div>
+    </div>
+}
+
+@if (_hasGateway)
+{
+    <div class="card" style="margin-top: 1.5rem;" data-tour="gateway-interface">
+        <div class="card-header">
+            <h2 class="card-title">Inspect a Gateway Interface</h2>
+        </div>
+        <div class="card-body">
+            <p class="page-description" style="margin-bottom: 0.75rem;">
+                Read-only detail straight off the gateway: the interface's addresses and, on a
+                DHCP WAN, how long the ISP lease has left; the SFP module's transceiver and
+                diagnostic readings; and the neighbors it has resolved on the link. Nothing here
+                changes gateway state or disturbs the connection.
+            </p>
+
+            @if (!_gatewaySshConfigured)
+            {
+                <div class="alert alert-warning">
+                    Gateway SSH isn't configured, so Network Optimizer can't read these.
+                    @if (_canConfigure)
+                    {
+                        <text>Set it up in <a href="/settings#gateway-ssh">Settings &gt; Gateway SSH</a>.</text>
+                    }
+                    else
+                    {
+                        <text>A site administrator sets that up.</text>
+                    }
+                </div>
+            }
+
+            <div class="form-group">
+                <label class="form-label">Interface</label>
+                <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+                    <select class="form-control" style="max-width: 320px;" @onchange="OnDiagInterfacePresetChange">
+                        <option value="">Custom interface</option>
+                        @if (_wanInterfaces.Any())
+                        {
+                            <optgroup label="WAN">
+                                @foreach (var wan in _wanInterfaces)
+                                {
+                                    var wanLabel = !string.IsNullOrEmpty(wan.NetworkGroup)
+                                        ? $"{wan.Name} ({wan.NetworkGroup}) - {wan.Interface}"
+                                        : $"{wan.Name} - {wan.Interface}";
+                                    <option value="@wan.Interface" selected="@(wan.Interface == _diagInterface)">@wanLabel</option>
+                                }
+                            </optgroup>
+                        }
+                    </select>
+                    <input type="text" class="form-control" @bind="_diagInterface"
+                           placeholder="eth4" style="flex: 1; min-width: 180px;" />
+                </div>
+                <p class="form-help">
+                    Pick a WAN to see its ISP lease, or type any interface on the gateway
+                    (an SFP port, a LAN bridge) to inspect it.
+                </p>
+            </div>
+
+            @if (!string.IsNullOrEmpty(_diagError))
+            {
+                <div class="alert alert-danger">@_diagError</div>
+            }
+
+            <div class="action-buttons" style="margin-top: 1rem;">
+                <button class="btn btn-primary" @onclick="RunGatewayDiagnostics"
+                        disabled="@(_diagRunning || !CanRunDiagnostics)">
+                    @if (_diagRunning) { <span class="spinner-sm"></span> <span>Reading...</span> }
+                    else { <span>Read interface</span> }
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_diagResult?.InterfaceInfo != null)
+{
+    var iface = _diagResult.InterfaceInfo;
+    <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header">
+            <h2 class="card-title">Addresses and DHCP Lease</h2>
+            <span class="status-badge @(string.Equals(iface.State, "UP", StringComparison.OrdinalIgnoreCase) ? "status-connected" : "status-error")">
+                @iface.Name · @(iface.State ?? "unknown")
+            </span>
+        </div>
+        <div class="card-body">
+            <div class="form-group">
+                <label class="form-label">Link</label>
+                <div class="form-value">
+                    @(iface.MacAddress ?? "-")
+                    @if (iface.Mtu.HasValue) { <span> · MTU @iface.Mtu</span> }
+                    @if (!string.IsNullOrEmpty(iface.DefaultGateway)) { <span> · default via @iface.DefaultGateway</span> }
+                </div>
+            </div>
+            @if (iface.Addresses.Count == 0)
+            {
+                <p class="page-description">No addresses configured on this interface.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Address</th>
+                            <th>Subnet</th>
+                            <th>Assignment</th>
+                            <th>Lease remaining</th>
+                            <th>Expires</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var addr in iface.Addresses)
+                        {
+                            <tr>
+                                <td>@addr.Cidr</td>
+                                <td>@(addr.SubnetMask ?? (addr.PrefixLength.HasValue ? $"/{addr.PrefixLength}" : "-"))</td>
+                                <td>@AssignmentLabel(addr)</td>
+                                <td>@LeaseRemainingLabel(addr)</td>
+                                <td>@LeaseExpiryLabel(addr, _diagResult.CollectedAt)</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+                <p class="form-help">
+                    A dynamic address is a DHCP lease; the gateway renews it around halfway
+                    through. The remaining time is how long the address stays valid if no renewal
+                    succeeds.
+                </p>
+            }
+        </div>
+    </div>
+}
+else if (_diagResult != null && !string.IsNullOrEmpty(_diagResult.InterfaceError))
+{
+    <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header"><h2 class="card-title">Addresses and DHCP lease</h2></div>
+        <div class="card-body">
+            <div class="alert alert-warning">@_diagResult.InterfaceError</div>
+        </div>
+    </div>
+}
+
+@if (_diagResult != null)
+{
+    <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header">
+            <h2 class="card-title">SFP Module</h2>
+            @if (!string.IsNullOrEmpty(_diagResult.SfpInterface) && _diagResult.SfpInterface != _diagResult.Interface)
+            {
+                <span class="status-badge status-active">read from @_diagResult.SfpInterface</span>
+            }
+        </div>
+        <div class="card-body">
+            @if (_diagResult.SfpModule != null)
+            {
+                <div class="table-responsive">
+                <table class="data-table">
+                    <tbody>
+                        @foreach (var field in _diagResult.SfpModule.Highlights())
+                        {
+                            <tr>
+                                <td class="detail-label">@field.Name</td>
+                                <td class="detail-value">@field.Value</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+                <details class="setup-guide" style="margin-top: 1rem;">
+                    <summary>All transceiver fields</summary>
+                    <div class="setup-guide-content">
+                        <div class="table-responsive">
+                        <table class="data-table">
+                            <tbody>
+                                @foreach (var field in _diagResult.SfpModule.Fields)
+                                {
+                                    <tr>
+                                        <td class="detail-label">@field.Name</td>
+                                        <td class="detail-value">@field.Value</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                        </div>
+                    </div>
+                </details>
+            }
+            else
+            {
+                <p class="page-description">@(_diagResult.SfpError ?? "No transceiver data for this interface.")</p>
+            }
+        </div>
+    </div>
+
+    <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header"><h2 class="card-title">Neighbors</h2></div>
+        <div class="card-body">
+            @if (_diagResult.Neighbors.Count > 0)
+            {
+                <div class="table-responsive">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Address</th>
+                            <th>MAC</th>
+                            <th class="hide-mobile">Vendor</th>
+                            <th>State</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var neighbor in _diagResult.Neighbors)
+                        {
+                            <tr>
+                                <td>@neighbor.IpAddress</td>
+                                <td>@(neighbor.MacAddress ?? "-")</td>
+                                <td class="hide-mobile">@(neighbor.Vendor ?? "-")</td>
+                                <td>
+                                    @(neighbor.State ?? "-")
+                                    @if (neighbor.IsRouter)
+                                    {
+                                        <span class="status-badge status-active" style="margin-left: 0.4rem;">router</span>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+            else
+            {
+                <p class="page-description">@(_diagResult.NeighborError ?? "No neighbors in the table for this interface.")</p>
+            }
+
+            @if (_diagResult.RawOutput.Count > 0)
+            {
+                <details class="setup-guide" style="margin-top: 1.25rem;">
+                    <summary>Raw command output</summary>
+                    <div class="setup-guide-content">
+                        @foreach (var entry in _diagResult.RawOutput)
+                        {
+                            <p><strong>@entry.Key</strong></p>
+                            <pre class="gateway-diag-raw">@(string.IsNullOrWhiteSpace(entry.Value) ? "(no output)" : entry.Value.Trim())</pre>
+                        }
+                    </div>
+                </details>
+            }
+        </div>
+    </div>
+}
+
+@if (_hasGateway)
+{
+    <div class="card dmesg-card" data-tour="gateway-diagnostics">
+        <div class="card-header dmesg-card-header">
+            <h2 class="card-title">Gateway Diagnostics</h2>
+            <button class="btn btn-primary btn-sm"
+                    disabled="@(!_gatewaySshConfigured || _siteAgentOffline || _dmesgRunning)"
+                    @onclick="RunDmesgAsync">
+                @if (_dmesgRunning)
+                {
+                    <span class="spinner spinner-sm"></span>
+                    <span>Running...</span>
+                }
+                else
+                {
+                    <span>Run Diagnostics</span>
+                }
+            </button>
+        </div>
+        <div class="card-body">
+            <p class="page-description dmesg-description">
+                Kernel message log from the gateway, parsed into categories. Noise like
+                connection tracking churn is counted rather than listed, so the findings
+                that matter stand out.
+            </p>
+
+            @if (!_gatewaySshConfigured && !_siteAgentOffline)
+            {
+                <p class="text-muted">
+                    Gateway SSH credentials haven't been configured.
+                    @if (_canConfigure)
+                    {
+                        <a href="/settings#gateway-ssh">Set them up in Settings - Connection.</a>
+                    }
+                </p>
+            }
+
+            @if (_dmesgError != null)
+            {
+                <div class="alert alert-danger">@_dmesgError</div>
+            }
+
+            @if (_dmesgReport != null)
+            {
+                @if (_dmesgReport.RunError != null)
+                {
+                    <div class="alert alert-danger">@_dmesgReport.RunError</div>
+                }
+                else
+                {
+                    <div class="dmesg-stats">
+                        @_dmesgReport.TotalLines.ToString("N0") lines
+                        @if (_dmesgReport.ApproximateUptime.HasValue)
+                        {
+                            var up = _dmesgReport.ApproximateUptime.Value;
+                            <span> · uptime ~@(up.Days > 0 ? $"{up.Days}d {up.Hours}h" : $"{up.Hours}h {up.Minutes}m")</span>
+                        }
+                        @if (_dmesgReport.RingBufferDominatedByNoise)
+                        {
+                            <span> · ring buffer dominated by noise (boot events may be missing)</span>
+                        }
+                    </div>
+
+                    @if (_dmesgReport.Categories.Count == 0)
+                    {
+                        <p class="text-muted">No notable events found.</p>
+                    }
+                    else
+                    {
+                        @foreach (var cat in _dmesgReport.Categories)
+                        {
+                            <details class="dmesg-category">
+                                <summary class="dmesg-category-header">
+                                    <span class="status-dot @SeverityDotClass(cat.Severity)"></span>
+                                    <strong class="dmesg-category-title">@cat.Title</strong>
+                                    <span class="dmesg-category-summary">@cat.Summary</span>
+                                </summary>
+                                @if (cat.Lines.Count > 0)
+                                {
+                                    <pre class="dmesg-category-output">@string.Join("\n", cat.Lines)</pre>
+                                }
+                            </details>
+                        }
+                    }
+
+                    <details class="dmesg-raw">
+                        <summary class="dmesg-raw-toggle">
+                            Show raw dmesg output
+                        </summary>
+                        <pre class="dmesg-raw-output">@_dmesgReport.RawOutput.Trim()</pre>
+                    </details>
+                }
+            }
+        </div>
+    </div>
+}
+
+<SiteAdminOnly>
+    <div class="card dmesg-card" data-tour="console-support-file">
+        <div class="card-header dmesg-card-header">
+            <h2 class="card-title">Console Support File</h2>
+            @if (ConnectionService.IsConnected && !ConnectionService.IsApiKeyAuth)
+            {
+                <div class="support-file-actions">
+                    <label class="checkbox-label"><input type="checkbox" @bind="_supportFileIncludeAll" /><span>Include all applications</span></label>
+                    <button class="btn btn-primary btn-sm"
+                            disabled="@_supportFileRunning"
+                            @onclick="GenerateSupportFileAsync">
+                        @if (_supportFileRunning)
+                        {
+                            <span class="spinner spinner-sm"></span>
+                            <span>Generating...</span>
+                        }
+                        else
+                        {
+                            <span>Generate &amp; Download</span>
+                        }
+                    </button>
+                </div>
+            }
+        </div>
+        <div class="card-body">
+            @if (ConnectionService.IsApiKeyAuth)
+            {
+                <p class="text-muted dmesg-stats">
+                    Support file generation requires a username and password connection to the
+                    UniFi Console, with the Super Admin role or the Control Plane - Full Admin
+                    permission. API key connections don't have the UniFi OS session this needs.
+                    @if (_canConfigure)
+                    {
+                        <a href="/settings#console-connection">Switch to username/password in Settings - Connection.</a>
+                    }
+                </p>
+            }
+            else if (!ConnectionService.IsConnected)
+            {
+                <p class="text-muted dmesg-stats">Not connected to a UniFi Console.</p>
+            }
+            else
+            {
+                <p class="page-description dmesg-description">
+                    Generate a full UniFi Support File from the console and download it.
+                    This is the same bundle the UniFi Console UI produces under
+                    Settings - Control Plane - Console - the format Ubiquiti Support
+                    expects when filing a ticket.
+                </p>
+            }
+
+            @if (_supportFileError != null)
+            {
+                <div class="alert alert-danger">@_supportFileError</div>
+            }
+
+            @if (_supportFileRunning)
+            {
+                <p class="dmesg-stats">
+                    The console is bundling diagnostics from all installed applications.
+                    This can take a few minutes on consoles running Protect or other apps.
+                </p>
+            }
+        </div>
+    </div>
+</SiteAdminOnly>
+
+<style>
+    .dmesg-card { margin-top: 1.5rem; }
+
+    .dmesg-card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+
+    .dmesg-description { margin-bottom: 0.75rem; }
+
+    .dmesg-stats {
+        margin-bottom: 1rem;
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+    }
+
+    .dmesg-category { margin-bottom: 0.75rem; }
+
+    .dmesg-category-header {
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .dmesg-category-title { font-size: 0.9rem; }
+
+    .dmesg-category-summary {
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+    }
+
+    .dmesg-category-output {
+        margin-top: 0.5rem;
+        max-height: 300px;
+        overflow-y: auto;
+    }
+
+    .dmesg-raw { margin-top: 1rem; }
+
+    .dmesg-raw-toggle {
+        cursor: pointer;
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+    }
+
+    .dmesg-raw-output {
+        margin-top: 0.5rem;
+        max-height: 400px;
+        overflow-y: auto;
+    }
+
+    .support-file-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+</style>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>
+    /// Whether this caller can open the Settings pages this page points at. Copy only - the controls
+    /// themselves are gated by their own wrappers.
+    /// </summary>
+    private bool _canConfigure;
+
+    private string _fromKey = "server"; // "server" or "device:{mac}"
+    private string _targetAddress = "1.1.1.1";
+    private ProbeMode _probeMode = ProbeMode.Icmp;
+    private int _port = 443;
+    private bool _running;
+    private string _runningKind = string.Empty;
+    private string _localCapabilities = "detecting...";
+    private string? _runError;
+    private bool _sshCredentialsMissing;
+
+    private List<DiscoveredDevice> _devices = new();
+    private List<WanInterfaceInfo> _wanInterfaces = new();
+    private string _selectedWanInterface = "";
+    private bool _isGatewaySelected;
+
+    // Probe origins to choose between - the server and the site's connected agents, each labeled
+    // with the WAN context it probes for. Empty on a site with only one origin, which is where
+    // the picker stays out of the way and the vantage list reads exactly as it always has.
+    private List<ProbeVantageOption> _probeVantages = new();
+
+    /// <summary>
+    /// Remembered vantage, per site. Which box a probe runs from is a property of the site being
+    /// looked at, not of the browser, so a multi-site operator doesn't carry one site's WAN
+    /// vantage into the next.
+    /// </summary>
+    private string VantageStorageKey => SiteContext.ScopeStorageKey("networkToolsVantage");
+
+    private PingProbeResult? _pingResult;
+    private DnsLookupResult? _dnsResult;
+    private TracerouteResult? _traceResult;
+
+    // Gateway interface diagnostics. The section only exists when the site has a gateway,
+    // since every command it runs is gateway-only; the SSH check drives the "configure
+    // credentials" hint rather than hiding the section, so the user can see what it offers.
+    private bool _hasGateway;
+    private bool _gatewaySshConfigured;
+    private string _diagInterface = "";
+    private GatewayDiagnosticsResult? _diagResult;
+    private bool _diagRunning;
+    private string? _diagError;
+
+    // Gateway dmesg diagnostics
+    private DmesgDiagnosticsReport? _dmesgReport;
+    private bool _dmesgRunning;
+    private string? _dmesgError;
+
+    // Console support file
+    private bool _supportFileRunning;
+    private string? _supportFileError;
+    private bool _supportFileIncludeAll;
+
+    private bool CanRunDiagnostics =>
+        _gatewaySshConfigured && !_siteAgentOffline && !string.IsNullOrWhiteSpace(_diagInterface);
+
+    private bool CanRun => !string.IsNullOrWhiteSpace(_targetAddress) && !_sshCredentialsMissing;
+
+    // Ping supports ICMP and TCP (there is no UDP ping); traceroute supports all three
+    // modes (ICMP, UDP, TCP). Both also need the site's agent online on an agent-backed site.
+    private bool CanPing => CanRun && !_siteAgentOffline && _probeMode != ProbeMode.Udp;
+    private bool CanTraceroute => CanRun && !_siteAgentOffline;
+
+    // Agent-backed secondary site whose on-site agent isn't currently connected. Probes run
+    // through that agent (server vantage over the tunnel, device vantages over SSH), so they
+    // can't run until it reconnects; the poll re-enables them and reloads the device list.
+    private bool _siteAgentOffline;
+    private bool _consoleDataLoaded;
+    private System.Threading.Timer? _agentStatusTimer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _canConfigure = AuthState is null
+            || (await Authz.AuthorizeAsync((await AuthState).User, SiteContext.Slug, Policies.SiteAdmin)).Succeeded;
+
+        var capTask = LocalProbe.GetCapabilityAsync();
+        var devicesTask = LoadDevicesAsync();
+        var wanTask = LoadWanInterfacesAsync();
+        var gatewaySshTask = LoadGatewaySshStateAsync();
+        await Task.WhenAll(capTask, devicesTask, wanTask, gatewaySshTask);
+        _localCapabilities = capTask.Result.Describe();
+        _consoleDataLoaded = ConnectionService.IsConnected;
+
+        if (!_consoleDataLoaded)
+            _ = WaitForConnectionThenReloadAsync();
+
+        await LoadProbeVantagesAsync();
+        await ApplyInitialVantageAsync();
+        await RefreshAgentAvailabilityAsync();
+        StartAgentStatusPolling();
+    }
+
+    private async Task WaitForConnectionThenReloadAsync()
+    {
+        if (!await ConnectionService.WaitForConnectionAsync()) return;
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                await LoadDevicesAsync();
+                await LoadWanInterfacesAsync();
+                await LoadGatewaySshStateAsync();
+                _consoleDataLoaded = true;
+                StateHasChanged();
+            });
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Vantage to start on, sent by whatever linked here - the Verify action on a WAN vantage is
+    /// the one that does. Takes precedence over the remembered choice: the link is the user asking
+    /// for a specific origin now, and it is checked against the real list, so a stale link falls
+    /// back rather than pointing the page at a vantage the select cannot show.
+    /// </summary>
+    [SupplyParameterFromQuery(Name = "from")]
+    public string? FromParam { get; set; }
+
+    /// <summary>
+    /// Decides the starting vantage once, in OnInitializedAsync after the vantage and device
+    /// lists have loaded, so no render can race the decision: a from= link first, then the
+    /// remembered choice, then the list's first entry. During prerender the localStorage read
+    /// throws and the fallback stands; the interactive circuit re-runs the decision in full.
+    /// </summary>
+    private async Task ApplyInitialVantageAsync()
+    {
+        // The link outranks the remembered choice and is never persisted - it overrides this
+        // load only. server and device keys resolve even when the vantage list is empty,
+        // since neither comes from it.
+        if (!string.IsNullOrEmpty(FromParam))
+        {
+            var keys = _probeVantages.Select(v => v.Key)
+                .Concat(new[] { ProbeVantages.ServerKey })
+                .Concat(_devices.Select(d => $"device:{d.Mac}"))
+                .ToList();
+            var resolved = ResolveVantageFromLink(FromParam, keys);
+            if (resolved != null)
+            {
+                ApplyVantage(resolved);
+                return;
+            }
+        }
+
+        var stored = await ReadStoredVantageAsync();
+        if (stored != null)
+        {
+            ApplyVantage(stored);
+            return;
+        }
+
+        EnsureDefaultVantage();
+    }
+
+    /// <summary>
+    /// The remembered vantage, or null when nothing valid is stored. A remembered agent that has
+    /// since been removed (or a device that is gone) must not leave the page pointing at a
+    /// vantage the select can't show.
+    /// </summary>
+    private async Task<string?> ReadStoredVantageAsync()
+    {
+        try
+        {
+            var stored = await JS.InvokeAsync<string>("localStorage.getItem", VantageStorageKey);
+            if (!string.IsNullOrEmpty(stored)
+                && (_probeVantages.Any(v => v.Key == stored)
+                    || (stored.StartsWith("device:") && _devices.Any(d => $"device:{d.Mac}" == stored))))
+                return stored;
+        }
+        catch { /* prerendering, or no localStorage - the default vantage is fine */ }
+        return null;
+    }
+
+    /// <summary>
+    /// With the server not offering itself, the default "server" key names nothing in the
+    /// vantage list; start on the first origin that does.
+    /// </summary>
+    private void EnsureDefaultVantage()
+    {
+        if (_probeVantages.Count > 0 && _probeVantages.All(v => v.Key != _fromKey) && !_fromKey.StartsWith("device:"))
+            ApplyVantage(_probeVantages[0].Key);
+    }
+
+    /// <summary>
+    /// Which offered vantage a "from" link means. Exact key first, then the first vantage
+    /// belonging to the named agent.
+    /// </summary>
+    /// <remarks>
+    /// Callers can only name an agent (<c>agent:7</c>): a WAN context records the agent that
+    /// probes it and no vantage id, while the picker keys an agent's entries per vantage
+    /// (<c>agent:7:wan2</c>). Returns null when nothing on offer matches, leaving the
+    /// remembered choice alone.
+    /// </remarks>
+    internal static string? ResolveVantageFromLink(string? fromParam, IEnumerable<string> vantageKeys)
+    {
+        if (string.IsNullOrEmpty(fromParam)) return null;
+
+        var keys = vantageKeys as IReadOnlyList<string> ?? vantageKeys.ToList();
+        return keys.FirstOrDefault(k => string.Equals(k, fromParam, StringComparison.OrdinalIgnoreCase))
+               ?? keys.FirstOrDefault(k => k.StartsWith(fromParam + ":", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Builds the vantage list: this site's connected agents, each labeled with the WAN context
+    /// assigned to it and whether it runs on the gateway, alongside the server when the server is
+    /// what probes this site. Best-effort - a site whose console or registry can't be read keeps
+    /// the single server vantage it has always had.
+    /// </summary>
+    private async Task LoadProbeVantagesAsync()
+    {
+        try
+        {
+            var connections = TunnelRegistry.GetForSite(SiteContext.Slug);
+            if (connections.Count == 0)
+            {
+                _probeVantages = new();
+                return;
+            }
+
+            List<WanContext> contexts;
+            await using (var siteDb = SiteDb.CreateForSite(SiteContext.Slug, SiteContext.IsDefault))
+                contexts = await siteDb.WanContexts.AsNoTracking().ToListAsync();
+
+            Dictionary<int, string> agentNames;
+            await using (var mainDb = await MainDbFactory.CreateDbContextAsync())
+            {
+                var site = await mainDb.Sites.AsNoTracking().FirstOrDefaultAsync(s => s.Slug == SiteContext.Slug);
+                agentNames = site == null
+                    ? new()
+                    : await mainDb.SiteAgents.AsNoTracking()
+                        .Where(a => a.SiteId == site.Id)
+                        .ToDictionaryAsync(a => a.Id, a => a.Name);
+            }
+
+            var wans = await LoadWanSummariesAsync();
+            var agents = new List<ProbeVantageAgent>();
+            foreach (var connection in connections)
+            {
+                var bindings = contexts
+                    .Where(c => c.AgentId == connection.AgentId)
+                    .Select(c => new ProbeVantageBinding(
+                        c.Id,
+                        c.Name,
+                        WanLabelFor(wans, c.WanInterface),
+                        c.InterfaceName ?? c.ProbeSourceIp))
+                    .ToList();
+                agents.Add(new ProbeVantageAgent(
+                    connection.AgentId,
+                    agentNames.GetValueOrDefault(connection.AgentId, connection.AgentName),
+                    // TODO(#1106): use the durable per-agent overload
+                    // IsAgentOnGatewayAsync(slug, agentId, candidates) instead - this one has no
+                    // persisted verdict, so a console that has not answered yet mislabels the
+                    // vantage.
+                    await OnGatewayDetector.MatchGatewayAddressAsync(SiteContext.Slug, connection.HostAddresses) != null,
+                    bindings));
+            }
+
+            _probeVantages = ProbeVantages.ForPicker(
+                serverProbesSite: !ExecutorFactory.ServerVantageIsAgent,
+                serverLabel: "Network Optimizer server",
+                agents);
+        }
+        catch
+        {
+            _probeVantages = new();
+        }
+    }
+
+    /// <summary>The site's WANs for labeling, or none when the console can't answer.</summary>
+    private async Task<IReadOnlyList<WanSummary>> LoadWanSummariesAsync()
+    {
+        try { return await PathView.GetWansAsync(); }
+        catch { return Array.Empty<WanSummary>(); }
+    }
+
+    /// <summary>A WAN key in UniFi's own wording ("My ISP WAN2"), or null when there is no WAN to name.</summary>
+    private static string? WanLabelFor(IReadOnlyList<WanSummary> wans, string? wanInterface)
+    {
+        if (string.IsNullOrEmpty(wanInterface)) return null;
+        var wan = wans.FirstOrDefault(w =>
+            string.Equals(w.WanInterface, wanInterface, StringComparison.OrdinalIgnoreCase));
+        return GatewayWanHelper.FormatWanLabel(
+            wan?.FriendlyName, GatewayWanHelper.WanIndexFromKey(wanInterface), null, null);
+    }
+
+    /// <summary>
+    /// Recomputes whether this site's on-site agent is offline. Probes route through the
+    /// agent for an agent-backed secondary site, so an offline agent locks them out; the
+    /// poll re-enables them when it reconnects. The default site never routes via agent.
+    /// </summary>
+    private async Task RefreshAgentAvailabilityAsync()
+    {
+        _siteAgentOffline = !SiteContext.IsDefault
+            && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug)
+            && !TunnelRouting.IsAgentOnline(SiteContext.Slug);
+    }
+
+    /// <summary>
+    /// Polls the site's agent tunnel so probes re-enable on their own once the agent
+    /// reconnects, and loads the console-dependent device list the moment the console
+    /// (which follows the agent) comes back. Only agent-backed secondary sites poll.
+    /// </summary>
+    private void StartAgentStatusPolling()
+    {
+        if (SiteContext.IsDefault) return;
+        _agentStatusTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    var before = _siteAgentOffline;
+                    await RefreshAgentAvailabilityAsync();
+                    var changed = before != _siteAgentOffline;
+
+                    // The vantage list is built from live tunnels, so an agent that was down when
+                    // the page opened would otherwise never appear in it.
+                    if (changed)
+                    {
+                        await LoadProbeVantagesAsync();
+                        EnsureDefaultVantage();
+                    }
+
+                    if (!_consoleDataLoaded && ConnectionService.IsConnected)
+                    {
+                        await LoadDevicesAsync();
+                        await LoadWanInterfacesAsync();
+                        _consoleDataLoaded = true;
+                        changed = true;
+                    }
+
+                    if (changed)
+                        StateHasChanged();
+                });
+            }
+            catch { /* keep the timer alive */ }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    public void Dispose()
+    {
+        _agentStatusTimer?.Dispose();
+        _agentStatusTimer = null;
+    }
+
+    private async Task LoadDevicesAsync()
+    {
+        try
+        {
+            if (!ConnectionService.IsConnected) return;
+            var devices = await ConnectionService.GetDiscoveredDevicesAsync();
+            _devices = devices?
+                .Where(d => !string.IsNullOrEmpty(d.Mac) && !string.IsNullOrEmpty(d.DisplayIpAddress))
+                .OrderBy(d => d.Type)
+                .ThenBy(d => d.Name)
+                .ToList() ?? new();
+            _hasGateway = _devices.Any(d => d.Type == DeviceType.Gateway);
+        }
+        catch { _devices = new(); }
+    }
+
+    private async Task LoadWanInterfacesAsync()
+    {
+        try
+        {
+            if (!ConnectionService.IsConnected) return;
+            _wanInterfaces = await SqmService.GetWanInterfacesFromControllerAsync();
+            // Start on the primary WAN: the lease countdown that prompted this is a WAN
+            // question, and it saves typing an interface name nobody memorizes.
+            if (string.IsNullOrEmpty(_diagInterface))
+                _diagInterface = _wanInterfaces.OrderBy(w => w.WanIndex).FirstOrDefault()?.Interface ?? "";
+        }
+        catch { _wanInterfaces = new(); }
+    }
+
+    /// <summary>
+    /// Whether gateway SSH is usable, which is what the diagnostics run needs. Only reads
+    /// the saved settings - it never opens a connection, so loading the page costs nothing.
+    /// </summary>
+    private async Task LoadGatewaySshStateAsync()
+    {
+        try
+        {
+            var settings = await GatewaySsh.GetSettingsAsync();
+            _gatewaySshConfigured = settings.Enabled
+                && !string.IsNullOrEmpty(settings.Username)
+                && settings.HasCredentials;
+        }
+        catch { _gatewaySshConfigured = false; }
+    }
+
+    private void OnDiagInterfacePresetChange(ChangeEventArgs e)
+    {
+        var value = e.Value?.ToString() ?? string.Empty;
+        // The blank "Custom interface" option leaves whatever is typed in the box alone.
+        if (!string.IsNullOrEmpty(value)) _diagInterface = value;
+    }
+
+    private async Task RunGatewayDiagnostics()
+    {
+        _diagRunning = true;
+        _diagError = null;
+        _diagResult = null;
+        StateHasChanged();
+        try
+        {
+            var result = await GatewayDiagnostics.RunAsync(_diagInterface.Trim());
+            if (!string.IsNullOrEmpty(result.RunError))
+                _diagError = result.RunError;
+            else
+                _diagResult = result;
+        }
+        catch (Exception ex)
+        {
+            _diagError = $"Couldn't read the interface: {ex.Message}";
+        }
+        finally
+        {
+            _diagRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task RunDmesgAsync()
+    {
+        _dmesgRunning = true;
+        _dmesgError = null;
+        _dmesgReport = null;
+        StateHasChanged();
+        try
+        {
+            _dmesgReport = await DmesgDiagnostics.RunAsync();
+        }
+        catch (Exception ex)
+        {
+            _dmesgError = $"Couldn't run dmesg: {ex.Message}";
+        }
+        finally
+        {
+            _dmesgRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task GenerateSupportFileAsync()
+    {
+        _supportFileRunning = true;
+        _supportFileError = null;
+        StateHasChanged();
+        try
+        {
+            var result = await SupportFile.GenerateAndDownloadAsync(networkOnly: !_supportFileIncludeAll);
+            if (!result.Success)
+            {
+                _supportFileError = result.Error;
+                return;
+            }
+
+            var token = NetworkOptimizer.Web.Endpoints.SupportFileEndpoints.Stage(
+                result.TempFilePath!, result.Filename ?? "support-file.tgz");
+            await JS.InvokeVoidAsync("open", $"/api/support-file/download/{token}", "_self");
+        }
+        catch (Exception ex)
+        {
+            _supportFileError = $"Couldn't generate the support file: {ex.Message}";
+        }
+        finally
+        {
+            _supportFileRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private static string SeverityDotClass(DmesgSeverity severity) => severity switch
+    {
+        DmesgSeverity.Error => "error",
+        DmesgSeverity.Warning => "provisioning",
+        _ => "online"
+    };
+
+    /// <summary>How the address got there: a DHCP lease, or configured by hand.</summary>
+    private static string AssignmentLabel(GatewayInterfaceAddress addr) =>
+        addr.IsDynamic ? "DHCP" : "Static";
+
+    /// <summary>
+    /// Time left on the lease. A static address (or an IPv6 address with an infinite
+    /// lifetime) reports "forever" rather than a countdown, so it reads as "never expires".
+    /// </summary>
+    private static string LeaseRemainingLabel(GatewayInterfaceAddress addr) =>
+        addr.ValidLifetime is TimeSpan span
+            ? TimeFormatHelper.FormatDuration(span)
+            : "Never expires";
+
+    /// <summary>Absolute local expiry, counted from when the commands actually ran.</summary>
+    private static string LeaseExpiryLabel(GatewayInterfaceAddress addr, DateTime collectedAtUtc) =>
+        addr.ValidLifetime is TimeSpan span
+            ? collectedAtUtc.Add(span).ToLocalTime().ToString("MMM d, yyyy HH:mm")
+            : "-";
+
+    private async Task OnVantageChanged(ChangeEventArgs e)
+    {
+        ApplyVantage(e.Value?.ToString() ?? "server");
+        // Saved whatever the vantage list holds: device and server keys never came from it, so
+        // gating on it lost a hand-picked device vantage on any site whose list came back empty.
+        // A deep link deliberately does not reach here - it overrides the load, not the choice.
+        try { await JS.InvokeVoidAsync("localStorage.setItem", VantageStorageKey, _fromKey); }
+        catch { /* remembering the vantage is best-effort */ }
+    }
+
+    /// <summary>Selects a vantage and resets the per-vantage state that only applies to the old one.</summary>
+    private void ApplyVantage(string key)
+    {
+        _fromKey = key;
+        _selectedWanInterface = "";
+        _sshCredentialsMissing = false;
+
+        if (_fromKey.StartsWith("device:"))
+        {
+            var mac = _fromKey.Substring("device:".Length);
+            var device = _devices.FirstOrDefault(d => d.Mac == mac);
+            _isGatewaySelected = device?.Type == DeviceType.Gateway;
+        }
+        else
+        {
+            _isGatewaySelected = false;
+        }
+    }
+
+    /// <summary>
+    /// What the chosen vantage binds its probes to: the gateway WAN picked by hand on a gateway
+    /// SSH vantage, or the WAN context's own interface / source IP on an agent vantage. Null
+    /// leaves the probe on the vantage's own route, which is what every vantage did before
+    /// contexts existed.
+    /// </summary>
+    private string? SelectedSourceBind()
+    {
+        if (_isGatewaySelected)
+            return string.IsNullOrEmpty(_selectedWanInterface) ? null : _selectedWanInterface;
+        return _probeVantages.FirstOrDefault(v => v.Key == _fromKey)?.SourceBind;
+    }
+
+    private void OnTargetPresetChange(ChangeEventArgs e)
+    {
+        var v = e.Value?.ToString() ?? string.Empty;
+        if (string.IsNullOrEmpty(v)) return;
+        if (v.StartsWith("ext:"))
+        {
+            _targetAddress = v.Substring(4);
+            _probeMode = ProbeMode.Icmp;
+        }
+        else if (v.StartsWith("dev:"))
+        {
+            var mac = v.Substring(4);
+            var match = _devices.FirstOrDefault(d => d.Mac == mac);
+            if (match != null && !string.IsNullOrEmpty(match.DisplayIpAddress))
+            {
+                _targetAddress = match.DisplayIpAddress;
+                _probeMode = ProbeMode.Icmp;
+            }
+        }
+    }
+
+    private async Task<IProbeExecutor?> ResolveExecutorAsync()
+    {
+        _sshCredentialsMissing = false;
+        if (_fromKey == "server") return ExecutorFactory.GetServer();
+        // A named agent runs the probe itself, rather than whichever agent the site's "server"
+        // vantage resolves to - the point of picking it is that it sits behind a given WAN.
+        if (_fromKey.StartsWith("agent:"))
+        {
+            // "agent:{id}" or "agent:{id}:{vantageId}" - the vantage decides the binding, which
+            // the picker option already carries, so only the agent id is needed here.
+            var rest = _fromKey.AsSpan("agent:".Length);
+            var separator = rest.IndexOf(':');
+            if (int.TryParse(separator >= 0 ? rest[..separator] : rest, out var vantageAgentId))
+                return ExecutorFactory.ForAgent(vantageAgentId);
+        }
+        if (_fromKey.StartsWith("device:"))
+        {
+            var mac = _fromKey.Substring("device:".Length);
+            var exec = await ExecutorFactory.ForDeviceAsync(mac);
+            if (exec == null)
+            {
+                _sshCredentialsMissing = true;
+                return null;
+            }
+            return exec;
+        }
+        return ExecutorFactory.GetServer();
+    }
+
+    /// <summary>
+    /// Resolve the target from the chosen vantage. A bare address is treated as a reverse
+    /// lookup, since asking a resolver to forward-resolve an address answers nothing.
+    /// </summary>
+    private async Task RunLookup()
+    {
+        _running = true;
+        _runningKind = "dns";
+        _pingResult = null;
+        _traceResult = null;
+        _dnsResult = null;
+        _runError = null;
+        StateHasChanged();
+        try
+        {
+            var executor = await ResolveExecutorAsync();
+            if (executor == null)
+            {
+                _runError = "Couldn't resolve the chosen vantage; check SSH credentials.";
+                return;
+            }
+            var address = _targetAddress.Trim();
+            var reverse = System.Net.IPAddress.TryParse(address, out _);
+            var target = new ProbeTarget(address, _probeMode, null, SelectedSourceBind());
+            _dnsResult = await executor.LookupAsync(target, reverse);
+        }
+        catch (Exception ex)
+        {
+            _runError = $"Lookup failed: {ex.Message}";
+        }
+        finally
+        {
+            _running = false;
+            _runningKind = string.Empty;
+            StateHasChanged();
+        }
+    }
+
+    private async Task RunPing()
+    {
+        _running = true;
+        _runningKind = "ping";
+        _pingResult = null;
+        _traceResult = null;
+        _dnsResult = null;
+        _runError = null;
+        StateHasChanged();
+        try
+        {
+            var executor = await ResolveExecutorAsync();
+            if (executor == null)
+            {
+                _runError = "Couldn't resolve the chosen vantage; check SSH credentials.";
+                return;
+            }
+            var target = new ProbeTarget(_targetAddress.Trim(), _probeMode, _probeMode == ProbeMode.Tcp ? _port : null, SelectedSourceBind());
+            _pingResult = await executor.PingAsync(target, count: 5);
+        }
+        catch (Exception ex)
+        {
+            _runError = $"Probe failed: {ex.Message}";
+        }
+        finally
+        {
+            _running = false;
+            _runningKind = string.Empty;
+            StateHasChanged();
+        }
+    }
+
+    private async Task RunTraceroute()
+    {
+        _running = true;
+        _runningKind = "trace";
+        _pingResult = null;
+        _traceResult = null;
+        _dnsResult = null;
+        _runError = null;
+        StateHasChanged();
+        try
+        {
+            var executor = await ResolveExecutorAsync();
+            if (executor == null)
+            {
+                _runError = "Couldn't resolve the chosen vantage; check SSH credentials.";
+                return;
+            }
+            var target = new ProbeTarget(_targetAddress.Trim(), _probeMode, _probeMode == ProbeMode.Tcp ? _port : null, SelectedSourceBind());
+            _traceResult = await executor.TracerouteAsync(
+                target,
+                maxHops: 30,
+                perHopTimeout: TimeSpan.FromSeconds(2),
+                totalDeadline: TimeSpan.FromSeconds(10));
+        }
+        catch (Exception ex)
+        {
+            _runError = $"Traceroute failed: {ex.Message}";
+        }
+        finally
+        {
+            _running = false;
+            _runningKind = string.Empty;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// Friendly label for a probe result's vantage id ("server" or "device:{mac}"):
+    /// the device's name/type when known, or the server/on-site-agent label.
+    /// </summary>
+    private string VantageLabel(string vantageId)
+    {
+        if (string.IsNullOrEmpty(vantageId)) return "Unknown";
+        if (vantageId.StartsWith("device:"))
+        {
+            var mac = vantageId.Substring("device:".Length);
+            var device = _devices.FirstOrDefault(d => d.Mac == mac);
+            return device != null ? LabelForDevice(device) : mac;
+        }
+        if (vantageId.StartsWith("agent:"))
+            return _probeVantages.FirstOrDefault(v => v.Key == vantageId)?.Label ?? vantageId;
+        if (vantageId == "server")
+            return ExecutorFactory.ServerVantageIsAgent ? "On-Site Agent" : "Network Optimizer server";
+        return vantageId;
+    }
+
+    private static string LabelForDevice(DiscoveredDevice d)
+    {
+        // The three common types are shortened for a dropdown ("AP", not "Access Point");
+        // everything else takes the shared display name rather than a raw enum member.
+        var type = d.Type switch
+        {
+            DeviceType.Gateway => "Gateway",
+            DeviceType.Switch => "Switch",
+            DeviceType.AccessPoint => "AP",
+            _ => d.Type.ToDisplayName()
+        };
+        var name = string.IsNullOrEmpty(d.Name) ? d.Mac : d.Name;
+        return string.IsNullOrEmpty(d.DisplayIpAddress)
+            ? $"{type}: {name}"
+            : $"{type}: {name} ({d.DisplayIpAddress})";
+    }
+}

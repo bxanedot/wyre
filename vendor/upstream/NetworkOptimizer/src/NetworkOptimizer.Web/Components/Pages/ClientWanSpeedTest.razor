@@ -1,0 +1,1336 @@
+@page "/client-wan-speedtest"
+@attribute [Authorize(Policy = Policies.RequireViewer)]
+@rendermode InteractiveServer
+@implements IDisposable
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Storage.Helpers
+@using NetworkOptimizer.Web.Components.Shared
+@using NetworkOptimizer.Core.Helpers
+@using Microsoft.AspNetCore.Authorization
+@using Microsoft.AspNetCore.Components.Authorization
+@using NetworkOptimizer.Web.Services.Authorization
+@inject IAuthorizationService Authz
+@inject IClientSpeedTestService ClientSpeedTestService
+@inject SiteContextService SiteContext
+@inject MonitoringReadinessService Readiness
+@inject SiteSpeedTestTargetResolver SiteTarget
+@inject SystemSettingsService SettingsService
+@inject NavigationManager NavigationManager
+@inject IJSRuntime JS
+@inject PullToRefreshState PtrState
+
+<PageTitle>Client WAN Speed Test - Network Optimizer</PageTitle>
+
+<a href="/wan-speedtest" class="back-link" title="Back to WAN Speed Test">
+    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M19 12H5M12 19l-7-7 7-7"/>
+    </svg>
+</a>
+
+<div class="page-header">
+    <h1>Client WAN Speed Test</h1>
+    <p class="page-description">Test internet speed from any device using an external speed test server</p>
+</div>
+
+<RestrictedSiteNotice />
+
+<div class="client-speedtest-container">
+    @if (_servers.Count == 0)
+    {
+        <div class="card">
+            <div class="card-body">
+                <div class="empty-state">
+                    <span class="empty-icon">🌐</span>
+                    <h3>External Speed Test Server Not Configured</h3>
+                    <p>@(_canConfigure ? "To use Client WAN Speed Tests, configure an external OpenSpeedTest server in Settings." : "Client WAN Speed Tests need an external OpenSpeedTest server, which a site administrator configures.")</p>
+                    <a href="/settings#external-speedtest-settings" class="btn btn-primary">Configure External Server</a>
+                </div>
+            </div>
+        </div>
+    }
+    else
+    {
+        <!-- Run Speed Test Card -->
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Run a Speed Test</h2>
+            </div>
+            <div class="card-body">
+                <div class="test-options">
+                    <div class="test-option">
+                        <div class="test-option-header">
+                            <h3>Browser Speed Test</h3>
+                            @if (_servers.Count > 1)
+                            {
+                                <select class="wan-reassign-select" style="min-width: 140px;"
+                                        @bind="_selectedServerId"
+                                        @bind:after="OnServerChanged">
+                                    @foreach (var s in _servers)
+                                    {
+                                        <option value="@s.Id">@s.Name@(s.IsDefault ? " (default)" : "")</option>
+                                    }
+                                </select>
+                            }
+                            else if (!string.IsNullOrEmpty(_selectedServer?.Name))
+                            {
+                                <span class="badge badge-wan">@_selectedServer.Name</span>
+                            }
+                            <a href="/settings#external-speedtest-settings" class="tooltip-icon settings-link" data-tooltip="Server settings">
+                                <img src="/images/gear.svg" alt="" style="width:16px;height:16px;" />
+                            </a>
+                        </div>
+                        <p>
+                            Run a speed test against your own external server. This measures your internet speed (WAN) -
+                            traffic goes from your device, out through your WAN, across the internet to the remote server, and back.
+                        </p>
+                        @if (AgentOnGateway)
+                        {
+                            <div class="alert alert-info">
+                                <strong>Agent on Gateway:</strong> This site's Agent runs on the UniFi Gateway itself,
+                                which doesn't host the speed-test pages that relay client WAN results back to this
+                                server. To enable client WAN tests here, deploy a Docker or bare-metal Agent on a
+                                separate box at the site (<a href="@($"/settings?tab=multisite&configure={SiteContext.Slug}")">Settings &gt; Multi-Site</a>).
+                            </div>
+                        }
+                        else if (AgentRequiredButOffline)
+                        {
+                            <div class="alert alert-warning">
+                                <strong>This site's Agent is offline.</strong> WAN speed test results for this site
+                                are attributed through the On-Site Agent, which isn't connected right now. Wait for
+                                the Agent to come back online (or check it under
+                                <a href="@($"/settings?tab=multisite&configure={SiteContext.Slug}")">Settings &gt; Multi-Site</a>), then
+                                reload this page. Running the test without the agent would record the result
+                                against the wrong site.
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="test-option-actions">
+                                <a href="@ExternalRunUrl" target="_blank" rel="opener" class="btn btn-primary">
+                                    Run WAN Speed Test
+                                </a>
+                                <span class="form-help">Opens in a new tab and auto-starts</span>
+                            </div>
+                            <div class="url-copy-row">
+                                <input type="text" class="url-display" value="@ExternalShareUrl" readonly />
+                                <button type="button" class="btn-icon" title="Copy URL" onclick="copyFromInput(this)">
+                                    <span class="copy-icon">📋</span>
+                                    <span class="copy-check" style="display:none;">✓</span>
+                                </button>
+                            </div>
+                            <p class="form-help browser-tip">
+                                <strong>Tip:</strong> Share this URL with any device on your network to test WAN speed from that device.
+                            </p>
+                        }
+                        @if (_selectedServer?.Scheme != "https")
+                        {
+                            <div class="alert alert-warning" style="margin-top: 1rem;">
+                                <strong>HTTPS Strongly Recommended:</strong> This server is configured over HTTP. Chrome and Edge will block speed test results from posting back due to Private Network Access restrictions. HTTPS with a reverse proxy is strongly recommended.
+                            </div>
+                        }
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Test History -->
+        <div class="card" id="client-wan-history-card">
+            <div class="card-header history-card-header">
+                <div class="header-title-row">
+                    <h2 class="card-title">Test History</h2>
+                    <div class="header-actions">
+                        <button class="btn btn-sm btn-secondary" @onclick="RefreshHistory" disabled="@_loading">
+                            @if (_loading)
+                            {
+                                <span class="spinner"></span>
+                                <span>Loading...</span>
+                            }
+                            else
+                            {
+                                <span>Refresh</span>
+                            }
+                        </button>
+                    </div>
+                </div>
+                @if (_results.Count > 0)
+                {
+                    <div class="wan-history-tabs">
+                        <button class="wan-history-tab @(_activeTab == "speed" ? "active" : "")" @onclick='() => SwitchTab("speed")'>Speed</button>
+                        <button class="wan-history-tab @(_activeTab == "latency" ? "active" : "")" @onclick='() => SwitchTab("latency")'>Latency</button>
+                        <button class="wan-history-tab @(_activeTab == "jitter" ? "active" : "")" @onclick='() => SwitchTab("jitter")'>Jitter</button>
+                    </div>
+                }
+            </div>
+            <div class="card-body">
+                @if (_results.Count > 0)
+                {
+                    @* Speed Chart *@
+                    @if (_activeTab == "speed")
+                    {
+                        <div class="wan-chart-container">
+                            <ApexChart @ref="_speedChart" TItem="ChartPoint"
+                                       Options="_speedChartOptions"
+                                       Height="@("250px")"
+                                       OnClick="OnChartClicked">
+                                @foreach (var series in _chartSeries)
+                                {
+                                    <ApexPointSeries TItem="ChartPoint"
+                                                     Items="@(IsSeriesVisible(series) ? series.DownloadData : _hiddenChartData)"
+                                                     Name="@($"{series.DisplayName} ↓")"
+                                                     SeriesType="SeriesType.Area"
+                                                     XValue="e => e.Timestamp"
+                                                     YValue="e => e.Y"
+                                                     OrderBy="e => e.X" />
+                                    <ApexPointSeries TItem="ChartPoint"
+                                                     Items="@(IsSeriesVisible(series) ? series.UploadData : _hiddenChartData)"
+                                                     Name="@($"{series.DisplayName} ↑")"
+                                                     SeriesType="SeriesType.Area"
+                                                     XValue="e => e.Timestamp"
+                                                     YValue="e => e.Y"
+                                                     OrderBy="e => e.X" />
+                                }
+                            </ApexChart>
+                        </div>
+                    }
+
+                    @* Latency Chart *@
+                    @if (_activeTab == "latency")
+                    {
+                        <div class="wan-chart-container">
+                            <ApexChart @ref="_latencyChart" TItem="ChartPoint"
+                                       Options="_latencyChartOptions"
+                                       Height="@("250px")">
+                                @foreach (var series in _chartSeries)
+                                {
+                                    <ApexPointSeries TItem="ChartPoint"
+                                                     Items="@(IsSeriesVisible(series) ? series.LatencyData : _hiddenChartData)"
+                                                     Name="@series.DisplayName"
+                                                     SeriesType="SeriesType.Line"
+                                                     XValue="e => e.Timestamp"
+                                                     YValue="e => e.Y"
+                                                     OrderBy="e => e.X" />
+                                }
+                            </ApexChart>
+                        </div>
+                    }
+
+                    @* Jitter Chart *@
+                    @if (_activeTab == "jitter")
+                    {
+                        <div class="wan-chart-container">
+                            <ApexChart @ref="_jitterChart" TItem="ChartPoint"
+                                       Options="_jitterChartOptions"
+                                       Height="@("250px")">
+                                @foreach (var series in _chartSeries)
+                                {
+                                    <ApexPointSeries TItem="ChartPoint"
+                                                     Items="@(IsSeriesVisible(series) ? series.JitterData : _hiddenChartData)"
+                                                     Name="@series.DisplayName"
+                                                     SeriesType="SeriesType.Line"
+                                                     XValue="e => e.Timestamp"
+                                                     YValue="e => e.Y"
+                                                     OrderBy="e => e.X" />
+                                }
+                            </ApexChart>
+                        </div>
+                    }
+
+                    @* Time Slider *@
+                    <div class="wan-time-slider">
+                        <input type="range" min="0" max="10" step="1" @bind="_sliderValue" @bind:after="OnSliderChanged" />
+                        <span class="time-label">@GetTimeLabel()</span>
+                    </div>
+
+                    <div class="wan-filter-badges @(string.IsNullOrEmpty(_serverFilter) && string.IsNullOrEmpty(_deviceFilter) ? "filter-area-empty" : "")">
+                        @if (!string.IsNullOrEmpty(_serverFilter))
+                        {
+                            <div class="device-filter-pill">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                                <span>Server: <strong>@_serverFilterName</strong></span>
+                                <button class="device-filter-clear" @onclick="ClearServerFilter" type="button">×</button>
+                            </div>
+                        }
+                        @if (!string.IsNullOrEmpty(_deviceFilter))
+                        {
+                            <div class="device-filter-pill">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                                <span>Device: <strong>@_deviceFilterName</strong></span>
+                                <button class="device-filter-clear" @onclick="ClearDeviceFilter" type="button">×</button>
+                            </div>
+                        }
+                    </div>
+
+                    @* History Table *@
+                    <div class="table-responsive" id="history-table">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th class="col-time">Time</th>
+                                    <th>Device</th>
+                                    @if (_servers.Count > 1)
+                                    {
+                                        <th class="hide-mobile">Server</th>
+                                    }
+                                    <th class="hide-mobile">
+                                        <span class="tooltip-wrapper tooltip-bottom">
+                                            ↓ Mbps
+                                            <span class="tooltip-icon">?</span>
+                                            <span class="tooltip-content">
+                                                <strong>From Device</strong><br />
+                                                Data transferred from the client device through WAN to the external server.
+                                            </span>
+                                        </span>
+                                    </th>
+                                    <th class="hide-mobile">
+                                        <span class="tooltip-wrapper tooltip-bottom">
+                                            ↑ Mbps
+                                            <span class="tooltip-icon">?</span>
+                                            <span class="tooltip-content">
+                                                <strong>To Device</strong><br />
+                                                Data transferred from the external server through WAN to the client device.
+                                            </span>
+                                        </span>
+                                    </th>
+                                    <th class="show-mobile">Mbps</th>
+                                    <th class="hide-mobile">Ping</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var result in _pagedResults)
+                                {
+                                    var isExpanded = _expandedId == result.Id;
+                                    <tr id="result-@result.Id"
+                                        class="history-row-clickable @(isExpanded ? "history-row-expanded" : "")"
+                                        @onclick="@(() => ToggleExpand(result.Id))">
+                                        <td>@result.TestTime.ToLocalTime().ToString("MMM dd HH:mm")</td>
+                                        <td>
+                                            @{
+                                                var isDeviceFiltered = string.Equals(_deviceFilter, result.DeviceHost, StringComparison.OrdinalIgnoreCase);
+                                            }
+                                            @if (!string.IsNullOrEmpty(result.DeviceName))
+                                            {
+                                                <span>@result.DeviceName</span>
+                                                <button class="device-filter-btn @(isDeviceFiltered ? "active" : "")" @onclick="() => ToggleDeviceFilter(result.DeviceHost, result.DeviceName ?? result.DeviceHost)" @onclick:stopPropagation data-tooltip="@(isDeviceFiltered ? "Clear device filter" : "Filter to this device")" data-tooltip-hover-only>
+                                                    <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                                                </button>
+                                                <br />
+                                                <code class="text-muted">@result.DeviceHost</code>
+                                            }
+                                            else
+                                            {
+                                                <code>@result.DeviceHost</code>
+                                                <button class="device-filter-btn @(isDeviceFiltered ? "active" : "")" @onclick="() => ToggleDeviceFilter(result.DeviceHost, result.DeviceHost)" @onclick:stopPropagation data-tooltip="@(isDeviceFiltered ? "Clear device filter" : "Filter to this device")" data-tooltip-hover-only>
+                                                    <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                                                </button>
+                                            }
+                                        </td>
+                                        @if (_servers.Count > 1)
+                                        {
+                                            <td class="hide-mobile">
+                                                @{
+                                                    var serverName = ResolveServerName(result.ExternalServerName);
+                                                    var isServerFiltered = string.Equals(_serverFilter, result.ExternalServerName, StringComparison.OrdinalIgnoreCase);
+                                                }
+                                                <span>@serverName</span>
+                                                @if (!string.IsNullOrEmpty(result.ExternalServerName))
+                                                {
+                                                    <button class="device-filter-btn @(isServerFiltered ? "active" : "")" @onclick="() => ToggleServerFilter(result.ExternalServerName!, serverName)" @onclick:stopPropagation data-tooltip="@(isServerFiltered ? "Clear server filter" : "Filter to this server")" data-tooltip-hover-only>
+                                                        <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                                                    </button>
+                                                }
+                                            </td>
+                                        }
+                                        <td class="hide-mobile">
+                                            @if (result.DownloadMbps > 0)
+                                            {
+                                                <span class="speed-value">@result.DownloadMbps.ToString("F1")</span>
+                                                <span class="speed-unit">Mbps</span>
+                                            }
+                                            else
+                                            {
+                                                <span>-</span>
+                                            }
+                                        </td>
+                                        <td class="hide-mobile">
+                                            @if (result.UploadMbps > 0)
+                                            {
+                                                <span class="speed-value">@result.UploadMbps.ToString("F1")</span>
+                                                <span class="speed-unit">Mbps</span>
+                                            }
+                                            else
+                                            {
+                                                <span>-</span>
+                                            }
+                                        </td>
+                                        <td class="show-mobile">@($"{(result.DownloadMbps > 0 ? $"↓{result.DownloadMbps:F0}" : "")}{(result.DownloadMbps > 0 && result.UploadMbps > 0 ? " " : "")}{(result.UploadMbps > 0 ? $"↑{result.UploadMbps:F0}" : "")}")</td>
+                                        <td class="hide-mobile">
+                                            @if (result.PingMs.HasValue)
+                                            {
+                                                <span>@(result.PingMs.Value % 1 == 0 && result.PingMs.Value >= 10 ? result.PingMs.Value.ToString("F0") : result.PingMs.Value.ToString("F1")) ms</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="text-muted">-</span>
+                                            }
+                                        </td>
+                                        <td class="expand-chevron">
+                                            <span>@(isExpanded ? "▲" : "▼")</span>
+                                        </td>
+                                    </tr>
+                                    <tr class="history-details-row">
+                                        <td colspan="@(_servers.Count > 1 ? 8 : 7)">
+                                            <div class="expand-wrapper @(isExpanded ? "expanded" : "")">
+                                                <div class="expand-content">
+                                                    <div class="history-details">
+                                                        <SpeedTestDetails Result="result"
+                                                                          Perspective="SpeedPerspective.Wan"
+                                                                          OnDelete="HandleDelete"
+                                                                          OnNotesChanged="HandleNotesChanged"
+                                                                          IsInTableRow="true"
+                                                                          ShowLiveViewLink="_liveViewLinkEnabled" />
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+
+                    @if (_totalPages > 1)
+                    {
+                        <div class="pagination">
+                            <button class="btn btn-sm btn-secondary" disabled="@(_page <= 1)" @onclick="() => ChangePage(-1)"><span class="pag-arrow">←</span> Prev</button>
+                            @{
+                                var hasFilter = !string.IsNullOrEmpty(_deviceFilter) || !string.IsNullOrEmpty(_serverFilter);
+                            }
+                            <span class="pagination-info">Page @_page of @_totalPages (@_filteredResults.Count@(hasFilter ? $" of {_results.Count}" : " total"))</span>
+                            <button class="btn btn-sm btn-secondary" disabled="@(_page >= _totalPages)" @onclick="() => ChangePage(1)">Next <span class="pag-arrow">→</span></button>
+                        </div>
+                    }
+                }
+                else if (!_loading)
+                {
+                    <div class="empty-state">
+                        <p>No WAN speed tests recorded yet.</p>
+                        <p class="form-help">Run a speed test from any device to see results here.</p>
+                    </div>
+                }
+            </div>
+        </div>
+
+        <!-- How it Works -->
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">How it Works</h2>
+            </div>
+            <div class="card-body">
+                <div class="info-section">
+                    <h4>WAN Speed Test via External Server</h4>
+                    <ol>
+                        <li>Open the speed test URL from any device on your network</li>
+                        <li>The test runs in your browser against the external server</li>
+                        <li>Traffic flows: your device → your WAN → internet → external server → internet → your WAN → your device</li>
+                        <li>Results are automatically reported back to Network Optimizer</li>
+                        <li>Device is identified by IP address and matched to UniFi client list</li>
+                    </ol>
+                    <p class="form-help">
+                        <strong>Note:</strong> This tests your internet (WAN) speed, not your LAN speed.
+                        Use the <a href="/client-speedtest">Client Speed Test</a> page to test LAN speed.
+                    </p>
+                </div>
+            </div>
+        </div>
+    }
+</div>
+
+<style>
+    .back-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 36px;
+        height: 36px;
+        border-radius: var(--border-radius);
+        color: var(--text-secondary);
+        background: var(--bg-tertiary);
+        transition: all 0.15s ease;
+        margin-bottom: 0.75rem;
+    }
+
+    .back-link:hover {
+        color: var(--text-primary);
+        background: var(--bg-hover);
+    }
+
+    .client-speedtest-container {
+        display: flex;
+        flex-direction: column;
+        gap: 1.5rem;
+    }
+
+    .test-options {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 1.5rem;
+    }
+
+    .test-option {
+        background: var(--bg-tertiary);
+        border-radius: var(--border-radius);
+        padding: 1.25rem;
+    }
+
+    .test-option-header {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-bottom: 0.75rem;
+    }
+
+    .test-option-header h3 {
+        margin: 0;
+        font-size: 1rem;
+    }
+
+    .settings-link {
+        margin-left: auto;
+        color: var(--text-muted);
+        transition: color 0.15s;
+    }
+
+    .settings-link:hover {
+        color: var(--text-primary);
+    }
+
+    .test-option p {
+        margin: 0 0 1rem;
+        color: var(--text-secondary);
+        font-size: 0.875rem;
+    }
+
+    .test-option-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem 1rem;
+        flex-wrap: wrap;
+    }
+
+    .test-option .browser-tip {
+        margin-top: 1rem;
+    }
+
+    .url-copy-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-top: 1rem;
+        padding: 0.5rem;
+        background: var(--bg-primary);
+        border-radius: var(--border-radius);
+    }
+
+    .url-display {
+        flex: 1;
+        font-size: 0.8125rem;
+        color: var(--text-secondary);
+        word-break: break-all;
+        background: transparent;
+        border: none;
+        outline: none;
+        font-family: monospace;
+        width: 100%;
+    }
+
+    .btn-icon {
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        padding: 0.25rem;
+        font-size: 1rem;
+        opacity: 0.7;
+        transition: opacity 0.15s;
+    }
+
+    .btn-icon:hover {
+        opacity: 1;
+    }
+
+    .copy-check {
+        color: var(--success-color);
+    }
+
+    .speed-value {
+        font-weight: 600;
+        font-size: 1rem;
+    }
+
+    .speed-unit {
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        margin-left: 0.25rem;
+    }
+
+    .badge-wan {
+        background: rgba(59, 130, 246, 0.2);
+        color: #60a5fa;
+    }
+
+    .history-card-header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.75rem;
+    }
+
+    .header-title-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+    }
+
+    .header-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+    }
+
+    .device-filter-btn {
+        color: var(--text-muted);
+        margin-left: 4px;
+        vertical-align: middle;
+        opacity: 0;
+        transition: opacity 0.15s, color 0.15s;
+        background: none;
+        border: none;
+        cursor: pointer;
+        padding: 0;
+        line-height: 1;
+    }
+
+    .device-filter-btn.active {
+        opacity: 1;
+        color: var(--primary-color);
+    }
+
+    .history-row-clickable:hover .device-filter-btn {
+        opacity: 1;
+    }
+
+    .device-filter-btn:hover {
+        color: var(--primary-color);
+    }
+
+    .device-filter-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+        padding: 0.25rem 0.5rem;
+        background: rgba(5, 89, 201, 0.15);
+        border: 1px solid rgba(5, 89, 201, 0.3);
+        border-radius: 999px;
+        font-size: 0.8125rem;
+        color: var(--text-secondary);
+        white-space: nowrap;
+    }
+
+    .device-filter-pill svg {
+        flex-shrink: 0;
+        color: var(--primary-color);
+    }
+
+    .device-filter-clear {
+        background: none;
+        border: none;
+        color: var(--text-muted);
+        font-size: 1.125rem;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0 0.125rem;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .device-filter-clear:hover {
+        color: var(--text-primary);
+        background: rgba(255, 255, 255, 0.1);
+    }
+
+    .filter-area-empty {
+        min-height: 0.5rem;
+        padding-bottom: 0;
+    }
+</style>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>
+    /// Whether this caller can open the Settings pages this page points at. Copy only - the controls
+    /// themselves are gated by their own wrappers.
+    /// </summary>
+    private bool _canConfigure;
+
+    private List<ExternalSpeedTestServer> _servers = new();
+
+    // On an agent-backed site the test starts at the on-site agent's /wan/ router,
+    // whose interstitial forwards to the external server: the agent becomes the
+    // page's referrer, so results post back through it with the real client LAN IP
+    // and the site slug stamped on the trusted agent->server hop - no ?site= in
+    // any user-facing URL. Direct/default sites link the external server directly.
+    private SiteSpeedTestTargetResolver.Result? _siteTarget;
+
+    // Site attribution for WAN results comes ONLY from the agent relay, so a
+    // non-default site with no live agent target must not offer a test link at
+    // all - the bare external URL would silently record against the default site.
+    // A not-yet-resolved target (null) counts as offline for the same reason.
+    private bool AgentRequiredButOffline =>
+        !SiteContext.IsDefault && _siteTarget is null or { UsesAgent: false };
+
+    // The agent runs on the gateway itself (monitoring-only): no speed-test
+    // listener exists at the site, so there is no relay page to link at all.
+    private bool AgentOnGateway => _siteTarget is { AgentOnGateway: true };
+
+    private string ExternalBaseUrl
+    {
+        get
+        {
+            if (_siteTarget is { UsesAgent: true, BaseUrl: not null } target)
+            {
+                var isDefaultServer = _selectedServer == null || _selectedServer.IsDefault;
+                return isDefaultServer
+                    ? $"{target.BaseUrl}/wan/"
+                    : $"{target.BaseUrl}/wan/{_selectedServer!.ServerId}/";
+            }
+            return _selectedServer?.Url ?? "";
+        }
+    }
+
+    private string ExternalRunUrl => $"{ExternalBaseUrl}?Run";
+    private string ExternalShareUrl => ExternalBaseUrl;
+
+    private ExternalSpeedTestServer? _selectedServer;
+    private int _selectedServerId;
+    private bool _loading;
+    private List<Iperf3Result> _results = new();
+    private (int Count, int MaxId) _resultsSignature;
+    private int _expandedId;
+    private int _page = 1;
+    private const int PageSize = 20;
+    private System.Threading.Timer? _pollTimer;
+
+    // Filters
+    private string _deviceFilter = "";
+    private string _deviceFilterName = "";
+    private string _serverFilter = "";
+    private string _serverFilterName = "";
+
+    // Chart state
+    private ApexChart<ChartPoint>? _speedChart;
+    private ApexChartOptions<ChartPoint> _speedChartOptions = new();
+    private ApexChart<ChartPoint>? _latencyChart;
+    private ApexChartOptions<ChartPoint> _latencyChartOptions = new();
+    private ApexChart<ChartPoint>? _jitterChart;
+    private ApexChartOptions<ChartPoint> _jitterChartOptions = new();
+    private List<ServerSeriesInfo> _chartSeries = new();
+    private List<ChartPoint> _hiddenChartData = new();
+    private string _activeTab = "speed";
+
+    // Time slider
+    private int _sliderValue = 6;
+    private static readonly (int hours, string label)[] TimeBreakpoints = new[]
+    {
+        (1, "1 hr"), (4, "4 hrs"), (24, "24 hrs"), (72, "3 days"),
+        (168, "1 week"), (336, "2 weeks"), (720, "30 days"),
+        (2160, "90 days"), (4320, "6 months"), (8760, "1 year"), (0, "All time")
+    };
+    private const int MaxChartPoints = 20;
+
+    private static readonly string[] SeriesColors = ChartPalette.Colors;
+
+    private class ChartPoint
+    {
+        public DateTime Timestamp { get; set; }
+        public decimal Value { get; set; }
+        public int ResultId { get; set; }
+        public long X => new DateTimeOffset(Timestamp, TimeSpan.Zero).ToUnixTimeMilliseconds();
+
+        // A padding point at the chart's edge: no result behind it, drawn as nothing.
+        public bool IsGap { get; init; }
+        public decimal? Y => IsGap ? null : Value;
+
+        public ChartPoint(DateTime timestamp, double value, int resultId)
+        {
+            Timestamp = DateTime.SpecifyKind(timestamp, DateTimeKind.Utc);
+            Value = (decimal)value;
+            ResultId = resultId;
+        }
+
+        public static ChartPoint Gap(DateTime timestamp) => new(timestamp, 0, 0) { IsGap = true };
+    }
+
+    // Every series on a chart must start and end at the same x, or ApexCharts hit-tests the hover in
+    // two dimensions (nearest point by pixel distance, any series) instead of by x alone, and on
+    // sparse test points the tooltip jumps and drops. Null edge points draw nothing, take no hover
+    // dot and get no tooltip row, so the padding is invisible. Empty series get both points too.
+    private static void PadToCommonSpan(IEnumerable<List<ChartPoint>> seriesLists)
+    {
+        var lists = seriesLists.ToList();
+        var points = lists.SelectMany(l => l).Where(p => !p.IsGap).ToList();
+        if (points.Count == 0) return;
+        var min = points.Min(p => p.Timestamp);
+        var max = points.Max(p => p.Timestamp);
+        foreach (var list in lists)
+        {
+            if (list.Count == 0 || list[0].Timestamp > min) list.Insert(0, ChartPoint.Gap(min));
+            if (list[^1].Timestamp < max) list.Add(ChartPoint.Gap(max));
+        }
+    }
+
+    private class ServerSeriesInfo
+    {
+        public string Key { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+        public string Color { get; set; } = "";
+        public List<ChartPoint> DownloadData { get; set; } = new();
+        public List<ChartPoint> UploadData { get; set; } = new();
+        public List<ChartPoint> LatencyData { get; set; } = new();
+        public List<ChartPoint> JitterData { get; set; } = new();
+        public bool IsSelected { get; set; }
+    }
+
+    private bool _noneSelected => !_chartSeries.Any(s => s.IsSelected);
+    private bool _allSelected => _chartSeries.All(s => s.IsSelected);
+    private bool _showAll => _noneSelected || _allSelected;
+    private bool IsSeriesVisible(ServerSeriesInfo series) => _showAll || series.IsSelected;
+
+    private List<Iperf3Result> _filteredResults
+    {
+        get
+        {
+            IEnumerable<Iperf3Result> q = GetTimeFilteredResults();
+            if (!string.IsNullOrEmpty(_deviceFilter))
+                q = q.Where(r => string.Equals(r.DeviceHost, _deviceFilter, StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrEmpty(_serverFilter))
+                q = q.Where(r => string.Equals(r.ExternalServerName, _serverFilter, StringComparison.OrdinalIgnoreCase));
+            return q.ToList();
+        }
+    }
+
+    private int _totalPages => Math.Max(1, (int)Math.Ceiling(_filteredResults.Count / (double)PageSize));
+    private IEnumerable<Iperf3Result> _pagedResults => _filteredResults.Skip((_page - 1) * PageSize).Take(PageSize);
+
+    private bool _liveViewLinkEnabled;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _canConfigure = AuthState is null
+            || (await Authz.AuthorizeAsync((await AuthState).User, SiteContext.Slug, Policies.SiteAdmin)).Succeeded;
+
+        PtrState.RefreshCallback = () => LoadResults();
+        PtrState.NotifyStateChanged = StateHasChanged;
+
+        _liveViewLinkEnabled = await Readiness.IsHistoricPlaybackAvailableAsync();
+
+        InitializeChartOptions();
+
+        _servers = await SettingsService.GetExternalSpeedTestServersAsync();
+        _selectedServer = _servers.FirstOrDefault(s => s.IsDefault) ?? _servers.FirstOrDefault();
+        _selectedServerId = _selectedServer?.Id ?? 0;
+        _siteTarget = await SiteTarget.ResolveAsync();
+
+        if (_selectedServer != null)
+            await LoadResults();
+
+        _pollTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    if (await LoadResults())
+                        await RenderActiveChart();
+                    else
+                        StateHasChanged();
+                });
+            }
+            catch { }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    private void OnServerChanged()
+    {
+        _selectedServer = _servers.FirstOrDefault(s => s.Id == _selectedServerId);
+    }
+
+    private string ResolveServerName(string? serverId)
+    {
+        if (string.IsNullOrEmpty(serverId)) return "-";
+        var server = _servers.FirstOrDefault(s => string.Equals(s.ServerId, serverId, StringComparison.OrdinalIgnoreCase));
+        return server?.Name ?? serverId;
+    }
+
+    private async Task<bool> LoadResults()
+    {
+        _loading = true;
+        try
+        {
+            _results = await ClientSpeedTestService.GetWanResultsAsync(200);
+            var signature = (_results.Count, _results.Count == 0 ? 0 : _results.Max(r => r.Id));
+            var changed = signature != _resultsSignature;
+            _resultsSignature = signature;
+            TransformChartData();
+            ApplyChartFilters();
+            return changed;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task RefreshHistory()
+    {
+        await LoadResults();
+        await RenderActiveChart();
+    }
+
+    private void ToggleExpand(int id)
+    {
+        _expandedId = _expandedId == id ? 0 : id;
+    }
+
+    private void ChangePage(int delta)
+    {
+        _page = Math.Clamp(_page + delta, 1, _totalPages);
+    }
+
+    private async Task HandleDelete(int id)
+    {
+        await ClientSpeedTestService.DeleteResultAsync(id);
+        await LoadResults();
+        await RenderActiveChart();
+    }
+
+    private async Task HandleNotesChanged((int Id, string? Notes) args)
+    {
+        await ClientSpeedTestService.UpdateNotesAsync(args.Id, args.Notes);
+        await LoadResults();
+    }
+
+    private async Task ToggleDeviceFilter(string host, string displayName)
+    {
+        if (string.Equals(_deviceFilter, host, StringComparison.OrdinalIgnoreCase))
+        { _deviceFilter = ""; _deviceFilterName = ""; }
+        else
+        { _deviceFilter = host; _deviceFilterName = displayName; }
+        _page = 1;
+        _expandedId = 0;
+        ApplyChartFilters();
+        await RenderActiveChart();
+    }
+
+    private async Task ToggleServerFilter(string serverId, string displayName)
+    {
+        if (string.Equals(_serverFilter, serverId, StringComparison.OrdinalIgnoreCase))
+        { _serverFilter = ""; _serverFilterName = ""; }
+        else
+        { _serverFilter = serverId; _serverFilterName = displayName; }
+        _page = 1;
+        _expandedId = 0;
+        ApplyChartFilters();
+        await RenderActiveChart();
+    }
+
+    private async Task ClearServerFilter()
+    {
+        _serverFilter = ""; _serverFilterName = "";
+        _page = 1; _expandedId = 0;
+        ApplyChartFilters();
+        await RenderActiveChart();
+    }
+
+    private async Task ClearDeviceFilter()
+    {
+        _deviceFilter = ""; _deviceFilterName = "";
+        _page = 1; _expandedId = 0;
+        ApplyChartFilters();
+        await RenderActiveChart();
+    }
+
+    #region Charts
+
+    private void InitializeChartOptions()
+    {
+        _speedChartOptions = new ApexChartOptions<ChartPoint>
+        {
+            Chart = new Chart
+            {
+                Background = "transparent",
+                Toolbar = new Toolbar { Show = false },
+                Zoom = new Zoom { Enabled = false },
+                RedrawOnParentResize = true,
+                RedrawOnWindowResize = true,
+                Animations = new Animations { Enabled = true, Speed = 300, AnimateGradually = new AnimateGradually { Enabled = false } }
+            },
+            Xaxis = new XAxis
+            {
+                Type = XAxisType.Datetime,
+                Labels = new XAxisLabels
+                {
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                    DatetimeUTC = false,
+                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                },
+                AxisBorder = new AxisBorder { Show = false },
+                AxisTicks = new AxisTicks { Show = false }
+            },
+            Yaxis = new List<YAxis>
+            {
+                new YAxis
+                {
+                    Min = 0,
+                    Labels = new YAxisLabels
+                    {
+                        Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                        Formatter = @"function(val) { return val != null ? val.toFixed(0) + ' Mbps' : ''; }"
+                    }
+                }
+            },
+            Grid = new Grid { BorderColor = "#374151", StrokeDashArray = 3 },
+            Stroke = new Stroke { Curve = Curve.Smooth, Width = 2 },
+            Legend = new Legend { Show = false },
+            Tooltip = new Tooltip
+            {
+                Theme = Mode.Dark,
+                Intersect = false,
+                Shared = true,
+                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                // The shared Monitoring tooltip, via its window hook (a serialized function string
+                // cannot import the module): rows ordered as the lines sit, and a dot on every one.
+                Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(1) + ' Mbps'; }, omitSeconds: true }) : ''; }"
+            },
+            Markers = new Markers { Size = 0, Hover = new MarkersHover { SizeOffset = 5 } },
+            Fill = new Fill
+            {
+                Type = new List<FillType> { FillType.Gradient },
+                Gradient = new FillGradient { ShadeIntensity = 0.3, OpacityFrom = 0.4, OpacityTo = 0.05 }
+            }
+        };
+
+        _latencyChartOptions = CreateMsChartOptions("ms");
+        _jitterChartOptions = CreateMsChartOptions("ms");
+    }
+
+    private ApexChartOptions<ChartPoint> CreateMsChartOptions(string unit)
+    {
+        return new ApexChartOptions<ChartPoint>
+        {
+            Chart = new Chart
+            {
+                Background = "transparent",
+                Toolbar = new Toolbar { Show = false },
+                Zoom = new Zoom { Enabled = false },
+                RedrawOnParentResize = true,
+                RedrawOnWindowResize = true,
+                Animations = new Animations { Enabled = true, Speed = 300, AnimateGradually = new AnimateGradually { Enabled = false } }
+            },
+            Xaxis = new XAxis
+            {
+                Type = XAxisType.Datetime,
+                Labels = new XAxisLabels
+                {
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                    DatetimeUTC = false,
+                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                },
+                AxisBorder = new AxisBorder { Show = false },
+                AxisTicks = new AxisTicks { Show = false }
+            },
+            Yaxis = new List<YAxis>
+            {
+                new YAxis
+                {
+                    Min = 0,
+                    Labels = new YAxisLabels
+                    {
+                        Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                        Formatter = @"function(val) { return val != null ? val.toFixed(1) + ' " + unit + @"' : ''; }"
+                    }
+                }
+            },
+            Grid = new Grid { BorderColor = "#374151", StrokeDashArray = 3 },
+            Stroke = new Stroke { Curve = Curve.Smooth, Width = 2 },
+            Legend = new Legend { Show = false },
+            Tooltip = new Tooltip
+            {
+                Theme = Mode.Dark,
+                Intersect = false,
+                Shared = true,
+                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(1) + ' " + unit + @"'; }, omitSeconds: true }) : ''; }"
+            },
+            Markers = new Markers { Size = 0, Hover = new MarkersHover { SizeOffset = 5 } }
+        };
+    }
+
+    private void TransformChartData()
+    {
+        var serverKeys = _results
+            .Where(r => r.Success)
+            .Select(r => r.ExternalServerName ?? "unknown")
+            .Distinct()
+            .OrderBy(k => k)
+            .ToList();
+
+        var previousSelection = _chartSeries.ToDictionary(s => s.Key, s => s.IsSelected);
+
+        _chartSeries = serverKeys.Select((key, i) => new ServerSeriesInfo
+        {
+            Key = key,
+            DisplayName = ResolveServerName(key),
+            Color = SeriesColors[i % SeriesColors.Length],
+            IsSelected = previousSelection.TryGetValue(key, out var selected) && selected
+        }).ToList();
+
+        if (_chartSeries.Count == 0 && _results.Any(r => r.Success))
+        {
+            _chartSeries.Add(new ServerSeriesInfo
+            {
+                Key = "unknown",
+                DisplayName = "Server",
+                Color = SeriesColors[0]
+            });
+        }
+
+        UpdateSpeedChartColors();
+        UpdateMsChartColors(_latencyChartOptions);
+        UpdateMsChartColors(_jitterChartOptions);
+    }
+
+    private void UpdateSpeedChartColors()
+    {
+        var colors = new List<string>();
+        var dashArray = new List<int>();
+        var fillTypes = new List<FillType>();
+        foreach (var s in _chartSeries)
+        {
+            colors.Add(s.Color); colors.Add(s.Color);
+            dashArray.Add(0); dashArray.Add(5);
+            fillTypes.Add(FillType.Gradient); fillTypes.Add(FillType.Gradient);
+        }
+        _speedChartOptions.Colors = colors;
+        if (_speedChartOptions.Stroke != null)
+            _speedChartOptions.Stroke.DashArray = dashArray;
+        _speedChartOptions.Fill = new Fill
+        {
+            Type = fillTypes,
+            Gradient = new FillGradient { ShadeIntensity = 0.3, OpacityFrom = 0.4, OpacityTo = 0.05 }
+        };
+    }
+
+    private void UpdateMsChartColors(ApexChartOptions<ChartPoint> opts)
+    {
+        var colors = _chartSeries.Select(s => s.Color).ToList();
+        opts.Colors = colors;
+        if (opts.Stroke != null)
+            opts.Stroke.DashArray = colors.Select(_ => 0).ToList();
+    }
+
+    private List<Iperf3Result> GetTimeFilteredResults()
+    {
+        var idx = Math.Clamp(_sliderValue, 0, TimeBreakpoints.Length - 1);
+        var hours = TimeBreakpoints[idx].hours;
+        if (hours <= 0) return _results;
+        var cutoff = DateTime.UtcNow.AddHours(-hours);
+        return _results.Where(r => r.TestTime >= cutoff).ToList();
+    }
+
+    private void ApplyChartFilters()
+    {
+        IEnumerable<Iperf3Result> filtered = GetTimeFilteredResults();
+        if (!string.IsNullOrEmpty(_deviceFilter))
+            filtered = filtered.Where(r => string.Equals(r.DeviceHost, _deviceFilter, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrEmpty(_serverFilter))
+            filtered = filtered.Where(r => string.Equals(r.ExternalServerName, _serverFilter, StringComparison.OrdinalIgnoreCase));
+        var timeFiltered = filtered.ToList();
+
+        var idx = Math.Clamp(_sliderValue, 0, TimeBreakpoints.Length - 1);
+        var shouldDownsample = TimeBreakpoints[idx].hours is 0 or > 4;
+
+        foreach (var series in _chartSeries)
+        {
+            var results = timeFiltered
+                .Where(r => r.Success && string.Equals(r.ExternalServerName ?? "unknown", series.Key, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(r => r.TestTime)
+                .ToList();
+
+            var downloadRaw = results.Select(r => new ChartPoint(r.TestTime, r.DownloadMbps, r.Id)).ToList();
+            var uploadRaw = results.Select(r => new ChartPoint(r.TestTime, r.UploadMbps, r.Id)).ToList();
+
+            if (shouldDownsample)
+            {
+                series.DownloadData = DownsampleLttb(CollapseClusters(downloadRaw), MaxChartPoints);
+                var keptIds = series.DownloadData.Select(d => d.ResultId).ToHashSet();
+                series.UploadData = uploadRaw.Where(u => keptIds.Contains(u.ResultId)).ToList();
+            }
+            else
+            {
+                series.DownloadData = downloadRaw;
+                series.UploadData = uploadRaw;
+            }
+
+            var latencyRaw = results
+                .Where(r => r.PingMs.HasValue)
+                .Select(r => new ChartPoint(r.TestTime, r.PingMs!.Value, r.Id))
+                .ToList();
+            series.LatencyData = shouldDownsample ? DownsampleLttb(CollapseClusters(latencyRaw), MaxChartPoints) : latencyRaw;
+
+            var jitterRaw = results
+                .Where(r => r.JitterMs.HasValue)
+                .Select(r => new ChartPoint(r.TestTime, r.JitterMs!.Value, r.Id))
+                .ToList();
+            series.JitterData = shouldDownsample ? DownsampleLttb(CollapseClusters(jitterRaw), MaxChartPoints) : jitterRaw;
+        }
+
+        // One span for every chart on the page, so a hidden server's stand-in series fits all of them.
+        var allSeries = _chartSeries.SelectMany(s => new[] { s.DownloadData, s.UploadData, s.LatencyData, s.JitterData }).ToList();
+        PadToCommonSpan(allSeries);
+        _hiddenChartData = allSeries.FirstOrDefault(s => s.Count > 0) is { } spanned
+            ? new List<ChartPoint> { ChartPoint.Gap(spanned[0].Timestamp), ChartPoint.Gap(spanned[^1].Timestamp) }
+            : new List<ChartPoint>();
+    }
+
+    private static List<ChartPoint> CollapseClusters(List<ChartPoint> data)
+    {
+        if (data.Count <= 3) return data;
+        var range = (double)(data.Max(d => d.Value) - data.Min(d => d.Value));
+        if (range < 1) return data;
+        var valueThreshold = range * 0.15;
+        var timeThreshold = TimeSpan.FromHours(2);
+
+        var result = new List<ChartPoint> { data[0] };
+        for (int i = 1; i < data.Count - 1; i++)
+        {
+            var lastKept = result[^1];
+            var curr = data[i];
+            if (curr.Timestamp - lastKept.Timestamp >= timeThreshold ||
+                Math.Abs((double)curr.Value - (double)lastKept.Value) > valueThreshold)
+                result.Add(curr);
+        }
+        result.Add(data[^1]);
+        return result;
+    }
+
+    private static List<ChartPoint> DownsampleLttb(List<ChartPoint> data, int targetCount)
+    {
+        if (data.Count <= targetCount || targetCount < 3) return data;
+
+        var result = new List<ChartPoint>(targetCount) { data[0] };
+        double bucketSize = (double)(data.Count - 2) / (targetCount - 2);
+        int prevIdx = 0;
+
+        for (int bucket = 0; bucket < targetCount - 2; bucket++)
+        {
+            int currStart = (int)Math.Floor(bucket * bucketSize) + 1;
+            int currEnd = (int)Math.Floor((bucket + 1) * bucketSize) + 1;
+            currEnd = Math.Min(currEnd, data.Count - 1);
+
+            double avgX, avgY;
+            if (bucket == targetCount - 3)
+            {
+                avgX = data[^1].X; avgY = (double)data[^1].Value;
+            }
+            else
+            {
+                int nextStart = currEnd;
+                int nextEnd = Math.Min((int)Math.Floor((bucket + 2) * bucketSize) + 1, data.Count - 1);
+                avgX = 0; avgY = 0; int count = 0;
+                for (int j = nextStart; j < nextEnd; j++) { avgX += data[j].X; avgY += (double)data[j].Value; count++; }
+                if (count > 0) { avgX /= count; avgY /= count; }
+                else { avgX = data[nextStart].X; avgY = (double)data[nextStart].Value; }
+            }
+
+            double maxArea = -1; int bestIdx = currStart;
+            double prevX = data[prevIdx].X, prevY = (double)data[prevIdx].Value;
+            for (int j = currStart; j < currEnd; j++)
+            {
+                double area = Math.Abs((prevX - avgX) * ((double)data[j].Value - prevY) - (prevX - data[j].X) * (avgY - prevY));
+                if (area > maxArea) { maxArea = area; bestIdx = j; }
+            }
+            result.Add(data[bestIdx]);
+            prevIdx = bestIdx;
+        }
+
+        result.Add(data[^1]);
+        return result;
+    }
+
+    private string GetTimeLabel() => TimeBreakpoints[_sliderValue].label;
+
+    private async Task OnSliderChanged()
+    {
+        _page = 1;
+        _expandedId = 0;
+        ApplyChartFilters();
+        await RenderActiveChart();
+    }
+
+    private async Task SwitchTab(string tab)
+    {
+        if (_activeTab == tab) return;
+        _activeTab = tab;
+        StateHasChanged();
+        await Task.Delay(50);
+        await RenderActiveChart();
+    }
+
+    private async Task RenderActiveChart()
+    {
+        StateHasChanged();
+        try
+        {
+            var chart = _activeTab switch
+            {
+                "latency" => _latencyChart,
+                "jitter" => _jitterChart,
+                _ => _speedChart
+            };
+            if (chart != null) await chart.RenderAsync();
+        }
+        catch { }
+    }
+
+    private async Task OnChartClicked(SelectedData<ChartPoint> data)
+    {
+        if (data?.DataPoint?.Items?.FirstOrDefault() is ChartPoint { IsGap: false } point)
+            await ScrollToResult(point.ResultId);
+    }
+
+    private async Task ScrollToResult(int resultId)
+    {
+        var index = _filteredResults.FindIndex(r => r.Id == resultId);
+        if (index >= 0)
+            _page = (index / PageSize) + 1;
+
+        _expandedId = resultId;
+        StateHasChanged();
+
+        await Task.Delay(100);
+        await JS.InvokeVoidAsync("noHighlightRow", $"result-{resultId}");
+    }
+
+    #endregion
+
+    public void Dispose()
+    {
+        _pollTimer?.Dispose();
+    }
+}

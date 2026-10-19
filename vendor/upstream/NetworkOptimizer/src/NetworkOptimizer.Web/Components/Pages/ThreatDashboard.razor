@@ -1,0 +1,3998 @@
+@page "/threats"
+@rendermode InteractiveServer
+@attribute [Authorize(Policy = Policies.RequireViewer)]
+@using Microsoft.AspNetCore.Authorization
+@using Microsoft.AspNetCore.Components.Authorization
+@using NetworkOptimizer.Web.Services.Authorization
+@inject IAuthorizationService Authz
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Threats.Models
+@using NetworkOptimizer.Threats.Interfaces
+@using NetworkOptimizer.Core.Helpers
+@inject ThreatDashboardService DashboardService
+@inject IThreatSettingsAccessor SettingsAccessor
+@inject NetworkOptimizer.Threats.CrowdSec.CrowdSecClient CrowdSecClient
+@inject NetworkOptimizer.Threats.ThreatCollectionService CollectionService
+@inject NetworkOptimizer.Web.Services.SiteContextService SiteContext
+@inject NetworkOptimizer.Threats.Interfaces.IUniFiClientAccessor UniFiClientAccessor
+@implements IDisposable
+@inject NavigationManager NavigationManager
+@inject ILogger<ThreatDashboard> Logger
+@inject IJSRuntime JS
+@inject PullToRefreshState PtrState
+@inject IThreatFilterAdminService ThreatFilterAdmin
+
+<PageTitle>Threat Intelligence - Network Optimizer</PageTitle>
+
+<div class="threat-page">
+<div class="page-header">
+    <PageBackButton />
+    <h1><a href="/threats" class="unstyled-link">Threat Intelligence</a></h1>
+    <p class="page-description">IPS / IDS event analysis, attack patterns, and exposure mapping</p>
+</div>
+
+@* CrowdSec opt-in banner - only show when CTI is not configured *@
+@if (!_crowdSecEnabled && !_crowdSecBannerDismissed)
+{
+    <div class="card banner-card">
+        <div class="card-body banner-card-body">
+            <span class="threat-desc-text">CrowdSec CTI enrichment adds reputation data and MITRE ATT&CK context to threat sources. Enable in <a href="/settings#crowdsec" style="color:var(--primary-color);">Settings</a> to unlock this data.</span>
+            <button class="btn btn-secondary btn-sm" @onclick="() => _crowdSecBannerDismissed = true">Dismiss</button>
+        </div>
+    </div>
+}
+
+@* CrowdSec rate limit warning *@
+@if (_crowdSecRateLimited)
+{
+    <div class="card banner-card banner-card-warning">
+        <div class="card-body banner-card-body">
+            <span class="threat-desc-text">CrowdSec daily API quota reached - remaining IPs will be enriched tomorrow. You can increase your quota in <a href="/settings#crowdsec" style="color:var(--primary-color);">Settings</a> or upgrade your CrowdSec plan.</span>
+            <button class="btn btn-secondary btn-sm" @onclick="() => _crowdSecRateLimited = false">Dismiss</button>
+        </div>
+    </div>
+}
+
+@* MaxMind GeoIP banner - only show when not configured *@
+@if (!_maxMindConfigured && !_maxMindBannerDismissed)
+{
+    <div class="card banner-card">
+        <div class="card-body banner-card-body">
+            <span class="threat-desc-text">MaxMind GeoIP adds country, city, and ASN data to threat sources for geographic analysis. Configure in <a href="/settings#maxmind" style="color:var(--primary-color);">Settings</a>.</span>
+            <button class="btn btn-secondary btn-sm" @onclick="() => _maxMindBannerDismissed = true">Dismiss</button>
+        </div>
+    </div>
+}
+
+@* Tab bar and time range *@
+<div class="threat-header-bar">
+    @if (_activeTab != "drilldown")
+    {
+        <div class="wifi-view-tabs-wrapper" style="margin-bottom:0;">
+            <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-left" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: -200, behavior: 'smooth'})">&#8249;</button>
+            <div class="wifi-view-tabs" style="border-bottom:none; padding-bottom:0;">
+                <button class="wifi-view-tab @(_activeTab == "overview" ? "active" : "")"
+                        @onclick='() => SetActiveTab("overview")'>Overview</button>
+                <button class="wifi-view-tab @(_activeTab == "exposure" ? "active" : "")"
+                        @onclick='() => SetActiveTab("exposure")'>Exposure</button>
+                <button class="wifi-view-tab @(_activeTab == "geographic" ? "active" : "")"
+                        @onclick='() => SetActiveTab("geographic")'>Geographic</button>
+                <button class="wifi-view-tab @(_activeTab == "sequences" ? "active" : "")"
+                        @onclick='() => SetActiveTab("sequences")'>Attack Sequences</button>
+                <button class="wifi-view-tab @(_activeTab == "search" ? "active" : "")"
+                        @onclick='() => SetActiveTab("search")'>Search</button>
+                <button class="wifi-view-tab"
+                        @onclick='() => NavigationManager.NavigateTo("/settings#threat-intelligence")'>Settings</button>
+            </div>
+            <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-right" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: 200, behavior: 'smooth'})">&#8250;</button>
+        </div>
+    }
+    else
+    {
+        <div class="drilldown-back">
+            <button class="btn btn-secondary btn-sm" @onclick="GoBack"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Back</button>
+            <span style="color:var(--text-secondary);">
+                @if (_drilldownPort != null) { <text>Port Details</text> }
+                else if (_drilldownProtocol != null) { <text>Protocol Details</text> }
+                else { <text>IP Details</text> }
+            </span>
+        </div>
+    }
+    <div class="threat-controls" style="@(_activeTab == "search" ? "display:none;" : "")">
+        @if (_noiseFilters.Count > 0)
+        {
+            <div style="display:flex; align-items:center; gap:0.25rem;">
+                <button class="btn btn-sm @(_filtersActive ? "btn-primary" : "btn-secondary")"
+                        @onclick="ToggleFiltersActive" disabled="@(!_canConfigure)"
+                        data-tooltip="@(_filtersActive ? "Noise filters active - click to disable" : "Noise filters disabled - click to enable")"
+                        data-tooltip-hover-only>
+                    <span>Filters</span>
+                    @{
+                        var activeCount = _noiseFilters.Count(f => f.Enabled);
+                    }
+                    @if (activeCount > 0)
+                    {
+                        <span class="noise-filter-badge@(!_filtersActive ? " noise-filter-badge-off" : "")">@activeCount</span>
+                    }
+                </button>
+                <button class="btn btn-sm btn-secondary filter-gear-btn"
+                        @onclick="() => _showFilterPanel = !_showFilterPanel"
+                        data-tooltip="Configure noise filters"
+                        data-tooltip-hover-only>&#9881;</button>
+            </div>
+        }
+        else
+        {
+            <button class="btn btn-sm btn-secondary"
+                    @onclick="() => _showFilterPanel = !_showFilterPanel"
+                    data-tooltip="Add noise filters to hide noisy traffic and suppress alerts"
+                    data-tooltip-hover-only>
+                Filters
+            </button>
+        }
+        <div class="time-range-selector" style="position:relative;">
+            <button class="time-btn threat-time-preset @(_timeRange == "1h" ? "active" : "")"
+                    @onclick='() => SetTimeRange("1h")'>1h</button>
+            <button class="time-btn threat-time-preset @(_timeRange == "4h" ? "active" : "")"
+                    @onclick='() => SetTimeRange("4h")'>4h</button>
+            <button class="time-btn threat-time-preset @(_timeRange == "24h" ? "active" : "")"
+                    @onclick='() => SetTimeRange("24h")'>24h</button>
+            <button class="time-btn threat-time-preset @(_timeRange == "7d" ? "active" : "")"
+                    @onclick='() => SetTimeRange("7d")'>7d</button>
+            <button class="time-btn threat-time-preset @(_timeRange == "30d" ? "active" : "")"
+                    @onclick='() => SetTimeRange("30d")'>30d</button>
+            <button class="time-btn threat-time-preset hide-mobile @(_timeRange == "90d" ? "active" : "")"
+                    @onclick='() => SetTimeRange("90d")'>90d</button>
+            <button class="time-btn custom-range-btn @(_showCustomRange || _timeRange == "custom" ? "active" : "")"
+                    @onclick="ToggleCustomRange"
+                    data-tooltip="@(_timeRange == "custom" && _customFrom.HasValue && _customTo.HasValue ? $"{_customFrom.Value.ToLocalTime():MMM dd HH:mm} - {_customTo.Value.ToLocalTime():MMM dd HH:mm}" : "Custom date range")"
+                    data-tooltip-hover-only>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                @if (_timeRange == "custom")
+                {
+                    <span class="custom-range-clear" @onclick="ClearCustomRange" @onclick:stopPropagation="true">×</span>
+                }
+            </button>
+            <div class="custom-range-popover @(_showCustomRange ? "open" : "")">
+                <div class="custom-range-form">
+                    <div class="custom-range-title">Custom Range</div>
+                    <div class="custom-range-field">
+                        <label class="noise-filter-label">From</label>
+                        <input type="datetime-local" value="@_customFromLocal" @onchange="e => SetCustomFrom(e.Value?.ToString())" class="custom-range-input" />
+                    </div>
+                    <div class="custom-range-field">
+                        <label class="noise-filter-label">To</label>
+                        <input type="datetime-local" value="@_customToLocal" @onchange="e => SetCustomTo(e.Value?.ToString())" class="custom-range-input" />
+                    </div>
+                    <div class="custom-range-actions">
+                        <button class="btn btn-sm btn-secondary" @onclick="CancelCustomRange">Cancel</button>
+                        <button class="btn btn-sm btn-primary" @onclick="ApplyCustomRange">Apply</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+@* Noise Filter Panel *@
+<div class="expand-wrapper @(_showFilterPanel ? "expanded" : "")">
+    <div class="expand-content">
+        <div class="card banner-card banner-card-accent">
+            <div class="card-body" style="padding:1rem;">
+                <div class="noise-filter-header">
+                    <h4>Noise Filters</h4>
+                    <span style="color:var(--text-muted); font-size:0.8rem;">Hide noisy traffic from dashboard views and alert notifications</span>
+                </div>
+
+                @* Add new filter form *@
+                @if (_canConfigure)
+                {
+                <div class="noise-filter-form">
+                    <div>
+                        <label class="noise-filter-label">Source IP</label>
+                        <input type="text" @bind="_newFilterSourceIp" placeholder="IP or CIDR"
+                               class="noise-filter-input" style="width:150px;" />
+                    </div>
+                    <div>
+                        <label class="noise-filter-label">Dest IP</label>
+                        <input type="text" @bind="_newFilterDestIp" placeholder="IP or CIDR"
+                               class="noise-filter-input" style="width:150px;" />
+                    </div>
+                    <div>
+                        <label class="noise-filter-label">Dest Port</label>
+                        <input type="text" @bind="_newFilterDestPort" placeholder="any"
+                               class="noise-filter-input" style="width:80px;" />
+                    </div>
+                    <div>
+                        <label class="noise-filter-label">Description</label>
+                        <input type="text" @bind="_newFilterDescription" placeholder="optional"
+                               class="noise-filter-input" style="width:200px;" />
+                    </div>
+                    <button class="btn btn-sm btn-primary" @onclick="AddNoiseFilterAsync">Add Filter</button>
+                    @if (!string.IsNullOrEmpty(_newFilterSourceIp) || !string.IsNullOrEmpty(_newFilterDestIp) || !string.IsNullOrEmpty(_newFilterDestPort) || !string.IsNullOrEmpty(_newFilterDescription))
+                    {
+                        <button class="btn btn-sm btn-secondary" @onclick="ClearFilterForm">Clear</button>
+                    }
+                </div>
+
+                }
+
+                @* Existing filters *@
+                @if (_noiseFilters.Count > 0)
+                {
+                    <div class="table-responsive">
+                        <table class="data-table" style="font-size:0.85rem;">
+                            <thead>
+                                <tr>
+                                    <th>Source IP</th>
+                                    <th>Dest IP</th>
+                                    <th>Dest Port</th>
+                                    <th>Description</th>
+                                    <th style="width:100px;">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var filter in _noiseFilters)
+                                {
+                                    <tr style="@(filter.Enabled ? "" : "opacity:0.5;")">
+                                        <td><code>@(filter.SourceIp ?? "*")</code></td>
+                                        <td><code>@(filter.DestIp ?? "*")</code></td>
+                                        <td><code>@(filter.DestPort?.ToString() ?? "*")</code></td>
+                                        <td>@filter.Description</td>
+                                        <td>
+                                            <div style="display:flex; gap:0.25rem;">
+                                                <SiteAdminOnly>
+                                                    <button class="btn btn-sm btn-secondary" @onclick="() => ToggleFilterAsync(filter)"
+                                                            data-tooltip="@(filter.Enabled ? "Disable" : "Enable")" data-tooltip-hover-only>
+                                                        @(filter.Enabled ? "On" : "Off")
+                                                    </button>
+                                                    <button class="btn btn-sm btn-danger" @onclick="() => DeleteFilterAsync(filter)"
+                                                            data-tooltip="Delete filter" data-tooltip-hover-only>X</button>
+                                                </SiteAdminOnly>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+                else
+                {
+                    <div class="text-muted-sm">No filters configured. Add one above to hide noisy traffic and suppress alerts.</div>
+                }
+            </div>
+        </div>
+    </div>
+</div>
+
+@if (CollectionService.BackfillCursorFor(BackfillSiteKey) != null)
+{
+    var cursor = CollectionService.BackfillCursorFor(BackfillSiteKey)!.Value;
+    var daysBack = (int)(DateTimeOffset.UtcNow - cursor).TotalDays;
+    <div class="backfill-status">
+        <span class="spinner-sm"></span>
+        <span>Building historical data - coverage: @(daysBack > 0 ? $"{daysBack}d" : "< 1d") back (@cursor.ToLocalTime().ToString("MMM d") to present)</span>
+    </div>
+}
+
+@if (_collectingFirstData)
+{
+    <div class="loading-container first-data-loading">
+        <span class="spinner"></span>
+        <p class="threat-desc-text">Collecting threat data from UniFi for the first time...</p>
+    </div>
+}
+else if (_loading && !_hasLoadedOnce)
+{
+    <div class="loading-container">
+        <span class="spinner"></span>
+    </div>
+}
+else
+{
+    @* ========== Overview Tab ========== *@
+    @if (_activeTab == "overview")
+    {
+        @* Summary stat cards *@
+        <div class="threat-summary-grid threat-summary-grid-compact">
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:var(--text-primary);">@FormatNumber(_dashboardData.Summary.TotalEvents)</div>
+                <div class="threat-stat-label">Total Events</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#ef4444;">@FormatNumber(_dashboardData.Summary.BlockedCount)</div>
+                <div class="threat-stat-label">Blocked</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#f59e0b;">@FormatNumber(_dashboardData.Summary.DetectedCount)</div>
+                <div class="threat-stat-label">Detected</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#3b82f6;">@FormatNumber(_dashboardData.Summary.UniqueSourceIps)</div>
+                <div class="threat-stat-label">Unique Sources</div>
+            </div>
+        </div>
+
+        @* Threat Timeline *@
+        <div class="chart-card">
+            <div class="chart-header">
+                <h3 class="chart-title">Threat Timeline</h3>
+            </div>
+            <div class="threat-chart-body">
+                <ApexChart @ref="_timelineChart" TItem="TimelineBucket"
+                           Options="_timelineChartOptions"
+                           Height="@("280px")">
+
+                    <ApexPointSeries TItem="TimelineBucket"
+                                     Items="@(ShowSev5 ? _timeline : _emptyTimeline)"
+                                     Name="Critical"
+                                     SeriesType="SeriesType.Area"
+                                     XValue="e => DateTime.SpecifyKind(e.Hour, DateTimeKind.Utc)"
+                                     YValue="e => (decimal)e.Severity5"
+                                     OrderBy="e => e.X" />
+                    <ApexPointSeries TItem="TimelineBucket"
+                                     Items="@(ShowSev4 ? _timeline : _emptyTimeline)"
+                                     Name="High"
+                                     SeriesType="SeriesType.Area"
+                                     XValue="e => DateTime.SpecifyKind(e.Hour, DateTimeKind.Utc)"
+                                     YValue="e => (decimal)e.Severity4"
+                                     OrderBy="e => e.X" />
+                    <ApexPointSeries TItem="TimelineBucket"
+                                     Items="@(ShowSev3 ? _timeline : _emptyTimeline)"
+                                     Name="Medium"
+                                     SeriesType="SeriesType.Area"
+                                     XValue="e => DateTime.SpecifyKind(e.Hour, DateTimeKind.Utc)"
+                                     YValue="e => (decimal)e.Severity3"
+                                     OrderBy="e => e.X" />
+                    <ApexPointSeries TItem="TimelineBucket"
+                                     Items="@(ShowSev2 ? _timeline : _emptyTimeline)"
+                                     Name="Low"
+                                     SeriesType="SeriesType.Area"
+                                     XValue="e => DateTime.SpecifyKind(e.Hour, DateTimeKind.Utc)"
+                                     YValue="e => (decimal)e.Severity2"
+                                     OrderBy="e => e.X" />
+                    <ApexPointSeries TItem="TimelineBucket"
+                                     Items="@(ShowSev1 ? _timeline : _emptyTimeline)"
+                                     Name="Info"
+                                     SeriesType="SeriesType.Area"
+                                     XValue="e => DateTime.SpecifyKind(e.Hour, DateTimeKind.Utc)"
+                                     YValue="e => (decimal)e.Severity1"
+                                     OrderBy="e => e.X" />
+                </ApexChart>
+
+                @* Severity Filter Badges (below chart, same pattern as WAN Speed Test) *@
+                <div class="wan-filter-badges">
+                    <button class="wan-filter-badge @(ShowSev5 ? "active" : "inactive")"
+                            @onclick="(e) => ToggleSeverity(5, e)">
+                        <span class="wan-badge-dot" style="background-color: #ef4444"></span>
+                        Critical
+                    </button>
+                    <button class="wan-filter-badge @(ShowSev4 ? "active" : "inactive")"
+                            @onclick="(e) => ToggleSeverity(4, e)">
+                        <span class="wan-badge-dot" style="background-color: #f97316"></span>
+                        High
+                    </button>
+                    <button class="wan-filter-badge @(ShowSev3 ? "active" : "inactive")"
+                            @onclick="(e) => ToggleSeverity(3, e)">
+                        <span class="wan-badge-dot" style="background-color: #eab308"></span>
+                        Medium
+                    </button>
+                    <button class="wan-filter-badge @(ShowSev2 ? "active" : "inactive")"
+                            @onclick="(e) => ToggleSeverity(2, e)">
+                        <span class="wan-badge-dot" style="background-color: #3b82f6"></span>
+                        Low
+                    </button>
+                    <button class="wan-filter-badge @(ShowSev1 ? "active" : "inactive")"
+                            @onclick="(e) => ToggleSeverity(1, e)">
+                        <span class="wan-badge-dot" style="background-color: #10b981"></span>
+                        Info
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        @* Kill Chain + Blocked vs Detected row *@
+        <div class="threat-two-chart-row">
+            @* Kill Chain Distribution *@
+            <div class="chart-card">
+                <div class="chart-header">
+                    <h3 class="chart-title">Kill Chain Distribution</h3>
+                </div>
+                <div class="threat-chart-body">
+                    @if (_dashboardData.KillChainDistribution.Count > 0)
+                    {
+                        <ApexChart @ref="_killChainChart" TItem="KillChainItem"
+                                   Options="_killChainChartOptions"
+                                   Height="@("220px")">
+                            <ApexPointSeries TItem="KillChainItem"
+                                             Items="_killChainItems"
+                                             Name="Events"
+                                             SeriesType="SeriesType.Bar"
+                                             XValue="e => GetKillChainLabel(e.Stage)"
+                                             YValue="e => (decimal)e.Count" />
+                        </ApexChart>
+                    }
+                    else
+                    {
+                        <div class="empty-state">
+                            <p>No kill chain data available.</p>
+                        </div>
+                    }
+                </div>
+            </div>
+
+            @* Blocked vs Detected *@
+            <div class="chart-card threat-action-chart">
+                <div class="chart-header">
+                    <h3 class="chart-title">Blocked vs Detected</h3>
+                </div>
+                <div class="threat-chart-body">
+                    @if (_dashboardData.Summary.TotalEvents > 0)
+                    {
+                        <ApexChart @ref="_actionChart" TItem="ActionBreakdownItem"
+                                   Options="_actionChartOptions"
+                                   Height="@("220px")">
+                            <ApexPointSeries TItem="ActionBreakdownItem"
+                                             Items="_actionBreakdownItems"
+                                             Name="Count"
+                                             SeriesType="SeriesType.Donut"
+                                             XValue="e => e.Label"
+                                             YAggregate="e => (decimal)e.Sum(x => x.Count)"
+                                             OrderBy="e => e.X" />
+                        </ApexChart>
+                    }
+                    else
+                    {
+                        <div class="empty-state">
+                            <p>No action data available.</p>
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+
+        @* Top Sources *@
+        <div class="card card-spaced">
+            <div class="card-header">
+                <h3 class="card-title">Top Sources</h3>
+            </div>
+            <div class="card-body">
+                @if (_dashboardData.TopSources.Count > 0)
+                {
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>IP</th>
+                                    <th>Country</th>
+                                    <th class="hide-mobile">ASN</th>
+                                    <th>Events</th>
+                                    <th>Severity</th>
+                                    @if (_crowdSecEnabled)
+                                    {
+                                        <th class="hide-mobile">Reputation</th>
+                                    }
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var source in _dashboardData.TopSources)
+                                {
+                                    <tr>
+                                        <td>@{ var srcName = GetClientName(source.SourceIp); }<a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToIp(source.SourceIp)"><code>@source.SourceIp</code></a>@if (srcName != null) { <span class="ip-client-name">@srcName</span> }</td>
+                                        <td>@if (string.IsNullOrEmpty(source.CountryCode)) { <span>-</span> } else { <span class="flag-icon" data-tooltip="@CountryTooltip(source.CountryCode)">@CountryFlag(source.CountryCode)</span> }</td>
+                                        <td class="hide-mobile">@(source.AsnOrg ?? (source.Asn.HasValue ? $"AS{source.Asn}" : "-"))</td>
+                                        <td>@FormatNumber(source.EventCount)</td>
+                                        <td>
+                                            <span class="severity-dot" style="background:@GetSeverityColor(source.MaxSeverity);"></span>
+                                            @GetSeverityLabel(source.MaxSeverity)
+                                        </td>
+                                        @if (_crowdSecEnabled)
+                                        {
+                                            <td class="hide-mobile">
+                                                <div class="reputation-cell-inner">
+                                                @{
+                                                    // Check manual cache first (persists across auto-refresh)
+                                                    var hasCachedCti = _manualCtiCache.TryGetValue(source.SourceIp, out var cachedCti);
+                                                    var effectiveBadge = source.CrowdSecReputation ?? cachedCti?.Badge;
+                                                    var effectiveBehaviors = source.TopBehaviors ?? cachedCti?.Behaviors;
+                                                }
+                                                @if (effectiveBadge != null)
+                                                {
+                                                    <span class="reputation-badge reputation-@effectiveBadge"
+                                                          data-tooltip="@(effectiveBehaviors ?? "No behaviors identified")">
+                                                        @effectiveBadge
+                                                    </span>
+                                                }
+                                                else if (NetworkOptimizer.Core.Helpers.NetworkUtilities.IsPrivateIpAddress(source.SourceIp))
+                                                {
+                                                    <span style="color:var(--text-muted);">Local</span>
+                                                }
+                                                else if (hasCachedCti)
+                                                {
+                                                    @* Looked up but not in CrowdSec database *@
+                                                    <span style="color:var(--text-muted);">Not in DB</span>
+                                                }
+                                                else if (_crowdSecRateLimited)
+                                                {
+                                                    <span style="color:var(--text-muted); font-size:0.75rem;"
+                                                          data-tooltip="CrowdSec daily quota reached - will retry automatically">Quota reached</span>
+                                                }
+                                                else
+                                                {
+                                                    @if (_lookingUpIp == source.SourceIp)
+                                                    {
+                                                        <span class="spinner-sm"></span>
+                                                    }
+                                                    else
+                                                    {
+                                                        <button class="btn btn-sm btn-primary"
+                                                                @onclick="() => LookUpReputationAsync(source)"
+                                                                data-tooltip="Query CrowdSec threat intelligence" data-tooltip-hover-only>
+                                                            Look up
+                                                        </button>
+                                                    }
+                                                }
+                                                </div>
+                                            </td>
+                                        }
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+                else
+                {
+                    <div class="empty-state">
+                        <p>No source data for this period.</p>
+                    </div>
+                }
+            </div>
+        </div>
+
+        @* Top Targeted Ports *@
+        <div class="card card-spaced">
+            <div class="card-header">
+                <h3 class="card-title">Top Targeted Ports</h3>
+            </div>
+            <div class="card-body">
+                @if (_dashboardData.TopTargetedPorts.Count > 0)
+                {
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Port</th>
+                                    <th>Service</th>
+                                    <th>Events</th>
+                                    <th class="hide-mobile">Unique IPs</th>
+                                    <th class="hide-mobile">Top Signature</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var port in _dashboardData.TopTargetedPorts)
+                                {
+                                    <tr>
+                                        @if (port.Port == 0 && !string.IsNullOrEmpty(port.Protocol))
+                                        {
+                                            <td><a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToProtocol(port.Protocol)"><code>@port.Protocol.ToUpperInvariant()</code></a></td>
+                                            <td>-</td>
+                                        }
+                                        else
+                                        {
+                                            <td><a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToPort(port.Port)"><code>@port.Port</code></a></td>
+                                            <td>@GetPortServiceName(port.Port)</td>
+                                        }
+                                        <td>@FormatNumber(port.EventCount)</td>
+                                        <td class="hide-mobile">@FormatNumber(port.UniqueSourceIps)</td>
+                                        <td class="hide-mobile text-truncate-300">@PrettifySignature(port.TopSignature)</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+                else
+                {
+                    <div class="empty-state">
+                        <p>No targeted port data for this period.</p>
+                    </div>
+                }
+            </div>
+        </div>
+
+        @* Attack Patterns *@
+        <div class="card card-spaced">
+            <div class="card-header">
+                <h3 class="card-title">Attack Patterns</h3>
+            </div>
+            <div class="card-body">
+                @if (_dashboardData.RecentPatterns.Count > 0)
+                {
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                    <th class="hide-mobile">Confidence</th>
+                                    <th>Events</th>
+                                    <th class="hide-mobile">Last Detected</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var pattern in _dashboardData.RecentPatterns)
+                                {
+                                    <tr>
+                                        <td>
+                                            <span class="status-badge pattern-type-badge">
+                                                @GetPatternTypeLabel(pattern.PatternType)
+                                            </span>
+                                        </td>
+                                        <td>@RenderPatternDescription(pattern)</td>
+                                        <td class="hide-mobile">@($"{pattern.Confidence:P0}")</td>
+                                        <td>@FormatNumber(pattern.EventCount)</td>
+                                        <td class="hide-mobile">@pattern.LastSeen.ToLocalTime().ToString("MMM dd HH:mm")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+                else
+                {
+                    <div class="empty-state">
+                        <p>No attack patterns detected for this period.</p>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
+    @* ========== Exposure Tab ========== *@
+    @if (_activeTab == "exposure")
+    {
+        @if (_exposureReport == null)
+        {
+            <div class="loading-container">
+                <span class="spinner"></span>
+            </div>
+        }
+        else
+        {
+            @* Geo-block recommendation banner *@
+            @if (_exposureReport.GeoBlockRecommendation is { } geoRec && geoRec.Countries.Count > 0)
+            {
+                <div class="card banner-card banner-card-warning">
+                    <div class="card-body" style="padding:0.75rem 1rem;">
+                        <div class="geo-rec-title">
+                            <strong style="color:var(--warning-color);">Geo-Block Recommendation</strong>
+                        </div>
+                        <div class="threat-desc-text">
+                            Blocking
+                            @foreach (var (country, idx) in geoRec.Countries.Select((c, i) => (c, i)))
+                            {
+                                @if (idx > 0) { <span>, </span> }
+                                <strong>@CountryFlag(country) @(CountryNames.TryGetValue(country, out var name) ? name : country)</strong>
+                            }
+                            could prevent <strong>@($"{geoRec.PreventionPercentage:F0}")%</strong> of detected threat events
+                            (@FormatNumber(geoRec.PreventableEvents) of @FormatNumber(geoRec.TotalDetectedEvents)).
+                        </div>
+                    </div>
+                </div>
+            }
+
+            @* Summary row *@
+            <div class="threat-summary-grid" style="grid-template-columns:repeat(3, 1fr);">
+                <div class="card threat-stat-card">
+                    <div class="threat-stat-value" style="color:var(--text-primary);">@_exposureReport.TotalExposedPorts</div>
+                    <div class="threat-stat-label">Exposed Ports</div>
+                </div>
+                <div class="card threat-stat-card">
+                    <div class="threat-stat-value" style="color:#ef4444;">@FormatNumber(_exposureReport.TotalThreatsTargetingExposed)</div>
+                    <div class="threat-stat-label">Threats Targeting Exposed</div>
+                </div>
+                <div class="card threat-stat-card">
+                    <div class="threat-stat-value" style="color:#f59e0b;">@_exposureReport.ExposedServices.Count</div>
+                    <div class="threat-stat-label">Port Forward Rules</div>
+                </div>
+            </div>
+
+            @* Port forward table with threat overlay *@
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Exposed Services</h3>
+                </div>
+                <div class="card-body">
+                    @if (_exposureReport.ExposedServices.Count > 0)
+                    {
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Port</th>
+                                        <th>Service</th>
+                                        <th class="hide-mobile">Target</th>
+                                        <th>Threats</th>
+                                        <th class="hide-mobile">Unique IPs</th>
+                                        <th class="hide-mobile">Top Signatures</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var svc in _exposureReport.ExposedServices)
+                                    {
+                                        <tr>
+                                            <td><a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToPort(svc.Port)"><code>@svc.Port</code></a>/<a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToProtocol(svc.Protocol.ToUpperInvariant())"><code>@svc.Protocol.ToUpperInvariant()</code></a></td>
+                                            <td>@(string.IsNullOrEmpty(svc.ServiceName) ? GetPortServiceName(svc.Port) : svc.ServiceName)</td>
+                                            <td class="hide-mobile">@svc.ForwardTarget</td>
+                                            <td>
+                                                @if (svc.ThreatCount > 0)
+                                                {
+                                                    <span class="threat-count-danger">@FormatNumber(svc.ThreatCount)</span>
+                                                }
+                                                else
+                                                {
+                                                    <span style="color:var(--text-muted);">0</span>
+                                                }
+                                            </td>
+                                            <td class="hide-mobile">@FormatNumber(svc.UniqueSourceIps)</td>
+                                            <td class="hide-mobile text-truncate-300">
+                                                @(svc.TopSignatures.Count > 0 ? string.Join(", ", svc.TopSignatures.Take(2).Select(PrettifySignature)) : "-")
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="empty-state">
+                            <div class="empty-icon">&#10003;</div>
+                            <h3>No Exposed Services</h3>
+                            <p>No port forward rules detected, or no threats are targeting forwarded ports.</p>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+    }
+
+    @* ========== Geographic Tab ========== *@
+    @if (_activeTab == "geographic")
+    {
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Country Breakdown</h3>
+            </div>
+            <div class="card-body">
+                @if (_geoDistribution.Count > 0)
+                {
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Country</th>
+                                    <th>Events</th>
+                                    <th>Percentage</th>
+                                    <th class="hide-mobile">Bar</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @{ var geoTotal = _geoDistribution.Values.Sum(); }
+                                @foreach (var entry in _geoDistribution.OrderByDescending(kv => kv.Value))
+                                {
+                                    var pct = geoTotal > 0 ? (double)entry.Value / geoTotal * 100 : 0;
+                                    <tr>
+                                        <td><span class="flag-icon">@CountryFlag(entry.Key)</span><span style="margin-left:0.4rem;"><strong>@(CountryNames.TryGetValue(entry.Key, out var countryName) ? countryName : entry.Key)</strong></span></td>
+                                        <td>@FormatNumber(entry.Value)</td>
+                                        <td>@($"{pct:F1}")%</td>
+                                        <td class="hide-mobile" style="width:40%;">
+                                            <div class="threat-bar-track">
+                                                <div class="threat-bar-fill" style="width:@($"{pct:F1}")%;"></div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+                else
+                {
+                    <div class="empty-state">
+                        <p>No geographic data available for this period.</p>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
+    @* ========== Attack Sequences Tab ========== *@
+    @if (_activeTab == "sequences")
+    {
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Multi-Stage Attack Sequences</h3>
+                <span class="tooltip-icon tooltip-icon-sm" data-tooltip="Source IPs that exhibited activity across 2+ kill chain stages, indicating potential coordinated attacks.">?</span>
+            </div>
+            <div class="card-body">
+                @if (_attackSequences.Count > 0)
+                {
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Source IP</th>
+                                    <th class="hide-mobile">Country</th>
+                                    <th class="hide-mobile">ASN</th>
+                                    <th>Stages</th>
+                                    <th class="hide-mobile">Events</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var seq in _attackSequences)
+                                {
+                                    <tr>
+                                        <td>@{ var seqName = GetClientName(seq.SourceIp); }<a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToIp(seq.SourceIp)"><code>@seq.SourceIp</code></a>@if (seqName != null) { <span class="ip-client-name">@seqName</span> }</td>
+                                        <td class="hide-mobile">@if (string.IsNullOrEmpty(seq.CountryCode)) { <span>-</span> } else { <span class="flag-icon" data-tooltip="@CountryTooltip(seq.CountryCode)">@CountryFlag(seq.CountryCode)</span> }</td>
+                                        <td class="hide-mobile text-truncate-200">@(seq.AsnOrg ?? "-")</td>
+                                        <td>
+                                            <div class="stage-bars">
+                                                @foreach (var stage in seq.Stages)
+                                                {
+                                                    <span class="stage-bar"
+                                                          data-tooltip="@GetKillChainLabel(stage.Stage): @stage.EventCount events, @PrettifySignature(stage.TopSignature)"
+                                                          style="min-width:@(Math.Max(24, stage.EventCount * 2))px; background:@GetStageColor(stage.Stage);">
+                                                        @GetStageAbbrev(stage.Stage)
+                                                    </span>
+                                                }
+                                            </div>
+                                        </td>
+                                        <td class="hide-mobile">@FormatNumber(seq.Stages.Sum(s => s.EventCount))</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+                else
+                {
+                    <div class="empty-state">
+                        <div class="empty-icon">&#10003;</div>
+                        <h3>No Multi-Stage Sequences</h3>
+                        <p>No source IPs exhibited activity across multiple kill chain stages in this period.</p>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
+    @* ========== Search Tab ========== *@
+    @if (_activeTab == "search")
+    {
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Search Threat Data</h3>
+            </div>
+            <div class="card-body" style="min-height:80px;">
+                <div class="search-input-row">
+                    <input type="text" value="@_searchText"
+                           @oninput="HandleSearchInput"
+                           @onkeydown="HandleSearchKeyDown"
+                           placeholder="IP, CIDR, country code/name, or ASN..."
+                           class="noise-filter-input search-input" />
+                    <button class="btn btn-primary" @onclick="ExecuteSearchAsync"
+                            disabled="@(_searchLoading || string.IsNullOrWhiteSpace(_searchText))">
+                        @if (_searchLoading)
+                        {
+                            <span class="spinner-sm"></span>
+                        }
+                        else
+                        {
+                            <span>Search</span>
+                        }
+                    </button>
+                </div>
+                @if (_searchClassification != null)
+                {
+                    <div class="search-classification">
+                        Searching with <strong>@_searchClassification</strong>
+                    </div>
+                }
+            </div>
+        </div>
+
+        @if (_searchResults != null)
+        {
+            @if (_searchResults.Count > 0)
+            {
+                <div class="card card-spaced">
+                    <div class="card-header">
+                        <h3 class="card-title">Results (@_searchResults.Count@(_searchResults.Count >= 200 ? "+" : ""))</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>IP</th>
+                                        <th>Role</th>
+                                        <th>Country</th>
+                                        <th class="hide-mobile">ASN</th>
+                                        <th>Events</th>
+                                        <th>Severity</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var entry in _searchResults)
+                                    {
+                                        <tr>
+                                            <td>@{ var searchName = GetClientName(entry.Ip); }<a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToIp(entry.Ip)"><code>@entry.Ip</code></a>@if (searchName != null) { <span class="ip-client-name">@searchName</span> }</td>
+                                            <td>
+                                                <span class="role-badge role-@entry.Role.ToLowerInvariant()">@entry.Role</span>
+                                            </td>
+                                            <td>@if (string.IsNullOrEmpty(entry.CountryCode)) { <span>-</span> } else { <span class="flag-icon" data-tooltip="@CountryTooltip(entry.CountryCode)">@CountryFlag(entry.CountryCode)</span> }</td>
+                                            <td class="hide-mobile">@(entry.AsnOrg ?? (entry.Asn.HasValue ? $"AS{entry.Asn}" : "-"))</td>
+                                            <td>@FormatNumber(entry.EventCount)</td>
+                                            <td>
+                                                <span class="severity-dot" style="background:@GetSeverityColor(entry.MaxSeverity);"></span>
+                                                @GetSeverityLabel(entry.MaxSeverity)
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            }
+            else
+            {
+                <div class="card card-spaced">
+                    <div class="card-body">
+                        <div class="empty-state">
+                            <p>No results found for this query.</p>
+                        </div>
+                    </div>
+                </div>
+            }
+        }
+    }
+
+    @* ========== IP Drill-Down Tab ========== *@
+    @if (_activeTab == "drilldown" && _drilldownData != null)
+    {
+        @* Header: IP + client name + first/last seen *@
+        <div class="drilldown-header">
+            <h2 class="drilldown-title" style="margin-top:-4px; line-height:1.2;">
+                <code>@_drilldownData.Ip</code>
+            </h2>
+            @{ var drilldownName = GetClientName(_drilldownData.Ip); }
+            @if (drilldownName != null)
+            {
+                <span class="drilldown-subtitle">@drilldownName</span>
+            }
+            @if (!string.IsNullOrEmpty(_drilldownData.CountryCode))
+            {
+                <span class="flag-icon" data-tooltip="@CountryTooltip(_drilldownData.CountryCode)" style="font-size:1.1rem;">
+                    @CountryFlag(_drilldownData.CountryCode)
+                </span>
+                <span class="threat-desc-text">@(CountryNames.TryGetValue(_drilldownData.CountryCode, out var cn) ? cn : _drilldownData.CountryCode.ToUpperInvariant())</span>
+            }
+            @if (!string.IsNullOrEmpty(_drilldownData.AsnOrg))
+            {
+                <span class="hide-mobile drilldown-asn text-truncate-300">@_drilldownData.AsnOrg</span>
+            }
+            @if (_crowdSecEnabled && !NetworkOptimizer.Core.Helpers.NetworkUtilities.IsPrivateIpAddress(_drilldownData.Ip))
+            {
+                var hasDrilldownCti = _manualCtiCache.TryGetValue(_drilldownData.Ip, out var drilldownCti);
+                var drilldownBadge = drilldownCti?.Badge;
+                var drilldownBehaviors = drilldownCti?.Behaviors;
+                <span class="cti-inline-group">
+                @if (drilldownBadge != null)
+                {
+                    <span class="reputation-badge reputation-@drilldownBadge"
+                          data-tooltip="@(drilldownBehaviors ?? "No behaviors identified")">
+                        @drilldownBadge
+                    </span>
+                    @if (string.Equals(drilldownBadge, "unknown", StringComparison.OrdinalIgnoreCase))
+                    {
+                        @if (_lookingUpIp == _drilldownData.Ip)
+                        {
+                            <span class="spinner-sm"></span>
+                        }
+                        else if (_crowdSecRateLimited)
+                        {
+                            <span style="color:var(--text-muted); font-size:0.75rem;"
+                                  data-tooltip="CrowdSec daily quota reached - will retry automatically">Quota reached</span>
+                        }
+                        else if (!_drilldownCtiLookedUp)
+                        {
+                            <button class="btn btn-sm btn-primary" @onclick="() => LookUpDrilldownReputationAsync(_drilldownData.Ip)"
+                                    data-tooltip="Query CrowdSec threat intelligence" data-tooltip-hover-only>
+                                Look up
+                            </button>
+                        }
+                    }
+                }
+                else if (hasDrilldownCti)
+                {
+                    <span class="text-muted-sm">Not in CrowdSec DB</span>
+                }
+                else if (_lookingUpIp == _drilldownData.Ip)
+                {
+                    <span class="spinner-sm"></span>
+                }
+                else if (_crowdSecRateLimited)
+                {
+                    <span style="color:var(--text-muted); font-size:0.75rem;"
+                          data-tooltip="CrowdSec daily quota reached - will retry automatically">Quota reached</span>
+                }
+                else
+                {
+                    <button class="btn btn-sm btn-primary" @onclick="() => LookUpDrilldownReputationAsync(_drilldownData.Ip)"
+                            data-tooltip="Query CrowdSec threat intelligence" data-tooltip-hover-only>
+                        Look up
+                    </button>
+                }
+                </span>
+            }
+            @if (_drilldownData.FirstSeen.HasValue)
+            {
+                <span class="drilldown-time">
+                    @_drilldownData.FirstSeen.Value.ToLocalTime().ToString("MMM dd HH:mm") - @_drilldownData.LastSeen?.ToLocalTime().ToString("MMM dd HH:mm")
+                </span>
+            }
+        </div>
+
+        @* CTI details row (behaviors) when we have data *@
+        @if (_crowdSecEnabled && !NetworkOptimizer.Core.Helpers.NetworkUtilities.IsPrivateIpAddress(_drilldownData.Ip))
+        {
+            var ctiEntry = _manualCtiCache.GetValueOrDefault(_drilldownData.Ip);
+            @if (ctiEntry?.Behaviors != null)
+            {
+                <div class="cti-detail" style="margin-bottom:0.5rem;">
+                    <span class="cti-detail-label">Known Behaviors:</span> @ctiEntry.Behaviors
+                </div>
+            }
+            @if (ctiEntry?.MitreTechniques?.Count > 0)
+            {
+                <div class="cti-detail" style="margin-bottom:1rem;">
+                    <span class="cti-detail-label">MITRE Techniques: </span>
+                    @foreach (var technique in ctiEntry.MitreTechniques)
+                    {
+                        <span class="mitre-technique" data-tooltip="@(technique.Name) - @(technique.Description)">@technique.Label</span>
+                    }
+                </div>
+            }
+        }
+
+        @* 4 stat cards *@
+        <div class="threat-summary-grid">
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:var(--text-primary);">@FormatNumber(_drilldownData.TotalEvents)</div>
+                <div class="threat-stat-label">Total Events</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#3b82f6;">@FormatNumber(_drilldownData.AsSourceCount)</div>
+                <div class="threat-stat-label">As Source</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#a78bfa;">@FormatNumber(_drilldownData.AsDestCount)</div>
+                <div class="threat-stat-label">As Destination</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#ef4444;">@FormatNumber(_drilldownData.BlockedCount)</div>
+                <div class="threat-stat-label">Blocked</div>
+            </div>
+        </div>
+
+        @* Destinations Accessed (when IP is source) *@
+        @if (_drilldownData.Destinations.Count > 0)
+        {
+            <div class="card card-spaced">
+                <div class="card-header">
+                    <h3 class="card-title">Destinations Accessed</h3>
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Destination</th>
+                                    <th class="hide-mobile">Domain</th>
+                                    <th>Port Ranges</th>
+                                    <th class="hide-mobile">Services</th>
+                                    <th>Events</th>
+                                    <th>Blocked</th>
+                                    <th class="hide-mobile" style="width:50px;"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var dest in _drilldownData.Destinations)
+                                {
+                                    <tr>
+                                        <td>@{ var destName = GetClientName(dest.Ip); }<a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToIp(dest.Ip)"><code>@dest.Ip</code></a>@if (destName != null) { <span class="ip-client-name">@destName</span> }</td>
+                                        <td class="hide-mobile">@(dest.Domain ?? "-")</td>
+                                        <td><code class="code-sm">@dest.PortRanges</code></td>
+                                        <td class="hide-mobile">@FormatServices(dest.Services)</td>
+                                        <td>@FormatNumber(dest.EventCount)</td>
+                                        <td>@(dest.BlockedCount > 0 ? FormatNumber(dest.BlockedCount) : "-")</td>
+                                        <td class="hide-mobile"><button class="btn btn-sm btn-secondary quick-filter-btn" @onclick="() => QuickFilterFromDrilldown(_drilldownIp, dest.Ip, null)" data-tooltip="Add noise filter for this source-dest pair" data-tooltip-hover-only>Filter</button></td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @* Sources Targeting (when IP is destination) *@
+        @if (_drilldownData.Sources.Count > 0)
+        {
+            <div class="card card-spaced">
+                <div class="card-header">
+                    <h3 class="card-title">Sources Targeting This IP</h3>
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Source</th>
+                                    <th class="hide-mobile">Domain</th>
+                                    <th>Port Ranges</th>
+                                    <th class="hide-mobile">Services</th>
+                                    <th>Events</th>
+                                    <th>Blocked</th>
+                                    <th class="hide-mobile" style="width:50px;"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var src in _drilldownData.Sources.Take(_sourcesVisible))
+                                {
+                                    <tr>
+                                        <td>@{ var srcPeerName = GetClientName(src.Ip); }<a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToIp(src.Ip)"><code>@src.Ip</code></a>@if (srcPeerName != null) { <span class="ip-client-name">@srcPeerName</span> }</td>
+                                        <td class="hide-mobile">@(src.Domain ?? "-")</td>
+                                        <td><code class="code-sm">@src.PortRanges</code></td>
+                                        <td class="hide-mobile">@FormatServices(src.Services)</td>
+                                        <td>@FormatNumber(src.EventCount)</td>
+                                        <td>@(src.BlockedCount > 0 ? FormatNumber(src.BlockedCount) : "-")</td>
+                                        <td class="hide-mobile"><button class="btn btn-sm btn-secondary quick-filter-btn" @onclick="() => QuickFilterFromDrilldown(src.Ip, _drilldownIp, null)" data-tooltip="Add noise filter for this source-dest pair" data-tooltip-hover-only>Filter</button></td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                    @if (_drilldownData.Sources.Count > _sourcesVisible)
+                    {
+                        <div class="show-more-row">
+                            <button class="btn btn-sm btn-secondary" @onclick="() => _sourcesVisible += DrilldownPageSize">
+                                Show more (@(_drilldownData.Sources.Count - _sourcesVisible) remaining)
+                            </button>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+
+        @* Port Ranges *@
+        @if (_drilldownData.PortRanges.Count > 0)
+        {
+            <div class="card card-spaced">
+                <div class="card-header">
+                    <h3 class="card-title">Port Ranges</h3>
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Port/Range</th>
+                                    <th>Service</th>
+                                    <th>Events</th>
+                                    <th>Blocked</th>
+                                    <th>Detected</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var pr in _drilldownData.PortRanges.Take(_portRangesVisible))
+                                {
+                                    <tr>
+                                        <td>
+                                            @if (pr.Port == 0 && !string.IsNullOrEmpty(pr.Service))
+                                            {
+                                                <a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToProtocol(pr.Service)"><code>@pr.Service</code></a>
+                                            }
+                                            else if (pr.Port == 0)
+                                            {
+                                                <code>0</code>
+                                            }
+                                            else if (pr.PortEnd == 0 || pr.PortEnd == pr.Port)
+                                            {
+                                                <a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToPort(pr.Port)"><code>@pr.Port</code></a>
+                                            }
+                                            else
+                                            {
+                                                @for (var p = pr.Port; p <= pr.PortEnd; p++)
+                                                {
+                                                    var port = p;
+                                                    @if (p > pr.Port) { <span style="color:var(--text-muted); margin:0 1px;">,</span> }
+                                                    <a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToPort(port)"><code>@port</code></a>
+                                                }
+                                            }
+                                        </td>
+                                        <td>@(pr.Port == 0 ? "-" : string.IsNullOrEmpty(pr.Service) ? "-" : pr.Service)</td>
+                                        <td>@FormatNumber(pr.EventCount)</td>
+                                        <td>@(pr.BlockedCount > 0 ? FormatNumber(pr.BlockedCount) : "-")</td>
+                                        <td>@(pr.DetectedCount > 0 ? FormatNumber(pr.DetectedCount) : "-")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                    @if (_drilldownData.PortRanges.Count > _portRangesVisible)
+                    {
+                        <div class="show-more-row">
+                            <button class="btn btn-sm btn-secondary" @onclick="() => _portRangesVisible += DrilldownPageSize">
+                                Show more (@(_drilldownData.PortRanges.Count - _portRangesVisible) remaining)
+                            </button>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+
+        @* Top Signatures *@
+        @if (_drilldownData.TopSignatures.Count > 0)
+        {
+            <div class="card card-spaced">
+                <div class="card-header">
+                    <h3 class="card-title">Top Signatures</h3>
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Signature</th>
+                                    <th class="hide-mobile">Category</th>
+                                    <th class="hide-mobile">Port</th>
+                                    <th class="hide-mobile">Domain</th>
+                                    <th>Blocked</th>
+                                    <th>Detected</th>
+                                    <th>Severity</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var sig in _drilldownData.TopSignatures)
+                                {
+                                    <tr>
+                                        <td class="text-truncate-400">@PrettifySignature(sig.Name)</td>
+                                        <td class="hide-mobile">
+                                            @if (string.IsNullOrEmpty(sig.Category))
+                                            {
+                                                <span>-</span>
+                                            }
+                                            else
+                                            {
+                                                foreach (var part in SplitCategory(sig.Category))
+                                                {
+                                                    <span class="category-badge @part.CssClass">@part.Label</span>
+                                                }
+                                            }
+                                        </td>
+                                        <td class="hide-mobile">
+                                            @if (sig.TopDestPort > 0)
+                                            {
+                                                <span>@sig.TopDestPort</span>
+                                                var svcName = GetPortServiceName(sig.TopDestPort);
+                                                @if (svcName != sig.TopDestPort.ToString())
+                                                {
+                                                    <span class="text-muted"> (@svcName)</span>
+                                                }
+                                            }
+                                            else
+                                            {
+                                                <span class="text-muted">-</span>
+                                            }
+                                        </td>
+                                        <td class="hide-mobile text-truncate-200">
+                                            @if (!string.IsNullOrEmpty(sig.Domain))
+                                            {
+                                                <span>@sig.Domain</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="text-muted">-</span>
+                                            }
+                                        </td>
+                                        <td>@FormatNumber(sig.BlockedCount)</td>
+                                        <td>@FormatNumber(sig.DetectedCount)</td>
+                                        <td>
+                                            <span class="severity-dot" style="background:@GetSeverityColor(sig.MaxSeverity);"></span>
+                                            @GetSeverityLabel(sig.MaxSeverity)
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (_drilldownData.TotalEvents == 0)
+        {
+            <div class="empty-state">
+                <p>No events found for this IP in the selected time range.</p>
+            </div>
+        }
+    }
+
+    @* ========== Port Drill-Down ========== *@
+    @if (_activeTab == "drilldown" && _portDrilldownData != null)
+    {
+        <div class="drilldown-header">
+            <h2 class="drilldown-title drilldown-title-inline">
+                <code>Port @_portDrilldownData.Port</code>
+                @if (!string.IsNullOrEmpty(_portDrilldownData.ServiceName))
+                {
+                    <span class="drilldown-subtitle">@_portDrilldownData.ServiceName</span>
+                }
+            </h2>
+            @if (_portDrilldownData.FirstSeen.HasValue)
+            {
+                <span class="drilldown-time">
+                    @_portDrilldownData.FirstSeen.Value.ToLocalTime().ToString("MMM dd HH:mm") - @_portDrilldownData.LastSeen?.ToLocalTime().ToString("MMM dd HH:mm")
+                </span>
+            }
+        </div>
+
+        <div class="threat-summary-grid">
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:var(--text-primary);">@FormatNumber(_portDrilldownData.TotalEvents)</div>
+                <div class="threat-stat-label">Total Events</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#3b82f6;">@FormatNumber(_portDrilldownData.UniqueSourceIps)</div>
+                <div class="threat-stat-label">Unique Sources</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#ef4444;">@FormatNumber(_portDrilldownData.BlockedCount)</div>
+                <div class="threat-stat-label">Blocked</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#f59e0b;">@FormatNumber(_portDrilldownData.DetectedCount)</div>
+                <div class="threat-stat-label">Detected</div>
+            </div>
+        </div>
+
+        @if (_portDrilldownData.Protocols.Count > 0)
+        {
+            <div class="protocols-row">
+                <span class="text-muted-sm">Protocols:</span>
+                @foreach (var proto in _portDrilldownData.Protocols)
+                {
+                    <a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToProtocol(proto.Protocol)">
+                        <code>@FormatServiceToken(proto.Protocol)</code> <span class="text-muted-sm" style="font-size:0.75rem;">(@proto.EventCount)</span>
+                    </a>
+                }
+            </div>
+        }
+
+        @if (_portDrilldownData.TopSources.Count > 0)
+        {
+            <div class="card card-spaced-sm">
+                <div class="card-header"><span class="card-title">Top Source IPs</span></div>
+                <div class="card-body card-body-flush">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Source IP</th>
+                                    <th class="hide-mobile">Country</th>
+                                    <th class="hide-mobile">ASN</th>
+                                    <th>Events</th>
+                                    <th>Blocked</th>
+                                    <th class="hide-mobile">Last Seen</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var src in _portDrilldownData.TopSources)
+                                {
+                                    <tr>
+                                        <td><a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToIp(src.Ip)"><code>@src.Ip</code></a></td>
+                                        <td class="hide-mobile">@if (string.IsNullOrEmpty(src.CountryCode)) { <span>-</span> } else { <span class="flag-icon" data-tooltip="@CountryTooltip(src.CountryCode)">@CountryFlag(src.CountryCode)</span> }</td>
+                                        <td class="hide-mobile"><span class="text-truncate-300" style="display:inline-block;">@(src.AsnOrg ?? "-")</span></td>
+                                        <td>@src.EventCount</td>
+                                        <td>@src.BlockedCount</td>
+                                        <td class="hide-mobile">@src.LastSeen.ToLocalTime().ToString("MMM dd HH:mm")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (_portDrilldownData.TopDestinations.Count > 0)
+        {
+            <div class="card card-spaced-sm">
+                <div class="card-header"><span class="card-title">Top Destinations</span></div>
+                <div class="card-body card-body-flush">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Destination IP</th>
+                                    <th>Events</th>
+                                    <th>Blocked</th>
+                                    <th>Unique Sources</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var dest in _portDrilldownData.TopDestinations)
+                                {
+                                    <tr>
+                                        <td>@{ var destName = GetClientName(dest.Ip); }<a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToIp(dest.Ip)"><code>@dest.Ip</code></a>@if (destName != null) { <span class="ip-client-name">@destName</span> }</td>
+                                        <td>@dest.EventCount</td>
+                                        <td>@dest.BlockedCount</td>
+                                        <td>@dest.UniqueSourceIps</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (_portDrilldownData.TopSignatures.Count > 0)
+        {
+            <div class="card card-spaced-sm">
+                <div class="card-header"><span class="card-title">Top Signatures</span></div>
+                <div class="card-body card-body-flush">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead><tr><th>Signature</th><th>Category</th><th>Events</th></tr></thead>
+                            <tbody>
+                                @foreach (var sig in _portDrilldownData.TopSignatures)
+                                {
+                                    <tr>
+                                        <td>@PrettifySignature(sig.Name)</td>
+                                        <td>@foreach (var part in SplitCategory(sig.Category)) { <span class="category-badge @part.CssClass">@part.Label</span> }</td>
+                                        <td>@sig.EventCount</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (_portDrilldownData.TotalEvents == 0)
+        {
+            <div class="empty-state"><p>No events found for this port in the selected time range.</p></div>
+        }
+    }
+
+    @* ========== Protocol Drill-Down ========== *@
+    @if (_activeTab == "drilldown" && _protocolDrilldownData != null)
+    {
+        <div class="drilldown-header">
+            <h2 class="drilldown-title drilldown-title-inline">
+                <code>@FormatServiceToken(_protocolDrilldownData.Protocol)</code>
+                <span class="drilldown-subtitle">Protocol</span>
+            </h2>
+            @if (_protocolDrilldownData.FirstSeen.HasValue)
+            {
+                <span class="drilldown-time">
+                    @_protocolDrilldownData.FirstSeen.Value.ToLocalTime().ToString("MMM dd HH:mm") - @_protocolDrilldownData.LastSeen?.ToLocalTime().ToString("MMM dd HH:mm")
+                </span>
+            }
+        </div>
+
+        <div class="threat-summary-grid">
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:var(--text-primary);">@FormatNumber(_protocolDrilldownData.TotalEvents)</div>
+                <div class="threat-stat-label">Total Events</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#3b82f6;">@FormatNumber(_protocolDrilldownData.UniqueSourceIps)</div>
+                <div class="threat-stat-label">Unique Sources</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#a78bfa;">@FormatNumber(_protocolDrilldownData.UniqueDestPorts)</div>
+                <div class="threat-stat-label">Unique Ports</div>
+            </div>
+            <div class="card threat-stat-card">
+                <div class="threat-stat-value" style="color:#ef4444;">@FormatNumber(_protocolDrilldownData.BlockedCount)</div>
+                <div class="threat-stat-label">Blocked</div>
+            </div>
+        </div>
+
+        @if (_protocolDrilldownData.TopPorts.Count > 0)
+        {
+            <div class="card card-spaced-sm">
+                <div class="card-header"><span class="card-title">Top Targeted Ports</span></div>
+                <div class="card-body card-body-flush">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead><tr><th>Port</th><th>Service</th><th>Events</th><th>Blocked</th></tr></thead>
+                            <tbody>
+                                @foreach (var port in _protocolDrilldownData.TopPorts)
+                                {
+                                    <tr>
+                                        <td><a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToPort(port.Port)"><code>@port.Port</code></a></td>
+                                        <td>@(string.IsNullOrEmpty(port.ServiceName) ? "-" : port.ServiceName)</td>
+                                        <td>@port.EventCount</td>
+                                        <td>@port.BlockedCount</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (_protocolDrilldownData.TopSources.Count > 0)
+        {
+            <div class="card card-spaced-sm">
+                <div class="card-header"><span class="card-title">Top Source IPs</span></div>
+                <div class="card-body card-body-flush">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Source IP</th>
+                                    <th class="hide-mobile">Country</th>
+                                    <th class="hide-mobile">ASN</th>
+                                    <th>Events</th>
+                                    <th>Blocked</th>
+                                    <th class="hide-mobile">Last Seen</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var src in _protocolDrilldownData.TopSources)
+                                {
+                                    <tr>
+                                        <td><a href="javascript:void(0)" class="ip-link" @onclick="() => DrillDownToIp(src.Ip)"><code>@src.Ip</code></a></td>
+                                        <td class="hide-mobile">@if (string.IsNullOrEmpty(src.CountryCode)) { <span>-</span> } else { <span class="flag-icon" data-tooltip="@CountryTooltip(src.CountryCode)">@CountryFlag(src.CountryCode)</span> }</td>
+                                        <td class="hide-mobile"><span class="text-truncate-300" style="display:inline-block;">@(src.AsnOrg ?? "-")</span></td>
+                                        <td>@src.EventCount</td>
+                                        <td>@src.BlockedCount</td>
+                                        <td class="hide-mobile">@src.LastSeen.ToLocalTime().ToString("MMM dd HH:mm")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (_protocolDrilldownData.TopSignatures.Count > 0)
+        {
+            <div class="card card-spaced-sm">
+                <div class="card-header"><span class="card-title">Top Signatures</span></div>
+                <div class="card-body card-body-flush">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead><tr><th>Signature</th><th>Category</th><th>Events</th></tr></thead>
+                            <tbody>
+                                @foreach (var sig in _protocolDrilldownData.TopSignatures)
+                                {
+                                    <tr>
+                                        <td>@PrettifySignature(sig.Name)</td>
+                                        <td>@foreach (var part in SplitCategory(sig.Category)) { <span class="category-badge @part.CssClass">@part.Label</span> }</td>
+                                        <td>@sig.EventCount</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (_protocolDrilldownData.TotalEvents == 0)
+        {
+            <div class="empty-state"><p>No events found for this protocol in the selected time range.</p></div>
+        }
+    }
+}
+</div>
+
+<style>
+    .threat-header-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+        min-height: 34px;
+    }
+
+    .threat-header-bar > .wifi-view-tabs-wrapper {
+        flex: 1 1 auto;
+        min-width: 200px;
+    }
+
+    .threat-header-bar > div:last-child {
+        margin-left: auto;
+    }
+
+    .threat-header-bar .wifi-tabs-scroll-btn {
+        border-bottom: none;
+        margin-top: 0.35rem;
+    }
+
+    .threat-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1rem;
+    }
+
+    .threat-summary-grid .card {
+        margin-bottom: 1.5rem;
+    }
+    .threat-summary-grid-compact .card {
+        margin-bottom: 0.75rem;
+    }
+
+    .threat-stat-card {
+        text-align: center;
+        padding: 1.25rem 1rem;
+    }
+
+    .threat-stat-value {
+        font-size: 2rem;
+        font-weight: 700;
+        line-height: 1.3;
+    }
+
+    .threat-stat-label {
+        font-size: 0.85rem;
+        color: var(--text-muted);
+    }
+
+    .threat-two-chart-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+        margin-bottom: 0.5rem;
+    }
+
+    .threat-chart-body {
+        padding-top: 16px;
+    }
+
+    .threat-page .data-table {
+        min-width: 0;
+    }
+
+    /* Override built-in ApexCharts legend text spacing (default: 15px pad / -15px margin = 0 net) */
+    .apexcharts-legend-text {
+        padding-left: 20px !important;
+    }
+
+    /* Horizontal distribution bars (matches Wi-Fi Optimizer load-bar pattern) */
+    .threat-bar-track {
+        background: var(--bg-hover);
+        border-radius: 0 var(--border-radius) var(--border-radius) 0;
+        height: 18px;
+        overflow: hidden;
+    }
+
+    .threat-bar-fill {
+        height: 100%;
+        background: #3b82f6;
+        border-radius: 0 var(--border-radius) var(--border-radius) 0;
+        min-width: 4px;
+        transition: width 0.3s ease;
+    }
+
+    /* CrowdSec reputation badges */
+    .reputation-badge {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: var(--border-radius);
+        font-size: 0.75rem;
+        font-weight: 500;
+        text-transform: capitalize;
+    }
+    .reputation-malicious { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+    .reputation-suspicious { background: rgba(249, 115, 22, 0.2); color: #f97316; }
+    .reputation-known { background: rgba(234, 179, 8, 0.2); color: #eab308; }
+    .reputation-benign { background: rgba(59, 130, 246, 0.2); color: #3b82f6; }
+    .reputation-safe { background: rgba(16, 185, 129, 0.2); color: #10b981; }
+    .reputation-unknown { background: var(--bg-hover); color: var(--text-muted); }
+
+    /* Kill chain stage bars in attack sequences table */
+    .stage-bar {
+        display: inline-block;
+        height: 22px;
+        max-width: 120px;
+        border-radius: 0 var(--border-radius) var(--border-radius) 0;
+        font-size: 0.7rem;
+        color: white;
+        line-height: 22px;
+        text-align: center;
+        padding: 0 4px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        transition: min-width 0.3s ease;
+    }
+
+    /* Clickable IP links */
+    .ip-link {
+        text-decoration: none;
+        cursor: pointer;
+    }
+    .ip-link code {
+        color: var(--primary-color);
+        cursor: pointer;
+    }
+    .ip-link:hover code {
+        color: var(--primary-hover);
+        text-decoration: underline;
+    }
+
+    .data-table thead {
+        background: rgba(255, 255, 255, 0.06);
+    }
+
+    .category-badge {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.78rem;
+        white-space: nowrap;
+        margin-right: 0.25rem;
+    }
+    .category-badge:last-child { margin-right: 0; }
+    .category-high { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+    .category-medium { background: rgba(249, 115, 22, 0.15); color: #f97316; }
+    .category-low { background: rgba(234, 179, 8, 0.15); color: #eab308; }
+    .category-safe { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+    .category-direction { background: rgba(59, 130, 246, 0.1); color: var(--text-secondary); }
+    .category-type { background: rgba(255, 255, 255, 0.08); color: var(--text-secondary); }
+    .category-neutral { background: rgba(255, 255, 255, 0.08); color: var(--text-secondary); }
+
+    /* Noise filter active count badge */
+    .noise-filter-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: var(--accent-color);
+        color: white;
+        font-size: 0.65rem;
+        font-weight: 700;
+        margin-left: 0.3rem;
+        padding: 0 4px;
+    }
+    .noise-filter-badge-off {
+        background: var(--text-muted);
+        opacity: 0.6;
+    }
+
+    @@media (max-width: 768px) {
+        .threat-header-bar {
+            flex-direction: column;
+            flex-wrap: nowrap;
+            align-items: stretch;
+            gap: 0.5rem;
+        }
+
+        .threat-header-bar > div:last-child {
+            margin-left: unset;
+            justify-content: space-between;
+        }
+
+        .threat-custom-label {
+            display: none;
+        }
+
+        .threat-time-preset {
+            padding: 0.35rem 0.5rem;
+            font-size: 0.75rem;
+        }
+
+        .threat-summary-grid {
+            grid-template-columns: repeat(2, 1fr);
+        }
+
+        .threat-two-chart-row {
+            grid-template-columns: 1fr;
+            margin-bottom: 1rem;
+        }
+
+        .threat-action-chart {
+            margin-top: -1.5rem;
+        }
+    }
+
+    .mitre-technique {
+        display: inline-block;
+        background: rgba(168, 85, 247, 0.15);
+        color: #c4b5fd;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+        margin: 0.2rem 0.25rem 0.2rem 0;
+        font-size: 0.8rem;
+        cursor: default;
+    }
+
+    /* Drilldown header: IP/Port/Protocol title row */
+    .drilldown-header {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        min-height: 33px;
+        margin-bottom: 1rem;
+        flex-wrap: wrap;
+    }
+    .drilldown-title {
+        margin: 0;
+        font-size: 1.5rem;
+        font-weight: 700;
+    }
+    .drilldown-title-inline {
+        display: flex;
+        align-items: baseline;
+        gap: 0.5rem;
+    }
+    .drilldown-title code {
+        font-size: 1.3rem;
+    }
+    .drilldown-subtitle {
+        color: var(--text-secondary);
+        font-size: 1rem;
+        font-weight: 400;
+    }
+    .drilldown-time {
+        color: var(--text-muted);
+        font-size: 0.8rem;
+        margin-left: auto;
+    }
+
+    /* Colored severity dot (background set inline) */
+    .severity-dot {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 0.4rem;
+    }
+
+    /* Noise filter form labels and inputs */
+    .noise-filter-label {
+        display: block;
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        margin-bottom: 0.15rem;
+    }
+    .noise-filter-input {
+        padding: 0.3rem 0.5rem;
+        background: var(--bg-primary);
+        border: 1px solid var(--bg-hover);
+        border-radius: var(--border-radius);
+        color: var(--text-primary);
+        font-size: 0.85rem;
+    }
+
+    /* Muted client name beside IPs */
+    .ip-client-name {
+        color: var(--text-muted);
+        margin-left: 0.25rem;
+    }
+
+    /* Info/warning banner cards with colored left border */
+    .banner-card {
+        margin-bottom: 1rem;
+        border-left: 3px solid var(--info-color);
+    }
+    .banner-card-warning {
+        border-left-color: var(--warning-color);
+    }
+    .banner-card-accent {
+        border-left-color: var(--accent-color);
+    }
+    .banner-card-body {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.75rem 1rem;
+    }
+
+    /* Quick filter buttons in drilldown tables */
+    .quick-filter-btn {
+        font-size: 0.7rem;
+        padding: 0.15rem 0.4rem;
+    }
+
+    .reputation-cell-inner {
+        min-height: 33px;
+        display: flex;
+        align-items: center;
+    }
+
+    /* Card spacing: section cards (1.5rem) and sub-cards (1rem) */
+    .threat-page .card-spaced { margin-bottom: 1.5rem; }
+    .threat-page .card-spaced-sm { margin-bottom: 1rem; }
+
+    /* Card body with no padding (table flush to edges) */
+    .card-body-flush { padding: 0; }
+
+    /* Country flag emoji (no pointer cursor) */
+    .flag-icon { cursor: default; }
+
+    /* Banner/description text */
+    .threat-desc-text {
+        color: var(--text-secondary);
+        font-size: 0.9rem;
+    }
+    .drilldown-asn {
+        color: var(--text-muted);
+        font-size: 0.85rem;
+    }
+
+    /* Dismiss button inside banner-card-body */
+    .banner-card-body > .btn { flex-shrink: 0; }
+
+    /* Noise filter panel header */
+    .noise-filter-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 0.75rem;
+    }
+    .noise-filter-header h4 {
+        margin: 0;
+        font-size: 0.95rem;
+        font-weight: 600;
+    }
+
+    /* Noise filter add-form row */
+    .noise-filter-form {
+        display: flex;
+        gap: 0.5rem;
+        align-items: flex-end;
+        flex-wrap: wrap;
+        margin-bottom: 0.75rem;
+    }
+
+    /* Small code for port ranges */
+    .code-sm { font-size: 0.8rem; }
+
+    /* "Show more" pagination row */
+    .show-more-row {
+        text-align: center;
+        padding: 0.75rem;
+    }
+
+    /* Muted helper text */
+    .text-muted-sm {
+        color: var(--text-muted);
+        font-size: 0.85rem;
+    }
+
+    /* Backfill progress bar */
+    .backfill-status {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.75rem;
+        color: var(--text-muted);
+        font-size: 0.8rem;
+    }
+
+    /* First-data loading state */
+    .first-data-loading {
+        flex-direction: column;
+        gap: 1rem;
+    }
+
+    /* CTI detail rows (behaviors, MITRE techniques) */
+    .cti-detail {
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+    }
+    .cti-detail-label {
+        color: var(--text-muted);
+    }
+
+    /* Custom range popover layout now in global app.css */
+
+    /* Drilldown back button row */
+    .drilldown-back {
+        display: flex;
+        align-items: center;
+        gap: 1.25rem;
+    }
+    .drilldown-back .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+    }
+
+    /* Header bar right-side controls */
+    .threat-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    /* Protocols list row in port drilldown */
+    .protocols-row {
+        display: flex;
+        align-items: baseline;
+        gap: 0.5rem;
+        margin-bottom: 0.5rem;
+        flex-wrap: wrap;
+    }
+
+    /* Pattern type badge */
+    .pattern-type-badge {
+        background: var(--bg-hover);
+        color: var(--text-secondary);
+        font-size: 0.8rem;
+    }
+
+    /* Threat count highlight in exposure table */
+    .threat-count-danger {
+        color: #ef4444;
+        font-weight: 600;
+    }
+
+    /* Geo-block recommendation title row */
+    .geo-rec-title {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.4rem;
+    }
+
+    /* Inline CrowdSec reputation group */
+    .cti-inline-group {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    /* Filter gear button */
+    .filter-gear-btn {
+        padding: 0.25rem 0.4rem;
+        font-size: 0.8rem;
+        min-width: 0;
+        line-height: 1;
+    }
+
+    /* Custom range calendar button styles now in global app.css */
+
+    /* Stage bars flex container */
+    .stage-bars {
+        display: flex;
+        gap: 4px;
+        align-items: center;
+        flex-wrap: wrap;
+    }
+
+    /* Search tab */
+    .search-input-row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+    }
+
+    .search-input {
+        flex: 1;
+        max-width: 500px;
+        font-size: 0.95rem;
+    }
+
+    .search-classification {
+        margin-top: 0.5rem;
+        font-size: 0.8rem;
+        color: var(--text-muted);
+    }
+
+    /* Role badges */
+    .role-badge {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+    }
+
+    .role-source {
+        background: rgba(59, 130, 246, 0.15);
+        color: #3b82f6;
+    }
+
+    .role-destination {
+        background: rgba(168, 85, 247, 0.15);
+        color: #a855f7;
+    }
+
+    .role-both {
+        background: rgba(249, 115, 22, 0.15);
+        color: #f59e0b;
+    }
+</style>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>
+    /// Noise filters decide which findings this site stops reporting, so adding, removing or
+    /// switching them off is a security decision rather than a view preference - and it lands for
+    /// everyone, not just the person who set it.
+    /// </summary>
+    private bool _canConfigure;
+
+    private async Task ResolveThreatPermissionsAsync()
+        => _canConfigure = AuthState is null
+            || (await Authz.AuthorizeAsync((await AuthState).User, SiteContext.Slug, Policies.SiteAdmin)).Succeeded;
+    // Progress state (backfill cursor, first-collection flag) is tracked per-site by the
+    // singleton collection service. Pass null for the default site, the slug otherwise.
+    private string? BackfillSiteKey => SiteContext.IsDefault ? null : SiteContext.Slug;
+
+    [SupplyParameterFromQuery(Name = "tab")]
+    public string? TabParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "ip")]
+    public string? IpParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "port")]
+    public string? PortParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "proto")]
+    public string? ProtoParam { get; set; }
+
+    private string? _lastTabParam;
+    private string? _lastIpParam;
+    private string? _lastPortParam;
+    private string? _lastProtoParam;
+    private bool _isNavigating;
+
+    private string _activeTab = "overview";
+    private string _timeRange = "24h";
+    private bool _loading = true;
+    private bool _hasLoadedOnce; // Once true, reloads don't destroy charts
+    private ThreatDashboardData _dashboardData = new();
+    private List<TimelineBucket> _timeline = [];
+    private Dictionary<string, int> _geoDistribution = new();
+    private ExposureReport? _exposureReport;
+    private List<AttackSequence> _attackSequences = [];
+    private bool _crowdSecEnabled;
+    private bool _crowdSecBannerDismissed;
+    private bool _maxMindConfigured;
+    private bool _maxMindBannerDismissed;
+    private bool _collectingFirstData;
+    private string? _lookingUpIp;
+    private bool _crowdSecRateLimited;
+    private bool _drilldownCtiLookedUp;
+    private System.Threading.Timer? _refreshTimer;
+    private System.Threading.Timer? _hydrationRefreshTimer;
+
+    // Drill-down state
+    private string? _drilldownIp;
+    private int? _drilldownPort;
+    private string? _drilldownProtocol;
+    private string _previousTab = "overview";
+    private bool _hasInAppHistory; // true when drilldown was entered via in-app navigation
+    private IpDrilldownData? _drilldownData;
+    private PortDrilldownData? _portDrilldownData;
+    private ProtocolDrilldownData? _protocolDrilldownData;
+    private const int DrilldownPageSize = 20;
+    private int _sourcesVisible = DrilldownPageSize;
+    private int _portRangesVisible = DrilldownPageSize;
+
+    // Severity filter state (all OFF = show everything, all ON = show everything)
+    private bool _showSev5; // Critical
+    private bool _showSev4; // High
+    private bool _showSev3; // Medium
+    private bool _showSev2; // Low
+    private bool _showSev1; // Info
+    private static readonly List<TimelineBucket> _emptyTimeline = [];
+
+    private bool SevNoneSelected => !_showSev5 && !_showSev4 && !_showSev3 && !_showSev2 && !_showSev1;
+    private bool SevAllSelected => _showSev5 && _showSev4 && _showSev3 && _showSev2 && _showSev1;
+    private bool SevShowAll => SevNoneSelected || SevAllSelected;
+    private bool ShowSev5 => SevShowAll || _showSev5;
+    private bool ShowSev4 => SevShowAll || _showSev4;
+    private bool ShowSev3 => SevShowAll || _showSev3;
+    private bool ShowSev2 => SevShowAll || _showSev2;
+    private bool ShowSev1 => SevShowAll || _showSev1;
+
+    // Noise filter state
+    private List<ThreatNoiseFilter> _noiseFilters = [];
+    private bool _filtersActive = true;
+    private bool? _filtersActiveBeforeDrilldown;
+    private string? _timeRangeBeforeDrilldown;
+    private DateTime? _customFromBeforeDrilldown;
+    private DateTime? _customToBeforeDrilldown;
+    private bool _showFilterPanel;
+    private string _newFilterSourceIp = "";
+    private string _newFilterDestIp = "";
+    private string _newFilterDestPort = "";
+    private string _newFilterDescription = "";
+
+    // Search state
+    private string _searchText = "";
+    private string? _searchClassification;
+    private bool _searchLoading;
+    private List<SearchResultEntry>? _searchResults;
+    private static readonly System.Text.RegularExpressions.Regex PartialIpRegex =
+        new(@"^\d{1,3}(\.\d{1,3}){0,2}\.?$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // Persist manual CTI lookups across auto-refresh cycles (fresh DB objects lose in-memory enrichment)
+    private readonly Dictionary<string, CtiLookupResult> _manualCtiCache = new();
+
+    private record CtiLookupResult(string? Badge, int? ThreatScore, string? Behaviors,
+        List<(string Name, string Label, string? Description)>? MitreTechniques = null);
+
+    // Chart refs and options - each chart needs its own options instance
+    // StateHasChanged alone does NOT update ApexCharts - need explicit update on @ref
+    // Single-series: UpdateSeriesAsync(true). Multi-series: RenderAsync() (per ClientDashboard pattern)
+    private ApexChart<TimelineBucket>? _timelineChart;
+    private ApexChart<KillChainItem>? _killChainChart;
+    private ApexChart<ActionBreakdownItem>? _actionChart;
+    private bool _chartNeedsUpdate;
+    private bool _timelineChartNewlyCreated;
+    private ApexChartOptions<TimelineBucket> _timelineChartOptions = CreateTimelineChartOptions();
+    private ApexChartOptions<KillChainItem> _killChainChartOptions = CreateKillChainChartOptions();
+    private ApexChartOptions<ActionBreakdownItem> _actionChartOptions = CreateActionChartOptions();
+
+    // Derived data for charts
+    private List<KillChainItem> _killChainItems = [];
+    private List<ActionBreakdownItem> _actionBreakdownItems = [];
+
+    // IP to client name lookup for local devices (cached 30s)
+    private static Dictionary<string, string> _clientNamesCache = new();
+    private static DateTime _clientNamesCacheExpiry = DateTime.MinValue;
+    // Site the cache was populated for. The cache is static (shared across circuits),
+    // so a site switch (full reload into the same static state) would otherwise resolve
+    // IPs to the previous site's client names until the TTL expired.
+    private static string? _clientNamesCacheSlug;
+    private static readonly object _clientNamesCacheLock = new();
+    private Dictionary<string, string> _clientNames = new();
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_chartNeedsUpdate)
+        {
+            _chartNeedsUpdate = false;
+            await RenderTimelineChartWithRetry();
+            try { if (_killChainChart != null) await _killChainChart.UpdateSeriesAsync(true); } catch { }
+            try { if (_actionChart != null) await _actionChart.UpdateSeriesAsync(true); } catch { }
+        }
+        else if (_timelineChartNewlyCreated && _timelineChart != null)
+        {
+            _timelineChartNewlyCreated = false;
+            await RenderTimelineChartWithRetry();
+        }
+    }
+
+    /// <summary>
+    /// ApexCharts JS initializes asynchronously after the component is mounted.
+    /// RenderAsync can fail with NRE if called before JS is ready.
+    /// Retry briefly to let JS catch up.
+    /// </summary>
+    private async Task RenderTimelineChartWithRetry()
+    {
+        if (_timelineChart == null) return;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                await _timelineChart.RenderAsync();
+                return;
+            }
+            catch (NullReferenceException)
+            {
+                await Task.Delay(150);
+            }
+            catch { return; }
+        }
+    }
+
+    private static string ResolveTab(string? param)
+    {
+        return param?.ToLowerInvariant() switch
+        {
+            "overview" => "overview",
+            "exposure" => "exposure",
+            "geographic" => "geographic",
+            "sequences" => "sequences",
+            "search" => "search",
+            "drilldown" => "drilldown",
+            _ => "overview"
+        };
+    }
+
+    private string BuildTabUrl(string tab, string? ip = null, int? port = null, string? proto = null)
+    {
+        var uri = new Uri(NavigationManager.Uri).GetLeftPart(UriPartial.Path) + "?tab=" + tab;
+        if (ip != null) uri += "&ip=" + Uri.EscapeDataString(ip);
+        if (port != null) uri += "&port=" + port;
+        if (proto != null) uri += "&proto=" + Uri.EscapeDataString(proto);
+        return uri;
+    }
+
+    protected override void OnParametersSet()
+    {
+        if (_isNavigating) return;
+
+        var paramsChanged = TabParam != _lastTabParam
+            || IpParam != _lastIpParam
+            || PortParam != _lastPortParam
+            || ProtoParam != _lastProtoParam;
+
+        if (paramsChanged && _lastTabParam != null)
+        {
+            var newTab = ResolveTab(TabParam);
+
+            if (newTab == "drilldown")
+            {
+                // Route to appropriate drilldown
+                if (!string.IsNullOrEmpty(IpParam))
+                    _ = DrillDownToIp(IpParam, pushHistory: false);
+                else if (!string.IsNullOrEmpty(PortParam) && int.TryParse(PortParam, out var port))
+                    _ = DrillDownToPort(port, pushHistory: false);
+                else if (!string.IsNullOrEmpty(ProtoParam))
+                    _ = DrillDownToProtocol(ProtoParam, pushHistory: false);
+                else
+                    _ = ExitDrilldown(pushHistory: false);
+            }
+            else if (_activeTab == "drilldown" && newTab != "drilldown")
+            {
+                // Leaving drilldown via back button
+                _ = ExitDrilldown(pushHistory: false);
+                if (newTab != _activeTab)
+                    _ = SetActiveTab(newTab, pushHistory: false);
+            }
+            else if (newTab != _activeTab)
+            {
+                _ = SetActiveTab(newTab, pushHistory: false);
+            }
+        }
+
+        _lastTabParam = TabParam;
+        _lastIpParam = IpParam;
+        _lastPortParam = PortParam;
+        _lastProtoParam = ProtoParam;
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        await ResolveThreatPermissionsAsync();
+
+        // Parse initial state from URL
+        var initialTab = ResolveTab(TabParam);
+        if (initialTab == "drilldown")
+        {
+            if (!string.IsNullOrEmpty(IpParam))
+            {
+                _activeTab = "drilldown";
+                _drilldownIp = IpParam;
+                _previousTab = "overview";
+            }
+            else if (!string.IsNullOrEmpty(PortParam) && int.TryParse(PortParam, out var port))
+            {
+                _activeTab = "drilldown";
+                _drilldownPort = port;
+                _previousTab = "overview";
+            }
+            else if (!string.IsNullOrEmpty(ProtoParam))
+            {
+                _activeTab = "drilldown";
+                _drilldownProtocol = ProtoParam;
+                _previousTab = "overview";
+            }
+            else
+            {
+                _activeTab = "overview";
+            }
+
+        }
+        else
+        {
+            _activeTab = initialTab;
+        }
+
+        _lastTabParam = TabParam;
+        _lastIpParam = IpParam;
+        _lastPortParam = PortParam;
+        _lastProtoParam = ProtoParam;
+
+        await CheckCrowdSecStatus();
+        await CheckMaxMindStatus();
+        await LoadClientNamesAsync();
+        await LoadNoiseFiltersAsync();
+        var filtersSetting = await SettingsAccessor.GetSettingAsync("threats.filters_active");
+        if (filtersSetting != null) _filtersActive = filtersSetting != "false";
+
+        // Disable filters for drilldown AFTER loading the persisted setting,
+        // so we can save/restore the user's preference when exiting drilldown.
+        if (_activeTab == "drilldown")
+        {
+            _filtersActiveBeforeDrilldown = _filtersActive;
+            _timeRangeBeforeDrilldown = _timeRange;
+            _filtersActive = false;
+            // IP drilldowns use 90d for investigation context (matches DrillDownToIp behavior)
+            if (_drilldownIp != null)
+                _timeRange = "90d";
+        }
+
+        PtrState.RefreshCallback = () => LoadDataAsync();
+        PtrState.NotifyStateChanged = StateHasChanged;
+        await LoadDataAsync();
+
+        // If the DB is empty (service hasn't collected yet), trigger an immediate collection
+        // and reload once it completes. Skip when on drilldown - overview data wasn't loaded
+        // but we already have drilldown data from the DB.
+        if (!CollectionService.HasCollectedOnceFor(BackfillSiteKey))
+        {
+            CollectionService.TriggerCollection();
+            // Only show blocking "collecting first data" UI on overview
+            if (_activeTab == "overview" && _dashboardData.Summary.TotalEvents == 0)
+            {
+                _collectingFirstData = true;
+                StateHasChanged();
+                _ = WaitForFirstCollectionAsync();
+            }
+        }
+
+        // Auto-refresh every 30 seconds while the dashboard is open
+        // Also triggers a collection cycle so backfill progresses faster while watching
+        _refreshTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                if (_lookingUpIp != null) return; // Don't refresh during CTI lookup
+                CollectionService.TriggerCollection();
+                await InvokeAsync(async () =>
+                {
+                    await LoadDataAsync();
+                });
+            }
+            catch { /* prevent timer death on circuit disconnect */ }
+        }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+    }
+
+    private async Task WaitForFirstCollectionAsync()
+    {
+        try
+        {
+            // Poll until the collection service completes its first cycle (max ~60s)
+            for (var i = 0; i < 30; i++)
+            {
+                await Task.Delay(2000);
+                if (CollectionService.HasCollectedOnceFor(BackfillSiteKey))
+                    break;
+            }
+
+            await InvokeAsync(async () =>
+            {
+                _collectingFirstData = false;
+                await LoadDataAsync();
+            });
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed waiting for first threat collection");
+            await InvokeAsync(() =>
+            {
+                _collectingFirstData = false;
+                StateHasChanged();
+            });
+        }
+    }
+
+    private async Task CheckCrowdSecStatus()
+    {
+        try
+        {
+            var apiKey = await SettingsAccessor.GetSettingAsync("crowdsec.api_key");
+            _crowdSecEnabled = !string.IsNullOrWhiteSpace(apiKey);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed to check CrowdSec status");
+            _crowdSecEnabled = false;
+        }
+    }
+
+    private async Task CheckMaxMindStatus()
+    {
+        try
+        {
+            var accountId = await SettingsAccessor.GetSettingAsync("maxmind.account_id");
+            var licenseKey = await SettingsAccessor.GetSettingAsync("maxmind.license_key");
+            _maxMindConfigured = !string.IsNullOrWhiteSpace(accountId) && !string.IsNullOrWhiteSpace(licenseKey);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed to check MaxMind status");
+        }
+    }
+
+    private async Task LoadClientNamesAsync()
+    {
+        // Check static cache first (shared across Blazor circuits, 30s TTL)
+        lock (_clientNamesCacheLock)
+        {
+            if (_clientNamesCacheExpiry > DateTime.UtcNow && _clientNamesCache.Count > 0
+                && _clientNamesCacheSlug == SiteContext.Slug)
+            {
+                _clientNames = _clientNamesCache;
+                return;
+            }
+        }
+
+        try
+        {
+            var apiClient = UniFiClientAccessor.Client;
+            if (apiClient == null) return;
+
+            var clients = await apiClient.GetAllKnownClientsAsync();
+            if (clients == null) return;
+
+            var names = new Dictionary<string, string>();
+            foreach (var c in clients)
+            {
+                var ip = c.BestIp;
+                if (string.IsNullOrEmpty(ip)) continue;
+
+                var name = !string.IsNullOrEmpty(c.Name) ? c.Name
+                    : !string.IsNullOrEmpty(c.Hostname) ? c.Hostname
+                    : null;
+                if (name != null)
+                    names.TryAdd(ip, name);
+            }
+
+            lock (_clientNamesCacheLock)
+            {
+                _clientNamesCache = names;
+                _clientNamesCacheExpiry = DateTime.UtcNow.AddSeconds(30);
+                _clientNamesCacheSlug = SiteContext.Slug;
+            }
+            _clientNames = names;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed to load client names for IP resolution");
+        }
+    }
+
+    private string? GetClientName(string ip)
+    {
+        return _clientNames.TryGetValue(ip, out var name) ? name : null;
+    }
+
+    private async Task LoadDataAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        DashboardService.FiltersDisabled = !_filtersActive;
+        DashboardService.SeverityFilter = SevShowAll ? null : GetActiveSeverities();
+
+        try
+        {
+            var (from, to) = GetTimeRange();
+
+            if (_activeTab == "overview")
+            {
+                var chartExisted = _timelineChart != null;
+                _dashboardData = await DashboardService.GetDashboardDataAsync(from, to);
+                if (CrowdSecClient.IsRateLimited) _crowdSecRateLimited = true;
+                ScheduleHydrationRefresh(_dashboardData.CtiHydrationCount);
+                _timeline = await DashboardService.GetTimelineDataAsync(from, to);
+                BuildDerivedChartData();
+
+                // Pin X-axis to the actual data extent (all severities) so toggling
+                // severity filters doesn't shrink/shift the visible date range.
+                if (_timeline.Count > 0)
+                {
+                    var minHour = _timeline[0].Hour;
+                    var maxHour = _timeline[^1].Hour;
+                    _timelineChartOptions.Xaxis.Min = new DateTimeOffset(DateTime.SpecifyKind(minHour, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+                    _timelineChartOptions.Xaxis.Max = new DateTimeOffset(DateTime.SpecifyKind(maxHour, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+                }
+
+                // Charts already in the DOM need an explicit update.
+                // Newly created single-series charts auto-render fine, but
+                // the multi-series timeline does not - flag it for a deferred
+                // RenderAsync once Blazor has mounted the component.
+                if (chartExisted)
+                    _chartNeedsUpdate = true;
+                else
+                    _timelineChartNewlyCreated = true;
+            }
+            else if (_activeTab == "exposure")
+            {
+                // Exposure report auto-fetches port forward rules from UniFi API
+                _exposureReport = await DashboardService.GetExposureReportAsync(from, to);
+            }
+            else if (_activeTab == "geographic")
+            {
+                _geoDistribution = await DashboardService.GetGeoDistributionAsync(from, to);
+            }
+            else if (_activeTab == "sequences")
+            {
+                _attackSequences = await DashboardService.GetAttackSequencesAsync(from, to);
+            }
+            else if (_activeTab == "search")
+            {
+                // Search is user-initiated, not auto-loaded
+            }
+            else if (_activeTab == "drilldown")
+            {
+                if (_drilldownIp != null)
+                {
+                    _drilldownData = await DashboardService.GetIpDrilldownAsync(_drilldownIp, from, to);
+
+                    // Seed CTI cache from DB if not already present (handles fresh nav / refresh)
+                    if (!_manualCtiCache.ContainsKey(_drilldownIp) && !NetworkUtilities.IsPrivateIpAddress(_drilldownIp))
+                    {
+                        var cached = await DashboardService.GetCachedCtiAsync(_drilldownIp);
+                        if (cached?.CrowdSecReputation != null)
+                        {
+                            _manualCtiCache[_drilldownIp] = new CtiLookupResult(
+                                cached.CrowdSecReputation, cached.ThreatScore, cached.TopBehaviors, cached.MitreTechniques);
+                        }
+                    }
+                }
+                else if (_drilldownPort != null)
+                    _portDrilldownData = await DashboardService.GetPortDrilldownAsync(_drilldownPort.Value, from, to);
+                else if (_drilldownProtocol != null)
+                    _protocolDrilldownData = await DashboardService.GetProtocolDrilldownAsync(_drilldownProtocol, from, to);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load threat dashboard data");
+        }
+        finally
+        {
+            _loading = false;
+            _hasLoadedOnce = true;
+            StateHasChanged();
+        }
+    }
+
+    private void BuildDerivedChartData()
+    {
+        // Kill chain items - ordered as escalating progression (Monitored → Post-Exploitation)
+        KillChainStage[] stageOrder = [
+            KillChainStage.Monitored,
+            KillChainStage.Reconnaissance,
+            KillChainStage.AttemptedExploitation,
+            KillChainStage.ActiveExploitation,
+            KillChainStage.PostExploitation
+        ];
+        _killChainItems = stageOrder
+            .Select(stage => new KillChainItem
+            {
+                Stage = stage,
+                Count = _dashboardData.KillChainDistribution.GetValueOrDefault(stage, 0)
+            })
+            .ToList();
+
+        // Action breakdown items
+        _actionBreakdownItems = new List<ActionBreakdownItem>
+        {
+            new() { Label = "Blocked", Count = _dashboardData.Summary.BlockedCount },
+            new() { Label = "Detected", Count = _dashboardData.Summary.DetectedCount }
+        };
+    }
+
+    private async Task LookUpReputationAsync(SourceIpSummary source)
+    {
+        _lookingUpIp = source.SourceIp;
+        StateHasChanged();
+        try
+        {
+            var (result, rateLimited) = await DashboardService.EnrichSingleSourceAsync(source);
+            if (rateLimited)
+            {
+                _crowdSecRateLimited = true;
+                return;
+            }
+
+            if (result?.CrowdSecReputation != null)
+            {
+                _manualCtiCache[source.SourceIp] = new CtiLookupResult(
+                    result.CrowdSecReputation, result.ThreatScore, result.TopBehaviors, result.MitreTechniques);
+            }
+            else
+            {
+                _manualCtiCache[source.SourceIp] = new CtiLookupResult(null, 0, null);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed to look up reputation for {Ip}", source.SourceIp);
+        }
+        finally
+        {
+            _lookingUpIp = null;
+            StateHasChanged();
+        }
+    }
+
+    private async Task LookUpDrilldownReputationAsync(string ip)
+    {
+        _lookingUpIp = ip;
+        StateHasChanged();
+        try
+        {
+            var source = new SourceIpSummary { SourceIp = ip };
+            var (result, rateLimited) = await DashboardService.EnrichSingleSourceAsync(source);
+
+            if (rateLimited)
+            {
+                _crowdSecRateLimited = true;
+                return; // Don't set _drilldownCtiLookedUp - lookup didn't complete
+            }
+
+            if (result?.CrowdSecReputation != null)
+            {
+                _manualCtiCache[ip] = new CtiLookupResult(
+                    result.CrowdSecReputation, result.ThreatScore, result.TopBehaviors, result.MitreTechniques);
+            }
+            else
+            {
+                _manualCtiCache[ip] = new CtiLookupResult(null, 0, null);
+            }
+            _drilldownCtiLookedUp = true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed to look up reputation for {Ip}", ip);
+        }
+        finally
+        {
+            _lookingUpIp = null;
+            StateHasChanged();
+        }
+    }
+
+    private async Task SetActiveTab(string tab, bool pushHistory = true)
+    {
+        if (_activeTab == tab) return;
+        // Null chart refs when leaving overview so chartExisted is correctly false
+        // when returning (stale refs to destroyed components would cause RenderAsync
+        // to fire on a disposed chart instead of letting the new one auto-render).
+        if (_activeTab == "overview")
+        {
+            _timelineChart = null;
+            _killChainChart = null;
+            _actionChart = null;
+        }
+        _activeTab = tab;
+        _showFilterPanel = false;
+        _showCustomRange = false;
+
+        if (pushHistory)
+        {
+            _isNavigating = true;
+            var uri = BuildTabUrl(tab);
+            NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
+            _lastTabParam = tab;
+            _lastIpParam = null;
+            _lastPortParam = null;
+            _lastProtoParam = null;
+            _isNavigating = false;
+        }
+
+        await LoadDataAsync();
+    }
+
+    private async Task SetTimeRange(string range)
+    {
+        if (_timeRange == range) return;
+        _timeRange = range;
+        _showCustomRange = false;
+        await LoadDataAsync();
+    }
+
+    private async Task ToggleSeverity(int level, MouseEventArgs e)
+    {
+        switch (level)
+        {
+            case 5: _showSev5 = !_showSev5; break;
+            case 4: _showSev4 = !_showSev4; break;
+            case 3: _showSev3 = !_showSev3; break;
+            case 2: _showSev2 = !_showSev2; break;
+            case 1: _showSev1 = !_showSev1; break;
+        }
+
+        await LoadDataAsync();
+    }
+
+    private int[]? GetActiveSeverities()
+    {
+        var list = new List<int>();
+        if (ShowSev5) list.Add(5);
+        if (ShowSev4) list.Add(4);
+        if (ShowSev3) list.Add(3);
+        if (ShowSev2) list.Add(2);
+        if (ShowSev1) list.Add(1);
+        return list.Count > 0 ? list.ToArray() : null;
+    }
+
+    private async Task DrillDownToIp(string ip, bool pushHistory = true)
+    {
+        if (_activeTab != "drilldown")
+            _previousTab = _activeTab;
+        if (_activeTab == "overview")
+        {
+            _timelineChart = null;
+            _killChainChart = null;
+            _actionChart = null;
+        }
+        _hasInAppHistory = true;
+        _drilldownIp = ip;
+        _drilldownCtiLookedUp = false;
+        _drilldownPort = null;
+        _drilldownProtocol = null;
+        _portDrilldownData = null;
+        _protocolDrilldownData = null;
+        _sourcesVisible = DrilldownPageSize;
+        _portRangesVisible = DrilldownPageSize;
+        if (_filtersActiveBeforeDrilldown == null)
+        {
+            _filtersActiveBeforeDrilldown = _filtersActive;
+            _timeRangeBeforeDrilldown = _timeRange;
+            _customFromBeforeDrilldown = _customFrom;
+            _customToBeforeDrilldown = _customTo;
+        }
+        _filtersActive = false;
+        _timeRange = "90d"; // Cosmetic: sync UI button; actual query hardcodes 90d below
+        DashboardService.FiltersDisabled = true;
+        _activeTab = "drilldown";
+        _showFilterPanel = false;
+        _showCustomRange = false;
+        _loading = true;
+
+        if (pushHistory)
+        {
+            _isNavigating = true;
+            var uri = BuildTabUrl("drilldown", ip: ip);
+            NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
+            _lastTabParam = "drilldown";
+            _lastIpParam = ip;
+            _lastPortParam = null;
+            _lastProtoParam = null;
+            _isNavigating = false;
+        }
+
+        // Seed CTI cache from overview's enriched top sources if not already cached
+        if (!_manualCtiCache.ContainsKey(ip) && _dashboardData?.TopSources != null)
+        {
+            var source = _dashboardData.TopSources.FirstOrDefault(s => s.SourceIp == ip);
+            if (source?.CrowdSecReputation != null)
+            {
+                _manualCtiCache[ip] = new CtiLookupResult(
+                    source.CrowdSecReputation, source.ThreatScore, source.TopBehaviors, source.MitreTechniques);
+            }
+        }
+
+        // Fallback: check DB cache directly (handles fresh nav / refresh where overview wasn't loaded)
+        if (!_manualCtiCache.ContainsKey(ip) && !NetworkUtilities.IsPrivateIpAddress(ip))
+        {
+            var cached = await DashboardService.GetCachedCtiAsync(ip);
+            if (cached?.CrowdSecReputation != null)
+            {
+                _manualCtiCache[ip] = new CtiLookupResult(
+                    cached.CrowdSecReputation, cached.ThreatScore, cached.TopBehaviors, cached.MitreTechniques);
+            }
+        }
+
+        StateHasChanged();
+
+        try
+        {
+            var to = DateTime.UtcNow;
+            var from = to.AddDays(-90);
+            _drilldownData = await DashboardService.GetIpDrilldownAsync(ip, from, to);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load drilldown for {Ip}", ip);
+            _drilldownData = new IpDrilldownData { Ip = ip };
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+            await JS.InvokeVoidAsync("eval", "(window.innerWidth <= 768 ? document.querySelector('.main-content') : document.querySelector('.page-content'))?.scrollTo(0, 0)");
+        }
+    }
+
+    private async Task DrillDownToPort(int port, bool pushHistory = true)
+    {
+        if (_activeTab != "drilldown")
+            _previousTab = _activeTab;
+        if (_activeTab == "overview")
+        {
+            _timelineChart = null;
+            _killChainChart = null;
+            _actionChart = null;
+        }
+        _hasInAppHistory = true;
+        _drilldownPort = port;
+        _drilldownIp = null;
+        _drilldownProtocol = null;
+        _drilldownData = null;
+        _protocolDrilldownData = null;
+        if (_filtersActiveBeforeDrilldown == null)
+        {
+            _filtersActiveBeforeDrilldown = _filtersActive;
+            _timeRangeBeforeDrilldown = _timeRange;
+            _customFromBeforeDrilldown = _customFrom;
+            _customToBeforeDrilldown = _customTo;
+        }
+        _filtersActive = false;
+        DashboardService.FiltersDisabled = true;
+        _activeTab = "drilldown";
+        _showFilterPanel = false;
+        _showCustomRange = false;
+        _loading = true;
+
+        if (pushHistory)
+        {
+            _isNavigating = true;
+            var uri = BuildTabUrl("drilldown", port: port);
+            NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
+            _lastTabParam = "drilldown";
+            _lastIpParam = null;
+            _lastPortParam = port.ToString();
+            _lastProtoParam = null;
+            _isNavigating = false;
+        }
+
+        StateHasChanged();
+
+        try
+        {
+            var (from, to) = GetTimeRange();
+            _portDrilldownData = await DashboardService.GetPortDrilldownAsync(port, from, to);
+            if (_portDrilldownData.TotalEvents == 0)
+                _portDrilldownData = await AutoExpandTimeRangeAsync(
+                    (f, t) => DashboardService.GetPortDrilldownAsync(port, f, t),
+                    d => d.TotalEvents > 0) ?? _portDrilldownData;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load drilldown for port {Port}", port);
+            _portDrilldownData = new PortDrilldownData { Port = port };
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+            await JS.InvokeVoidAsync("eval", "(window.innerWidth <= 768 ? document.querySelector('.main-content') : document.querySelector('.page-content'))?.scrollTo(0, 0)");
+        }
+    }
+
+    private async Task DrillDownToProtocol(string protocol, bool pushHistory = true)
+    {
+        if (_activeTab != "drilldown")
+            _previousTab = _activeTab;
+        if (_activeTab == "overview")
+        {
+            _timelineChart = null;
+            _killChainChart = null;
+            _actionChart = null;
+        }
+        _hasInAppHistory = true;
+        _drilldownProtocol = protocol;
+        _drilldownIp = null;
+        _drilldownPort = null;
+        _drilldownData = null;
+        _portDrilldownData = null;
+        if (_filtersActiveBeforeDrilldown == null)
+        {
+            _filtersActiveBeforeDrilldown = _filtersActive;
+            _timeRangeBeforeDrilldown = _timeRange;
+            _customFromBeforeDrilldown = _customFrom;
+            _customToBeforeDrilldown = _customTo;
+        }
+        _filtersActive = false;
+        DashboardService.FiltersDisabled = true;
+        _activeTab = "drilldown";
+        _showFilterPanel = false;
+        _showCustomRange = false;
+        _loading = true;
+
+        if (pushHistory)
+        {
+            _isNavigating = true;
+            var uri = BuildTabUrl("drilldown", proto: protocol);
+            NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
+            _lastTabParam = "drilldown";
+            _lastIpParam = null;
+            _lastPortParam = null;
+            _lastProtoParam = protocol;
+            _isNavigating = false;
+        }
+
+        StateHasChanged();
+
+        try
+        {
+            var (from, to) = GetTimeRange();
+            _protocolDrilldownData = await DashboardService.GetProtocolDrilldownAsync(protocol, from, to);
+            if (_protocolDrilldownData.TotalEvents == 0)
+                _protocolDrilldownData = await AutoExpandTimeRangeAsync(
+                    (f, t) => DashboardService.GetProtocolDrilldownAsync(protocol, f, t),
+                    d => d.TotalEvents > 0) ?? _protocolDrilldownData;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load drilldown for protocol {Protocol}", protocol);
+            _protocolDrilldownData = new ProtocolDrilldownData { Protocol = protocol };
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+            await JS.InvokeVoidAsync("eval", "(window.innerWidth <= 768 ? document.querySelector('.main-content') : document.querySelector('.page-content'))?.scrollTo(0, 0)");
+        }
+    }
+
+    private async Task GoBack()
+    {
+        if (_hasInAppHistory)
+            await JS.InvokeVoidAsync("history.back");
+        else
+            await ExitDrilldown();
+    }
+
+    private async Task ExitDrilldown(bool pushHistory = true)
+    {
+        _drilldownIp = null;
+        _drilldownPort = null;
+        _drilldownProtocol = null;
+        _drilldownData = null;
+        _portDrilldownData = null;
+        _protocolDrilldownData = null;
+        if (_filtersActiveBeforeDrilldown.HasValue)
+        {
+            _filtersActive = _filtersActiveBeforeDrilldown.Value;
+            DashboardService.FiltersDisabled = !_filtersActive;
+            _filtersActiveBeforeDrilldown = null;
+        }
+        if (_timeRangeBeforeDrilldown != null)
+        {
+            _timeRange = _timeRangeBeforeDrilldown;
+            _customFrom = _customFromBeforeDrilldown;
+            _customTo = _customToBeforeDrilldown;
+            _timeRangeBeforeDrilldown = null;
+        }
+        _activeTab = _previousTab;
+        _showFilterPanel = false;
+        _showCustomRange = false;
+
+        // Null chart refs when returning to overview so chartExisted is correctly
+        // false in LoadDataAsync - stale refs from before drilldown would cause
+        // RenderAsync on a disposed chart instead of letting the new one auto-render.
+        if (_activeTab == "overview")
+        {
+            _timelineChart = null;
+            _killChainChart = null;
+            _actionChart = null;
+        }
+
+        if (pushHistory)
+        {
+            _isNavigating = true;
+            var uri = BuildTabUrl(_activeTab);
+            NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
+            _lastTabParam = _activeTab;
+            _lastIpParam = null;
+            _lastPortParam = null;
+            _lastProtoParam = null;
+            _isNavigating = false;
+        }
+
+        await LoadDataAsync();
+    }
+
+    private bool _showCustomRange;
+    private DateTime? _customFrom;
+    private DateTime? _customTo;
+    private string _customFromLocal => _customFrom?.ToLocalTime().ToString("yyyy-MM-ddTHH:mm") ?? "";
+    private string _customToLocal => _customTo?.ToLocalTime().ToString("yyyy-MM-ddTHH:mm") ?? "";
+
+    private (DateTime from, DateTime to) GetTimeRange()
+    {
+        if (_timeRange == "custom" && _customFrom.HasValue && _customTo.HasValue)
+            return (_customFrom.Value, _customTo.Value);
+
+        var to = DateTime.UtcNow;
+        var from = _timeRange switch
+        {
+            "1h" => to.AddHours(-1),
+            "4h" => to.AddHours(-4),
+            "7d" => to.AddDays(-7),
+            "30d" => to.AddDays(-30),
+            "90d" => to.AddDays(-90),
+            _ => to.AddDays(-1) // 24h default
+        };
+        return (from, to);
+    }
+
+    private static readonly string[] TimeRangeEscalation = ["1h", "4h", "24h", "7d", "30d", "90d"];
+
+    private async Task<T?> AutoExpandTimeRangeAsync<T>(Func<DateTime, DateTime, Task<T>> query, Func<T, bool> hasData) where T : class
+    {
+        // Find the current range's position in escalation order
+        var currentIdx = Array.IndexOf(TimeRangeEscalation, _timeRange);
+        var startIdx = currentIdx >= 0 ? currentIdx + 1 : 0;
+
+        var to = DateTime.UtcNow;
+        for (var i = startIdx; i < TimeRangeEscalation.Length; i++)
+        {
+            var from = TimeRangeEscalation[i] switch
+            {
+                "1h" => to.AddHours(-1),
+                "4h" => to.AddHours(-4),
+                "7d" => to.AddDays(-7),
+                "30d" => to.AddDays(-30),
+                "90d" => to.AddDays(-90),
+                _ => to.AddDays(-1)
+            };
+
+            var result = await query(from, to);
+            if (hasData(result))
+            {
+                _timeRange = TimeRangeEscalation[i];
+                return result;
+            }
+        }
+
+        return null;
+    }
+
+    private DotNetObjectReference<ThreatDashboard>? _dotNetRef;
+
+    private async Task ToggleCustomRange()
+    {
+        _showCustomRange = !_showCustomRange;
+        if (_showCustomRange && _timeRange != "custom")
+        {
+            // Seed the picker with the current time window so users can adjust from there
+            var (from, to) = GetTimeRange();
+            _customFrom = from;
+            _customTo = to;
+        }
+        await SetupClickOutsideHandler();
+    }
+
+    [JSInvokable]
+    public void CloseCustomRange()
+    {
+        if (_showCustomRange)
+        {
+            _showCustomRange = false;
+            InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task SetupClickOutsideHandler()
+    {
+        try
+        {
+            if (_showCustomRange)
+            {
+                _dotNetRef ??= DotNetObjectReference.Create(this);
+                await JS.InvokeVoidAsync("eval",
+                    "window.__teardownThreatPopover = function() {" +
+                    "  if (window.__threatPopoverHandler) { document.removeEventListener('mousedown', window.__threatPopoverHandler); window.__threatPopoverHandler = null; }" +
+                    "};" +
+                    "window.__setupThreatPopover = function(ref) {" +
+                    "  window.__teardownThreatPopover();" +
+                    "  window.__threatPopoverHandler = function(e) {" +
+                    "    if (!e.target.closest('.custom-range-popover') && !e.target.closest('.time-btn')) {" +
+                    "      window.__teardownThreatPopover();" +
+                    "      ref.invokeMethodAsync('CloseCustomRange');" +
+                    "    }" +
+                    "  };" +
+                    "  setTimeout(function() { document.addEventListener('mousedown', window.__threatPopoverHandler); }, 0);" +
+                    "};");
+                await JS.InvokeVoidAsync("__setupThreatPopover", _dotNetRef);
+            }
+            else
+            {
+                await JS.InvokeVoidAsync("eval",
+                    "window.__teardownThreatPopover && window.__teardownThreatPopover();");
+            }
+        }
+        catch { /* JS interop can fail during dispose/prerender */ }
+    }
+
+    private void SetCustomFrom(string? value)
+    {
+        if (DateTime.TryParse(value, out var dt))
+            _customFrom = dt.ToUniversalTime();
+    }
+
+    private void SetCustomTo(string? value)
+    {
+        if (DateTime.TryParse(value, out var dt))
+            _customTo = dt.ToUniversalTime();
+    }
+
+    private async Task CancelCustomRange()
+    {
+        _showCustomRange = false;
+        await SetupClickOutsideHandler();
+    }
+
+    private async Task ApplyCustomRange()
+    {
+        _timeRange = "custom";
+        _showCustomRange = false;
+        await SetupClickOutsideHandler();
+        await LoadDataAsync();
+    }
+
+    private async Task ClearCustomRange()
+    {
+        _timeRange = "24h";
+        _customFrom = null;
+        _customTo = null;
+        _showCustomRange = false;
+        await LoadDataAsync();
+    }
+
+    // --- Chart Options Factories (each chart must have its own instance) ---
+
+    private static ApexChartOptions<TimelineBucket> CreateTimelineChartOptions()
+    {
+        return new ApexChartOptions<TimelineBucket>
+        {
+            Chart = new Chart
+            {
+                Background = "transparent",
+                Stacked = true,
+                Toolbar = new Toolbar { Show = false },
+                Zoom = new Zoom { Enabled = false },
+                Animations = new Animations
+                {
+                    Enabled = true,
+                    Speed = 300,
+                    AnimateGradually = new AnimateGradually { Enabled = false }
+                }
+            },
+            Colors = new List<string> { "#ef4444", "#f97316", "#eab308", "#3b82f6", "#10b981" },
+            Xaxis = new XAxis
+            {
+                Type = XAxisType.Datetime,
+                Labels = new XAxisLabels
+                {
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                    DatetimeUTC = false,
+                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                },
+                AxisBorder = new AxisBorder { Show = false },
+                AxisTicks = new AxisTicks { Show = false }
+            },
+            Yaxis = new List<YAxis>
+            {
+                new YAxis
+                {
+                    Min = 0,
+                    Labels = new YAxisLabels
+                    {
+                        Style = new AxisLabelStyle { Colors = "#9ca3af" },
+                        Formatter = @"function(val) { return val != null ? val.toFixed(0) : ''; }"
+                    }
+                }
+            },
+            Grid = new Grid
+            {
+                BorderColor = "#374151",
+                StrokeDashArray = 3
+            },
+            Stroke = new Stroke
+            {
+                Curve = Curve.Smooth,
+                Width = 2
+            },
+            Legend = new Legend { Show = false },
+            Tooltip = new Tooltip
+            {
+                Theme = Mode.Dark,
+                Intersect = false,
+                Shared = true,
+                X = new TooltipX { Format = "MMM dd, HH:mm" }
+            },
+            Fill = new Fill
+            {
+                Type = new List<FillType> { FillType.Solid },
+                Opacity = new List<double> { 0.15 }
+            }
+        };
+    }
+
+    private static ApexChartOptions<KillChainItem> CreateKillChainChartOptions()
+    {
+        return new ApexChartOptions<KillChainItem>
+        {
+            Chart = new Chart
+            {
+                Background = "transparent",
+                Toolbar = new Toolbar { Show = false },
+                Animations = new Animations { Enabled = true, Speed = 300 }
+            },
+            Colors = new List<string> { "#64748b", "#3b82f6", "#f59e0b", "#ef4444", "#a78bfa" },
+            PlotOptions = new PlotOptions
+            {
+                Bar = new PlotOptionsBar
+                {
+                    Horizontal = true,
+                    BorderRadius = 4,
+                    BarHeight = "60%",
+                    Distributed = true
+                }
+            },
+            Xaxis = new XAxis
+            {
+                Labels = new XAxisLabels
+                {
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" }
+                },
+                AxisBorder = new AxisBorder { Show = false },
+                AxisTicks = new AxisTicks { Show = false }
+            },
+            Yaxis = new List<YAxis>
+            {
+                new YAxis
+                {
+                    Labels = new YAxisLabels
+                    {
+                        Style = new AxisLabelStyle { Colors = "#9ca3af", FontSize = "12px" }
+                    }
+                }
+            },
+            Grid = new Grid
+            {
+                BorderColor = "#374151",
+                StrokeDashArray = 3
+            },
+            Legend = new Legend { Show = false },
+            Tooltip = new Tooltip { Theme = Mode.Dark },
+            DataLabels = new DataLabels { Enabled = false }
+        };
+    }
+
+    private static ApexChartOptions<ActionBreakdownItem> CreateActionChartOptions()
+    {
+        return new ApexChartOptions<ActionBreakdownItem>
+        {
+            Chart = new Chart
+            {
+                Background = "transparent",
+                Animations = new Animations { Enabled = true, Speed = 300 }
+            },
+            Colors = new List<string> { "#ef4444", "#f59e0b" },
+            Legend = new Legend
+            {
+                Show = true,
+                Position = LegendPosition.Bottom,
+                Labels = new LegendLabels { Colors = "#9ca3af" }
+            },
+            Tooltip = new Tooltip { Theme = Mode.Dark },
+            PlotOptions = new PlotOptions
+            {
+                Pie = new PlotOptionsPie
+                {
+                    Donut = new PlotOptionsDonut
+                    {
+                        Size = "65%"
+                    }
+                }
+            },
+            DataLabels = new DataLabels
+            {
+                Enabled = true,
+                Formatter = @"function(val) { return val.toFixed(1) + '%'; }"
+            }
+        };
+    }
+
+    // --- Helper Methods ---
+
+    private static string GetSeverityColor(int severity)
+    {
+        return severity switch
+        {
+            5 => "#ef4444",
+            4 => "#f97316",
+            3 => "#eab308",
+            2 => "#3b82f6",
+            1 => "#10b981",
+            _ => "#64748b"
+        };
+    }
+
+    private static string GetSeverityLabel(int severity)
+    {
+        return severity switch
+        {
+            5 => "Critical",
+            4 => "High",
+            3 => "Medium",
+            2 => "Low",
+            1 => "Info",
+            _ => "Unknown"
+        };
+    }
+
+    private static string GetKillChainLabel(KillChainStage stage)
+    {
+        return stage switch
+        {
+            KillChainStage.Monitored => "Monitored",
+            KillChainStage.Reconnaissance => "Reconnaissance",
+            KillChainStage.AttemptedExploitation => "Attempted Exploit",
+            KillChainStage.ActiveExploitation => "Active Exploit",
+            KillChainStage.PostExploitation => "Post-Exploitation",
+            _ => stage.ToString()
+        };
+    }
+
+    private static string GetPatternTypeLabel(PatternType patternType)
+    {
+        return patternType switch
+        {
+            PatternType.ScanSweep => "Scan/Sweep",
+            PatternType.BruteForce => "Brute Force",
+            PatternType.ExploitCampaign => "Exploit Campaign",
+            PatternType.DDoS => "DDoS",
+            _ => patternType.ToString()
+        };
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex IpPattern =
+        new(@"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private RenderFragment RenderPatternDescription(ThreatPattern pattern) => __builder =>
+    {
+        var desc = pattern.Description;
+        var seq = 0;
+        var lastEnd = 0;
+        foreach (System.Text.RegularExpressions.Match match in IpPattern.Matches(desc))
+        {
+            var ip = match.Value;
+            if (match.Index > lastEnd)
+                __builder.AddContent(seq++, desc[lastEnd..match.Index]);
+            __builder.OpenElement(seq++, "a");
+            __builder.AddAttribute(seq++, "href", "javascript:void(0)");
+            __builder.AddAttribute(seq++, "class", "ip-link");
+            __builder.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () => DrillDownToIp(ip)));
+            __builder.OpenElement(seq++, "code");
+            __builder.AddContent(seq++, ip);
+            __builder.CloseElement();
+            __builder.CloseElement();
+            lastEnd = match.Index + match.Length;
+        }
+        __builder.AddContent(seq, desc[lastEnd..]);
+    };
+
+    private static string GetPortServiceName(int port)
+        => NetworkOptimizer.Core.Helpers.NetworkUtilities.GetPortServiceName(port) ?? port.ToString();
+
+    private static string FormatNumber(int value)
+    {
+        return value switch
+        {
+            >= 1_000_000 => $"{value / 1_000_000.0:F1}M",
+            >= 10_000 => $"{value / 1_000.0:F1}K",
+            >= 1_000 => $"{value:N0}",
+            _ => value.ToString()
+        };
+    }
+
+    private static string CountryFlag(string? countryCode)
+    {
+        if (string.IsNullOrEmpty(countryCode) || countryCode.Length != 2) return "";
+        var upper = countryCode.ToUpperInvariant();
+        return string.Concat(
+            char.ConvertFromUtf32(0x1F1E6 + (upper[0] - 'A')),
+            char.ConvertFromUtf32(0x1F1E6 + (upper[1] - 'A')));
+    }
+
+    private static readonly Dictionary<string, string> CountryNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["AF"] = "Afghanistan", ["AL"] = "Albania", ["DZ"] = "Algeria", ["AR"] = "Argentina",
+        ["AM"] = "Armenia", ["AU"] = "Australia", ["AT"] = "Austria", ["AZ"] = "Azerbaijan",
+        ["BD"] = "Bangladesh", ["BY"] = "Belarus", ["BE"] = "Belgium", ["BA"] = "Bosnia and Herzegovina",
+        ["BR"] = "Brazil", ["BG"] = "Bulgaria", ["KH"] = "Cambodia", ["CA"] = "Canada",
+        ["CL"] = "Chile", ["CN"] = "China", ["CO"] = "Colombia", ["CR"] = "Costa Rica",
+        ["HR"] = "Croatia", ["CU"] = "Cuba", ["CY"] = "Cyprus", ["CZ"] = "Czechia",
+        ["DK"] = "Denmark", ["EC"] = "Ecuador", ["EG"] = "Egypt", ["EE"] = "Estonia",
+        ["ET"] = "Ethiopia", ["FI"] = "Finland", ["FR"] = "France", ["GE"] = "Georgia",
+        ["DE"] = "Germany", ["GH"] = "Ghana", ["GR"] = "Greece", ["HK"] = "Hong Kong",
+        ["HU"] = "Hungary", ["IS"] = "Iceland", ["IN"] = "India", ["ID"] = "Indonesia",
+        ["IR"] = "Iran", ["IQ"] = "Iraq", ["IE"] = "Ireland", ["IL"] = "Israel",
+        ["IT"] = "Italy", ["JP"] = "Japan", ["JO"] = "Jordan", ["KZ"] = "Kazakhstan",
+        ["KE"] = "Kenya", ["KP"] = "North Korea", ["KR"] = "South Korea", ["KW"] = "Kuwait",
+        ["LV"] = "Latvia", ["LB"] = "Lebanon", ["LT"] = "Lithuania", ["LU"] = "Luxembourg",
+        ["MY"] = "Malaysia", ["MX"] = "Mexico", ["MD"] = "Moldova", ["MN"] = "Mongolia",
+        ["MA"] = "Morocco", ["MM"] = "Myanmar", ["NL"] = "Netherlands", ["NZ"] = "New Zealand",
+        ["NG"] = "Nigeria", ["NO"] = "Norway", ["PK"] = "Pakistan", ["PA"] = "Panama",
+        ["PE"] = "Peru", ["PH"] = "Philippines", ["PL"] = "Poland", ["PT"] = "Portugal",
+        ["QA"] = "Qatar", ["RO"] = "Romania", ["RU"] = "Russia", ["SA"] = "Saudi Arabia",
+        ["RS"] = "Serbia", ["SG"] = "Singapore", ["SK"] = "Slovakia", ["SI"] = "Slovenia",
+        ["ZA"] = "South Africa", ["ES"] = "Spain", ["LK"] = "Sri Lanka", ["SE"] = "Sweden",
+        ["CH"] = "Switzerland", ["TW"] = "Taiwan", ["TH"] = "Thailand", ["TR"] = "Turkey",
+        ["UA"] = "Ukraine", ["AE"] = "UAE", ["GB"] = "United Kingdom", ["US"] = "United States",
+        ["UY"] = "Uruguay", ["UZ"] = "Uzbekistan", ["VE"] = "Venezuela", ["VN"] = "Vietnam",
+    };
+
+    private static string CountryLabel(string? code)
+    {
+        if (string.IsNullOrEmpty(code)) return "-";
+        var flag = CountryFlag(code);
+        var name = CountryNames.TryGetValue(code, out var n) ? n : code.ToUpperInvariant();
+        return flag;
+    }
+
+    private static string CountryTooltip(string? code)
+    {
+        if (string.IsNullOrEmpty(code)) return "";
+        var name = CountryNames.TryGetValue(code, out var n) ? n : code.ToUpperInvariant();
+        return $"{code.ToUpperInvariant()} - {name}";
+    }
+
+    private record CategoryPart(string Label, string CssClass);
+
+    private static readonly string[] SeverityPrefixes =
+        ["high risk", "low risk", "medium risk", "not suspicious", "potentially bad", "misc"];
+    private static readonly string[] DirectionTokens = ["incoming", "outgoing", "inbound", "outbound", "local"];
+    // Protocols/services that should stay ALL-CAPS (acronyms/abbreviations)
+    private static readonly HashSet<string> ProtocolTokens = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // Transport & network
+        "IP", "TCP", "UDP", "ICMP", "IGMP", "GGP", "ST", "EGP", "IGP", "PUP", "HMP",
+        "RDP", "DCCP", "XTP", "DDP", "GRE", "ESP", "AH", "RSVP", "PIM", "SCTP", "FC",
+        // IPv6
+        "IPV6", "IDRP",
+        // Routing
+        "RIP", "EIGRP", "OSPF", "ISIS", "VRRP",
+        // Application
+        "HTTP", "HTTPS", "SSH", "DNS", "FTP", "SMTP", "SNMP", "SIP", "IMAP", "IMAPS",
+        "POP3", "POP3S", "NTP", "LDAP", "SMB", "TLS", "SSL", "MQTT", "QUIC", "RPC",
+        "TFTP", "DHCP", "ARP", "IRC", "VPN", "IPP", "MODBUS", "TSAP", "RTSP", "MSSQL",
+        // Tunneling & encapsulation
+        "L2TP", "IPIP", "MPLS", "GTP",
+        // Database & services
+        "MSSQL", "AMQP", "NFS", "VNC", "SOCKS", "PPTP", "LDAPS", "SMTPS",
+        // Other acronyms
+        "P2P", "HIP", "WESP", "ROHC"
+    };
+
+    // Underscore-separated or special names that need aliasing/formatting
+    private static readonly Dictionary<string, string> ServiceNameMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["MICROSOFT_DS"] = "SMB",
+        ["NETBIOS_SESSION"] = "NetBIOS",
+        ["FTP_DATA"] = "FTP Data",
+        ["FTPS_CONTROL"] = "FTPS",
+        ["DNC_RPC"] = "RPC",
+        ["XNS_IDP"] = "XNS-IDP",
+        ["ISO_TP4"] = "ISO-TP4",
+        ["IDPR_CMTP"] = "IDPR-CMTP",
+        ["IPV6_ROUTE"] = "IPv6 Route",
+        ["IPV6_FRAG"] = "IPv6 Frag",
+        ["IPV6_ICMP"] = "ICMPv6",
+        ["IPV6_NONXT"] = "IPv6 No Next",
+        ["IPV6_OPTS"] = "IPv6 Opts",
+        ["AX_25"] = "AX.25",
+        ["MPLS_IN_IP"] = "MPLS-in-IP",
+        ["MOBILITY_HEADER"] = "Mobility Header",
+        ["IPENCAP"] = "IP Encap",
+        ["ETHERIP"] = "EtherIP",
+        ["IPCOMP"] = "IPComp",
+        ["UDPLITE"] = "UDP-Lite",
+        ["MANET"] = "MANET",
+        ["SHIM6"] = "Shim6",
+        ["OTHER"] = "Other",
+        ["MONGODB"] = "MongoDB",
+        ["POSTGRESQL"] = "PostgreSQL",
+        ["MYSQL"] = "MySQL",
+        ["IPSEC"] = "IPSec",
+        ["INFLUXDB"] = "InfluxDB",
+        ["ELASTICSEARCH"] = "Elasticsearch",
+        ["NETBIOS"] = "NetBIOS",
+    };
+
+    private static string FormatServices(string? services)
+    {
+        if (string.IsNullOrEmpty(services)) return "-";
+        return string.Join(", ", services.Split(',', StringSplitOptions.TrimEntries)
+            .Select(FormatServiceToken));
+    }
+
+    private static string FormatServiceToken(string token)
+    {
+        var trimmed = token.Trim();
+        if (ServiceNameMap.TryGetValue(trimmed, out var mapped)) return mapped;
+        if (ProtocolTokens.Contains(trimmed)) return trimmed.ToUpperInvariant();
+        return TitleCaseWithProtocols(trimmed);
+    }
+
+    private static string PrettifySignature(string? sig)
+    {
+        if (string.IsNullOrEmpty(sig)) return "-";
+
+        // Only prettify synthetic "Flow:" signatures; real IPS signatures pass through raw
+        if (!sig.StartsWith("Flow:", StringComparison.OrdinalIgnoreCase))
+            return sig;
+
+        // "Flow: MICROSOFT_DS incoming blocked" → "SMB - Incoming Blocked"
+        var parts = sig[5..].Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) return sig;
+
+        var service = FormatServiceToken(parts[0]);
+        var rest = parts.Length > 1
+            ? string.Join(" ", parts.Skip(1).Select(p =>
+                System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(p.ToLowerInvariant())))
+            : "";
+
+        return rest.Length > 0 ? $"{service} - {rest}" : service;
+    }
+
+    private static string TitleCaseWithProtocols(string text)
+    {
+        // Replace underscores with spaces first
+        var normalized = text.Replace('_', ' ');
+        var titleCased = System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(normalized.ToLowerInvariant());
+        var words = titleCased.Split(' ');
+        for (var i = 0; i < words.Length; i++)
+        {
+            if (ServiceNameMap.TryGetValue(words[i], out var mapped))
+                words[i] = mapped;
+            else if (ProtocolTokens.Contains(words[i]))
+                words[i] = words[i].ToUpperInvariant();
+        }
+        return string.Join(' ', words);
+    }
+
+    private static List<CategoryPart> SplitCategory(string category)
+    {
+        var parts = new List<CategoryPart>();
+        var lower = category.ToLowerInvariant().Trim();
+        var remainder = lower;
+
+        // Extract severity prefix
+        foreach (var prefix in SeverityPrefixes)
+        {
+            if (!lower.StartsWith(prefix)) continue;
+            var label = System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(prefix);
+            var cssClass = prefix.Contains("high") ? "category-high" :
+                prefix.Contains("not suspicious") ? "category-safe" :
+                prefix.Contains("low") ? "category-low" :
+                prefix.Contains("medium") || prefix.Contains("potentially") ? "category-medium" : "category-neutral";
+            parts.Add(new CategoryPart(label, cssClass));
+            remainder = lower[prefix.Length..].Trim();
+            break;
+        }
+
+        // Extract direction
+        foreach (var dir in DirectionTokens)
+        {
+            if (!remainder.StartsWith(dir)) continue;
+            parts.Add(new CategoryPart(System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(dir), "category-direction"));
+            remainder = remainder[dir.Length..].Trim();
+            break;
+        }
+
+        // Remainder is the protocol/type - use FormatServiceToken for known service names
+        if (remainder.Length > 0)
+        {
+            var label = FormatServiceToken(remainder);
+            parts.Add(new CategoryPart(label, "category-type"));
+        }
+
+        // Fallback: if no parts matched, return the whole thing
+        if (parts.Count == 0)
+            parts.Add(new CategoryPart(TitleCaseWithProtocols(lower), "category-neutral"));
+
+        return parts;
+    }
+
+    private static string GetStageColor(KillChainStage stage)
+    {
+        return stage switch
+        {
+            KillChainStage.Monitored => "#64748b",
+            KillChainStage.Reconnaissance => "#3b82f6",
+            KillChainStage.AttemptedExploitation => "#f59e0b",
+            KillChainStage.ActiveExploitation => "#ef4444",
+            KillChainStage.PostExploitation => "#a78bfa",
+            _ => "#64748b"
+        };
+    }
+
+    private static string GetStageAbbrev(KillChainStage stage)
+    {
+        return stage switch
+        {
+            KillChainStage.Monitored => "Mon",
+            KillChainStage.Reconnaissance => "Recon",
+            KillChainStage.AttemptedExploitation => "Attempt",
+            KillChainStage.ActiveExploitation => "Active",
+            KillChainStage.PostExploitation => "Post",
+            _ => "?"
+        };
+    }
+
+    // --- Chart data models ---
+
+    private class KillChainItem
+    {
+        public KillChainStage Stage { get; set; }
+        public int Count { get; set; }
+    }
+
+    private class ActionBreakdownItem
+    {
+        public string Label { get; set; } = string.Empty;
+        public int Count { get; set; }
+    }
+
+    // --- Noise Filter Methods ---
+
+    private async Task ToggleFiltersActive()
+    {
+        _filtersActive = !_filtersActive;
+        _ = SettingsAccessor.SaveSettingAsync("threats.filters_active", _filtersActive ? "true" : "false");
+        await LoadDataAsync();
+    }
+
+    private async Task LoadNoiseFiltersAsync()
+    {
+        try { _noiseFilters = await DashboardService.GetNoiseFiltersAsync(); }
+        catch (Exception ex) { Logger.LogDebug(ex, "Failed to load noise filters"); }
+    }
+
+    private async Task AddNoiseFilterAsync()
+    {
+        var filter = new ThreatNoiseFilter
+        {
+            SourceIp = string.IsNullOrWhiteSpace(_newFilterSourceIp) ? null : _newFilterSourceIp.Trim(),
+            DestIp = string.IsNullOrWhiteSpace(_newFilterDestIp) ? null : _newFilterDestIp.Trim(),
+            DestPort = int.TryParse(_newFilterDestPort, out var p) ? p : null,
+            Description = string.IsNullOrWhiteSpace(_newFilterDescription) ? BuildFilterDescription() : _newFilterDescription.Trim()
+        };
+
+        // Must have at least one field
+        if (filter.SourceIp == null && filter.DestIp == null && filter.DestPort == null) return;
+
+        await ThreatFilterAdmin.SaveNoiseFilterAsync(filter);
+        _newFilterSourceIp = "";
+        _newFilterDestIp = "";
+        _newFilterDestPort = "";
+        _newFilterDescription = "";
+        await LoadNoiseFiltersAsync();
+        await LoadDataAsync();
+    }
+
+    private void ClearFilterForm()
+    {
+        _newFilterSourceIp = "";
+        _newFilterDestIp = "";
+        _newFilterDestPort = "";
+        _newFilterDescription = "";
+    }
+
+    private string BuildFilterDescription()
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(_newFilterSourceIp)) parts.Add($"src={_newFilterSourceIp.Trim()}");
+        if (!string.IsNullOrWhiteSpace(_newFilterDestIp)) parts.Add($"dst={_newFilterDestIp.Trim()}");
+        if (!string.IsNullOrWhiteSpace(_newFilterDestPort)) parts.Add($"port={_newFilterDestPort.Trim()}");
+        return string.Join(", ", parts);
+    }
+
+    private async Task ToggleFilterAsync(ThreatNoiseFilter filter)
+    {
+        await DashboardService.ToggleNoiseFilterAsync(filter.Id, !filter.Enabled);
+        await LoadNoiseFiltersAsync();
+        await LoadDataAsync();
+    }
+
+    private async Task DeleteFilterAsync(ThreatNoiseFilter filter)
+    {
+        await ThreatFilterAdmin.DeleteNoiseFilterAsync(filter.Id);
+        await LoadNoiseFiltersAsync();
+        await LoadDataAsync();
+    }
+
+    private async Task QuickFilterFromDrilldown(string? sourceIp, string? destIp, int? destPort)
+    {
+        _newFilterSourceIp = sourceIp ?? "";
+        _newFilterDestIp = destIp ?? "";
+        _newFilterDestPort = destPort?.ToString() ?? "";
+        _newFilterDescription = "";
+        _showFilterPanel = true;
+        await Task.CompletedTask; // Let UI show the pre-filled form
+    }
+
+    // --- Search Methods ---
+
+    private void HandleSearchInput(ChangeEventArgs e)
+    {
+        _searchText = e.Value?.ToString() ?? "";
+        _searchClassification = null;
+    }
+
+    private async Task HandleSearchKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(_searchText))
+            await ExecuteSearchAsync();
+    }
+
+    private ThreatSearchQuery ClassifySearchInput(string input)
+    {
+        var trimmed = input.Trim();
+
+        // 1. CIDR - contains /
+        if (trimmed.Contains('/'))
+        {
+            _searchClassification = $"CIDR subnet: {trimmed}";
+            return new ThreatSearchQuery { Cidr = trimmed };
+        }
+
+        // 2. Exact IP - full IPv4 (3 dots) or IPv6 (contains colon)
+        // IPAddress.TryParse accepts partial IPs like "192.168" (as 192.0.0.168), so check dot count for IPv4
+        if ((trimmed.Contains(':') || trimmed.Count(c => c == '.') == 3) && System.Net.IPAddress.TryParse(trimmed, out _))
+        {
+            _searchClassification = $"Exact IP: {trimmed}";
+            return new ThreatSearchQuery { IpExact = trimmed };
+        }
+
+        // 3. Partial IP (e.g. "192.168." or "10.0" or "162.158") - must contain a dot to avoid catching plain numbers
+        if (trimmed.Contains('.') && PartialIpRegex.IsMatch(trimmed))
+        {
+            var prefix = trimmed.EndsWith('.') ? trimmed : trimmed + ".";
+            _searchClassification = $"IP prefix: {prefix}*";
+            return new ThreatSearchQuery { IpPrefix = prefix };
+        }
+
+        // 4. Country code - exactly 2 letters, exists in dictionary
+        if (trimmed.Length == 2 && trimmed.All(char.IsLetter) &&
+            CountryNames.ContainsKey(trimmed.ToUpperInvariant()))
+        {
+            var code = trimmed.ToUpperInvariant();
+            _searchClassification = $"Country: {CountryFlag(code)} {CountryNames[code]}";
+            return new ThreatSearchQuery { CountryCode = code };
+        }
+
+        // 5. ASN number - "AS13335" or plain "13335"
+        var asnText = trimmed.StartsWith("AS", StringComparison.OrdinalIgnoreCase) ? trimmed[2..] : trimmed;
+        if (int.TryParse(asnText, out var asnNum) && trimmed.StartsWith("AS", StringComparison.OrdinalIgnoreCase))
+        {
+            _searchClassification = $"ASN: AS{asnNum}";
+            return new ThreatSearchQuery { AsnNumber = asnNum };
+        }
+
+        // Also match plain number if it looks like an ASN (> 0)
+        if (int.TryParse(trimmed, out var plainAsn) && plainAsn > 0)
+        {
+            _searchClassification = $"ASN: AS{plainAsn}";
+            return new ThreatSearchQuery { AsnNumber = plainAsn };
+        }
+
+        // 6. Country name - substring match
+        var countryMatch = CountryNames.FirstOrDefault(kv =>
+            kv.Value.Contains(trimmed, StringComparison.OrdinalIgnoreCase));
+        if (countryMatch.Key != null)
+        {
+            _searchClassification = $"Country: {CountryFlag(countryMatch.Key)} {countryMatch.Value}";
+            return new ThreatSearchQuery { CountryCode = countryMatch.Key };
+        }
+
+        // 7. Fallback - ASN org name
+        _searchClassification = $"ASN org containing: \"{trimmed}\"";
+        return new ThreatSearchQuery { AsnOrgLike = trimmed };
+    }
+
+    private async Task ExecuteSearchAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_searchText)) return;
+
+        _searchLoading = true;
+        _searchResults = null;
+        StateHasChanged();
+
+        try
+        {
+            var query = ClassifySearchInput(_searchText);
+            var from = DateTime.MinValue;
+            var to = DateTime.UtcNow;
+            DashboardService.FiltersDisabled = !_filtersActive;
+            var results = await DashboardService.SearchAsync(from, to, query);
+
+            // Auto-drill-down: if exactly 1 result, go straight to IP detail
+            if (results.Count == 1)
+            {
+                _searchLoading = false;
+                _searchResults = results;
+                StateHasChanged();
+                await DrillDownToIp(results[0].Ip);
+                return;
+            }
+
+            _searchResults = results;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Search failed");
+            _searchResults = [];
+        }
+        finally
+        {
+            _searchLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// Schedule a one-shot refresh after background CTI hydration should be complete.
+    /// Timed to count * 600ms (500ms spacing + overhead).
+    /// Only fires once per unique hydration count to prevent refresh loops.
+    /// </summary>
+    private int _lastHydrationCount;
+    private void ScheduleHydrationRefresh(int hydrationCount)
+    {
+        if (hydrationCount <= 0) return;
+        if (hydrationCount == _lastHydrationCount) return; // same IPs still pending - don't loop
+        _lastHydrationCount = hydrationCount;
+
+        _hydrationRefreshTimer?.Dispose();
+        var delayMs = hydrationCount * 600 + 1500; // spacing + buffer
+        _hydrationRefreshTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    await LoadDataAsync();
+                });
+            }
+            catch { /* component may be disposed */ }
+        }, null, delayMs, Timeout.Infinite);
+    }
+
+    public void Dispose()
+    {
+        _refreshTimer?.Dispose();
+        _hydrationRefreshTimer?.Dispose();
+        _dotNetRef?.Dispose();
+    }
+}

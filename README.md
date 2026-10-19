@@ -13,8 +13,9 @@ Wyre is a small desktop control panel for Windows and Linux. It brings together 
 - Pointer speed and acceleration controls for Windows and GNOME Linux. Other Linux desktops can run Wyre, but their pointer settings are not yet supported.
 - Windows and Linux power profile controls with a review step and one-step undo.
 - Pointer changes have a review step and one-step undo.
-- No accounts, telemetry, background services, or bundled source from the archives in `SOURCE_REVIEW.md`.
-- Reference project decisions are documented in `REFERENCES.md`.
+- No accounts, telemetry, or background services.
+- The complete source snapshots requested from five upstream projects are preserved under `vendor/upstream/`. They are not compiled into Wyre's installer and keep their own licenses; see [UPSTREAMS.md](UPSTREAMS.md).
+- Review of the earlier local source archives is documented in `SOURCE_REVIEW.md`.
 
 ## Run from source
 

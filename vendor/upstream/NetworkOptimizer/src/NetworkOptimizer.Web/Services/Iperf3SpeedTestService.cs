@@ -1,0 +1,1031 @@
+using System.Diagnostics;
+using Microsoft.EntityFrameworkCore;
+using NetworkOptimizer.Alerts.Events;
+using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Core.Helpers;
+using NetworkOptimizer.Storage;
+using NetworkOptimizer.Storage.Interfaces;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.UniFi;
+using NetworkOptimizer.UniFi.Models;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// Service for running iperf3 speed tests to UniFi devices.
+/// Uses UniFiSshService for SSH operations with shared credentials.
+/// One instance exists per site, owned by <see cref="SpeedTestServiceRegistry"/>:
+/// devices, SSH credentials, and results live in that site's database, and the
+/// tests run against that site's devices (through the agent tunnel when the
+/// site's SSH is routed that way).
+/// </summary>
+public class Iperf3SpeedTestService : IIperf3SpeedTestService
+{
+    private readonly ILogger<Iperf3SpeedTestService> _logger;
+    private readonly IServiceProvider _serviceProvider;
+    private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
+    private readonly UniFiSshService _sshService;
+    private readonly SystemSettingsService _settingsService;
+    private readonly INetworkPathAnalyzer _pathAnalyzer;
+    private readonly UniFiConnectionService _connectionService;
+    private readonly ITopologySnapshotService _snapshotService;
+    private readonly SiteTunnelRouting _tunnelRouting;
+    private readonly AgentIperf3Service _agentIperf3;
+    private readonly IAlertEventBus? _alertEventBus;
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
+    private readonly string _siteSuffix;
+
+    // Track running tests to prevent duplicates
+    private readonly HashSet<string> _runningTests = new();
+    private readonly object _lock = new();
+
+    private readonly Licensing.LicenseStateService? _licenseState;
+
+    // Default iperf3 port
+    private const int Iperf3Port = 5201;
+
+    // Cache detected OS per host to avoid repeated checks
+    private readonly Dictionary<string, bool> _isWindowsCache = new();
+
+    // Cache iperf3 path per host (for Windows with paths containing spaces)
+    private readonly Dictionary<string, string> _iperf3PathCache = new();
+
+    public Iperf3SpeedTestService(
+        ILogger<Iperf3SpeedTestService> logger,
+        IServiceProvider serviceProvider,
+        IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+        UniFiSshRegistry uniFiSshRegistry,
+        SystemSettingsService settingsService,
+        INetworkPathAnalyzer pathAnalyzer,
+        SiteConnectionRegistry siteConnections,
+        ITopologySnapshotService snapshotService,
+        SiteTunnelRouting tunnelRouting,
+        AgentIperf3Service agentIperf3,
+        Licensing.LicenseStateService? licenseState = null,
+        IAlertEventBus? alertEventBus = null,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
+    {
+        _licenseState = licenseState;
+        _logger = logger;
+        _serviceProvider = serviceProvider;
+        _dbFactory = dbFactory;
+        _siteDbFactory = siteDbFactory;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
+        _siteSuffix = _isDefault ? "" : $" (site {_siteSlug})";
+        _sshService = uniFiSshRegistry.GetFor(_siteSlug);
+        _settingsService = settingsService;
+        _pathAnalyzer = pathAnalyzer;
+        _connectionService = siteConnections.GetFor(_siteSlug);
+        _snapshotService = snapshotService;
+        _tunnelRouting = tunnelRouting;
+        _agentIperf3 = agentIperf3;
+        _alertEventBus = alertEventBus;
+    }
+
+    /// <summary>
+    /// Creates a DI scope pinned to this instance's site so scoped services
+    /// (repositories, DbContext) hit this site's database.
+    /// </summary>
+    private IServiceScope CreateSiteScope()
+    {
+        var scope = _serviceProvider.CreateScope();
+        scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(_siteSlug);
+        return scope;
+    }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct = default)
+    {
+        if (!_isDefault)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
+    }
+
+    /// <summary>
+    /// Get iperf3 test settings
+    /// </summary>
+    public Task<Iperf3Settings> GetSettingsAsync() => _settingsService.GetIperf3SettingsAsync();
+
+    /// <summary>
+    /// Get all configured devices (delegates to UniFiSshService)
+    /// </summary>
+    public Task<List<DeviceSshConfiguration>> GetDevicesAsync() => _sshService.GetDevicesAsync();
+
+    /// <summary>
+    /// Save a device (delegates to UniFiSshService)
+    /// </summary>
+    public Task<DeviceSshConfiguration> SaveDeviceAsync(DeviceSshConfiguration device) => _sshService.SaveDeviceAsync(device);
+
+    /// <summary>
+    /// Delete a device (delegates to UniFiSshService)
+    /// </summary>
+    public Task DeleteDeviceAsync(int id) => _sshService.DeleteDeviceAsync(id);
+
+    /// <summary>
+    /// Test SSH connection to a device (using global credentials)
+    /// </summary>
+    public Task<(bool success, string message)> TestConnectionAsync(string host) => _sshService.TestConnectionAsync(host);
+
+    /// <summary>
+    /// Test SSH connection to a device (using device-specific credentials if configured)
+    /// </summary>
+    public Task<(bool success, string message)> TestConnectionAsync(DeviceSshConfiguration device) => _sshService.TestConnectionAsync(device);
+
+    /// <summary>
+    /// Check if iperf3 is available on a device (using global credentials)
+    /// </summary>
+    public Task<(bool available, string version)> CheckIperf3AvailableAsync(string host) => _sshService.CheckToolAvailableAsync(host, "iperf3");
+
+    /// <summary>
+    /// Check if iperf3 is available on a device (using device-specific credentials if configured)
+    /// </summary>
+    public Task<(bool available, string version)> CheckIperf3AvailableAsync(DeviceSshConfiguration device)
+    {
+        // Use custom binary path if configured, otherwise default to "iperf3"
+        var iperf3Bin = !string.IsNullOrWhiteSpace(device.Iperf3BinaryPath)
+            ? device.Iperf3BinaryPath
+            : "iperf3";
+        return _sshService.CheckToolAvailableAsync(device, iperf3Bin);
+    }
+
+    /// <summary>
+    /// Detect if the remote host is running Windows
+    /// </summary>
+    private async Task<bool> IsWindowsHostAsync(DeviceSshConfiguration device)
+    {
+        lock (_lock)
+        {
+            if (_isWindowsCache.TryGetValue(device.Host, out var cached))
+                return cached;
+        }
+
+        // Detect OS by trying uname (present on all Unix-like systems, absent on Windows).
+        // No stderr redirect needed - we just check success and output content.
+        // If uname fails or returns unrecognized output, assume Windows.
+        var unameResult = await _sshService.RunCommandWithDeviceAsync(device, "uname -s");
+        var os = unameResult.success ? unameResult.output.Trim().ToLowerInvariant() : "";
+        var isWindows = !(os.Contains("linux") || os.Contains("darwin") || os.Contains("freebsd") || os.Contains("unix"));
+
+        lock (_lock) { _isWindowsCache[device.Host] = isWindows; }
+        _logger.LogInformation("Detected {Host} as {OS}", device.Host, isWindows ? "Windows" : "Linux/Unix");
+        return isWindows;
+    }
+
+    /// <summary>
+    /// Kill iperf3 processes on the remote host
+    /// </summary>
+    private async Task KillIperf3Async(DeviceSshConfiguration device, bool isWindows)
+    {
+        if (isWindows)
+        {
+            // Use taskkill directly - simpler and more reliable
+            await _sshService.RunCommandWithDeviceAsync(device, "taskkill /F /IM iperf3.exe 2>&1 || echo done");
+        }
+        else
+        {
+            await _sshService.RunCommandWithDeviceAsync(device, "pkill -9 iperf3 2>/dev/null || true");
+        }
+    }
+
+    /// <summary>
+    /// Get the full path to iperf3 on Windows (needed for WMI when path contains spaces).
+    /// </summary>
+    /// <param name="device">Device to look on.</param>
+    /// <returns>The path, or null with the SSH error when the lookup could not run at all.</returns>
+    private async Task<(string? Path, string? SshError)> GetWindowsIperf3PathAsync(DeviceSshConfiguration device)
+    {
+        lock (_lock)
+        {
+            if (_iperf3PathCache.TryGetValue(device.Host, out var cached))
+                return (cached, null);
+        }
+
+        var result = await _sshService.RunCommandWithDeviceAsync(device, "where.exe iperf3");
+        if (result.success && !string.IsNullOrWhiteSpace(result.output))
+        {
+            // Take first line (in case multiple are found)
+            var path = result.output.Split('\n', '\r')[0].Trim();
+            if (!string.IsNullOrEmpty(path))
+            {
+                lock (_lock) { _iperf3PathCache[device.Host] = path; }
+                return (path, null);
+            }
+        }
+
+        // A lookup that never ran is not a missing binary. Carry the SSH error back so the caller
+        // reports what actually stopped it instead of telling somebody to install what they have.
+        return (null, result.success ? null : result.output?.Trim());
+    }
+
+    /// <summary>
+    /// Start iperf3 server on the remote host (one-shot mode)
+    /// </summary>
+    private async Task<(bool success, string output)> StartIperf3ServerAsync(DeviceSshConfiguration device, bool isWindows)
+    {
+        if (isWindows)
+        {
+            // Use configured path if set, otherwise find iperf3 in PATH
+            string? iperf3Path = device.Iperf3BinaryPath;
+            string? sshError = null;
+            if (string.IsNullOrWhiteSpace(iperf3Path))
+                (iperf3Path, sshError) = await GetWindowsIperf3PathAsync(device);
+
+            if (string.IsNullOrEmpty(iperf3Path))
+            {
+                return (false, sshError is { Length: > 0 }
+                    ? $"Could not reach the device over SSH to look for iperf3: {sshError}"
+                    : "iperf3 not found. Install iperf3 and ensure it's in the system PATH, or configure a custom path.");
+            }
+
+            // Use WMI to create a detached process that survives SSH session end.
+            // Base64-encode the PowerShell script to avoid quoting issues across
+            // cmd and pwsh SSH shells (pwsh double-parses nested quotes).
+            var psScript = $"$r = Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList '\"{iperf3Path}\" -s -p {Iperf3Port}'; if ($r.ReturnValue -eq 0) {{ 'started:' + $r.ProcessId }} else {{ 'failed:' + $r.ReturnValue }}";
+            var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(psScript));
+            var cmd = $"pwsh -EncodedCommand {encoded}";
+            return await _sshService.RunCommandWithDeviceAsync(device, cmd);
+        }
+        else
+        {
+            // Use configured path if set, otherwise default to "iperf3" from PATH
+            var iperf3Bin = !string.IsNullOrWhiteSpace(device.Iperf3BinaryPath)
+                ? device.Iperf3BinaryPath
+                : "iperf3";
+            var cmd = $"nohup {iperf3Bin} -s -p {Iperf3Port} > /tmp/iperf3_server.log 2>&1 & echo $!";
+            return await _sshService.RunCommandWithDeviceAsync(device, cmd);
+        }
+    }
+
+    /// <summary>
+    /// Check if iperf3 server is running on the remote host
+    /// </summary>
+    private async Task<bool> IsIperf3ServerRunningAsync(DeviceSshConfiguration device, bool isWindows)
+    {
+        if (isWindows)
+        {
+            // Use tasklist to check if iperf3 is running - output process list for better debugging
+            var result = await _sshService.RunCommandWithDeviceAsync(device,
+                "tasklist /FI \"IMAGENAME eq iperf3.exe\"");
+            _logger.LogDebug("Windows tasklist output for iperf3: {Output}", result.output);
+
+            // tasklist shows the process info if found, or "INFO: No tasks are running..." if not
+            var isRunning = result.success && result.output.Contains("iperf3", StringComparison.OrdinalIgnoreCase)
+                && !result.output.Contains("No tasks", StringComparison.OrdinalIgnoreCase);
+
+            if (!isRunning)
+            {
+                // Double-check with netstat for port listening
+                var portCheck = await _sshService.RunCommandWithDeviceAsync(device,
+                    $"netstat -an | findstr \":{Iperf3Port}\" | findstr LISTENING");
+                _logger.LogDebug("Windows netstat output for port {Port}: {Output}", Iperf3Port, portCheck.output);
+                isRunning = portCheck.success && portCheck.output.Contains("LISTENING");
+            }
+
+            return isRunning;
+        }
+        else
+        {
+            var result = await _sshService.RunCommandWithDeviceAsync(device, "pgrep -x iperf3 > /dev/null 2>&1 && echo 'running' || echo 'stopped'");
+            if (result.output.Contains("running"))
+                return true;
+
+            // Double-check with netstat/ss
+            var portCheck = await _sshService.RunCommandWithDeviceAsync(device,
+                $"netstat -tln 2>/dev/null | grep -q ':{Iperf3Port}' && echo 'listening' || ss -tln 2>/dev/null | grep -q ':{Iperf3Port}' && echo 'listening' || echo 'not_listening'");
+            return portCheck.output.Contains("listening");
+        }
+    }
+
+    /// <summary>
+    /// Get iperf3 server log from the remote host
+    /// </summary>
+    private async Task<string> GetIperf3ServerLogAsync(DeviceSshConfiguration device, bool isWindows)
+    {
+        if (isWindows)
+        {
+            // Try to get more helpful info about what went wrong
+            var checkIperf3 = await _sshService.RunCommandWithDeviceAsync(device, "where.exe iperf3 || echo NOT_FOUND");
+            if (checkIperf3.output.Contains("NOT_FOUND"))
+            {
+                return "iperf3 not found in PATH. Install iperf3 and ensure it's in system PATH.";
+            }
+            return $"iperf3 found at: {checkIperf3.output.Trim()}. Check that no other process is using port {Iperf3Port}.";
+        }
+        else
+        {
+            var result = await _sshService.RunCommandWithDeviceAsync(device, "cat /tmp/iperf3_server.log 2>/dev/null");
+            return result.output;
+        }
+    }
+
+    /// <summary>
+    /// Run a full speed test to a device using system settings
+    /// </summary>
+    public async Task<Iperf3Result> RunSpeedTestAsync(DeviceSshConfiguration device)
+    {
+        var settings = await _settingsService.GetIperf3SettingsAsync();
+        var parallelStreams = Math.Clamp(device.Iperf3ParallelStreams ?? GetParallelStreamsForDevice(device.DeviceType, settings), 1, 16);
+        var duration = Math.Clamp(device.Iperf3DurationSeconds ?? settings.DurationSeconds, 1, 300);
+        return await RunSpeedTestAsync(device, duration, parallelStreams);
+    }
+
+    /// <inheritdoc />
+    public async Task<Iperf3Result> RunSpeedTestAsync(NetworkOptimizer.UniFi.DiscoveredDevice device)
+    {
+        // UniFi devices have iperf3 built in but don't run it persistently.
+        var config = new DeviceSshConfiguration
+        {
+            Name = device.Name ?? "Unknown Device",
+            Host = device.IpAddress ?? "",
+            DeviceType = device.Type,
+            Enabled = true,
+            StartIperf3Server = true
+        };
+
+        // Null for everything but gateway hardware in AP mode whose Device SSH login is refused.
+        var router = _serviceProvider.GetRequiredService<Ssh.DeviceSshRouterRegistry>().GetFor(_siteSlug);
+        var overrides = await router.GetCredentialOverridesAsync(Ssh.DeviceSshTarget.From(device, config.Host));
+        if (overrides != null)
+        {
+            config.SshUsername = overrides.Username;
+            config.SshPassword = overrides.Password;
+            config.SshPrivateKeyPath = overrides.PrivateKeyPath;
+        }
+
+        return await RunSpeedTestAsync(config);
+    }
+
+    /// <summary>
+    /// Determine the appropriate parallel streams setting based on device type
+    /// </summary>
+    private static int GetParallelStreamsForDevice(DeviceType deviceType, Iperf3Settings settings)
+    {
+        if (deviceType.IsGateway())
+            return settings.GatewayParallelStreams;
+        if (deviceType.UsesUniFiIperfStreams())
+            return settings.UniFiParallelStreams;
+        return settings.OtherParallelStreams;
+    }
+
+    /// <summary>
+    /// Run a full speed test to a device with specific parameters
+    /// </summary>
+    public async Task<Iperf3Result> RunSpeedTestAsync(DeviceSshConfiguration device, int durationSeconds, int parallelStreams)
+    {
+        var host = device.Host;
+
+        if (_licenseState != null && !_licenseState.IsSiteOperational(_siteSlug))
+        {
+            _logger.LogWarning("LAN speed test refused: site {Site} is license-restricted", _siteSlug);
+            return new Iperf3Result
+            {
+                DeviceHost = host,
+                DeviceName = device.Name,
+                DeviceType = device.DeviceType.ToString(),
+                Success = false,
+                ErrorMessage = Licensing.LicenseGuard.RestrictedMessage
+            };
+        }
+
+        // Check if test is already running for this host
+        lock (_lock)
+        {
+            if (_runningTests.Contains(host))
+            {
+                return new Iperf3Result
+                {
+                    DeviceHost = host,
+                    DeviceName = device.Name,
+                    DeviceType = device.DeviceType.ToString(),
+                    Success = false,
+                    ErrorMessage = "A speed test is already running for this device"
+                };
+            }
+            _runningTests.Add(host);
+        }
+
+        var result = new Iperf3Result
+        {
+            DeviceHost = host,
+            DeviceName = device.Name,
+            DeviceType = device.DeviceType.ToString(),
+            TestTime = DateTime.UtcNow,
+            DurationSeconds = durationSeconds,
+            ParallelStreams = parallelStreams
+        };
+
+        // Determine if we should manage the iperf3 server ourselves
+        var manageServer = device.StartIperf3Server;
+        var isWindows = false;
+
+        try
+        {
+            _logger.LogInformation("Starting iperf3 speed test to {Device} ({Host})", device.Name, host);
+
+            // Quick connectivity check for saved devices (Id > 0) - skip for UniFi devices
+            // which already have UI-level online checks
+            if (manageServer && device.Id > 0)
+            {
+                var (sshOk, sshMsg) = await _sshService.TestConnectionAsync(device);
+                if (!sshOk)
+                {
+                    result.Success = false;
+                    result.ErrorMessage = $"Cannot connect to device: {sshMsg}";
+                    _logger.LogWarning("Speed test aborted - SSH connection failed to {Host}: {Message}", host, sshMsg);
+                    return result;
+                }
+            }
+
+            // Refresh topology to get current link speeds before test
+            _pathAnalyzer.InvalidateTopologyCache();
+
+            // Detect OS if we need to manage the server
+            if (manageServer)
+            {
+                isWindows = await IsWindowsHostAsync(device);
+                _logger.LogDebug("Target {Host} detected as {OS}", host, isWindows ? "Windows" : "Linux/Unix");
+
+                // Step 1: Kill any existing iperf3 server on the device
+                _logger.LogDebug("Cleaning up any existing iperf3 processes on {Host}", host);
+                await KillIperf3Async(device, isWindows);
+
+                // Step 2: Start iperf3 server on the remote device
+                _logger.LogDebug("Starting iperf3 server on {Host}", host);
+                var serverStartResult = await StartIperf3ServerAsync(device, isWindows);
+
+                if (!serverStartResult.success)
+                {
+                    result.Success = false;
+                    result.ErrorMessage = $"Failed to start iperf3 server: {serverStartResult.output}";
+                    return result;
+                }
+
+                _logger.LogDebug("iperf3 server start command sent to {Host}, output: {Output}", host, serverStartResult.output);
+
+                // Brief delay to let server start - iperf3 client has 5s connect timeout as fallback
+                await Task.Delay(300);
+            }
+            else
+            {
+                _logger.LogDebug("Assuming iperf3 server is already running on {Host} (StartIperf3Server=false)", host);
+            }
+
+            try
+            {
+                // Step 3: Run download test (device -> client, with -R flag) - "From Device"
+                _logger.LogDebug("Running download test from {Host}", host);
+                var downloadResult = await RunIperf3ClientAsync(host, durationSeconds, parallelStreams, reverse: true);
+
+                if (downloadResult.success)
+                {
+                    result.RawDownloadJson = downloadResult.output;
+                    ParseIperf3Result(downloadResult.output, result, isUpload: false);
+                }
+                else
+                {
+                    _logger.LogWarning("Download test failed: {Error}", downloadResult.output);
+                }
+
+                // Brief delay to let link rates stabilize, then capture snapshot
+                await Task.Delay(1000);
+                _ = _snapshotService.CaptureSnapshotAsync(_siteSlug, host);
+
+                // Brief delay before Phase 2 (upload test)
+                await Task.Delay(500);
+
+                // Step 4: Run upload test (client -> device) - "To Device"
+                _logger.LogDebug("Running upload test to {Host}", host);
+                var uploadResult = await RunIperf3ClientAsync(host, durationSeconds, parallelStreams, reverse: false);
+
+                if (uploadResult.success)
+                {
+                    result.RawUploadJson = uploadResult.output;
+                    ParseIperf3Result(uploadResult.output, result, isUpload: true);
+                }
+                else
+                {
+                    _logger.LogWarning("Upload test failed: {Error}", uploadResult.output);
+                }
+
+                result.Success = downloadResult.success || uploadResult.success;
+                if (!result.Success)
+                {
+                    result.ErrorMessage = $"Both tests failed. Download: {downloadResult.output}, Upload: {uploadResult.output}";
+                }
+            }
+            finally
+            {
+                if (manageServer)
+                {
+                    // Step 5: Clean up - stop iperf3 server
+                    _logger.LogDebug("Stopping iperf3 server on {Host}", host);
+                    await KillIperf3Async(device, isWindows);
+                }
+            }
+
+            // Perform path analysis first - this resolves hostname to IP and finds the client
+            await AnalyzePathAsync(result, host);
+
+            // Copy MAC from path analysis if available (needed for hostname-based tests)
+            if (string.IsNullOrEmpty(result.ClientMac) && !string.IsNullOrEmpty(result.PathAnalysis?.Path?.DestinationMac))
+            {
+                result.ClientMac = result.PathAnalysis.Path.DestinationMac;
+            }
+
+            // Enrich with client info (MAC, name, Wi-Fi signal) if target is a UniFi client
+            // Don't overwrite DeviceName (SSH tests have name from config), but do capture Wi-Fi/MAC
+            await _connectionService.EnrichSpeedTestWithClientInfoAsync(result, setDeviceName: false, overwriteMac: false);
+
+            // Save result to database
+            await SaveResultAsync(result);
+
+            // Publish alert event for regression detection
+            await PublishSpeedTestAlertAsync(result);
+
+            _logger.LogInformation("Speed test to {Device} completed: {FromDevice:F1} Mbps from / {ToDevice:F1} Mbps to device",
+                device.Name, result.DownloadMbps, result.UploadMbps);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error running speed test to {Device}", device.Name);
+            result.Success = false;
+            result.ErrorMessage = ex.Message;
+
+            // Try to clean up if we started the server
+            if (manageServer)
+            {
+                try
+                {
+                    await KillIperf3Async(device, isWindows);
+                }
+                catch (Exception cleanupEx)
+                {
+                    _logger.LogDebug(cleanupEx, "Cleanup error");
+                }
+            }
+
+            return result;
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                _runningTests.Remove(host);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Get recent speed test results.
+    /// Retries path analysis for results missing valid paths (within last 30 min).
+    /// </summary>
+    public async Task<List<Iperf3Result>> GetRecentResultsAsync(int count = 50, int hours = 0)
+    {
+        using var scope = CreateSiteScope();
+        var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
+        var results = await repository.GetRecentIperf3ResultsAsync(count, hours);
+
+        // Exclude WAN results - LAN page shows both server-initiated and client-initiated tests
+        results = results.Where(r => r.Direction != SpeedTestDirection.CloudflareWan
+                                  && r.Direction != SpeedTestDirection.CloudflareWanGateway
+                                  && r.Direction != SpeedTestDirection.UwnWan
+                                  && r.Direction != SpeedTestDirection.UwnWanGateway
+                                  && r.Direction != SpeedTestDirection.OpenSpeedTestWan).ToList();
+
+        // Retry path analysis for recent results (last 30 min) without a valid path
+        var retryWindow = DateTime.UtcNow.AddMinutes(-30);
+        var needsRetry = results.Where(r =>
+            r.TestTime > retryWindow &&
+            (r.PathAnalysis == null ||
+             r.PathAnalysis.Path == null ||
+             !r.PathAnalysis.Path.IsValid))
+            .Where(r => PathAnalysisRetryGate.TryClaim(nameof(Iperf3SpeedTestService), r.Id))
+            .ToList();
+
+        if (needsRetry.Count > 0)
+        {
+            _logger.LogInformation("Retrying path analysis for {Count} results without valid paths", needsRetry.Count);
+            await using var db = await CreateSiteDbAsync();
+            foreach (var result in needsRetry)
+            {
+                db.Attach(result);
+                await AnalyzePathAsync(result, result.DeviceHost);
+            }
+            await db.SaveChangesAsync();
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Search speed test results by device name, host, MAC, or network path involvement.
+    /// </summary>
+    public async Task<List<Iperf3Result>> SearchResultsAsync(string filter, int count = 50, int hours = 0)
+    {
+        using var scope = CreateSiteScope();
+        var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
+        return await repository.SearchIperf3ResultsAsync(filter, count, hours);
+    }
+
+    /// <summary>
+    /// Get speed test results for a specific device
+    /// </summary>
+    public async Task<List<Iperf3Result>> GetResultsForDeviceAsync(string deviceHost, int count = 20)
+    {
+        using var scope = CreateSiteScope();
+        var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
+        return await repository.GetIperf3ResultsForDeviceAsync(deviceHost, count);
+    }
+
+    /// <summary>
+    /// Gets recent successful LAN speed test results for a set of AP device IPs,
+    /// grouped by AP MAC address.
+    /// </summary>
+    public async Task<Dictionary<string, List<Iperf3Result>>> GetApDeviceTestsAsync(
+        Dictionary<string, string> apIpToMac, int countPerAp = 3)
+    {
+        if (apIpToMac.Count == 0) return new();
+
+        await using var db = await CreateSiteDbAsync();
+        var apIps = apIpToMac.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var results = await db.Iperf3Results
+            .Where(r => apIps.Contains(r.DeviceHost) && r.Direction == SpeedTestDirection.ServerToDevice && r.Success)
+            .OrderByDescending(r => r.TestTime)
+            .ToListAsync();
+
+        return results
+            .Where(r => apIpToMac.ContainsKey(r.DeviceHost))
+            .GroupBy(r => apIpToMac[r.DeviceHost], StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Take(countPerAp).ToList(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Delete a single speed test result by ID
+    /// </summary>
+    public async Task<bool> DeleteResultAsync(int id)
+    {
+        using var scope = CreateSiteScope();
+        var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
+        return await repository.DeleteIperf3ResultAsync(id);
+    }
+
+    /// <summary>
+    /// Updates the notes for a speed test result.
+    /// </summary>
+    public async Task<bool> UpdateNotesAsync(int id, string? notes)
+    {
+        using var scope = CreateSiteScope();
+        var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
+        return await repository.UpdateIperf3ResultNotesAsync(id, notes);
+    }
+
+    /// <summary>
+    /// Clear all speed test history
+    /// </summary>
+    public async Task<int> ClearHistoryAsync()
+    {
+        using var scope = CreateSiteScope();
+        var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
+        var results = await repository.GetRecentIperf3ResultsAsync(int.MaxValue);
+        var count = results.Count;
+        await repository.ClearIperf3HistoryAsync();
+        return count;
+    }
+
+    private async Task SaveResultAsync(Iperf3Result result)
+    {
+        try
+        {
+            using var scope = CreateSiteScope();
+            var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
+            await repository.SaveIperf3ResultAsync(result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to save iperf3 result to database");
+        }
+    }
+
+    /// <summary>
+    /// Runs the iperf3 client for one direction. For an agent-backed secondary
+    /// site (devices reached via the tunnel), the client runs at the site's agent
+    /// so throughput reflects the site LAN; otherwise it runs locally on this
+    /// server, exactly as before. The default site is never routed via agent, so
+    /// its path is unchanged.
+    /// </summary>
+    private async Task<(bool success, string output)> RunIperf3ClientAsync(string host, int duration, int streams, bool reverse)
+    {
+        if (!_isDefault && await _tunnelRouting.IsViaAgentAsync(_siteSlug))
+        {
+            _logger.LogDebug("Routing iperf3 client to agent for site {Slug} against {Host} (reverse={Reverse})",
+                _siteSlug, host, reverse);
+            return await _agentIperf3.RunClientAsync(_siteSlug, host, Iperf3Port, duration, streams, reverse, CancellationToken.None);
+        }
+
+        return await RunLocalIperf3Async(host, duration, streams, reverse);
+    }
+
+    private async Task<(bool success, string output)> RunLocalIperf3Async(string host, int duration, int streams, bool reverse)
+    {
+        // --connect-timeout in ms - fail fast if server isn't running (5 second connection timeout)
+        var args = $"-c {host} -p {Iperf3Port} -t {duration} -P {streams} -J --connect-timeout 5000";
+        if (reverse)
+        {
+            args += " -R";
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = ProcessUtilities.GetIperf3Path(),
+            Arguments = args,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = new Process { StartInfo = startInfo };
+
+        try
+        {
+            process.Start();
+
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+
+            // Connection timeout is 5s, so overall timeout can be shorter
+            var timeoutMs = (duration + 15) * 1000;
+            using var cts = new CancellationTokenSource(timeoutMs);
+            try
+            {
+                await process.WaitForExitAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // Timeout occurred
+            }
+
+            if (!process.HasExited)
+            {
+                process.Kill();
+                return (false, "iperf3 client timed out");
+            }
+
+            var output = await outputTask;
+            var error = await errorTask;
+
+            if (process.ExitCode != 0)
+            {
+                return (false, string.IsNullOrEmpty(error) ? output : error);
+            }
+
+            // iperf3 may return exit code 0 but have an error in JSON (e.g., connection timeout)
+            // Check for error field in JSON output
+            if (output.Contains("\"error\""))
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(output);
+                    if (doc.RootElement.TryGetProperty("error", out var errorProp))
+                    {
+                        var errorMsg = errorProp.GetString();
+                        if (!string.IsNullOrEmpty(errorMsg))
+                        {
+                            return (false, errorMsg);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // If we can't parse, just return the raw output
+                    _logger.LogDebug(ex, "Failed to parse iperf3 error JSON, returning raw output");
+                }
+            }
+
+            return (true, output);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Local iperf3 execution failed for {Host}", host);
+            return (false, ex.Message);
+        }
+    }
+
+    private void ParseIperf3Result(string json, Iperf3Result result, bool isUpload)
+    {
+        var parsed = Iperf3JsonParser.Parse(json, _logger);
+
+        // Extract local IP (only need to do this once)
+        if (string.IsNullOrEmpty(result.LocalIp) && !string.IsNullOrEmpty(parsed.LocalIp))
+        {
+            result.LocalIp = parsed.LocalIp;
+        }
+
+        // Resolve hostname-based DeviceHost to the actual IP used by iperf3
+        if (!string.IsNullOrEmpty(parsed.RemoteIp)
+            && !System.Net.IPAddress.TryParse(result.DeviceHost, out _))
+        {
+            _logger.LogDebug("Resolved DeviceHost {Hostname} to {Ip} from iperf3 connection",
+                result.DeviceHost, parsed.RemoteIp);
+            // iperf3 on a dual-stack listener can report the peer as ::ffff:a.b.c.d; store plain IPv4.
+            result.DeviceHost = NetworkUtilities.NormalizeToIPv4String(parsed.RemoteIp) ?? parsed.RemoteIp;
+        }
+
+        // Handle errors
+        if (!string.IsNullOrEmpty(parsed.ErrorMessage))
+        {
+            if (isUpload)
+                result.ErrorMessage = $"Upload error: {parsed.ErrorMessage}";
+            else
+                result.ErrorMessage = (result.ErrorMessage ?? "") + $" Download error: {parsed.ErrorMessage}";
+            return;
+        }
+
+        // Apply results
+        if (isUpload)
+        {
+            result.UploadBitsPerSecond = parsed.BitsPerSecond;
+            result.UploadBytes = parsed.Bytes;
+            result.UploadRetransmits = parsed.Retransmits;
+        }
+        else
+        {
+            result.DownloadBitsPerSecond = parsed.BitsPerSecond;
+            result.DownloadBytes = parsed.Bytes;
+            result.DownloadRetransmits = parsed.Retransmits;
+        }
+    }
+
+    /// <summary>
+    /// Analyze the network path and grade the speed test result.
+    /// Retry logic is built into CalculatePathAsync.
+    /// Uses snapshot captured during the test to pick max wireless rates.
+    /// </summary>
+    private async Task AnalyzePathAsync(Iperf3Result result, string targetHost)
+    {
+        try
+        {
+            // Get snapshot if available (captured between Phase 1 and Phase 2)
+            var snapshot = _snapshotService.GetSnapshot(_siteSlug, targetHost);
+
+            _logger.LogDebug("Analyzing network path to {Host} from {SourceIp}{Snapshot}",
+                targetHost, result.LocalIp ?? "auto",
+                snapshot != null ? " (with snapshot)" : "");
+
+            // When comparing with a snapshot, invalidate cache to get fresh "current" rates
+            if (snapshot != null)
+            {
+                _pathAnalyzer.InvalidateTopologyCache();
+            }
+
+            var path = await _pathAnalyzer.CalculatePathAsync(targetHost, result.LocalIp, retryOnFailure: true, snapshot);
+
+            // The iperf3-reported local address can be off-topology (Docker bridge
+            // networking, or a multi-NIC agent box picking the wrong interface). The
+            // agent's reported LAN IP is the operator-correctable address the site
+            // already advertises for speed test targets (NO_AGENT_LAN_IP), so when
+            // the server endpoint wasn't found, retry the trace anchored there.
+            if ((!_isDefault || await _serviceProvider.GetRequiredService<SiteAgentCoverage>().CoversAsync(_siteSlug))
+                && !path.IsValid && path.ErrorMessage == NetworkPath.ServerPositionNotFoundError)
+            {
+                var agentLanIp = await _serviceProvider.GetRequiredService<AgentEnrollmentService>()
+                    .GetOnlineAgentLanIpAsync(_siteSlug);
+                if (!string.IsNullOrEmpty(agentLanIp) && agentLanIp != result.LocalIp)
+                {
+                    _logger.LogDebug("Server position not found from {LocalIp}; retrying with agent LAN IP {AgentIp}",
+                        result.LocalIp ?? "auto", agentLanIp);
+                    path = await _pathAnalyzer.CalculatePathAsync(targetHost, agentLanIp, retryOnFailure: false, snapshot);
+                    if (path.IsValid)
+                        result.LocalIp = agentLanIp;
+                }
+            }
+
+            var analysis = _pathAnalyzer.AnalyzeSpeedTest(
+                path,
+                result.DownloadMbps,
+                result.UploadMbps,
+                result.DownloadRetransmits,
+                result.UploadRetransmits,
+                result.DownloadBytes,
+                result.UploadBytes);
+
+            result.PathAnalysis = analysis;
+
+            // Clean up snapshot after use
+            if (snapshot != null)
+                _snapshotService.RemoveSnapshot(_siteSlug, targetHost);
+
+            if (analysis.Path.IsValid)
+            {
+                _logger.LogInformation("Path analysis: {Hops} hops, theoretical max {MaxMbps} Mbps, " +
+                    "from-device efficiency {FromEff:F0}% ({FromGrade}), to-device efficiency {ToEff:F0}% ({ToGrade})",
+                    analysis.Path.Hops.Count,
+                    analysis.Path.TheoreticalMaxMbps,
+                    analysis.FromDeviceEfficiencyPercent,
+                    analysis.FromDeviceGrade,
+                    analysis.ToDeviceEfficiencyPercent,
+                    analysis.ToDeviceGrade);
+            }
+            else
+            {
+                _logger.LogDebug("Path analysis incomplete: {Error}", analysis.Path.ErrorMessage);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to analyze network path to {Host}", targetHost);
+            // Don't fail the test - path analysis is optional
+        }
+    }
+
+    private async Task PublishSpeedTestAlertAsync(Iperf3Result result)
+    {
+        if (_alertEventBus == null || !result.Success) return;
+
+        try
+        {
+            var downloadMbps = result.DownloadMbps;
+            var uploadMbps = result.UploadMbps;
+            var deviceLabel = result.DeviceName ?? result.DeviceHost;
+
+            await _alertEventBus.PublishAsync(new AlertEvent
+            {
+                EventType = "speedtest.completed",
+                Severity = AlertSeverity.Info,
+                Source = "speedtest",
+                Title = $"LAN Speed test: {deviceLabel} - {downloadMbps:F0} / {uploadMbps:F0} Mbps{_siteSuffix}",
+                Message = $"Device {deviceLabel} ({result.DeviceHost}): From device {downloadMbps:F1} Mbps, To device {uploadMbps:F1} Mbps",
+                DeviceIp = result.DeviceHost,
+                DeviceName = result.DeviceName,
+                MetricValue = downloadMbps,
+                SourceUrl = $"/speedtest?result={result.Id}",
+                Context = new Dictionary<string, string>
+                {
+                    ["downloadMbps"] = downloadMbps.ToString("F1"),
+                    ["uploadMbps"] = uploadMbps.ToString("F1")
+                }
+            });
+
+            // Check for regression vs recent average for same device and direction
+            try
+            {
+                await using var db = await CreateSiteDbAsync();
+                var recent = await db.Iperf3Results
+                    .AsNoTracking()
+                    .Where(r => r.DeviceHost == result.DeviceHost && r.Id != result.Id && r.Success
+                        && r.Direction == result.Direction
+                        && r.DownloadBitsPerSecond > 0)
+                    .OrderByDescending(r => r.TestTime)
+                    .Take(5)
+                    .ToListAsync();
+
+                if (recent.Count >= 3)
+                {
+                    var avgDownload = recent.Average(r => r.DownloadMbps);
+                    var dropPercent = avgDownload > 0 ? (avgDownload - downloadMbps) / avgDownload * 100 : 0;
+
+                    if (dropPercent > 0)
+                    {
+                        await _alertEventBus.PublishAsync(new AlertEvent
+                        {
+                            EventType = "speedtest.regression",
+                            Severity = dropPercent >= 50 ? AlertSeverity.Error
+                                : dropPercent >= 25 ? AlertSeverity.Warning : AlertSeverity.Info,
+                            Source = "speedtest",
+                            Title = $"Speed regression: {deviceLabel} at {downloadMbps:F0} Mbps ({dropPercent:F0}% below average){_siteSuffix}",
+                            Message = $"{deviceLabel} download is {dropPercent:F0}% below the recent average of {avgDownload:F0} Mbps",
+                            DeviceIp = result.DeviceHost,
+                            DeviceName = result.DeviceName,
+                            MetricValue = downloadMbps,
+                            ThresholdValue = avgDownload,
+                            SourceUrl = $"/speedtest?result={result.Id}",
+                            Context = new Dictionary<string, string>
+                            {
+                                ["current_mbps"] = downloadMbps.ToString("F1"),
+                                ["average_mbps"] = avgDownload.ToString("F1"),
+                                ["drop_percent"] = dropPercent.ToString("F0"),
+                                ["sample_count"] = recent.Count.ToString()
+                            }
+                        });
+                    }
+                }
+            }
+            catch (Exception regressEx)
+            {
+                _logger.LogDebug(regressEx, "Failed to check speed test regression");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to publish speed test alert event");
+        }
+    }
+
+}

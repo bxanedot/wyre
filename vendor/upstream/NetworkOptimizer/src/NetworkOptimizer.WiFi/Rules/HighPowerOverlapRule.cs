@@ -1,0 +1,105 @@
+using NetworkOptimizer.WiFi.Helpers;
+using NetworkOptimizer.WiFi.Models;
+using NetworkOptimizer.WiFi.Services;
+
+namespace NetworkOptimizer.WiFi.Rules;
+
+/// <summary>
+/// Rule that detects when multiple non-mesh APs on the same channel
+/// are all using high TX power, which causes excessive co-channel interference.
+/// </summary>
+public class HighPowerOverlapRule : IWiFiOptimizerRule
+{
+    private readonly PropagationService _propagationService;
+
+    public HighPowerOverlapRule(PropagationService propagationService)
+    {
+        _propagationService = propagationService;
+    }
+
+    public string RuleId => "WIFI-HIGH-POWER-OVERLAP-001";
+
+    /// <summary>
+    /// TX power threshold in dBm above which is considered "high".
+    /// </summary>
+    private const int HighPowerThreshold = 23;
+
+    public IEnumerable<HealthIssue> EvaluateAll(WiFiOptimizerContext ctx)
+    {
+        var bands = new[] { RadioBand.Band2_4GHz, RadioBand.Band5GHz, RadioBand.Band6GHz };
+
+        foreach (var band in bands)
+        {
+            // Group radios by channel
+            var radiosByChannel = ctx.AccessPoints
+                .SelectMany(ap => ap.Radios
+                    .Where(r => r.Band == band && r.Channel.HasValue)
+                    .Select(r => new { Ap = ap, Radio = r }))
+                .GroupBy(x => x.Radio.Channel!.Value)
+                .Where(g => g.Count() > 1);
+
+            foreach (var group in radiosByChannel)
+            {
+                var channel = group.Key;
+                var apsOnChannel = group.Select(x => x.Ap).Distinct().ToList();
+
+                // Filter out mesh pairs - they MUST be on the same channel
+                var nonMeshAps = WiFiAnalysisHelpers.FilterOutMeshPairs(apsOnChannel, band, channel);
+                if (nonMeshAps.Count < 2)
+                    continue;
+
+                // Spatial filter: remove APs that don't actually interfere with any other AP in the group
+                if (ctx.PropagationContext != null)
+                {
+                    nonMeshAps = WiFiAnalysisHelpers.FilterByPropagation(
+                        nonMeshAps, band, channel, ctx.PropagationContext, _propagationService);
+                    if (nonMeshAps.Count < 2)
+                        continue;
+                }
+
+                // Check if multiple non-mesh APs have high power
+                var highPowerAps = nonMeshAps
+                    .Where(ap => ap.Radios.Any(r =>
+                        r.Band == band &&
+                        r.Channel == channel &&
+                        (r.TxPowerMode?.Equals("high", StringComparison.OrdinalIgnoreCase) == true ||
+                         (r.TxPower.HasValue && r.TxPower >= HighPowerThreshold))))
+                    .ToList();
+
+                if (highPowerAps.Count > 1)
+                {
+                    var recommendation = "Consider reducing TX power on some APs or changing channels to reduce overlap.";
+
+                    var hasUnplacedAps = ctx.PropagationContext == null ||
+                        highPowerAps.Any(ap => !ctx.PropagationContext.ApsByMac.ContainsKey(ap.Mac.ToLowerInvariant()));
+                    if (hasUnplacedAps)
+                        recommendation += " Place your APs on the Signal Map for more accurate interference analysis based on physical distance and wall attenuation.";
+
+                    var issue = new HealthIssue
+                    {
+                        Severity = HealthIssueSeverity.Warning,
+                        Dimensions = { HealthDimension.SignalQuality, HealthDimension.ChannelHealth },
+                        Class = HealthIssueClass.Measured,
+                        Key = HealthIssueKeys.For(RuleId, band.ToUniFiCode(), channel.ToString(),
+                            HealthIssueKeys.Macs(highPowerAps.Select(ap => ap.Mac))),
+                        Title = $"High Power Overlap on {band.ToDisplayString()} Channel {channel}",
+                        Description = $"{string.Join(", ", highPowerAps.Select(x => x.Name))} are all using high TX power on the same channel, which may cause co-channel interference.",
+                        Recommendation = recommendation,
+                        ScoreImpact = -5,
+                        AffectedChannels = { channel }
+                    };
+                    // Measured overlap stays a warning; the hint only says whose choice it was.
+                    if (highPowerAps.All(ap => ap.Radios.Any(r => r.Band == band && r.Channel == channel && r.ChannelIsFixed)))
+                        RadioIntent.AppendHint(issue, RadioIntent.ChannelHint);
+                    yield return issue;
+                }
+            }
+        }
+    }
+
+    public HealthIssue? Evaluate(WiFiOptimizerContext ctx)
+    {
+        // Use EvaluateAll for multi-issue rules
+        return null;
+    }
+}

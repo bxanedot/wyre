@@ -1,0 +1,1188 @@
+using System.Net;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using NetworkOptimizer.Audit.Services;
+using NetworkOptimizer.Core;
+using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Diagnostics.Models;
+using NetworkOptimizer.UniFi.Helpers;
+using NetworkOptimizer.UniFi.Models;
+
+namespace NetworkOptimizer.Diagnostics.Analyzers;
+
+/// <summary>
+/// Analyzes network configuration for performance optimization opportunities:
+/// Hardware Acceleration, Jumbo Frames, Flow Control, and cellular QoS.
+/// </summary>
+public class PerformanceAnalyzer
+{
+    private readonly DeviceTypeDetectionService _deviceTypeDetection;
+    private readonly ILogger<PerformanceAnalyzer>? _logger;
+
+    /// <summary>
+    /// Set after Analyze() runs - indicates whether a cellular WAN was detected.
+    /// </summary>
+    public bool CellularWanDetected { get; private set; }
+
+    public PerformanceAnalyzer(
+        DeviceTypeDetectionService deviceTypeDetection,
+        ILogger<PerformanceAnalyzer>? logger = null)
+    {
+        _deviceTypeDetection = deviceTypeDetection;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Run all performance checks.
+    /// </summary>
+    public List<PerformanceIssue> Analyze(
+        List<UniFiDeviceResponse> devices,
+        List<UniFiNetworkConfig> networks,
+        List<UniFiClientResponse> clients,
+        JsonDocument? settingsData,
+        JsonDocument? qosRulesData,
+        JsonDocument? wanEnrichedData = null,
+        bool runPerformanceChecks = true,
+        bool runCellularChecks = true,
+        List<UniFiPortProfile>? portProfiles = null,
+        List<WanShaperState>? wanShaperStates = null)
+    {
+        var issues = new List<PerformanceIssue>();
+
+        if (runPerformanceChecks)
+        {
+            issues.AddRange(CheckHardwareAcceleration(devices, settingsData));
+            issues.AddRange(CheckJumboFrames(devices, settingsData));
+            issues.AddRange(CheckFlowControl(devices, networks, clients, settingsData, portProfiles));
+            issues.AddRange(CheckSqmFirmwareRegression(devices, networks));
+            issues.AddRange(CheckSqmNotShaping(devices, wanShaperStates));
+        }
+
+        if (runCellularChecks)
+        {
+            issues.AddRange(CheckCellularQos(devices, qosRulesData, wanEnrichedData));
+        }
+
+        return issues;
+    }
+
+    /// <summary>
+    /// Check if Hardware Acceleration (packet offload) is enabled on the gateway.
+    /// Suppressed when NetFlow is enabled, since NetFlow requires CPU-based packet inspection.
+    /// </summary>
+    [VendorSpecific("UniFi", "Reads gateway.HardwareOffload from UniFi device response")]
+    internal List<PerformanceIssue> CheckHardwareAcceleration(
+        List<UniFiDeviceResponse> devices, JsonDocument? settingsData = null)
+    {
+        var issues = new List<PerformanceIssue>();
+
+        var gateway = devices.FirstOrDefault(d => d.DeviceType == DeviceType.Gateway);
+        if (gateway == null)
+        {
+            _logger?.LogDebug("No gateway found, skipping Hardware Acceleration check");
+            return issues;
+        }
+
+        if (gateway.HardwareOffload == false)
+        {
+            if (IsNetFlowEnabled(settingsData))
+            {
+                _logger?.LogDebug("Hardware Acceleration disabled but NetFlow is enabled - suppressing recommendation");
+                return issues;
+            }
+
+            issues.Add(new PerformanceIssue
+            {
+                Title = "Hardware Acceleration Disabled",
+                Description = "Hardware Acceleration is disabled on your gateway. " +
+                    "This means all traffic is processed by the CPU instead of using the kernel's fast forwarding path (SFE), " +
+                    "which can significantly reduce throughput and increase CPU load even under light traffic.",
+                Recommendation = "Enable Hardware Acceleration in UniFi Devices > [your gateway] > Settings > Services. " +
+                    "Some features like Smart Queues may auto-disable it, but newer firmware versions allow re-enabling it.",
+                Severity = PerformanceSeverity.Recommendation,
+                Category = PerformanceCategory.Performance,
+                DeviceName = gateway.Name
+            });
+        }
+
+        return issues;
+    }
+
+    /// <summary>
+    /// Check if NetFlow is enabled in the controller settings.
+    /// </summary>
+    [VendorSpecific("UniFi", "Parses UniFi settings JSON 'data' array with 'key' discriminator (netflow)")]
+    internal static bool IsNetFlowEnabled(JsonDocument? settingsData)
+    {
+        if (settingsData == null)
+            return false;
+
+        if (!settingsData.RootElement.TryGetProperty("data", out var data) ||
+            data.ValueKind != JsonValueKind.Array)
+            return false;
+
+        foreach (var item in data.EnumerateArray())
+        {
+            if (!item.TryGetProperty("key", out var key) || key.GetString() != "netflow")
+                continue;
+
+            return item.TryGetProperty("enabled", out var enabled) &&
+                   enabled.ValueKind == JsonValueKind.True;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Check Jumbo Frames configuration using exclusion-aware global switch settings.
+    /// Three scenarios: global off (suggest enabling), global on with excluded device off (mismatch),
+    /// global off but all excluded devices on (suggest using global).
+    /// </summary>
+    [VendorSpecific("UniFi", "Uses GlobalSwitchSettings parsed from UniFi settings JSON")]
+    internal List<PerformanceIssue> CheckJumboFrames(
+        List<UniFiDeviceResponse> devices,
+        JsonDocument? settingsData)
+    {
+        var issues = new List<PerformanceIssue>();
+        var settings = GlobalSwitchSettings.FromSettingsJson(settingsData);
+        bool globalJumbo = settings?.JumboFramesEnabled ?? false;
+
+        // Find excluded devices and their Jumbo Frames status
+        var excludedDevices = GetExcludedDevicesWithSetting(devices, settings,
+            d => settings?.GetEffectiveJumboFrames(d) ?? false);
+
+        if (globalJumbo)
+        {
+            // Scenario 2: Global ON, check for excluded devices
+            foreach (var (device, effectiveValue) in excludedDevices)
+            {
+                if (!effectiveValue)
+                {
+                    // Excluded device has Jumbo OFF - MTU mismatch
+                    var eName = HtmlEncode(device.Name);
+                    issues.Add(new PerformanceIssue
+                    {
+                        Title = $"Jumbo Frames Disabled on {device.Name}",
+                        Description = $"Jumbo Frames are enabled globally, but {device.Name} is using device-specific " +
+                            "settings with Jumbo Frames disabled. This creates an MTU mismatch that can cause " +
+                            "fragmentation and reduced throughput on paths through this device.",
+                        Recommendation = $"Enable Global Switch Settings on this device in UniFi Devices > " +
+                            $"{eName}, or enable Jumbo Frames in its device-specific settings.",
+                        Severity = PerformanceSeverity.Recommendation,
+                        Category = PerformanceCategory.Performance,
+                        DeviceName = device.Name
+                    });
+                }
+                else
+                {
+                    // Excluded device has Jumbo ON but not inheriting global - suggest absorbing
+                    var eName2 = HtmlEncode(device.Name);
+                    issues.Add(new PerformanceIssue
+                    {
+                        Title = $"Jumbo Frames Set Per-Device on {device.Name}",
+                        Description = $"Jumbo Frames are enabled both globally and on {device.Name}, but {device.Name} " +
+                            "is using device-specific settings instead of inheriting from Global Switch Settings. " +
+                            "If the global setting changes, this device won't follow.",
+                        Recommendation = $"Enable Global Switch Settings on {eName2} in UniFi Devices > " +
+                            $"{eName2} so it automatically inherits global settings.",
+                        Severity = PerformanceSeverity.Info,
+                        Category = PerformanceCategory.Performance,
+                        DeviceName = device.Name
+                    });
+                }
+            }
+        }
+        else
+        {
+            // Global OFF - check scenarios 1 and 3
+            var excludedWithJumboOn = excludedDevices.Where(e => e.EffectiveValue).ToList();
+            var excludedWithJumboOff = excludedDevices.Where(e => !e.EffectiveValue).ToList();
+
+            if (excludedDevices.Count > 0 && excludedWithJumboOff.Count == 0 && excludedWithJumboOn.Count > 0)
+            {
+                // Scenario 3: Global OFF, all excluded devices have it ON
+                issues.Add(new PerformanceIssue
+                {
+                    Title = "Jumbo Frames Set Per-Device",
+                    Description = "Jumbo Frames are enabled on all your devices individually, but the global switch " +
+                        "setting is off. If a new device is added, it won't have Jumbo Frames unless manually configured.",
+                    Recommendation = "Consider enabling Jumbo Frames in UniFi Network Settings > Networks > " +
+                        "Global Switch Settings (at the bottom) for consistent coverage across all current and future devices.",
+                    Severity = PerformanceSeverity.Info,
+                    Category = PerformanceCategory.Performance
+                });
+            }
+            else
+            {
+                // Scenario 1: Global OFF, not all devices have it
+                int highSpeedAccessPorts = CountHighSpeedAccessPorts(devices);
+
+                if (highSpeedAccessPorts >= 2)
+                {
+                    string description;
+                    PerformanceSeverity severity;
+
+                    if (excludedWithJumboOn.Count > 0)
+                    {
+                        var deviceNames = string.Join(", ", excludedWithJumboOn.Select(e => e.Device.Name));
+                        description = $"You have {highSpeedAccessPorts} access ports running at 2.5 GbE or higher. " +
+                            $"Jumbo Frames are enabled on {deviceNames} but not on the remaining devices, " +
+                            "creating an MTU mismatch that can cause fragmentation.";
+                        severity = PerformanceSeverity.Recommendation;
+                    }
+                    else
+                    {
+                        description = $"You have {highSpeedAccessPorts} access ports running at 2.5 GbE or higher, " +
+                            "but Jumbo Frames are not enabled. Jumbo Frames (MTU 9000) cut per-packet overhead, " +
+                            "worth roughly 5-8% more throughput for large transfers on high-speed links.";
+                        severity = PerformanceSeverity.Info;
+                    }
+
+                    issues.Add(new PerformanceIssue
+                    {
+                        Title = "Jumbo Frames Not Enabled",
+                        Description = description,
+                        Recommendation = "Enable Jumbo Frames in UniFi Network Settings > Networks > Global Switch Settings (at the bottom). " +
+                            "Ensure all devices on the path support Jumbo Frames to avoid fragmentation.",
+                        Severity = severity,
+                        Category = PerformanceCategory.Performance
+                    });
+                }
+            }
+        }
+
+        return issues;
+    }
+
+    /// <summary>
+    /// Check Flow Control configuration using exclusion-aware global switch settings.
+    /// Three scenarios: global off (suggest enabling), global on with excluded device off (mismatch),
+    /// global off but all excluded devices on (suggest using global).
+    /// </summary>
+    [VendorSpecific("UniFi", "Uses GlobalSwitchSettings parsed from UniFi settings JSON")]
+    internal List<PerformanceIssue> CheckFlowControl(
+        List<UniFiDeviceResponse> devices,
+        List<UniFiNetworkConfig> networks,
+        List<UniFiClientResponse> clients,
+        JsonDocument? settingsData,
+        List<UniFiPortProfile>? portProfiles = null)
+    {
+        var issues = new List<PerformanceIssue>();
+        var settings = GlobalSwitchSettings.FromSettingsJson(settingsData);
+        bool globalFlowCtrl = settings?.FlowControlEnabled ?? false;
+
+        // Find excluded devices and their Flow Control status
+        // Exclude gateways - Flow Control is a switch-only feature in UniFi
+        var excludedDevices = GetExcludedDevicesWithSetting(devices, settings,
+            d => settings?.GetEffectiveFlowControl(d) ?? false)
+            .Where(e => e.Device.DeviceType != DeviceType.Gateway)
+            .ToList();
+
+        if (globalFlowCtrl)
+        {
+            // Scenario 2: Global ON, check for excluded devices
+            foreach (var (device, effectiveValue) in excludedDevices)
+            {
+                var eName = HtmlEncode(device.Name);
+                if (!effectiveValue)
+                {
+                    // Excluded device has Flow Control OFF - mismatch
+                    issues.Add(new PerformanceIssue
+                    {
+                        Title = $"Flow Control Disabled on {device.Name}",
+                        Description = $"Flow Control is enabled globally, but {device.Name} is using device-specific " +
+                            "settings with Flow Control disabled. This means this device won't send or respond to " +
+                            "pause frames, which can lead to packet loss during traffic bursts.",
+                        Recommendation = $"Enable Global Switch Settings on this device in UniFi Devices > " +
+                            $"{eName}, or enable Flow Control in its device-specific settings.",
+                        Severity = PerformanceSeverity.Recommendation,
+                        Category = PerformanceCategory.Performance,
+                        DeviceName = device.Name
+                    });
+                }
+                else
+                {
+                    // Excluded device has Flow Control ON but not inheriting global - suggest absorbing
+                    issues.Add(new PerformanceIssue
+                    {
+                        Title = $"Flow Control Set Per-Device on {device.Name}",
+                        Description = $"Flow Control is enabled both globally and on {device.Name}, but {device.Name} " +
+                            "is using device-specific settings instead of inheriting from Global Switch Settings. " +
+                            "If the global setting changes, this device won't follow.",
+                        Recommendation = $"Enable Global Switch Settings on {eName} in UniFi Devices > " +
+                            $"{eName} so it automatically inherits global settings.",
+                        Severity = PerformanceSeverity.Info,
+                        Category = PerformanceCategory.Performance,
+                        DeviceName = device.Name
+                    });
+                }
+            }
+
+            // Check port profiles and per-port overrides
+            issues.AddRange(CheckFlowControlPortProfiles(devices, portProfiles, settings));
+        }
+        else
+        {
+            // Global OFF - check scenarios 1 and 3
+            var excludedWithFlowCtrlOn = excludedDevices.Where(e => e.EffectiveValue).ToList();
+            var excludedWithFlowCtrlOff = excludedDevices.Where(e => !e.EffectiveValue).ToList();
+
+            if (excludedDevices.Count > 0 && excludedWithFlowCtrlOff.Count == 0 && excludedWithFlowCtrlOn.Count > 0)
+            {
+                // Scenario 3: Global OFF, all excluded devices have it ON
+                issues.Add(new PerformanceIssue
+                {
+                    Title = "Flow Control Set Per-Device",
+                    Description = "Flow Control is enabled on all your devices individually, but the global switch " +
+                        "setting is off. New devices won't have Flow Control unless manually configured.",
+                    Recommendation = "Consider enabling Flow Control in UniFi Network Settings > Internet (at the bottom) " +
+                        "for consistent coverage.",
+                    Severity = PerformanceSeverity.Info,
+                    Category = PerformanceCategory.Performance
+                });
+            }
+            else
+            {
+                // Scenario 1: Global OFF, not all devices have it
+                // Check triggering conditions: fast WAN or mixed speeds + WiFi devices
+                bool hasFastWan = networks
+                    .Where(n => n.Purpose.Equals("wan", StringComparison.OrdinalIgnoreCase))
+                    .Any(n => n.WanProviderCapabilities?.DownloadMbps > 800);
+
+                var accessPortSpeeds = GetAccessPortSpeedTiers(devices);
+                bool hasMixedSpeeds = accessPortSpeeds.Count >= 2;
+
+                int wifiUserDeviceCount = 0;
+                if (hasMixedSpeeds)
+                    wifiUserDeviceCount = CountWirelessUserDevices(clients);
+
+                bool mixedSpeedCondition = hasMixedSpeeds && wifiUserDeviceCount >= 10;
+
+                if (!hasFastWan && !mixedSpeedCondition)
+                    return issues;
+
+                string description;
+                PerformanceSeverity severity;
+
+                if (excludedWithFlowCtrlOn.Count > 0)
+                {
+                    var deviceNames = string.Join(", ", excludedWithFlowCtrlOn.Select(e => e.Device.Name));
+                    severity = PerformanceSeverity.Recommendation;
+
+                    if (hasFastWan && mixedSpeedCondition)
+                    {
+                        description = "Your network has a fast WAN connection (> 800 Mbps) and mixed-speed switch ports " +
+                            $"with {wifiUserDeviceCount} wireless user devices. Flow Control is enabled on {deviceNames} " +
+                            "but not on the remaining devices, creating inconsistent burst handling.";
+                    }
+                    else if (hasFastWan)
+                    {
+                        description = $"Your WAN speed exceeds 800 Mbps. Flow Control is enabled on {deviceNames} " +
+                            "but not on the remaining devices.";
+                    }
+                    else
+                    {
+                        var speedList = string.Join(", ", accessPortSpeeds.OrderBy(s => s).Select(s => $"{s} Mbps"));
+                        description = $"Your network has mixed port speeds ({speedList}) and {wifiUserDeviceCount} " +
+                            $"wireless user devices. Flow Control is enabled on {deviceNames} but not on the remaining devices.";
+                    }
+                }
+                else
+                {
+                    severity = PerformanceSeverity.Info;
+
+                    if (hasFastWan && mixedSpeedCondition)
+                    {
+                        description = "Your network has a fast WAN connection (> 800 Mbps) and mixed-speed switch ports " +
+                            $"with {wifiUserDeviceCount} wireless user devices. Flow Control helps prevent packet loss " +
+                            "when faster ports overwhelm slower ones during bursts.";
+                    }
+                    else if (hasFastWan)
+                    {
+                        description = "Your WAN speed exceeds 800 Mbps. Enabling Flow Control can help prevent packet loss " +
+                            "during traffic bursts when your gateway receives data faster than it can forward to slower LAN devices. " +
+                            "This is most beneficial with multi-gigabit WAN connections (1.5+ Gbps).";
+                    }
+                    else
+                    {
+                        var speedList = string.Join(", ", accessPortSpeeds.OrderBy(s => s).Select(s => $"{s} Mbps"));
+                        description = $"Your network has mixed port speeds ({speedList}) and {wifiUserDeviceCount} " +
+                            "wireless user devices. Flow Control helps prevent packet loss when faster ports send " +
+                            "to slower ones during bursts.";
+                    }
+                }
+
+                issues.Add(new PerformanceIssue
+                {
+                    Title = "Consider Flow Control",
+                    Description = description,
+                    Recommendation = "If you are noticing internet performance deficiency on certain devices, " +
+                        "consider enabling Flow Control in UniFi Network Settings > Internet (at the bottom).",
+                    Severity = severity,
+                    Category = PerformanceCategory.Performance
+                });
+            }
+        }
+
+        return issues;
+    }
+
+    private static readonly Version SqmLastGoodFirmware = new(5, 0, 10);
+
+    // Firmware version that fixes the SQM regression, keyed by gateway model. The UXG line
+    // ships fixes behind the UCG line, so it lands the fix a couple of point releases earlier
+    // in the affected window; the two lines eventually converge.
+    private static readonly Dictionary<string, Version> SqmFixedFirmwareByGateway = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["UXG-Fiber"] = new(5, 1, 17),
+        ["UXG-Max"] = new(5, 1, 17),
+        ["UCG-Fiber"] = new(5, 1, 19),
+        ["UCG-Max"] = new(5, 1, 19),
+    };
+
+    /// <summary>
+    /// Check if SQM is enabled on a gateway running firmware within the affected window.
+    /// Firmware versions after 5.0.10 introduced a SQM download throughput regression
+    /// on high-bandwidth connections (bottlenecked to ~800 Mbps or less). It was fixed in
+    /// 5.1.17 on UXG models and 5.1.19 on UCG models, so only firmware below the gateway's
+    /// fixed version (and above 5.0.10) is flagged.
+    /// </summary>
+    internal List<PerformanceIssue> CheckSqmFirmwareRegression(
+        List<UniFiDeviceResponse> devices,
+        List<UniFiNetworkConfig> networks)
+    {
+        var issues = new List<PerformanceIssue>();
+
+        var gateway = devices.FirstOrDefault(d => d.DeviceType == DeviceType.Gateway);
+        if (gateway == null)
+            return issues;
+
+        if (!SqmFixedFirmwareByGateway.TryGetValue(gateway.FriendlyModelName, out var fixedFirmware))
+            return issues;
+
+        var firmwareStr = gateway.DisplayableVersion ?? gateway.Version;
+        if (string.IsNullOrEmpty(firmwareStr) || !Version.TryParse(firmwareStr, out var firmware))
+            return issues;
+
+        if (firmware <= SqmLastGoodFirmware || firmware >= fixedFirmware)
+            return issues;
+
+        var sqmWans = networks.Where(n =>
+            string.Equals(n.Purpose, "wan", StringComparison.OrdinalIgnoreCase) &&
+            n.WanSmartqEnabled &&
+            (n.WanProviderCapabilities?.DownloadMbps > 500 || n.WanProviderCapabilities?.UploadMbps > 500))
+            .ToList();
+
+        if (sqmWans.Count == 0)
+            return issues;
+
+        var wanNames = string.Join(", ", sqmWans.Select(w => w.Name));
+
+        issues.Add(new PerformanceIssue
+        {
+            Title = "SQM Performance Regression on Current Firmware",
+            Description = $"Your {gateway.FriendlyModelName} is running firmware {firmwareStr} with SQM enabled on {wanNames}. " +
+                $"UniFi OS versions from after 5.0.10 through 5.1.15 have a known SQM download throughput regression that can bottleneck speeds to 800 Mbps or less on faster connections. UniFi OS {fixedFirmware} fixes it on this gateway.",
+            Recommendation = $"Upgrade to UniFi OS {fixedFirmware} or later, which restores full SQM download performance on high-speed connections.",
+            Severity = PerformanceSeverity.Recommendation,
+            Category = PerformanceCategory.Performance,
+            DeviceName = gateway.Name
+        });
+
+        return issues;
+    }
+
+    /// <summary>
+    /// Check whether the WANs that have Smart Queues enabled are actually being shaped.
+    ///
+    /// UniFi Network regularly accepts the Smart Queues toggle without provisioning the queues:
+    /// the setting reads as on, no shaper is ever created, and the connection runs unshaped with
+    /// nothing on screen to say so. The gateway's own traffic control is the only place the truth
+    /// shows, so the states come from an SSH read (GatewayShaperProbeService) and are empty
+    /// whenever the gateway cannot be reached - a site we cannot see raises nothing.
+    ///
+    /// Egress rides the WAN's data-path interface (upload), ingress rides its "ifb" companion
+    /// (download), and a direction UniFi was explicitly told to shape at 0 is not expected to
+    /// have a shaper at all.
+    /// </summary>
+    [VendorSpecific("UniFi", "UniFi Network's Smart Queues provisioning and its ifb ingress device naming")]
+    internal List<PerformanceIssue> CheckSqmNotShaping(
+        List<UniFiDeviceResponse> devices,
+        List<WanShaperState>? wanShaperStates)
+    {
+        var issues = new List<PerformanceIssue>();
+
+        if (wanShaperStates == null || wanShaperStates.Count == 0)
+            return issues;
+
+        var gatewayName = devices.FirstOrDefault(d => d.DeviceType == DeviceType.Gateway)?.Name;
+
+        foreach (var state in wanShaperStates)
+        {
+            // The WAN's own interface missing means we asked about a device this box does not
+            // have, so the readout says nothing about UniFi's provisioning.
+            if (!state.Egress.DeviceFound)
+            {
+                _logger?.LogDebug(
+                    "Skipping Smart Queues shaper check for {Wan}: {Interface} not found on the gateway",
+                    state.WanName, state.Interface);
+                continue;
+            }
+
+            var uploadExpected = state.UpRateMbps != 0;
+            var downloadExpected = state.DownRateMbps != 0;
+
+            var uploadShaped = state.Egress.HasRootHtb;
+            var downloadShaped = state.Ingress.DeviceFound && state.Ingress.HasRootHtb;
+
+            var uploadMissing = uploadExpected && !uploadShaped;
+            var downloadMissing = downloadExpected && !downloadShaped;
+
+            if (!uploadMissing && !downloadMissing)
+                continue;
+
+            var preamble = $"Smart Queues is enabled for {state.WanName} in UniFi Network, but the gateway ";
+            string description;
+
+            if (uploadMissing && downloadMissing)
+            {
+                description = preamble +
+                    $"has no shaper on {state.Interface} or {state.IfbInterface}. UniFi Network took the setting " +
+                    "without provisioning the queues, so this connection is running unshaped.";
+            }
+            else if (uploadMissing)
+            {
+                description = downloadShaped
+                    ? preamble + $"is only shaping download. {state.Interface} has no shaper, so upload traffic is running unshaped."
+                    : preamble + $"has no shaper on {state.Interface}, so upload traffic is running unshaped.";
+            }
+            else
+            {
+                description = uploadShaped
+                    ? preamble + $"is only shaping upload. {state.IfbInterface} has no shaper, so download traffic is running unshaped."
+                    : preamble + $"has no shaper on {state.IfbInterface}, so download traffic is running unshaped.";
+            }
+
+            issues.Add(new PerformanceIssue
+            {
+                Title = $"Smart Queues Not Shaping on {state.WanName}",
+                Description = description,
+                Recommendation = "Add any QoS rule in UniFi Network under Settings > Policy Engine > Policy Table > QoS Rules. " +
+                    "It does not matter what the rule targets - creating one makes UniFi Network provision the queues. " +
+                    "Give it about 45 seconds, then run Analyze again.",
+                Severity = PerformanceSeverity.Recommendation,
+                Category = PerformanceCategory.Performance,
+                DeviceName = gatewayName
+            });
+        }
+
+        return issues;
+    }
+
+    /// <summary>
+    /// Check if cellular WAN is present and QoS rules cover bandwidth-heavy app categories.
+    /// </summary>
+    [VendorSpecific("UniFi", "Reads UniFi WAN interfaces, modem mbb_overrides, and QoS rule JSON")]
+    internal List<PerformanceIssue> CheckCellularQos(
+        List<UniFiDeviceResponse> devices,
+        JsonDocument? qosRulesData,
+        JsonDocument? wanEnrichedData)
+    {
+        var issues = new List<PerformanceIssue>();
+
+        var gateway = devices.FirstOrDefault(d => d.DeviceType == DeviceType.Gateway);
+        if (gateway == null)
+        {
+            return issues;
+        }
+
+        var wanInterfaces = gateway.GetWanInterfaces();
+        var cellularWan = wanInterfaces.FirstOrDefault(w => w.IsCellular);
+
+        if (cellularWan == null)
+        {
+            _logger?.LogDebug("No cellular WAN detected, skipping QoS check");
+            return issues;
+        }
+
+        CellularWanDetected = true;
+
+        // Check WAN failover mode from enriched config
+        bool isFailover = IsCellularFailover(cellularWan, wanEnrichedData);
+
+        // Check data limits from the modem device (umbb)
+        var modem = devices.FirstOrDefault(d =>
+            d.Type.Equals("umbb", StringComparison.OrdinalIgnoreCase));
+        var dataLimit = GetModemDataLimit(modem);
+        bool hasSmallDataPlan = dataLimit.Enabled && dataLimit.Bytes < 500L * 1024 * 1024 * 1024;
+
+        _logger?.LogInformation(
+            "Cellular WAN detected ({Key}, type={Type}, failover={Failover}, dataLimit={Limit}), checking QoS rule coverage",
+            cellularWan.Key, cellularWan.Type, isFailover,
+            dataLimit.Enabled ? $"{dataLimit.Bytes / (1024L * 1024 * 1024)} GB" : "none");
+
+        // Failover or small data plan → Recommendation (more urgent)
+        // Load balanced with large/no data cap → Info
+        var severity = (isFailover || hasSmallDataPlan)
+            ? PerformanceSeverity.Recommendation
+            : PerformanceSeverity.Info;
+
+        string cellularContext = isFailover
+            ? "Your cellular WAN is configured as failover"
+            : "Your cellular WAN is in the load balancing mix";
+
+        // Get the cellular WAN's network config _id so we only count QoS rules assigned to it
+        string? cellularWanConfigId = GetCellularWanConfigId(cellularWan, wanEnrichedData);
+        _logger?.LogDebug("Cellular WAN config ID: {Id}", cellularWanConfigId ?? "not found");
+
+        // Parse existing QoS rules to find which apps are targeted by LIMIT rules on the cellular WAN
+        var targetedAppIds = GetTargetedAppIds(qosRulesData, cellularWanConfigId, _logger);
+
+        // Check each category - build context-aware descriptions showing partial coverage
+        var streamingGap = BuildCategoryGapDescription(cellularContext, targetedAppIds,
+            StreamingAppIds.StreamingVideo, StreamingAppIds.MinStreamingForCoverage, "streaming video apps");
+        if (streamingGap != null)
+        {
+            issues.Add(new PerformanceIssue
+            {
+                Title = "Streaming Video Not Rate-Limited",
+                Description = streamingGap,
+                Recommendation = "Create a QoS Rule under Settings > Policy Engine > Policy Table > QoS Rules to limit " +
+                    "streaming video apps when on cellular. " +
+                    "<br><a href=\"https://ozarkconnect.net/blog/unifi-5g-backup-qos\" target=\"_blank\">How-To Guide</a>",
+                Severity = severity,
+                Category = PerformanceCategory.CellularDataSavings,
+                DeviceName = gateway.Name
+            });
+        }
+
+        var cloudGap = BuildCategoryGapDescription(cellularContext, targetedAppIds,
+            StreamingAppIds.CloudStorage, StreamingAppIds.MinCloudForCoverage, "cloud storage apps");
+        if (cloudGap != null)
+        {
+            issues.Add(new PerformanceIssue
+            {
+                Title = "Cloud Sync Not Rate-Limited",
+                Description = cloudGap,
+                Recommendation = "Create a QoS Rule under Settings > Policy Engine > Policy Table > QoS Rules to limit cloud storage sync speed when on cellular. " +
+                    "This prevents large uploads/downloads from burning through your data plan. " +
+                    "<br><a href=\"https://ozarkconnect.net/blog/unifi-5g-backup-qos\" target=\"_blank\">How-To Guide</a>",
+                Severity = severity,
+                Category = PerformanceCategory.CellularDataSavings,
+                DeviceName = gateway.Name
+            });
+        }
+
+        var downloadGap = BuildCategoryGapDescription(cellularContext, targetedAppIds,
+            StreamingAppIds.LargeDownloads, StreamingAppIds.MinDownloadsForCoverage, "game stores and large download platforms");
+        if (downloadGap != null)
+        {
+            issues.Add(new PerformanceIssue
+            {
+                Title = "Game/App Downloads Not Rate-Limited",
+                Description = downloadGap,
+                Recommendation = "Create a QoS Rule under Settings > Policy Engine > Policy Table > QoS Rules to limit or block game/app downloads when on cellular. " +
+                    "Game updates alone can exceed monthly data caps in a single download. " +
+                    "<br><a href=\"https://ozarkconnect.net/blog/unifi-5g-backup-qos\" target=\"_blank\">How-To Guide</a>",
+                Severity = severity,
+                Category = PerformanceCategory.CellularDataSavings,
+                DeviceName = gateway.Name
+            });
+        }
+
+        return issues;
+    }
+
+    /// <summary>
+    /// When global Flow Control is ON, check for port profiles and individual switch ports
+    /// that have Flow Control explicitly disabled - creating inconsistency with the global setting.
+    /// Trunk ports (connecting switches/gateways on both sides) are excluded since disabling
+    /// FC on high-speed inter-switch links is a common and often optimal practice.
+    /// </summary>
+    [VendorSpecific("UniFi", "Reads FlowControlEnabled from port profiles and flow_control_enabled from switch port_table")]
+    internal List<PerformanceIssue> CheckFlowControlPortProfiles(
+        List<UniFiDeviceResponse> devices,
+        List<UniFiPortProfile>? portProfiles,
+        GlobalSwitchSettings? settings)
+    {
+        var issues = new List<PerformanceIssue>();
+
+        // Build profile lookup if available
+        var profilesById = portProfiles?.ToDictionary(p => p.Id, StringComparer.OrdinalIgnoreCase)
+            ?? new Dictionary<string, UniFiPortProfile>(StringComparer.OrdinalIgnoreCase);
+
+        var trunkPorts = GetInfrastructureTrunkPorts(devices);
+
+        // Find profiles with FC explicitly disabled
+        if (portProfiles != null)
+        {
+            var fcOffProfiles = portProfiles
+                .Where(p => p.FlowControlEnabled == false && p.Forward != "disabled"
+                    && !p.Name.Contains("trunk", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (fcOffProfiles.Count > 0)
+            {
+                _logger?.LogDebug("Found {Count} port profiles with Flow Control disabled", fcOffProfiles.Count);
+
+                foreach (var profile in fcOffProfiles)
+                {
+                    var profileName = HtmlEncode(profile.Name);
+                    issues.Add(new PerformanceIssue
+                    {
+                        Title = $"Flow Control Disabled in Profile \"{profile.Name}\"",
+                        Description = $"Flow Control is enabled globally, but the Port Profile " +
+                            $"\"{profile.Name}\" has Flow Control disabled. Any port assigned to this profile " +
+                            "will not use Flow Control, overriding the global setting.",
+                        Recommendation = $"If this isn't intentional, enable Flow Control in the " +
+                            $"\"{profileName}\" port profile or remove the override so it inherits the global setting.",
+                        Severity = PerformanceSeverity.Info,
+                        Category = PerformanceCategory.Performance
+                    });
+                }
+            }
+        }
+
+        // Find ports on each switch with FC off (via port_table field or profile override)
+        foreach (var device in devices)
+        {
+            if (device.PortTable == null || device.DeviceType == DeviceType.Gateway)
+                continue;
+
+            // Only check devices where FC would otherwise be on
+            bool deviceFcOn = settings?.GetEffectiveFlowControl(device) ?? false;
+            if (!deviceFcOn)
+                continue;
+
+            var affectedPorts = new List<string>();
+            foreach (var port in device.PortTable)
+            {
+                if (port.Forward == "disabled")
+                    continue;
+
+                if (trunkPorts.Contains((device.Mac.ToLowerInvariant(), port.PortIdx)))
+                    continue;
+
+                bool portFcOff;
+                string? profileName = null;
+
+                if (!string.IsNullOrEmpty(port.PortConfId) &&
+                    profilesById.TryGetValue(port.PortConfId, out var profile))
+                {
+                    if (profile.Forward == "disabled")
+                        continue;
+
+                    // Profile takes precedence when it explicitly sets FC;
+                    // fall back to port's own field when profile doesn't set it
+                    portFcOff = profile.FlowControlEnabled.HasValue
+                        ? profile.FlowControlEnabled == false
+                        : port.FlowControlEnabled == false;
+                    profileName = profile.Name;
+                }
+                else
+                {
+                    portFcOff = port.FlowControlEnabled == false;
+                }
+
+                if (portFcOff)
+                {
+                    affectedPorts.Add(profileName != null
+                        ? $"{port.Name} (\"{profileName}\")"
+                        : port.Name);
+                }
+            }
+
+            if (affectedPorts.Count > 0)
+            {
+                var deviceName = HtmlEncode(device.Name);
+                var portList = string.Join(", ", affectedPorts);
+                issues.Add(new PerformanceIssue
+                {
+                    Title = $"Flow Control Overridden on {device.Name}",
+                    Description = $"Flow Control is enabled globally, but {affectedPorts.Count} " +
+                        $"port(s) on {device.Name} have it disabled: {portList}.",
+                    Recommendation = $"If this isn't intentional, enable Flow Control on these ports " +
+                        $"on {deviceName} in UniFi Network - Ports.",
+                    Severity = PerformanceSeverity.Info,
+                    Category = PerformanceCategory.Performance,
+                    DeviceName = device.Name
+                });
+
+                _logger?.LogDebug("Device {Name}: {Count} ports with FC disabled: {Ports}",
+                    device.Name, affectedPorts.Count, portList);
+            }
+        }
+
+        return issues;
+    }
+
+    #region Helper Methods
+
+    /// <summary>
+    /// HTML-encode a value for safe inclusion in recommendation strings rendered as MarkupString.
+    /// </summary>
+    private static string HtmlEncode(string? value) => WebUtility.HtmlEncode(value ?? "") ?? "";
+
+    /// <summary>
+    /// Finds the enriched WAN configuration entry matching the given WAN interface key.
+    /// The enriched config is an array of objects with a "configuration" property containing
+    /// wan_networkgroup (e.g., "WAN3") which maps to the interface key (e.g., "wan3").
+    /// </summary>
+    internal static JsonElement? FindMatchingWanConfig(GatewayWanInterface cellularWan, JsonDocument? wanEnrichedData)
+    {
+        if (wanEnrichedData == null)
+            return null;
+
+        JsonElement configArray;
+        if (wanEnrichedData.RootElement.ValueKind == JsonValueKind.Array)
+            configArray = wanEnrichedData.RootElement;
+        else if (wanEnrichedData.RootElement.TryGetProperty("data", out var data) &&
+                 data.ValueKind == JsonValueKind.Array)
+            configArray = data;
+        else
+            return null;
+
+        foreach (var entry in configArray.EnumerateArray())
+        {
+            if (!entry.TryGetProperty("configuration", out var config))
+                continue;
+
+            if (!config.TryGetProperty("wan_networkgroup", out var networkGroup))
+                continue;
+
+            if (networkGroup.GetString()?.Equals(cellularWan.Key, StringComparison.OrdinalIgnoreCase) == true)
+                return config;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Determines if the cellular WAN is configured as failover-only (not load balanced).
+    /// </summary>
+    internal static bool IsCellularFailover(GatewayWanInterface cellularWan, JsonDocument? wanEnrichedData)
+    {
+        var config = FindMatchingWanConfig(cellularWan, wanEnrichedData);
+        if (config == null)
+            return true; // Can't determine, assume failover (more conservative)
+
+        if (config.Value.TryGetProperty("wan_load_balance_type", out var lbType))
+            return lbType.GetString()?.Equals("failover-only", StringComparison.OrdinalIgnoreCase) == true;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Extracts data limit info from the cellular modem's mbb_overrides.
+    /// Uses the primary SIM slot's data_limit_enabled and data_soft_limit_bytes.
+    /// </summary>
+    internal static (bool Enabled, long Bytes) GetModemDataLimit(UniFiDeviceResponse? modem)
+    {
+        if (modem?.AdditionalData == null)
+            return (false, 0);
+
+        if (!modem.AdditionalData.TryGetValue("mbb_overrides", out var overridesEl))
+            return (false, 0);
+
+        if (!overridesEl.TryGetProperty("sim", out var simArray) ||
+            simArray.ValueKind != JsonValueKind.Array)
+            return (false, 0);
+
+        // Find the primary slot, or use slot 1 as default
+        int primarySlot = 1;
+        if (overridesEl.TryGetProperty("primary_slot", out var primaryEl) &&
+            primaryEl.TryGetInt32(out int ps))
+        {
+            primarySlot = ps;
+        }
+
+        foreach (var sim in simArray.EnumerateArray())
+        {
+            int slot = sim.TryGetProperty("slot", out var slotEl) && slotEl.TryGetInt32(out int s) ? s : 0;
+            if (slot != primarySlot)
+                continue;
+
+            bool enabled = sim.TryGetProperty("data_limit_enabled", out var dle) && dle.GetBoolean();
+            long bytes = sim.TryGetProperty("data_soft_limit_bytes", out var dsl) && dsl.TryGetInt64(out long b) ? b : 0;
+
+            return (enabled, bytes);
+        }
+
+        return (false, 0);
+    }
+
+    /// <summary>
+    /// Get excluded devices and their effective setting value.
+    /// Returns only devices that are in the switch_exclusions list.
+    /// </summary>
+    internal static List<(UniFiDeviceResponse Device, bool EffectiveValue)> GetExcludedDevicesWithSetting(
+        List<UniFiDeviceResponse> devices,
+        GlobalSwitchSettings? settings,
+        Func<UniFiDeviceResponse, bool> getEffectiveValue)
+    {
+        if (settings == null)
+            return new List<(UniFiDeviceResponse, bool)>();
+
+        return devices
+            .Where(d => !string.IsNullOrEmpty(d.Mac) && settings.IsExcluded(d.Mac))
+            .Select(d => (Device: d, EffectiveValue: getEffectiveValue(d)))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Count access ports (non-uplink, non-WAN, up, speed > 0) at 2.5 GbE or higher.
+    /// </summary>
+    internal static int CountHighSpeedAccessPorts(List<UniFiDeviceResponse> devices)
+    {
+        int count = 0;
+
+        foreach (var device in devices)
+        {
+            if (device.PortTable == null)
+                continue;
+
+            foreach (var port in device.PortTable)
+            {
+                if (IsAccessPort(port) && port.Speed >= 2500)
+                    count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Get the set of distinct speed tiers among active access ports.
+    /// </summary>
+    internal static HashSet<int> GetAccessPortSpeedTiers(List<UniFiDeviceResponse> devices)
+    {
+        var speeds = new HashSet<int>();
+
+        foreach (var device in devices)
+        {
+            if (device.PortTable == null)
+                continue;
+
+            foreach (var port in device.PortTable)
+            {
+                if (IsAccessPort(port))
+                    speeds.Add(port.Speed);
+            }
+        }
+
+        return speeds;
+    }
+
+    /// <summary>
+    /// Builds a set of (device MAC, port index) pairs for ports that connect infrastructure
+    /// devices (switches and gateways) to each other. Both sides of each link are included.
+    /// </summary>
+    internal static HashSet<(string Mac, int PortIdx)> GetInfrastructureTrunkPorts(
+        List<UniFiDeviceResponse> devices)
+    {
+        var trunkPorts = new HashSet<(string Mac, int PortIdx)>();
+
+        var infraMacs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var d in devices)
+        {
+            if (d.DeviceType is DeviceType.Switch or DeviceType.Gateway && !string.IsNullOrEmpty(d.Mac))
+                infraMacs.Add(d.Mac);
+        }
+
+        foreach (var device in devices)
+        {
+            if (device.DeviceType is not (DeviceType.Switch or DeviceType.Gateway))
+                continue;
+            if (device.Uplink == null || string.IsNullOrEmpty(device.Uplink.UplinkMac))
+                continue;
+            if (!infraMacs.Contains(device.Uplink.UplinkMac))
+                continue;
+
+            // This device's uplink port (normalize MAC case for consistent lookup)
+            if (device.Uplink.PortIdx.HasValue)
+                trunkPorts.Add((device.Mac.ToLowerInvariant(), device.Uplink.PortIdx.Value));
+
+            // The upstream device's downlink port
+            trunkPorts.Add((device.Uplink.UplinkMac.ToLowerInvariant(), device.Uplink.UplinkRemotePort));
+        }
+
+        return trunkPorts;
+    }
+
+    /// <summary>
+    /// Whether a switch port is an "access port" (non-uplink, non-WAN, active).
+    /// </summary>
+    private static bool IsAccessPort(SwitchPort port)
+    {
+        return !port.IsUplink &&
+               port.Up &&
+               port.Speed > 0 &&
+               !(port.NetworkName?.StartsWith("wan", StringComparison.OrdinalIgnoreCase) == true);
+    }
+
+    /// <summary>
+    /// Count wireless client devices that are user devices (phones, laptops, tablets).
+    /// </summary>
+    private int CountWirelessUserDevices(List<UniFiClientResponse> clients)
+    {
+        int count = 0;
+
+        foreach (var client in clients)
+        {
+            if (!client.IsWired)
+            {
+                var detection = _deviceTypeDetection.DetectDeviceType(client);
+                var category = detection.Category;
+
+                if (category == ClientDeviceCategory.Smartphone ||
+                    category == ClientDeviceCategory.Laptop ||
+                    category == ClientDeviceCategory.Tablet ||
+                    category == ClientDeviceCategory.Desktop)
+                {
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Extracts the cellular WAN's network config _id from the enriched WAN config.
+    /// </summary>
+    internal static string? GetCellularWanConfigId(GatewayWanInterface cellularWan, JsonDocument? wanEnrichedData)
+    {
+        var config = FindMatchingWanConfig(cellularWan, wanEnrichedData);
+        if (config == null)
+            return null;
+
+        return config.Value.TryGetProperty("_id", out var idProp) ? idProp.GetString() : null;
+    }
+
+    /// <summary>
+    /// Parse QoS rules and return all app IDs targeted by enabled LIMIT rules
+    /// that are assigned to the specified WAN network.
+    /// </summary>
+    internal static HashSet<int> GetTargetedAppIds(JsonDocument? qosRulesData, string? cellularWanConfigId, ILogger? logger = null)
+    {
+        var targetedAppIds = new HashSet<int>();
+
+        if (qosRulesData == null)
+        {
+            logger?.LogDebug("QoS rules data is null");
+            return targetedAppIds;
+        }
+
+        // QoS rules response can be either a flat array or wrapped in a data property
+        JsonElement rulesArray;
+        if (qosRulesData.RootElement.ValueKind == JsonValueKind.Array)
+        {
+            rulesArray = qosRulesData.RootElement;
+        }
+        else if (qosRulesData.RootElement.TryGetProperty("data", out var data) &&
+                 data.ValueKind == JsonValueKind.Array)
+        {
+            rulesArray = data;
+        }
+        else
+        {
+            logger?.LogDebug("QoS rules: unexpected JSON structure (kind={Kind})", qosRulesData.RootElement.ValueKind);
+            return targetedAppIds;
+        }
+
+        logger?.LogDebug("QoS rules: found {Count} rules total", rulesArray.GetArrayLength());
+
+        foreach (var rule in rulesArray.EnumerateArray())
+        {
+            string? ruleName = rule.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : null;
+
+            // Must be enabled
+            if (!rule.TryGetProperty("enabled", out var enabled) || !enabled.GetBoolean())
+            {
+                logger?.LogDebug("QoS rule '{Name}': skipped (disabled)", ruleName ?? "unnamed");
+                continue;
+            }
+
+            // Must be a limiting rule
+            string? objectiveStr = rule.TryGetProperty("objective", out var objective) ? objective.GetString() : null;
+            if (objectiveStr?.Equals("LIMIT", StringComparison.OrdinalIgnoreCase) != true)
+            {
+                logger?.LogDebug("QoS rule '{Name}': skipped (objective={Objective})", ruleName ?? "unnamed", objectiveStr ?? "null");
+                continue;
+            }
+
+            // Must be assigned to the cellular WAN (has wan_or_vpn_network matching the cellular config ID)
+            if (cellularWanConfigId != null)
+            {
+                string? ruleWan = rule.TryGetProperty("wan_or_vpn_network", out var wanProp) ? wanProp.GetString() : null;
+                if (ruleWan == null || !ruleWan.Equals(cellularWanConfigId, StringComparison.OrdinalIgnoreCase))
+                {
+                    logger?.LogDebug("QoS rule '{Name}': skipped (wan_or_vpn_network={Wan}, need {Need})",
+                        ruleName ?? "unnamed", ruleWan ?? "none", cellularWanConfigId);
+                    continue;
+                }
+            }
+
+            // Collect app IDs from destination
+            if (rule.TryGetProperty("destination", out var destination) &&
+                destination.TryGetProperty("app_ids", out var appIds) &&
+                appIds.ValueKind == JsonValueKind.Array)
+            {
+                var ruleAppIds = new List<int>();
+                foreach (var appId in appIds.EnumerateArray())
+                {
+                    if (appId.TryGetInt32(out int id))
+                    {
+                        targetedAppIds.Add(id);
+                        ruleAppIds.Add(id);
+                    }
+                }
+                logger?.LogDebug("QoS rule '{Name}': LIMIT with {Count} app IDs: [{Ids}]",
+                    ruleName ?? "unnamed", ruleAppIds.Count, string.Join(", ", ruleAppIds));
+            }
+            else
+            {
+                logger?.LogDebug("QoS rule '{Name}': LIMIT but no destination.app_ids found", ruleName ?? "unnamed");
+            }
+        }
+
+        logger?.LogDebug("QoS: {Count} total targeted app IDs across cellular WAN LIMIT rules", targetedAppIds.Count);
+        return targetedAppIds;
+    }
+
+    /// <summary>
+    /// Check category coverage and build a description with context about partial coverage.
+    /// Returns null if the category is fully covered, otherwise returns a description string.
+    /// </summary>
+    private static string? BuildCategoryGapDescription(
+        string cellularContext, HashSet<int> targetedAppIds,
+        HashSet<int> categoryAppIds, int minForCoverage, string categoryLabel)
+    {
+        var coveredIds = categoryAppIds.Where(id => targetedAppIds.Contains(id)).ToList();
+        var uncoveredIds = categoryAppIds.Where(id => !targetedAppIds.Contains(id)).ToList();
+
+        if (coveredIds.Count >= minForCoverage)
+            return null; // Fully covered
+
+        if (coveredIds.Count > 0)
+        {
+            // Partial coverage - show what's covered and what's missing
+            var coveredNames = coveredIds
+                .Select(id => StreamingAppIds.AppNames.TryGetValue(id, out var n) ? n : null)
+                .Where(n => n != null).ToList();
+            var uncoveredNames = uncoveredIds
+                .Take(4)
+                .Select(id => StreamingAppIds.AppNames.TryGetValue(id, out var n) ? n : id.ToString())
+                .ToList();
+
+            return $"{cellularContext}. Your QoS rules cover {string.Join(", ", coveredNames)}, " +
+                $"but {string.Join(", ", uncoveredNames)}" +
+                (uncoveredIds.Count > 4 ? $" and {uncoveredIds.Count - 4} more" : "") +
+                " don't have bandwidth limits.";
+        }
+
+        // No coverage at all - don't list specific apps
+        return $"{cellularContext}, but {categoryLabel} don't have bandwidth limits.";
+    }
+
+    #endregion
+}

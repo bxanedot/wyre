@@ -1,0 +1,1168 @@
+@using NetworkOptimizer.Storage.Models
+@using Microsoft.EntityFrameworkCore
+@using NetworkOptimizer.Web.Components.Shared.Monitoring
+@inject MonitoringLiveStats LiveStats
+@inject SiteContextService SiteCtx
+@inject NetworkOptimizer.Web.Services.Monitoring.ProbeExecutorFactory ExecutorFactory
+@inject NetworkOptimizer.Web.Services.IMonitoringTargetService TargetService
+@inject Microsoft.JSInterop.IJSRuntime JS
+@inject NetworkOptimizer.Web.Services.Monitoring.MonitoringPathView PathView
+
+<div class="card">
+    <div class="card-header card-header-collapsible" @onclick="ToggleCollapse">
+        <h2 class="card-title">Latency Targets</h2>
+        @if (ShowScopeFilter)
+        {
+            <div class="time-range-selector wan-selector @(_wanChoices.Count > 3 ? "wan-selector-many" : "")" @onclick:stopPropagation>
+                <button class="time-btn @(LanScope || ShowingAll ? "active" : "")"
+                        @onclick="PickLanAsync" @onclick:stopPropagation>LAN</button>
+                @foreach (var w in _wanChoices)
+                {
+                    @* All lights every pill: it shows every WAN, and on a single-WAN site the
+                       parent has no option list to fill the selection from. *@
+                    <button class="time-btn @(!LanScope && (ShowingAll || SelectedWanKeys.Contains(w.Key)) ? "active" : "")"
+                            @onclick="() => PickWanAsync(w.Key)" @onclick:stopPropagation>
+                        @{
+                            var wp = NetworkOptimizer.UniFi.GatewayWanHelper.SplitWanLabel(
+                                w.Label, NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(w.Key));
+                        }@(wp.Name ?? w.Label)@if (wp.WanToken != null && wp.Name != null)
+                        {<span class="wan-pill-token">@wp.WanToken</span>}
+                    </button>
+                }
+                @if (!ShowingAll)
+                {
+                    <button class="time-btn wan-all-btn"
+                            @onclick="() => PickWanAsync(AllWansKey)" @onclick:stopPropagation>All</button>
+                }
+                @if (ScopeIsNarrowed)
+                {
+                    <WanFilterResetButton OnReset="ResetScopeAsync" />
+                }
+            </div>
+            @* Narrows the rows the scope already chose. Hidden on mobile: the scope row alone
+               already wraps there, and the Type column still says what each row is. *@
+            <div class="time-range-selector lt-type-filter hide-mobile" @onclick:stopPropagation>
+                @foreach (var t in AvailableTypes())
+                {
+                    <button class="time-btn @(_typeFilter == t ? "active" : "")"
+                            @onclick="() => PickTypeAsync(t)" @onclick:stopPropagation>@TypeFilterLabel(t)</button>
+                }
+                <button class="time-btn @(_typeFilter == null ? "active" : "")"
+                        @onclick="() => PickTypeAsync(null)" @onclick:stopPropagation>All</button>
+            </div>
+        }
+        <div class="card-header-badges">
+            <span class="status-badge status-active" @onclick:stopPropagation="true">@VisibleTargets().Count(t => t.Enabled && !t.IsRetired) active</span>
+            <span class="issue-type-chevron">@(_collapsed ? "▼" : "▲")</span>
+        </div>
+    </div>
+    <div class="expand-wrapper @(!_collapsed ? "expanded" : "")">
+        <div class="expand-content">
+    <div class="card-body">
+        <div class="lt-intro">
+            <p class="section-description">
+                Default WAN targets and one fabric target per discovered device. The @ProberNoun probes
+                each target at @ProberPossessive own interval and writes results to the <code>latency</code>
+                measurement in InfluxDB.
+            </p>
+            <div class="lt-actions">
+                <a href="@RunProbeUrl" class="btn btn-sm btn-secondary">Run Probe</a>
+                @if (HiddenCount > 0)
+                {
+                    <button class="btn btn-sm btn-secondary" @onclick="ToggleShowHidden"
+                            data-tooltip="Removed targets are kept so their measurements stay readable.">
+                        @(_showHidden ? "Hide removed" : $"Show removed ({HiddenCount})")
+                    </button>
+                }
+                <SiteOperatorOnly>
+                    <button class="btn btn-sm btn-primary" @onclick="ShowAddTargetFromTop">
+                        + Add Target
+                    </button>
+                </SiteOperatorOnly>
+            </div>
+        </div>
+
+        @if (Targets.Count == 0)
+        {
+            <div class="empty-state">
+                <p>No targets yet. They'll appear once the agent's first cycle completes.</p>
+            </div>
+        }
+        else
+        {
+            <div class="table-responsive">
+            @* The table, not a row: which target is first depends on the site, and the pencil the
+               step is about only exists for a role that can rename. *@
+            <table class="data-table" data-tour="latency-target-rename">
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Target</th>
+                        <th>Address</th>
+                        @if (WanContexts.Count > 0)
+                        {
+                            <th>WAN / Path</th>
+                        }
+                        <th>Interval</th>
+                        <th>Latest</th>
+                        <th>Last verified</th>
+                        @* Two action columns, not one: a retired row has no Pause, and with both
+                           buttons sharing a cell its Remove slid left out of line with every other
+                           Remove. Separate cells put the table's own column alignment to work. *@
+                        <th></th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @if (!VisibleTargets().Any())
+                    {
+                        <tr>
+                            <td colspan="@VisibleColumnCount" class="latency-targets-empty">
+                                @* Names both things the reader narrowed by, since either one alone
+                                   leaves the other looking like the reason. *@
+                                @(LanScope
+                                    ? (_typeFilter != null
+                                        ? "No targets of this type on this network."
+                                        : "No targets on this network yet.")
+                                    : (_typeFilter != null
+                                        ? "No targets of this type for this WAN."
+                                        : "No targets for this WAN."))
+                            </td>
+                        </tr>
+                    }
+                    @foreach (var t in VisibleTargets())
+                    {
+                        var latest = LiveStats.GetTargetStats(t.TargetId);
+                        <tr id="latency-target-@t.Id" class="@(t.Enabled ? "" : "latency-target-paused")">
+                            <td>
+                                <span class="status-badge @TargetTypeBadgeClass(t.TargetType)">
+                                    @TargetTypeBadgeLabel(t.TargetType)
+                                </span>
+                            </td>
+                            <td>
+                                @if (_editingNameId == t.Id)
+                                {
+                                    <div class="inline-name-edit">
+                                        <input type="text" class="form-control" @ref="_nameInput" @bind="_editName" @bind:event="oninput"
+                                               @onkeydown="@(e => TargetNameEditKey(e, t))" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                                        <div class="inline-name-edit-actions">
+                                            <button type="button" class="btn btn-primary btn-sm" @onclick="() => SaveTargetNameAsync(t)"
+                                                    disabled="@string.IsNullOrWhiteSpace(_editName)">Save</button>
+                                            <button type="button" class="btn btn-secondary btn-sm" @onclick="CancelTargetNameEdit">Cancel</button>
+                                        </div>
+                                    </div>
+                                }
+                                else
+                                {
+                                    <span class="inline-name-cell">
+                                        <span>@t.Name</span>
+                                        <SiteOperatorOnly>
+                                            <button type="button" class="inline-name-edit-btn" data-tooltip="Rename target"
+                                                    aria-label="Rename target" @onclick="() => StartTargetNameEdit(t)">
+                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                                                    <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z" />
+                                                </svg>
+                                            </button>
+                                        </SiteOperatorOnly>
+                                    </span>
+                                }
+                            </td>
+                            <td><code>@t.Address</code></td>
+                            @if (WanContexts.Count > 0)
+                            {
+                                <td>
+                                    <SiteOperatorOnly>
+                                        <select class="cadence-select"
+                                            @onchange="(e) => UpdateWanContextAsync(t.Id, e)">
+                                        <option value="" selected="@(t.WanContextId == null)">Default path</option>
+                                        @foreach (var wc in OrderedWanContexts)
+                                        {
+                                            <option value="@wc.Id" selected="@(t.WanContextId == wc.Id)">@wc.Name</option>
+                                        }
+                                    </select>
+                                    </SiteOperatorOnly>
+                                </td>
+                            }
+                            <td>
+                                @{ var currentInterval = t.PollIntervalSeconds; }
+                                <SiteOperatorOnly>
+                                    <select class="cadence-select"
+                                        @onchange="(e) => UpdateIntervalAsync(t.Id, e)">
+                                    <option value="2" selected="@(currentInterval == 2)">2 s</option>
+                                    <option value="5" selected="@(currentInterval == 5)">5 s</option>
+                                    <option value="10" selected="@(currentInterval == 10)">10 s</option>
+                                    <option value="15" selected="@(currentInterval == 15)">15 s</option>
+                                    <option value="30" selected="@(currentInterval == 30)">30 s</option>
+                                    <option value="60" selected="@(currentInterval == 60)">60 s</option>
+                                    <option value="120" selected="@(currentInterval == 120)">2 m</option>
+                                    <option value="300" selected="@(currentInterval == 300)">5 m</option>
+                                </select>
+                                </SiteOperatorOnly>
+                            </td>
+                            <td>
+                                @if (t.IsHidden)
+                                {
+                                    <span class="text-muted" data-tooltip="@HiddenTooltip">removed</span>
+                                }
+                                else if (t.IsRetired)
+                                {
+                                    <span class="text-muted" data-tooltip="@RetiredTooltip(t)">retired</span>
+                                }
+                                else if (!t.Enabled)
+                                {
+                                    <span class="text-muted">paused</span>
+                                }
+                                else if (latest != null)
+                                {
+                                    @if (latest.Success && latest.RttAvgMs.HasValue)
+                                    {
+                                        <span>@($"{latest.RttAvgMs.Value:0.#} ms")</span>
+                                        @if (latest.LossPercent > 0)
+                                        {
+                                            <span style="color: var(--danger-color); margin-left: 0.5rem;">
+                                                @($"{latest.LossPercent:0.#}% loss")
+                                            </span>
+                                        }
+                                    }
+                                    else
+                                    {
+                                        <span style="color: var(--danger-color);">no response</span>
+                                    }
+                                }
+                                else
+                                {
+                                    <span class="text-muted">-</span>
+                                }
+                            </td>
+                            <td>
+                                @if (t.LastVerified.HasValue)
+                                { <span>@RelativeTime(t.LastVerified.Value)</span> }
+                                else
+                                { <span class="text-muted">never</span> }
+                            </td>
+                            <td class="lt-action-cell lt-action-cell-first">
+                                @if (t.IsHidden)
+                                {
+                                    <SiteAdminOnly>
+                                        <button class="btn btn-sm btn-secondary"
+                                            @onclick="() => RestoreTargetAsync(t.Id)"
+                                            data-tooltip="Put this target back on the list and resume probing it">
+                                        Restore
+                                    </button>
+                                    </SiteAdminOnly>
+                                }
+                                else if (!t.IsRetired)
+                                {
+                                    @* A retired target's address answers to nothing, so there is no probing to resume. *@
+                                    <SiteOperatorOnly>
+                                        <button class="btn btn-sm btn-secondary"
+                                            @onclick="() => SetTargetEnabledAsync(t.Id, !t.Enabled)"
+                                            data-tooltip="@(t.Enabled ? "Pause probing" : "Resume probing")">
+                                        @(t.Enabled ? "Pause" : "Resume")
+                                    </button>
+                                    </SiteOperatorOnly>
+                                }
+                            </td>
+                            <td class="lt-action-cell lt-action-cell-last">
+                                @if (!t.IsHidden)
+                                {
+                                    <SiteAdminOnly>
+                                        <button class="btn btn-sm btn-danger"
+                                            @onclick="() => DeleteTargetAsync(t.Id)"
+                                            data-tooltip="@RemoveTooltip(t)">
+                                        Remove
+                                    </button>
+                                    </SiteAdminOnly>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+                @if (!string.IsNullOrEmpty(_targetError))
+                {
+                    <p class="alert alert-danger">@_targetError</p>
+                }
+            </div>
+            <p class="page-description page-description-footnote">
+                <strong>Pause</strong> stops probing a target. <strong>Remove</strong> hides it as
+                well, but keeps everything it measured so <strong>Restore</strong> can bring it back.
+            </p>
+        }
+
+        @if (!CanAddTargets)
+        {
+            <p class="page-description" style="margin-top: 0.75rem;">
+                <a href="@($"/settings?tab=multisite&configure={SiteCtx.Slug}")">Deploy an On-Site Agent</a> to
+                this site to add latency targets - the agent probes them from inside the site's
+                network.
+            </p>
+        }
+        else if (_showAddTarget)
+        {
+            <div class="lt-add-form" id="add-target-form">
+                <div class="lt-form-grid">
+                    <div class="form-group lt-form-wide">
+                        <label class="form-label">Name</label>
+                        <input type="text" class="form-control" @bind="_newTargetName" placeholder="My ISP gateway" />
+                    </div>
+                    <div class="form-group lt-form-wide">
+                        <label class="form-label">Address</label>
+                        <input type="text" class="form-control" @bind="_newTargetAddress" placeholder="192.168.1.1 or hostname" />
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Type</label>
+                        <select class="form-control" @bind="_newTargetType">
+                            <option value="Custom">Custom</option>
+                            <option value="InternetService">Internet</option>
+                            <option value="AccessIsp">ISP</option>
+                            <option value="Transit">Transit</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Probe</label>
+                        <select class="form-control" @bind="_newTargetProbeMode">
+                            <option value="Icmp">ICMP</option>
+                            <option value="Tcp">TCP</option>
+                        </select>
+                    </div>
+                    @if (_newTargetProbeMode == "Tcp")
+                    {
+                        <div class="form-group">
+                            <label class="form-label">Port</label>
+                            <input type="number" class="form-control" @bind="_newTargetPort" placeholder="443" />
+                        </div>
+                    }
+                    @if (WanContexts.Count > 0)
+                    {
+                        <div class="form-group">
+                            <label class="form-label">WAN / Path</label>
+                            <select class="form-control" @bind="_newTargetWanContextId">
+                                <option value="">Default path</option>
+                                @foreach (var wc in OrderedWanContexts)
+                                {
+                                    <option value="@wc.Id">@wc.Name</option>
+                                }
+                            </select>
+                        </div>
+                    }
+                    <div class="form-group">
+                        <label class="form-label">Interval</label>
+                        <select class="form-control" @bind="_newTargetInterval">
+                            <option value="5">5 s</option>
+                            <option value="10">10 s</option>
+                            <option value="15">15 s</option>
+                            <option value="30">30 s</option>
+                            <option value="60">60 s</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="lt-form-actions">
+                    <SiteOperatorOnly>
+                        <button class="btn btn-sm btn-primary" @onclick="AddTargetAsync" disabled="@_addingTarget">
+                            @if (_addingTarget) { <span class="spinner-sm"></span> } else { <span>Add</span> }
+                        </button>
+                    </SiteOperatorOnly>
+                    <button class="btn btn-sm btn-tertiary" @onclick="() => _showAddTarget = false">Cancel</button>
+                </div>
+                @if (!string.IsNullOrEmpty(_addTargetError))
+                {
+                    <p class="form-error">@_addTargetError</p>
+                }
+            </div>
+        }
+        else
+        {
+            @* Adding a target is Operator; REMOVING one stays Admin. The target list is curated and
+               expensive to rebuild - it accumulates over time and nothing recreates it - so the
+               asymmetry is deliberate: measuring one more thing is cheap and reversible, losing one
+               that someone established months ago is not. *@
+            <div class="lt-actions lt-actions-bottom">
+                <a href="@RunProbeUrl" class="btn btn-sm btn-secondary">Run Probe</a>
+                <SiteOperatorOnly>
+                    <button class="btn btn-sm btn-primary" @onclick="ShowAddTarget">
+                        + Add Target
+                    </button>
+                </SiteOperatorOnly>
+            </div>
+        }
+    </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .lt-type-filter {
+        margin: 0 0.5rem;
+    }
+
+    .data-table td.lt-action-cell {
+        white-space: nowrap;
+    }
+
+    .data-table td.lt-action-cell-first {
+        text-align: right;
+        padding-right: 0.5rem;
+    }
+
+    .data-table td.lt-action-cell-last {
+        text-align: left;
+        padding-left: 0;
+    }
+
+    .lt-intro {
+        display: flex;
+        align-items: flex-start;
+        gap: 1rem;
+    }
+
+    .lt-intro .section-description {
+        flex: 1;
+    }
+
+    .lt-actions {
+        display: flex;
+        gap: 0.5rem;
+        flex: 0 0 auto;
+    }
+
+    .lt-actions .btn {
+        white-space: nowrap;
+    }
+
+    .lt-actions-bottom {
+        margin-top: 0.75rem;
+    }
+
+    .lt-add-form {
+        margin-top: 1rem;
+        padding: 1rem 1.25rem 1.25rem;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--border-radius-lg);
+    }
+
+    .lt-form-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1rem;
+    }
+
+    .lt-form-grid .form-group {
+        margin-bottom: 0;
+    }
+
+    .lt-form-wide {
+        grid-column: span 2;
+    }
+
+    .lt-form-actions {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 1rem;
+    }
+
+    @@media (max-width: 1024px) {
+        .lt-form-grid {
+            grid-template-columns: repeat(2, 1fr);
+        }
+    }
+
+    @@media (max-width: 768px) {
+        .lt-intro {
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .lt-intro .section-description {
+            margin-bottom: 0.5rem;
+        }
+
+        .lt-intro .lt-actions {
+            margin-bottom: 1rem;
+        }
+
+        .lt-form-grid {
+            grid-template-columns: 1fr;
+        }
+
+        .lt-form-wide {
+            grid-column: span 1;
+        }
+
+        .lt-form-actions .btn {
+            flex: 1;
+        }
+    }
+</style>
+
+@code {
+    [Parameter, EditorRequired]
+    public List<MonitoringTarget> Targets { get; set; } = new();
+
+    /// <summary>
+    /// The site's multi-WAN monitoring contexts. When empty (the common single-WAN
+    /// case) the WAN column and picker stay hidden and the table reads as before.
+    /// </summary>
+    [Parameter]
+    public List<WanContext> WanContexts { get; set; } = new();
+
+    /// <summary>
+    /// What to call the primary WAN in the WAN pickers. A target with no vantage is probed over
+    /// the primary WAN, and naming that WAN the way the vantages beside it are named keeps the
+    /// list one kind of thing; "Primary" states a role and leaves the reader to work out which
+    /// connection holds it.
+    /// </summary>
+    [Parameter]
+    public string PrimaryWanLabel { get; set; } = "Primary";
+
+    /// <summary>The tab's WAN selection, so this list shows the same WANs the charts above do.</summary>
+    [Parameter]
+    public IReadOnlyCollection<string> SelectedWanKeys { get; set; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Raised with the key the user picked, or <see cref="AllWansKey"/> for All, so the tab can move
+    /// its own filters with this one.
+    /// </summary>
+    [Parameter]
+    public EventCallback<string> OnWanSelected { get; set; }
+
+    /// <summary>Sentinel for the All pill, which is not a WAN and can never collide with a key.</summary>
+    public const string AllWansKey = "*";
+
+    private sealed record WanChoice(string Key, string Label, bool IsPrimary);
+    private List<WanChoice> _wanChoices = new();
+
+    /// <summary>
+    /// All is every WAN at once rather than a mode of its own, so it lives in the same selection the
+    /// rest of the tab reads and needs nothing else to remember it.
+    /// </summary>
+    /// <summary>
+    /// Whether the scope is holding a COMPARISON, the only state a clear undoes. One WAN alone, or
+    /// the LAN alone, is the view the user switched to rather than a filter over it - see the same
+    /// rule on the tab's own WAN bar. All counts: it is every WAN at once, and it takes the place of
+    /// the All pill once that pill has nothing left to offer.
+    /// </summary>
+    /// <para>
+    /// Never on a single-WAN site: there the All pill is on screen whenever anything is narrowed,
+    /// and it already restores the whole list - a clear beside it would be the same button twice.
+    /// </para>
+    private bool ScopeIsNarrowed =>
+        !SingleWan && (AllScope || (!LanScope && SelectedWanKeys.Count > 1));
+
+    /// <summary>Whether the site has one WAN, where LAN and WAN are the only real split.</summary>
+    private bool SingleWan => _wanChoices.Count == 1;
+
+    /// <summary>
+    /// Whether the list is showing everything: All outright, or nothing picked - which is where a
+    /// single-WAN site starts, and what VisibleTargets already treats as unfiltered. On a multi-WAN
+    /// site the parent always seeds a selection, so this is exactly AllScope there.
+    /// </summary>
+    private bool ShowingAll => AllScope || (!LanScope && SelectedWanKeys.Count == 0);
+
+    /// <summary>Back to one WAN - the primary, matching what the tab's own clear returns to.</summary>
+    private async Task ResetScopeAsync()
+    {
+        var primary = _wanChoices.FirstOrDefault(w => w.IsPrimary) ?? _wanChoices.FirstOrDefault();
+        if (primary != null) await PickWanAsync(primary.Key);
+    }
+
+    private async Task PickWanAsync(string key)
+    {
+        await HoldPositionAsync();
+        // Filtering a list that is closed changes something the user cannot see, so open it.
+        _collapsed = false;
+        if (OnWanSelected.HasDelegate) await OnWanSelected.InvokeAsync(key);
+    }
+
+    /// <summary>
+    /// Holds the card still across a filter change: the pills also pick the chart series above it,
+    /// and the statistics table there grows or shrinks by rows, sliding the pill out from under the
+    /// cursor. Not while collapsed - the click opens the card, and collapse-reveal.js scrolls that.
+    /// </summary>
+    private async Task HoldPositionAsync()
+    {
+        if (_collapsed) return;
+        await JS.InvokeVoidAsync("noHoldScroll", "latency-targets");
+    }
+
+    /// <summary>
+    /// Drops a type filter the new scope cannot show. Done here rather than in the pill handlers
+    /// because those run before the parent has changed the scope, so they would test the type
+    /// against the list it is leaving - a Fabric filter surviving into a WAN scope leaves the row
+    /// with nothing active and the table with nothing in it.
+    /// </summary>
+    protected override void OnParametersSet()
+    {
+        if (_typeFilter is MonitoringTargetType t && !AvailableTypes().Contains(t))
+            _typeFilter = null;
+    }
+
+    private async Task PickLanAsync()
+    {
+        await HoldPositionAsync();
+        _collapsed = false;
+        if (OnLanSelected.HasDelegate) await OnLanSelected.InvokeAsync();
+    }
+
+    private async Task PickTypeAsync(MonitoringTargetType? type)
+    {
+        await HoldPositionAsync();
+        _typeFilter = type;
+        _collapsed = false;
+    }
+
+    /// <summary>
+    /// The types the current scope can actually contain. The LAN holds this network's own devices
+    /// and the targets pointed at it; a WAN holds neither, because neither leaves by one.
+    /// </summary>
+    private IReadOnlyList<MonitoringTargetType> AvailableTypes() => LanScope
+        ? new[] { MonitoringTargetType.Fabric, MonitoringTargetType.Custom }
+        : AllScope
+            ? new[] { MonitoringTargetType.Fabric, MonitoringTargetType.AccessIsp, MonitoringTargetType.Transit,
+                MonitoringTargetType.InternetService, MonitoringTargetType.Custom }
+            : new[] { MonitoringTargetType.AccessIsp, MonitoringTargetType.Transit,
+                MonitoringTargetType.InternetService, MonitoringTargetType.Custom };
+
+    /// <summary>
+    /// How many removed targets pressing Show removed would actually reveal - narrowed the same
+    /// way the list is, so the count can never promise rows the current scope would filter out.
+    /// </summary>
+    private int HiddenCount => InScope(Targets.Where(t => t.IsHidden)).Count();
+
+    /// <summary>
+    /// Remove keeps a probed target's row so its series stays named, and only really deletes one
+    /// that never ran. The button says which it will do, because the two are not the same promise.
+    /// </summary>
+    private static string RemoveTooltip(MonitoringTarget t) => t.LastVerified != null
+        ? "Take this target off the list. Its measurements are kept, so nothing it recorded is orphaned."
+        : "Delete this target. It has never been probed, so there is nothing to keep.";
+
+    private const string HiddenTooltip =
+        "Removed from the list. Its measurements are kept so charts can still name them.";
+
+    /// <summary>
+    /// Why a target was retired, and what it still offers: the measurements stay readable, which
+    /// is the reason the row is here rather than gone.
+    /// </summary>
+    private static string RetiredTooltip(MonitoringTarget t) =>
+        string.IsNullOrWhiteSpace(t.RetiredReason)
+            ? "No longer probed. Its measurements are kept."
+            : $"{t.RetiredReason}. No longer probed; its measurements are kept.";
+
+    /// <summary>
+    /// The Type column's badge. Access ISP is shortened to the name the filter pill above it uses,
+    /// which is also the widest label the column has to carry.
+    /// </summary>
+    private static string TargetTypeBadgeLabel(MonitoringTargetType type) =>
+        type == MonitoringTargetType.AccessIsp ? "ISP" : type.ToDisplayName();
+
+    private static string TypeFilterLabel(MonitoringTargetType type) => type switch
+    {
+        MonitoringTargetType.AccessIsp => "ISP",
+        MonitoringTargetType.InternetService => "Internet",
+        _ => type.ToDisplayName(),
+    };
+
+    /// <summary>
+    /// The rows for the WANs on screen. A target with no WAN of its own belongs to the primary, the
+    /// same rule every other per-WAN reader uses.
+    /// </summary>
+    /// <summary>
+    /// WAN contexts in WAN1, WAN2, WAN3 order. The order lives in the UniFi key (wan, wan2), so
+    /// GatewayWanHelper reads it rather than anything re-parsing the display name. That helper
+    /// answers 0 for a context predating WanInterface, which would otherwise sort such a row
+    /// above WAN1 instead of after the WANs it cannot be placed among.
+    /// </summary>
+    private IEnumerable<WanContext> OrderedWanContexts => WanContexts
+        .OrderBy(c => NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(c.WanInterface) is var i && i >= 1
+            ? i
+            : int.MaxValue)
+        .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Columns in the table, so an empty-state row spans all of them.</summary>
+    private int VisibleColumnCount => WanContexts.Count > 0 ? 9 : 8;
+
+    /// <summary>
+    /// What actually probes the listed targets, for the card's own description of itself. A target
+    /// assigned to a WAN context with an agent is probed by that agent; the rest fall to the server
+    /// vantage, which is itself the on-site agent on an agent-backed site. Both can be true at once,
+    /// and saying only one of them is wrong on every mixed site.
+    /// </summary>
+    private const string BothProbers = "server / agent";
+
+    private string ProberNoun
+    {
+        get
+        {
+            var contextsById = WanContexts.ToDictionary(w => w.Id);
+            var byAgent = false;
+            var byServer = false;
+
+            foreach (var target in VisibleTargets())
+            {
+                var assignedAgent = target.WanContextId is int id
+                                    && contextsById.TryGetValue(id, out var context)
+                                    && context.AgentId != null;
+
+                if (assignedAgent || ExecutorFactory.ServerVantageIsAgent) byAgent = true;
+                else byServer = true;
+            }
+
+            if (byAgent && byServer) return BothProbers;
+            if (byAgent) return "agent";
+            if (byServer) return "server";
+            return ExecutorFactory.ServerVantageIsAgent ? "agent" : "server";
+        }
+    }
+
+    /// <summary>Possessive matching <see cref="ProberNoun"/>: two probers take their, one takes its.</summary>
+    private string ProberPossessive => ProberNoun == BothProbers ? "their" : "its";
+
+    /// <summary>
+    /// The WAN context the scope filter names, or null when the scope names no single WAN (LAN,
+    /// All, or several selected). What the filter says is the only signal available when no rows
+    /// are showing, and it is a truer one than falling back to the server.
+    /// </summary>
+    private WanContext? ScopeWanContext
+    {
+        get
+        {
+            if (LanScope || AllScope || SelectedWanKeys.Count != 1) return null;
+
+            var key = NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(SelectedWanKeys.First());
+            return WanContexts.FirstOrDefault(c => !string.IsNullOrEmpty(c.WanInterface)
+                && string.Equals(NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(c.WanInterface!),
+                    key, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>
+    /// Run Probe opens Network Tools on the agent that actually probes these rows, taken from the
+    /// WAN context most of them sit on. MonitoringTarget.VantagePoint cannot answer this - every
+    /// target stores "server" whoever collects it. Null leaves Network Tools on its own default.
+    /// </summary>
+    private string? RunProbeVantage
+    {
+        get
+        {
+            if (WanContexts.Count == 0) return null;
+
+            // With every WAN in scope no single context speaks for the rows, so name a defined
+            // origin rather than whichever WAN happened to contribute the most: the server when
+            // it probes this site, otherwise the first agent vantage in WAN order.
+            if (ShowingAll)
+            {
+                if (!ExecutorFactory.ServerVantageIsAgent)
+                    return NetworkOptimizer.Web.Services.Monitoring.ProbeVantages.ServerKey;
+
+                var first = OrderedWanContexts.FirstOrDefault(c => c.AgentId != null);
+                return first?.AgentId is int firstAgentId
+                    ? $"agent:{firstAgentId}:{first.Id}"
+                    : NetworkOptimizer.Web.Services.Monitoring.ProbeVantages.ServerKey;
+            }
+
+            var dominantContextId = VisibleTargets()
+                .Where(t => t.WanContextId != null)
+                .GroupBy(t => t.WanContextId!.Value)
+                .OrderByDescending(g => g.Count())
+                .Select(g => (int?)g.Key)
+                .FirstOrDefault();
+
+            // No rows to infer from falls back to what the filter names, then to a lone context.
+            var context = dominantContextId is int id
+                ? WanContexts.FirstOrDefault(w => w.Id == id)
+                : ScopeWanContext ?? (WanContexts.Count == 1 ? WanContexts[0] : null);
+
+            // The picker keys an agent entry per WAN vantage, and a vantage id IS the context id.
+            // Naming the server beats sending nothing: no param leaves whatever was last used.
+            return context?.AgentId is int agentId
+                ? $"agent:{agentId}:{context.Id}"
+                : NetworkOptimizer.Web.Services.Monitoring.ProbeVantages.ServerKey;
+        }
+    }
+
+    private string RunProbeUrl => RunProbeVantage is string vantage
+        ? $"/network-tools?from={Uri.EscapeDataString(vantage)}"
+        : "/network-tools";
+
+    private IEnumerable<MonitoringTarget> VisibleTargets() =>
+        InScope(_showHidden ? Targets : Targets.Where(t => !t.IsHidden));
+
+    /// <summary>
+    /// The type and LAN/WAN narrowing the card is currently showing, applied to whatever set is
+    /// handed in. Shared with <see cref="HiddenCount"/> so the Show removed button counts what
+    /// pressing it would actually reveal.
+    /// </summary>
+    private IEnumerable<MonitoringTarget> InScope(IEnumerable<MonitoringTarget> targets)
+    {
+        IEnumerable<MonitoringTarget> ordered = targets.OrderBy(t => t.TargetType).ThenBy(t => t.Name);
+        if (_typeFilter is MonitoringTargetType wanted) ordered = ordered.Where(t => t.TargetType == wanted);
+        // The LAN is what sits on this network, whatever WAN a row happens to be stamped with, and
+        // a WAN is the opposite. Only All carries both.
+        if (LanScope)
+            return ordered.Where(NetworkOptimizer.Web.Services.Monitoring.LocalTargetResolver.IsLocal);
+        if (AllScope) return ordered;
+        if (_wanChoices.Count == 0 || SelectedWanKeys.Count == 0) return ordered;
+        ordered = ordered.Where(t => !NetworkOptimizer.Web.Services.Monitoring.LocalTargetResolver.IsLocal(t));
+        var primaryKey = _wanChoices.FirstOrDefault(w => w.IsPrimary)?.Key;
+        return ordered.Where(t => NetworkOptimizer.Storage.Models.MonitoringTarget.IsUnpinned(t.WanInterface)
+            ? primaryKey != null && SelectedWanKeys.Contains(primaryKey)
+            : SelectedWanKeys.Any(k => string.Equals(
+                NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(k),
+                NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(t.WanInterface!),
+                StringComparison.OrdinalIgnoreCase)));
+    }
+
+    /// <summary>
+    /// The primary plus every context-bound WAN - the same set Upstream Path Discovery offers, since
+    /// those are the only WANs a target can be filed under.
+    /// </summary>
+    private async Task LoadWanChoicesAsync()
+    {
+        var choices = new List<WanChoice>();
+        var liveWans = new List<NetworkOptimizer.Web.Services.Monitoring.WanSummary>();
+        try { liveWans = (await PathView.GetWansAsync()).ToList(); }
+        catch { }
+
+        var primaryKey = NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(
+            liveWans.FirstOrDefault(w => w.IsPrimary)?.WanInterface
+            ?? liveWans.FirstOrDefault()?.WanInterface
+            ?? NetworkOptimizer.UniFi.GatewayWanHelper.DefaultWanKey);
+        choices.Add(new WanChoice(primaryKey, WanLabelFor(liveWans, primaryKey, null), IsPrimary: true));
+
+        foreach (var ctx in WanContexts.Where(c => !string.IsNullOrEmpty(c.WanInterface)))
+        {
+            var key = NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(ctx.WanInterface!);
+            if (choices.Any(c => string.Equals(c.Key, key, StringComparison.OrdinalIgnoreCase))) continue;
+            choices.Add(new WanChoice(key, WanLabelFor(liveWans, key, ctx.Name), IsPrimary: false));
+        }
+        // WAN order, not the order the vantages came back in - those are read by name, which put
+        // these pills out of sequence against every other WAN bar on the page.
+        //
+        // The single choice is KEPT. A site with one WAN still has a LAN worth separating from it,
+        // and dropping it left that site a LAN pill with nothing to sit beside.
+        _wanChoices = choices
+            .OrderBy(c => NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(c.Key)).ToList();
+    }
+
+    private static string WanLabelFor(
+        List<NetworkOptimizer.Web.Services.Monitoring.WanSummary> liveWans, string key, string? fallbackName)
+    {
+        var live = liveWans.FirstOrDefault(w => string.Equals(
+            NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(w.WanInterface), key,
+            StringComparison.OrdinalIgnoreCase));
+        return NetworkOptimizer.UniFi.GatewayWanHelper.FormatWanLabel(
+            live?.FriendlyName ?? fallbackName,
+            NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(key), null, null);
+    }
+
+    [Parameter]
+    public EventCallback OnTargetsChanged { get; set; }
+
+    // A manually added target is probed from the "server" vantage, which on an external
+    // (non-default) site is the on-site agent, which is now a question of configuration rather
+    // than of an agent being connected this second.
+    //
+    // So a secondary site offers this even with no agent enrolled yet, and the probe fails with
+    // "No on-site agent is online to run the probe". That is deliberate (TJ, 2026-08-03): a control
+    // that explains itself beats one that silently is not there, and targets added now are seeded
+    // ready for the agent that arrives later. Do not re-gate this on the agent being live.
+    private bool CanAddTargets => SiteCtx.IsDefault || ExecutorFactory.ServerVantageIsAgent;
+
+    private bool _collapsed = true;
+
+    /// <summary>Reveals removed targets. Deliberately not persisted: it is a look at what was taken
+    /// off the list, not a preference, and a sticky one would leave the list permanently fuller.</summary>
+    private bool _showHidden;
+    private bool _showAddTarget;
+    private bool _addingTarget;
+    private string _newTargetName = "";
+    private string _newTargetAddress = "";
+    private string _newTargetType = "Custom";
+    private string _newTargetProbeMode = "Icmp";
+    private int _newTargetPort = 443;
+    private int _newTargetInterval = 10;
+    private string _newTargetWanContextId = "";
+    private MonitoringTargetType? _typeFilter;
+
+    /// <summary>Scoped to this network rather than to a WAN; the WAN pills go unlit.</summary>
+    [Parameter] public bool LanScope { get; set; }
+
+    /// <summary>
+    /// Whether the page is on the explicit All scope. Not the same as every WAN happening to be
+    /// selected: All asks for the whole site and takes the LAN with it, a hand-built selection
+    /// asks for exactly the WANs in it.
+    /// </summary>
+    [Parameter] public bool AllScope { get; set; }
+    [Parameter] public EventCallback OnLanSelected { get; set; }
+
+    /// <summary>
+    /// The scope row shows once there is more than one WAN, or as soon as there is anything on the
+    /// LAN to separate out - a single-WAN site still benefits from telling the two apart.
+    /// </summary>
+    private bool ShowScopeFilter => _wanChoices.Count > 1
+        || Targets.Any(NetworkOptimizer.Web.Services.Monitoring.LocalTargetResolver.IsLocal);
+
+    private bool _revealAddForm;
+    private bool _ringAddForm;
+    private string? _addTargetError;
+    private string? _targetError;
+
+    private void ToggleCollapse() => _collapsed = !_collapsed;
+
+    /// <summary>
+    /// Expands the card (it defaults collapsed) and scrolls to a specific target's row with a
+    /// brief highlight. Called from the LAN flaky-target advisory so "review in Latency Targets"
+    /// lands the user on the exact row. Mirrors the scroll+outline pattern used elsewhere on the
+    /// monitoring page (Monitoring.ScrollToFlakyTargetsAsync).
+    /// </summary>
+    public async Task ExpandAndHighlightAsync(int targetId)
+    {
+        _collapsed = false;
+        StateHasChanged();
+        // Let the expand animation start and the row render before scrolling to it.
+        await Task.Delay(350);
+        await JS.InvokeVoidAsync("noHighlightRow", $"latency-target-{targetId}");
+    }
+
+    /// <summary>
+    /// Opens the card and scrolls to it, with no row to single out. Sent here to assign targets,
+    /// someone needs the list in front of them - scrolling a collapsed card into view leaves them
+    /// looking at its header and nothing else.
+    /// </summary>
+    public async Task ExpandAndRevealAsync()
+    {
+        _collapsed = false;
+        StateHasChanged();
+        await Task.Delay(350);
+        await JS.InvokeVoidAsync("noHighlightTarget", "latency-targets");
+    }
+
+    private async Task SetTargetEnabledAsync(int targetId, bool enabled)
+    {
+        await MutateAsync(() => TargetService.SetEnabledAsync(targetId, enabled));
+    }
+
+    // Inline rename, as the Sites table does it. The service carries the role and the audit
+    // envelope; the gate here only decides whether the pencil is drawn.
+    private int? _editingNameId;
+    private string _editName = "";
+    private ElementReference _nameInput;
+
+    private async Task StartTargetNameEdit(MonitoringTarget t)
+    {
+        _editingNameId = t.Id;
+        _editName = t.Name;
+        StateHasChanged();
+        await Task.Delay(1); // let the input render before it is focused
+        await _nameInput.FocusAsync();
+    }
+
+    private void CancelTargetNameEdit()
+    {
+        _editingNameId = null;
+        _editName = "";
+    }
+
+    private async Task SaveTargetNameAsync(MonitoringTarget t)
+    {
+        var name = _editName?.Trim();
+        if (string.IsNullOrWhiteSpace(name) || name == t.Name)
+        {
+            CancelTargetNameEdit();
+            return;
+        }
+        await MutateAsync(() => TargetService.SetNameAsync(t.Id, name));
+        // Closed only once it took. A refused name - too long, or a role that cannot rename - kept
+        // its reason under the table while the box it was typed into had already gone.
+        if (_targetError == null) CancelTargetNameEdit();
+    }
+
+    private async Task TargetNameEditKey(KeyboardEventArgs e, MonitoringTarget t)
+    {
+        if (e.Key == "Enter") await SaveTargetNameAsync(t);
+        else if (e.Key == "Escape") CancelTargetNameEdit();
+    }
+
+    private async Task DeleteTargetAsync(int targetId)
+    {
+        await MutateAsync(() => TargetService.DeleteAsync(targetId));
+    }
+
+    private async Task RestoreTargetAsync(int targetId)
+    {
+        await MutateAsync(() => TargetService.SetHiddenAsync(targetId, false));
+    }
+
+    private async Task ToggleShowHidden()
+    {
+        await HoldPositionAsync();
+        _showHidden = !_showHidden;
+        _collapsed = false;
+    }
+
+    private async Task UpdateIntervalAsync(int targetId, ChangeEventArgs e)
+    {
+        if (!int.TryParse(e.Value?.ToString(), out var interval)) return;
+        await MutateAsync(() => TargetService.SetPollIntervalAsync(targetId, interval));
+    }
+
+    private async Task UpdateWanContextAsync(int targetId, ChangeEventArgs e)
+    {
+        int? contextId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : null;
+        await MutateAsync(() => TargetService.SetWanContextAsync(targetId, contextId));
+    }
+
+    /// <summary>
+    /// Runs a target edit and refreshes the list. A failure surfaces on the card rather than being
+    /// swallowed: these used to end in an empty catch, so a rejected or failed edit looked like a
+    /// row that simply declined to change.
+    /// </summary>
+    private async Task MutateAsync(Func<Task<bool>> edit)
+    {
+        _targetError = null;
+        try
+        {
+            await edit();
+            await OnTargetsChanged.InvokeAsync();
+        }
+        catch (Exception ex)
+        {
+            _targetError = ex is NetworkOptimizer.Web.Services.Gates.AuthorizationDeniedException
+                ? "You do not have permission to change monitoring targets."
+                : $"Could not update the target: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Opens the add form and scrolls it into view. The card sits low on the page, so the form
+    /// can otherwise open entirely below the fold and the button look like it did nothing.
+    /// </summary>
+    private void ShowAddTarget()
+    {
+        _showAddTarget = true;
+        _revealAddForm = true;
+        PreselectWanFromScope();
+    }
+
+    /// <summary>
+    /// Same, from the button beside the description. This one rings the form as well: it acts at
+    /// a distance - the whole target table can sit between the button and what it opened - and
+    /// after that scroll the user needs telling which thing on screen is the one they asked for.
+    /// The button under the table does not, because the form opens exactly where it was.
+    /// </summary>
+    private void ShowAddTargetFromTop()
+    {
+        _showAddTarget = true;
+        _revealAddForm = true;
+        _ringAddForm = true;
+        PreselectWanFromScope();
+    }
+
+    /// <summary>
+    /// Opens the form on the WAN the list is already filtered to, when a vantage measures it.
+    /// Adding a target while looking at one WAN almost always means adding it to that WAN, and
+    /// leaving the field on the default path meant the new row vanished from the very view it was
+    /// added in. Only for a single WAN in scope: LAN and All are not one WAN, and a hand-built
+    /// selection of several does not name one either.
+    /// </summary>
+    private void PreselectWanFromScope()
+    {
+        _newTargetWanContextId = "";
+        if (ScopeWanContext is { } vantage) _newTargetWanContextId = vantage.Id.ToString();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await LoadWanChoicesAsync();
+        // The scope arrives as a parameter, so re-seed the open form here. Seeding only on open
+        // left the default following the filter just once, across a cancel and reopen.
+        if (_showAddTarget) PreselectWanFromScope();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // After the render that created it, not before - there is no element to scroll to until
+        // the form is actually in the DOM. Scroll only, no ring: the user pressed the button that
+        // opened this, so nothing needs pointing out to them.
+        if (!_revealAddForm) return;
+        _revealAddForm = false;
+        if (_ringAddForm)
+        {
+            _ringAddForm = false;
+            await JS.InvokeVoidAsync("noHighlightTarget", "add-target-form", "center", "var(--border-radius-lg)");
+        }
+        else
+        {
+            await JS.InvokeVoidAsync("noScrollTo", "add-target-form", "center");
+        }
+    }
+
+    private async Task AddTargetAsync()
+    {
+        _addTargetError = null;
+        _addingTarget = true;
+        StateHasChanged();
+        try
+        {
+            await TargetService.AddAsync(new NetworkOptimizer.Web.Services.NewMonitoringTarget
+            {
+                Name = _newTargetName,
+                Address = _newTargetAddress,
+                TargetType = Enum.TryParse<MonitoringTargetType>(_newTargetType, out var tt) ? tt : MonitoringTargetType.Custom,
+                ProbeMode = _newTargetProbeMode == "Tcp"
+                    ? NetworkOptimizer.Core.Enums.ProbeMode.Tcp
+                    : NetworkOptimizer.Core.Enums.ProbeMode.Icmp,
+                Port = _newTargetPort,
+                PollIntervalSeconds = _newTargetInterval,
+                WanContextId = int.TryParse(_newTargetWanContextId, out var wcId) ? wcId : null
+            });
+
+            _showAddTarget = false;
+            _newTargetName = "";
+            _newTargetAddress = "";
+            _newTargetType = "Custom";
+            _newTargetProbeMode = "Icmp";
+            _newTargetPort = 443;
+            _newTargetInterval = 10;
+            _newTargetWanContextId = "";
+            await OnTargetsChanged.InvokeAsync();
+        }
+        catch (NetworkOptimizer.Web.Services.MonitoringTargetValidationException ex)
+        {
+            _addTargetError = ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _addTargetError = $"Failed to add target: {ex.Message}";
+        }
+        finally
+        {
+            _addingTarget = false;
+        }
+    }
+
+
+    private static string TargetTypeBadgeClass(MonitoringTargetType type) => type switch
+    {
+        MonitoringTargetType.Fabric => "status-connected",
+        MonitoringTargetType.Wan => "status-active",
+        MonitoringTargetType.AccessIsp => "status-active",
+        MonitoringTargetType.Transit => "status-active",
+        MonitoringTargetType.InternetService => "status-active",
+        MonitoringTargetType.Custom => "status-active",
+        _ => "status-disconnected"
+    };
+
+    private static string RelativeTime(DateTime when)
+    {
+        var delta = DateTime.UtcNow - DateTime.SpecifyKind(when, DateTimeKind.Utc);
+        if (delta < TimeSpan.Zero) return "just now";
+        if (delta < TimeSpan.FromSeconds(15)) return "just now";
+        if (delta < TimeSpan.FromMinutes(1)) return $"{(int)delta.TotalSeconds}s ago";
+        if (delta < TimeSpan.FromHours(1)) return $"{(int)delta.TotalMinutes}m ago";
+        if (delta < TimeSpan.FromDays(1)) return $"{(int)delta.TotalHours}h ago";
+        return $"{(int)delta.TotalDays}d ago";
+    }
+}

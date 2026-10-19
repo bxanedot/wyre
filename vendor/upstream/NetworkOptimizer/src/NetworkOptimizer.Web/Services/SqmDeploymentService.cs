@@ -1,0 +1,1445 @@
+using System.Text;
+using NetworkOptimizer.Core.Helpers;
+using NetworkOptimizer.Sqm;
+using NetworkOptimizer.Sqm.Models;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Web.Services.Ssh;
+using SqmConfig = NetworkOptimizer.Sqm.Models.SqmConfiguration;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// Service for deploying SQM scripts to UniFi gateways via SSH.
+/// Uses IGatewaySshService for gateway SSH operations.
+/// </summary>
+public class SqmDeploymentService : ISqmDeploymentService
+{
+    private readonly ILogger<SqmDeploymentService> _logger;
+    private readonly IGatewaySshService _gatewaySsh;
+    private readonly IUdmBootService _udmBoot;
+    private readonly IServiceProvider _serviceProvider;
+    private readonly SiteContextService _siteContext;
+    private readonly Licensing.LicenseStateService _licenseState;
+
+    // Gateway paths
+    private const string OnBootDir = "/data/on_boot.d";
+    private const string SqmDir = "/data/sqm";
+
+    // The boot script installs its dependencies inline on a first deploy: it downloads
+    // the verified Ookla binary, then apt-get installs jq. On a cold apt cache or a slow WAN that
+    // runs well past the 30 second default, so give it room rather than tearing down a
+    // deployment that is still working. Re-deploys skip the whole block and finish fast.
+    // Five minutes is comfortably clear of a slow first install without leaving the page
+    // sitting on a boot script that has genuinely wedged.
+    private static readonly TimeSpan BootScriptTimeout = TimeSpan.FromMinutes(5);
+
+    public SqmDeploymentService(
+        ILogger<SqmDeploymentService> logger,
+        IGatewaySshService gatewaySsh,
+        IUdmBootService udmBoot,
+        IServiceProvider serviceProvider,
+        SiteContextService siteContext,
+        Licensing.LicenseStateService licenseState)
+    {
+        _logger = logger;
+        _gatewaySsh = gatewaySsh;
+        _udmBoot = udmBoot;
+        _serviceProvider = serviceProvider;
+        _siteContext = siteContext;
+        _licenseState = licenseState;
+    }
+
+    /// <summary>
+    /// Get gateway SSH settings
+    /// </summary>
+    private Task<GatewaySshSettings> GetGatewaySettingsAsync()
+        => _gatewaySsh.GetSettingsAsync();
+
+    /// <summary>
+    /// Run SSH command on gateway (shorthand)
+    /// </summary>
+    private Task<(bool success, string output)> RunCommandAsync(string command, TimeSpan? timeout = null)
+        => _gatewaySsh.RunCommandAsync(command, timeout);
+
+    /// <inheritdoc />
+    public Task<bool> IsAwaitingAgentAsync() => _gatewaySsh.IsAwaitingAgentTunnelAsync();
+
+    /// <summary>
+    /// Test SSH connection to the gateway
+    /// </summary>
+    public Task<(bool success, string message)> TestConnectionAsync()
+        => _gatewaySsh.TestConnectionAsync();
+
+    /// <summary>
+    /// Install udm-boot package on the gateway.
+    /// This enables scripts in /data/on_boot.d/ to run automatically on boot
+    /// and persist across firmware updates.
+    /// </summary>
+    public Task<(bool success, string message)> InstallUdmBootAsync()
+        => _udmBoot.InstallAsync();
+
+    /// <summary>
+    /// Parse SSH output delimited by ---KEY--- markers into a dictionary.
+    /// </summary>
+    private static Dictionary<string, string> ParseDelimitedOutput(string output)
+    {
+        var sections = new Dictionary<string, string>();
+        var lines = output.Split('\n');
+        string? currentKey = null;
+        var currentValue = new List<string>();
+
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("---") && trimmed.EndsWith("---") && trimmed.Length > 6)
+            {
+                // Save previous section
+                if (currentKey != null)
+                {
+                    sections[currentKey] = string.Join("\n", currentValue);
+                }
+                currentKey = trimmed.Trim('-');
+                currentValue.Clear();
+            }
+            else if (currentKey != null)
+            {
+                currentValue.Add(line);
+            }
+        }
+
+        // Save last section
+        if (currentKey != null)
+        {
+            sections[currentKey] = string.Join("\n", currentValue);
+        }
+
+        return sections;
+    }
+
+    /// <summary>
+    /// Get a section value from parsed delimited output, returning empty string if not found.
+    /// </summary>
+    private static string GetSection(Dictionary<string, string> sections, string key)
+        => sections.TryGetValue(key, out var value) ? value : "";
+
+    internal static string BuildDeploymentStatusCommand()
+    {
+        return
+            "echo '---UDM_BOOT_CHECK---'; test -f /etc/systemd/system/udm-boot.service && echo 'installed' || echo 'missing'; " +
+            "echo '---UDM_BOOT_ENABLED---'; systemctl is-enabled udm-boot 2>/dev/null || echo 'disabled'; " +
+            $"echo '---SQM_BOOT_SCRIPTS---'; ls {OnBootDir}/20-sqm-*.sh 2>/dev/null | grep -v 'sqm-monitor' | wc -l; " +
+            $"echo '---SQM_SPEEDTEST_SCRIPTS---'; ls {SqmDir}/*-speedtest.sh 2>/dev/null | wc -l; " +
+            $"echo '---SQM_MONITOR_CHECK---'; test -f {OnBootDir}/20-sqm-monitor.sh && echo 'exists' || echo 'missing'; " +
+            "echo '---WATCHDOG_RUNNING---'; crontab -l 2>/dev/null | grep -q sqm-watchdog && echo 'active' || echo 'inactive'; " +
+            "echo '---CRON_CHECK---'; crontab -l 2>/dev/null | grep -c sqm || echo '0'; " +
+            $"echo '---SPEEDTEST_CLI---'; SPEEDTEST_SHA256=$(case \"$(uname -m)\" in aarch64|arm64) echo '{ScriptGenerator.ManagedSpeedtestAarch64BinarySha256}' ;; armv7l|armv7) echo '{ScriptGenerator.ManagedSpeedtestArmhfBinarySha256}' ;; x86_64|amd64) echo '{ScriptGenerator.ManagedSpeedtestX86_64BinarySha256}' ;; *) echo 'unsupported' ;; esac); test \"$SPEEDTEST_SHA256\" != 'unsupported' && command -v sha256sum >/dev/null 2>&1 && test -f '{ScriptGenerator.ManagedSpeedtestPath}' && test ! -L '{ScriptGenerator.ManagedSpeedtestPath}' && test -x '{ScriptGenerator.ManagedSpeedtestPath}' && printf '%s  %s\\n' \"$SPEEDTEST_SHA256\" '{ScriptGenerator.ManagedSpeedtestPath}' | sha256sum -c - >/dev/null 2>&1 && '{ScriptGenerator.ManagedSpeedtestPath}' --version 2>/dev/null | head -n 1 | grep -Fq 'Speedtest by Ookla {ScriptGenerator.ManagedSpeedtestCliVersion} ({ScriptGenerator.ManagedSpeedtestBuildId})' && echo 'installed' || echo 'missing'; " +
+            "echo '---BC_CHECK---'; command -v bc >/dev/null 2>&1 && echo 'installed' || echo 'missing'; " +
+            "echo '---JQ_CHECK---'; command -v jq >/dev/null 2>&1 && echo 'installed' || echo 'missing'; " +
+            // Scripts from before the awk change compute rates with bc, which every upgrade
+            // removes. A redeploy replaces them.
+            $"echo '---SCRIPTS_ON_BC---'; grep -l '| bc' {SqmDir}/*.sh 2>/dev/null | wc -l; " +
+            // Ping scripts from before the probe lock existed keep adjusting during a congestion
+            // learning sample; a redeploy installs the guard.
+            $"echo '---PING_GUARD_MISSING---'; for f in {SqmDir}/*-ping.sh; do [ -f \"$f\" ] && ! grep -q PROBE_LOCK \"$f\" && echo \"$f\"; done | wc -l";
+    }
+
+    /// <summary>
+    /// Check if SQM scripts are already deployed
+    /// </summary>
+    public async Task<SqmDeploymentStatus> CheckDeploymentStatusAsync()
+    {
+        var status = new SqmDeploymentStatus();
+
+        try
+        {
+            // Run all status checks in a single SSH connection using delimiters
+            // TODO: use IUdmBootService.IsInstalledAsync() for the udm-boot check instead of
+            // this inline test (shared gateway boot infrastructure -
+            // NetworkOptimizer.Web.Services.Ssh.UdmBootService).
+            var combinedCommand = BuildDeploymentStatusCommand();
+
+            var result = await RunCommandAsync(combinedCommand);
+            var sections = ParseDelimitedOutput(result.output);
+
+            // Process results
+            status.UdmBootInstalled = result.success && GetSection(sections, "UDM_BOOT_CHECK").Contains("installed");
+            status.UdmBootEnabled = result.success && GetSection(sections, "UDM_BOOT_ENABLED").Trim() == "enabled";
+
+            var sqmBootOutput = GetSection(sections, "SQM_BOOT_SCRIPTS");
+            if (int.TryParse(sqmBootOutput.Trim(), out int bootScriptCount))
+            {
+                status.SpeedtestScriptDeployed = bootScriptCount > 0;
+                status.PingScriptDeployed = bootScriptCount > 0;
+            }
+
+            var sqmScriptsOutput = GetSection(sections, "SQM_SPEEDTEST_SCRIPTS");
+            if (int.TryParse(sqmScriptsOutput.Trim(), out int sqmScriptCount))
+            {
+                status.SpeedtestScriptDeployed = status.SpeedtestScriptDeployed || sqmScriptCount > 0;
+            }
+
+            status.TcMonitorDeployed = result.success && GetSection(sections, "SQM_MONITOR_CHECK").Contains("exists");
+
+            status.WatchdogTimerRunning = result.success && GetSection(sections, "WATCHDOG_RUNNING").Trim() == "active";
+
+            var cronOutput = GetSection(sections, "CRON_CHECK");
+            if (int.TryParse(cronOutput.Trim(), out int cronCount))
+            {
+                status.CronJobsConfigured = cronCount;
+            }
+
+            status.SpeedtestCliInstalled = result.success && GetSection(sections, "SPEEDTEST_CLI").Contains("installed");
+
+            status.BcInstalled = result.success && GetSection(sections, "BC_CHECK").Contains("installed");
+            status.JqInstalled = result.success && GetSection(sections, "JQ_CHECK").Contains("installed");
+
+            if (int.TryParse(GetSection(sections, "PING_GUARD_MISSING").Trim(), out int unguarded))
+            {
+                status.PingScriptsWithoutProbeGuard = unguarded;
+            }
+
+            if (int.TryParse(GetSection(sections, "SCRIPTS_ON_BC").Trim(), out int onBc))
+            {
+                status.ScriptsUsingBc = onBc;
+            }
+
+            status.IsDeployed = status.SpeedtestScriptDeployed && status.PingScriptDeployed;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error checking SQM deployment status");
+            status.Error = ex.Message;
+        }
+
+        return status;
+    }
+
+    /// <summary>
+    /// Clean ALL SQM scripts and cron entries from the gateway.
+    /// Call this ONCE before deploying any WANs to handle renamed connections.
+    /// </summary>
+    public async Task<(bool success, string message)> CleanAllSqmScriptsAsync()
+    {
+        try
+        {
+            _logger.LogInformation("Cleaning all SQM scripts and cron entries");
+
+            // Remove all SQM boot scripts
+            await RunCommandAsync(
+                $"rm -f {OnBootDir}/20-sqm-*.sh {OnBootDir}/21-sqm-*.sh");
+
+            // Remove all SQM data directories
+            await RunCommandAsync(
+                $"rm -rf {SqmDir}/*");
+
+            // Remove ALL SQM-related cron entries (catches renamed connections)
+            await RunCommandAsync(
+                "crontab -l 2>/dev/null | grep -v -E 'sqm|SQM' | crontab -");
+
+            _logger.LogInformation("Successfully cleaned all SQM scripts and cron entries");
+            return (true, "Cleaned all SQM scripts and cron entries");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error cleaning SQM scripts");
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Lightweight cleanup after a failed deployment.
+    /// Removes only the specific WAN's scripts and cron entries, not the full SQM removal.
+    /// </summary>
+    private async Task CleanupFailedDeploymentAsync(string? connectionName, string interfaceName)
+    {
+        try
+        {
+            var safeName = Sqm.InputSanitizer.SanitizeConnectionName(connectionName ?? interfaceName);
+            _logger.LogInformation("Cleaning up failed deployment for {Name} ({Interface})", connectionName, interfaceName);
+
+            // Remove the boot script for this specific WAN
+            await RunCommandAsync($"rm -f {OnBootDir}/20-sqm-{safeName}.sh");
+
+            // Remove SQM data directory for this WAN
+            await RunCommandAsync($"rm -rf {SqmDir}/{safeName}-*.sh {SqmDir}/{safeName}-*.txt");
+
+            // Remove cron entries for this specific WAN (match on connection name). Deliberately
+            // an unanchored match, so cleaning up "wan" also takes "wan2": a deploy that failed
+            // this badly means Adaptive SQM comes off the box entirely, not partly.
+            await RunCommandAsync(
+                $"crontab -l 2>/dev/null | grep -v '{safeName}' | crontab -");
+
+            // Invalidate status cache so refresh shows accurate state
+            SqmService.InvalidateStatusCache();
+
+            _logger.LogInformation("Cleanup completed for {Name}", connectionName);
+        }
+        catch (Exception ex)
+        {
+            // Log but don't throw - cleanup is best-effort
+            _logger.LogWarning(ex, "Error during cleanup of failed deployment for {Name}", connectionName);
+        }
+    }
+
+    /// <summary>
+    /// Lightweight cleanup after a failed SQM Monitor deployment.
+    /// </summary>
+    private async Task CleanupFailedSqmMonitorAsync()
+    {
+        try
+        {
+            _logger.LogInformation("Cleaning up failed SQM Monitor deployment");
+
+            // Remove the boot script
+            await RunCommandAsync($"rm -f {OnBootDir}/20-sqm-monitor.sh");
+
+            // Stop and disable any partially-created services (including legacy watchdog timer)
+            await RunCommandAsync(
+                "systemctl stop sqm-monitor-watchdog.timer sqm-monitor 2>/dev/null; " +
+                "systemctl disable sqm-monitor-watchdog.timer sqm-monitor 2>/dev/null");
+
+            // Remove watchdog cron entry
+            await RunCommandAsync(
+                "(crontab -l 2>/dev/null | grep -v sqm-watchdog) | crontab -");
+
+            // Remove service files and monitor directory
+            await RunCommandAsync("rm -rf /data/sqm-monitor");
+            await RunCommandAsync(
+                "rm -f /etc/systemd/system/sqm-monitor.service " +
+                "/etc/systemd/system/sqm-monitor-watchdog.timer /etc/systemd/system/sqm-monitor-watchdog.service");
+            await RunCommandAsync("systemctl daemon-reload");
+
+            _logger.LogInformation("SQM Monitor cleanup completed");
+        }
+        catch (Exception ex)
+        {
+            // Log but don't throw - cleanup is best-effort
+            _logger.LogWarning(ex, "Error during cleanup of failed SQM Monitor deployment");
+        }
+    }
+
+    /// <summary>
+    /// Deploy SQM scripts to the gateway
+    /// </summary>
+    /// <param name="config">SQM configuration for this WAN</param>
+    /// <param name="baseline">Optional hourly baseline data</param>
+    /// <param name="initialDelaySeconds">Delay before first speedtest (default 60s, use higher values for additional WANs to stagger)</param>
+    public async Task<SqmDeploymentResult> DeployAsync(SqmConfig config, Dictionary<string, string>? baseline = null, int initialDelaySeconds = 60)
+    {
+        var result = new SqmDeploymentResult();
+        var steps = new List<string>();
+
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("SQM deploy refused: site {Site} is license-restricted", _siteContext.Slug);
+            result.Success = false;
+            result.Error = Licensing.LicenseGuard.RestrictedMessage;
+            return result;
+        }
+
+        var settings = await GetGatewaySettingsAsync();
+        if (settings == null || string.IsNullOrEmpty(settings.Host))
+        {
+            result.Success = false;
+            result.Error = "Gateway SSH not configured";
+            return result;
+        }
+
+        var device = new DeviceSshConfiguration
+        {
+            Host = settings.Host,
+            SshUsername = settings.Username,
+            SshPassword = settings.Password,
+            SshPrivateKeyPath = settings.PrivateKeyPath
+        };
+
+        try
+        {
+            // Note: profile settings (including WAN link speed caps) are already applied
+            // by the caller via CreateSqmConfiguration. Do NOT re-apply here without link
+            // speed context, as that would overwrite the caps with uncapped values.
+
+            // Security: Validate all inputs before script generation to prevent command injection.
+            // This is defense-in-depth - the UI also validates before calling DeployAsync,
+            // but we validate again here to protect against direct API calls or code changes.
+            var manager = new SqmManager(config);
+            var validationErrors = manager.ValidateConfiguration();
+            if (validationErrors.Count > 0)
+            {
+                result.Success = false;
+                result.Error = $"Configuration validation failed: {string.Join("; ", validationErrors)}";
+                _logger.LogWarning("SQM deployment blocked due to validation errors: {Errors}", validationErrors);
+                return result;
+            }
+            _logger.LogInformation("Deploying SQM with config: {Summary}", config.GetParameterSummary());
+
+            // Verify ping target is reachable on the specified interface before deployment
+            steps.Add("Testing ping target reachability...");
+            var pingTestResult = await TestPingTargetAsync(config.Interface, config.PingHost);
+            if (!pingTestResult.success)
+            {
+                // Clean up any existing deployment for this WAN before reporting failure
+                steps.Add("Ping target unreachable, cleaning up...");
+                await CleanupFailedDeploymentAsync(config.ConnectionName, config.Interface);
+                steps.Add("Cleanup complete");
+
+                result.Success = false;
+                result.Error = pingTestResult.error;
+                result.Steps = steps;
+                _logger.LogWarning("SQM deployment blocked: ping target {Host} not reachable on {Interface}",
+                    config.PingHost, config.Interface);
+                return result;
+            }
+            steps.Add($"Ping target {config.PingHost} is reachable on {config.Interface}");
+
+            // Verify IFB device exists (UniFi creates this when Smart Queues is enabled)
+            steps.Add("Verifying IFB device exists...");
+            var ifbDevice = $"ifb{config.Interface}";
+            var ifbCheckResult = await RunCommandAsync($"ip link show {ifbDevice}");
+            var ifbExists = ifbCheckResult.success || ifbCheckResult.output.Contains($"{ifbDevice}: ");
+            if (!ifbExists)
+            {
+                steps.Add("IFB device not found, cleaning up...");
+                await CleanupFailedDeploymentAsync(config.ConnectionName, config.Interface);
+                steps.Add("Cleanup complete");
+
+                result.Success = false;
+                result.Error = $"IFB device {ifbDevice} does not exist. " +
+                    "Smart Queues is enabled but UniFi didn't actually create the traffic control classes - this is a known UniFi bug. " +
+                    "To fix it, add any QoS rule in UniFi Network (Settings > Policy Engine > Policy Table > QoS Rules). " +
+                    "It doesn't matter what the rule targets. Wait 45 seconds, then deploy again.";
+                result.Steps = steps;
+                _logger.LogWarning("SQM deployment blocked: IFB device {Device} not found on gateway", ifbDevice);
+                return result;
+            }
+            steps.Add($"IFB device {ifbDevice} is present");
+
+            // Step 1: Create directories
+            steps.Add("Creating directories...");
+            var mkdirResult = await RunCommandAsync(
+                $"mkdir -p {OnBootDir} {SqmDir}");
+            if (!mkdirResult.success)
+            {
+                throw new Exception($"Failed to create directories: {mkdirResult.output}");
+            }
+
+            // Step 2: Generate the self-contained boot script
+            steps.Add("Generating SQM boot script...");
+            var generator = new ScriptGenerator(config, initialDelaySeconds);
+            baseline ??= GenerateDefaultBaseline(config);
+            var scripts = generator.GenerateAllScripts(baseline, GenerateUploadBaseline(config));
+            var bootScriptName = generator.GetBootScriptName();
+
+            // Step 3: Deploy the boot script
+            foreach (var (filename, content) in scripts)
+            {
+                steps.Add($"Deploying {filename}...");
+                var (deployed, deployError) = await DeployScriptAsync(filename, content);
+                if (!deployed)
+                {
+                    throw new Exception($"Failed to deploy {filename}: {deployError}");
+                }
+            }
+
+            // Step 4: Run the boot script to set up everything
+            steps.Add("Running boot script (installs deps, creates scripts, configures cron)...");
+            var setupResult = await RunCommandAsync(
+                $"chmod +x {OnBootDir}/{bootScriptName} && {OnBootDir}/{bootScriptName}",
+                BootScriptTimeout);
+
+            if (!setupResult.success)
+            {
+                // Log detailed output for debugging
+                _logger.LogWarning(
+                    "Boot script execution failed for {Name} ({Interface}). Output: {Output}",
+                    config.ConnectionName, config.Interface, setupResult.output);
+
+                // Add truncated output to steps for UI visibility
+                if (!string.IsNullOrWhiteSpace(setupResult.output))
+                {
+                    var truncatedOutput = setupResult.output.Length > 300
+                        ? setupResult.output[..300] + "..."
+                        : setupResult.output;
+                    _logger.LogWarning("Boot script output (truncated): {Output}", truncatedOutput);
+
+                    // Split output into lines for better UI display
+                    var outputLines = truncatedOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var line in outputLines.Take(10)) // Limit to 10 lines
+                    {
+                        steps.Add($"  {line.Trim()}");
+                    }
+                    if (outputLines.Length > 10)
+                    {
+                        steps.Add($"  ... ({outputLines.Length - 10} more lines)");
+                    }
+                }
+
+                // Clean up the failed deployment
+                steps.Add("Boot script failed, cleaning up...");
+                await CleanupFailedDeploymentAsync(config.ConnectionName, config.Interface);
+                steps.Add("Cleanup complete");
+
+                var logFile = $"/var/log/sqm-{config.ConnectionName?.ToLowerInvariant() ?? config.Interface}.log";
+                result.Success = false;
+                result.Steps = steps;
+                result.Error = $"Boot script did not complete successfully. Check gateway logs at {logFile} for details.";
+                return result;
+            }
+
+            result.Success = true;
+            result.Steps = steps;
+            result.Message = $"SQM deployed for {config.ConnectionName} ({config.Interface})";
+            _logger.LogInformation("SQM deployment completed for {Name} ({Interface})",
+                config.ConnectionName, config.Interface);
+
+            // Invalidate SQM status cache so the new status gets fetched
+            SqmService.InvalidateStatusCache();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SQM deployment failed");
+            result.Success = false;
+            result.Error = ex.Message;
+            result.Steps = steps;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Deploy a single script to the gateway
+    /// </summary>
+    private async Task<(bool success, string? error)> DeployScriptAsync(string filename, string content)
+    {
+        // All SQM scripts now go to on_boot.d (self-contained boot scripts)
+        var targetPath = $"{OnBootDir}/{filename}";
+
+        // SFTP, not an echo | base64 -d exec: a boot script with dynamic upload outgrows the SSH exec packet.
+        var (written, error) = await _gatewaySsh.UploadTextFileAsync(content, targetPath);
+
+        if (!written)
+        {
+            _logger.LogError("Failed to write {File}: {Error}", filename, error);
+            return (false, error);
+        }
+
+        // Make executable
+        var chmodResult = await RunCommandAsync($"chmod +x '{targetPath}'");
+        if (!chmodResult.success)
+        {
+            _logger.LogWarning("Failed to chmod {File}: {Error}", filename, chmodResult.output);
+        }
+
+        _logger.LogDebug("Deployed {File} to {Path}", filename, targetPath);
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Deploy SQM Monitor script. Uses TcMonitorPort from gateway settings.
+    /// Exposes all SQM data (TC rates, speedtest results, ping data) via HTTP.
+    /// </summary>
+    public async Task<(bool success, string? warning)> DeploySqmMonitorAsync(string wan1Interface, string wan1Name, string wan2Interface, string wan2Name)
+    {
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("SQM monitor deploy refused: site {Site} is license-restricted", _siteContext.Slug);
+            return (false, Licensing.LicenseGuard.RestrictedMessage);
+        }
+
+        var settings = await GetGatewaySettingsAsync();
+        if (settings == null || string.IsNullOrEmpty(settings.Host))
+        {
+            _logger.LogError("Gateway SSH not configured");
+            return (false, null);
+        }
+
+        var device = new DeviceSshConfiguration
+        {
+            Host = settings.Host,
+            SshUsername = settings.Username,
+            SshPassword = settings.Password,
+            SshPrivateKeyPath = settings.PrivateKeyPath
+        };
+
+        try
+        {
+            // Generate SQM monitor script content using port from settings
+            var sqmMonitorScript = GenerateSqmMonitorScript(wan1Interface, wan1Name, wan2Interface, wan2Name, settings.TcMonitorPort);
+
+            // Deploy to on_boot.d
+            var (deployed, deployError) = await DeployScriptAsync("20-sqm-monitor.sh", sqmMonitorScript);
+            if (!deployed)
+            {
+                return (false, $"Failed to deploy 20-sqm-monitor.sh: {deployError}");
+            }
+
+            // Run the script to set up SQM monitor
+            var runResult = await RunCommandAsync(
+                $"{OnBootDir}/20-sqm-monitor.sh");
+
+            if (!runResult.success)
+            {
+                // Log detailed output for debugging
+                _logger.LogWarning(
+                    "SQM Monitor setup script did not complete successfully. Output: {Output}",
+                    runResult.output);
+
+                // Build error message with truncated output
+                var errorMessage = "SQM Monitor script did not complete successfully.";
+                if (!string.IsNullOrWhiteSpace(runResult.output))
+                {
+                    var truncatedOutput = runResult.output.Length > 300
+                        ? runResult.output[..300] + "..."
+                        : runResult.output;
+                    _logger.LogWarning("SQM Monitor script output (truncated): {Output}", truncatedOutput);
+                    errorMessage += $" Output: {truncatedOutput}";
+                }
+
+                // Clean up the failed deployment
+                await CleanupFailedSqmMonitorAsync();
+
+                return (false, errorMessage);
+            }
+
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to deploy SQM Monitor");
+            return (false, null);
+        }
+    }
+
+    /// <summary>
+    /// Remove SQM scripts from the gateway
+    /// </summary>
+    public async Task<(bool success, List<string> steps)> RemoveAsync(bool includeTcMonitor = true)
+    {
+        var steps = new List<string>();
+        var settings = await GetGatewaySettingsAsync();
+        if (settings == null || string.IsNullOrEmpty(settings.Host))
+        {
+            return (false, new List<string> { "Gateway SSH not configured" });
+        }
+
+        var device = new DeviceSshConfiguration
+        {
+            Host = settings.Host,
+            SshUsername = settings.Username,
+            SshPassword = settings.Password,
+            SshPrivateKeyPath = settings.PrivateKeyPath
+        };
+
+        try
+        {
+            // Remove ALL SQM-related cron jobs (catches renamed connections too)
+            steps.Add("Removing SQM cron jobs...");
+            await RunCommandAsync(
+                "crontab -l 2>/dev/null | grep -v -E 'sqm|SQM' | crontab -");
+
+            // Remove boot scripts (new format: 20-sqm-{name}.sh)
+            steps.Add("Removing SQM boot scripts...");
+            await RunCommandAsync(
+                $"rm -f {OnBootDir}/20-sqm-*.sh");
+
+            // Remove legacy boot scripts (old format)
+            await RunCommandAsync(
+                $"rm -f {OnBootDir}/21-sqm-*.sh");
+
+            // Remove SQM directory with all scripts and data
+            steps.Add("Removing SQM data directory...");
+            await RunCommandAsync(
+                $"rm -rf {SqmDir}");
+
+            // Remove legacy data files
+            await RunCommandAsync(
+                "rm -f /data/sqm-*.sh /data/sqm-*.txt /data/sqm-scripts");
+
+            // Remove SQM Monitor if requested
+            if (includeTcMonitor)
+            {
+                steps.Add("Stopping SQM Monitor service...");
+                await RunCommandAsync(
+                    "systemctl stop sqm-monitor-watchdog.timer sqm-monitor 2>/dev/null; " +
+                    "systemctl disable sqm-monitor-watchdog.timer sqm-monitor 2>/dev/null");
+
+                // Remove watchdog cron entry
+                await RunCommandAsync(
+                    "(crontab -l 2>/dev/null | grep -v sqm-watchdog) | crontab -");
+
+                steps.Add("Removing SQM Monitor...");
+                await RunCommandAsync(
+                    $"rm -f {OnBootDir}/20-sqm-monitor.sh");
+                await RunCommandAsync(
+                    "rm -rf /data/sqm-monitor");
+                await RunCommandAsync(
+                    "rm -f /etc/systemd/system/sqm-monitor.service " +
+                    "/etc/systemd/system/sqm-monitor-watchdog.timer /etc/systemd/system/sqm-monitor-watchdog.service && " +
+                    "systemctl daemon-reload");
+            }
+
+            steps.Add("SQM removal complete");
+            _logger.LogInformation("SQM scripts removed (SQM Monitor: {SqmMonitor})", includeTcMonitor);
+
+            // Invalidate SQM status cache so the "Offline" status gets cached
+            SqmService.InvalidateStatusCache();
+
+            return (true, steps);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to remove SQM scripts");
+            steps.Add($"Error: {ex.Message}");
+            return (false, steps);
+        }
+    }
+
+    /// <summary>
+    /// Trigger the SQM adjustment speedtest script on the gateway
+    /// This runs the deployed script which does baseline blending and TC adjustment
+    /// </summary>
+    public async Task<(bool success, string message)> TriggerSqmAdjustmentAsync(string wanName)
+    {
+        var settings = await GetGatewaySettingsAsync();
+        if (settings == null || string.IsNullOrEmpty(settings.Host))
+        {
+            return (false, "Gateway SSH not configured");
+        }
+
+        var device = new DeviceSshConfiguration
+        {
+            Host = settings.Host,
+            SshUsername = settings.Username,
+            SshPassword = settings.Password,
+            SshPrivateKeyPath = settings.PrivateKeyPath
+        };
+
+        try
+        {
+            // Use same sanitization as deployment to ensure script path matches
+            var scriptName = Sqm.InputSanitizer.SanitizeConnectionName(wanName);
+            var scriptPath = $"/data/sqm/{scriptName}-speedtest.sh";
+
+            _logger.LogInformation("Triggering SQM adjustment script: {Script}", scriptPath);
+
+            // Check if script exists
+            var checkResult = await RunCommandAsync($"test -f {scriptPath} && echo 'exists'");
+            if (!checkResult.success || !checkResult.output.Contains("exists"))
+            {
+                return (false, $"SQM script not found: {scriptPath}");
+            }
+
+            // Run the script (speedtest can take up to 60 seconds, use 90s timeout)
+            var result = await RunCommandAsync(scriptPath, TimeSpan.FromSeconds(90));
+
+            // Script writes to log file, not stdout. Any output = error
+            if (result.success && string.IsNullOrWhiteSpace(result.output))
+            {
+                _logger.LogInformation("SQM adjustment completed for {Wan}", wanName);
+                return (true, "SQM adjustment completed successfully");
+            }
+            else
+            {
+                var errorOutput = result.output;
+
+                // Script errors go to log file, not stdout - check the log for the actual error
+                if (string.IsNullOrWhiteSpace(errorOutput))
+                {
+                    var logPath = $"/var/log/sqm-{scriptName}.log";
+                    var logResult = await RunCommandAsync($"grep 'ERROR:' {logPath} | tail -1");
+                    if (logResult.success && !string.IsNullOrWhiteSpace(logResult.output))
+                    {
+                        // Extract just the error message (after "ERROR: ")
+                        var errorMatch = logResult.output;
+                        var errorIdx = errorMatch.IndexOf("ERROR: ", StringComparison.Ordinal);
+                        errorOutput = errorIdx >= 0 ? errorMatch[(errorIdx + 7)..].Trim() : errorMatch.Trim();
+                    }
+                    else
+                    {
+                        errorOutput = "(unknown error)";
+                    }
+                }
+
+                _logger.LogWarning("SQM adjustment failed for {Wan}: {Output}", wanName, errorOutput);
+
+                // Deduplicate repeated lines (e.g., speedtest CLI may repeat the same error for each server attempt)
+                var dedupedOutput = string.Join("\n", errorOutput
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(l => l.Trim())
+                    .Where(l => !string.IsNullOrWhiteSpace(l))
+                    .Distinct());
+
+                return (false, $"Error: {dedupedOutput}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to trigger SQM adjustment for {Wan}", wanName);
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Get the last N lines of the SQM log for a specific WAN connection.
+    /// Useful for debugging failed speedtests or checking adjustment history.
+    /// </summary>
+    /// <param name="wanName">The WAN connection name</param>
+    /// <param name="lines">Number of lines to retrieve (default 50)</param>
+    /// <returns>Success status and log output or error message</returns>
+    public async Task<(bool success, string output)> GetWanLogsAsync(string wanName, int lines = 50)
+    {
+        var settings = await GetGatewaySettingsAsync();
+        if (settings == null || string.IsNullOrEmpty(settings.Host))
+        {
+            return (false, "Gateway SSH not configured");
+        }
+
+        try
+        {
+            // Sanitize WAN name for use in file path
+            var logName = Sqm.InputSanitizer.SanitizeConnectionName(wanName);
+            var logPath = $"/var/log/sqm-{logName}.log";
+
+            _logger.LogInformation("Fetching last {Lines} lines of {LogPath}", lines, logPath);
+
+            // Check if log file exists first
+            var checkResult = await RunCommandAsync($"test -f {logPath} && echo 'exists'");
+            if (!checkResult.success || !checkResult.output.Contains("exists"))
+            {
+                return (false, $"Log file not found: {logPath}");
+            }
+
+            // Get the last N lines
+            var result = await RunCommandAsync($"tail -n {lines} {logPath}");
+
+            if (result.success)
+            {
+                return (true, result.output);
+            }
+            else
+            {
+                return (false, $"Failed to read log: {result.output}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get WAN logs for {Wan}", wanName);
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Test that a ping target is reachable on the specified interface.
+    /// Runs 3 pings and fails if all of them fail.
+    /// </summary>
+    private async Task<(bool success, string? error)> TestPingTargetAsync(string interfaceName, string pingHost)
+    {
+        try
+        {
+            _logger.LogInformation("Testing ping target {Host} on interface {Interface}", pingHost, interfaceName);
+
+            // Sanitize inputs for shell command
+            var safeInterface = Sqm.InputSanitizer.ValidateInterface(interfaceName);
+            var safePingHost = Sqm.InputSanitizer.ValidatePingHost(pingHost);
+
+            if (!safeInterface.isValid)
+            {
+                return (false, $"Invalid interface name: {safeInterface.error}");
+            }
+            if (!safePingHost.isValid)
+            {
+                return (false, $"Invalid ping target: {safePingHost.error}");
+            }
+
+            // Run 3 pings with 2 second timeout each, binding to the specified interface
+            // Success if exit code 0 OR output contains successful ping response
+            var pingCmd = $"ping -c 3 -W 2 -I {interfaceName} {pingHost} 2>&1";
+            var pingResult = await RunCommandAsync(pingCmd, TimeSpan.FromSeconds(15));
+
+            if (pingResult.success || pingResult.output.Contains("bytes from"))
+            {
+                _logger.LogInformation("Ping target {Host} is reachable on {Interface}", pingHost, interfaceName);
+                return (true, null);
+            }
+
+            _logger.LogWarning("Ping target {Host} is not reachable on {Interface}. Output: {Output}",
+                pingHost, interfaceName, pingResult.output);
+
+            var errorMsg = $"Ping target '{pingHost}' is not reachable on interface {interfaceName}. " +
+                $"This means the ping-based SQM adjustments won't work.\n\n" +
+                $"To find a suitable ping target:\n" +
+                $"1. SSH to your gateway\n" +
+                $"2. Test connectivity: ping -c 3 -I {interfaceName} 1.1.1.1\n" +
+                $"3. If that fails, try a hop within your ISP's network\n\n" +
+                $"Common choices:\n" +
+                $"- Cloudflare DNS (1.1.1.1)\n" +
+                $"- Google DNS (8.8.8.8)\n" +
+                $"- A router within your ISP's network";
+
+            return (false, errorMsg);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error testing ping target {Host} on {Interface}", pingHost, interfaceName);
+            return (false, $"Error testing ping target: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Generate a baseline based on connection type patterns.
+    /// Uses empirical data patterns scaled to the nominal speed.
+    /// </summary>
+    private Dictionary<string, string> GenerateDefaultBaseline(SqmConfig config)
+    {
+        // The configuration's profile carries the learned curves when a learned profile is in use;
+        // otherwise this is the connection type's built-in pattern, as before.
+        return config.GetProfile().GetHourlyBaseline(config.CongestionSeverity);
+    }
+
+    /// <summary>
+    /// The 168-hour upload schedule, or null when upload stays static (strength 0, the default),
+    /// in which case the generated scripts are identical to those before dynamic upload existed.
+    /// </summary>
+    private static Dictionary<string, string>? GenerateUploadBaseline(SqmConfig config) =>
+        config.DynamicUpload ? config.GetProfile().GetHourlyUploadBaseline(config.UploadCongestionSeverity) : null;
+
+    /// <summary>
+    /// Get SQM status for all WANs by parsing gateway logs
+    /// </summary>
+    public async Task<List<SqmWanStatus>> GetSqmWanStatusAsync()
+    {
+        var result = new List<SqmWanStatus>();
+
+        var settings = await GetGatewaySettingsAsync();
+        if (settings == null || string.IsNullOrEmpty(settings.Host))
+        {
+            return result;
+        }
+
+        var device = new DeviceSshConfiguration
+        {
+            Host = settings.Host,
+            SshUsername = settings.Username,
+            SshPassword = settings.Password,
+            SshPrivateKeyPath = settings.PrivateKeyPath
+        };
+
+        try
+        {
+            // Find all SQM log files
+            var logListResult = await RunCommandAsync(
+                "ls /var/log/sqm-*.log 2>/dev/null | xargs -I {} basename {} .log | sed 's/sqm-//'");
+
+            if (!logListResult.success || string.IsNullOrWhiteSpace(logListResult.output))
+            {
+                return result;
+            }
+
+            var wanNames = logListResult.output.Trim().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var wanName in wanNames)
+            {
+                var status = new SqmWanStatus { Name = wanName };
+
+                // Get last 50 lines of the log file
+                var logResult = await RunCommandAsync(
+                    $"tail -50 /var/log/sqm-{wanName}.log 2>/dev/null");
+
+                if (logResult.success && !string.IsNullOrWhiteSpace(logResult.output))
+                {
+                    ParseSqmLog(logResult.output, status);
+                }
+
+                // Get current rate from result file
+                var resultFileResult = await RunCommandAsync(
+                    $"cat /data/sqm/{wanName}-result.txt 2>/dev/null");
+
+                if (resultFileResult.success && !string.IsNullOrWhiteSpace(resultFileResult.output))
+                {
+                    // Format: "Measured download speed: 206 Mbps"
+                    var match = System.Text.RegularExpressions.Regex.Match(
+                        resultFileResult.output, @"(\d+)\s*Mbps");
+                    if (match.Success && double.TryParse(match.Groups[1].Value, out var rate))
+                    {
+                        status.CurrentRateMbps = rate;
+                    }
+                }
+
+                result.Add(status);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get SQM WAN status");
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Parse SQM log output to extract status information
+    /// </summary>
+    private void ParseSqmLog(string logContent, SqmWanStatus status)
+    {
+        var lines = logContent.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+        // Process lines in reverse to find most recent entries
+        foreach (var line in lines.Reverse())
+        {
+            // Parse timestamp: [Fri Dec 27 19:48:02 UTC 2024]
+            var timestampMatch = System.Text.RegularExpressions.Regex.Match(
+                line, @"\[([A-Za-z]+ [A-Za-z]+ \d+ \d+:\d+:\d+ [A-Z]+ \d+)\]");
+
+            DateTime? timestamp = null;
+            if (timestampMatch.Success)
+            {
+                // Try to parse the date
+                if (DateTime.TryParse(timestampMatch.Groups[1].Value, out var parsed))
+                {
+                    timestamp = parsed;
+                }
+            }
+
+            // Look for speedtest results: "Measured: 206 Mbps"
+            if (status.LastSpeedtestMeasured == null)
+            {
+                var measuredMatch = System.Text.RegularExpressions.Regex.Match(
+                    line, @"Measured:\s*(\d+(?:\.\d+)?)\s*Mbps");
+                if (measuredMatch.Success && double.TryParse(measuredMatch.Groups[1].Value, out var measured))
+                {
+                    status.LastSpeedtestMeasured = measured;
+                    status.LastSpeedtest = timestamp;
+                }
+            }
+
+            // Look for adjusted speed: "Adjusted to 196 Mbps"
+            if (status.LastSpeedtestAdjusted == null)
+            {
+                var adjustedMatch = System.Text.RegularExpressions.Regex.Match(
+                    line, @"Adjusted to\s*(\d+(?:\.\d+)?)\s*Mbps");
+                if (adjustedMatch.Success && double.TryParse(adjustedMatch.Groups[1].Value, out var adjusted)
+                    && adjusted > 0)
+                {
+                    status.LastSpeedtestAdjusted = adjusted;
+                    if (status.LastSpeedtest == null)
+                        status.LastSpeedtest = timestamp;
+                }
+            }
+
+            // Look for ping adjustment: "Ping adjusted to 195 Mbps (latency: 12.5ms)"
+            if (status.LastPingAdjustment == null)
+            {
+                var pingMatch = System.Text.RegularExpressions.Regex.Match(
+                    line, @"Ping adjusted to\s*(\d+(?:\.\d+)?)\s*Mbps\s*\(latency:\s*(\d+(?:\.\d+)?)ms\)");
+                if (pingMatch.Success)
+                {
+                    if (double.TryParse(pingMatch.Groups[1].Value, out var pingRate))
+                        status.LastPingRate = pingRate;
+                    if (double.TryParse(pingMatch.Groups[2].Value, out var latency))
+                        status.LastLatencyMs = latency;
+                    status.LastPingAdjustment = timestamp;
+                }
+            }
+
+            // If we have all the data we need, stop
+            if (status.LastSpeedtestMeasured != null && status.LastPingAdjustment != null)
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Generate SQM Monitor script content - exposes all SQM data via HTTP
+    /// </summary>
+    private string GenerateSqmMonitorScript(string wan1Interface, string wan1Name, string wan2Interface, string wan2Name, int port)
+    {
+        // Security: Sanitize connection names for use in file paths (lowercase, safe chars)
+        // Display names use EscapeForShellDoubleQuote to preserve casing while preventing injection
+        var wan1LogName = Sqm.InputSanitizer.SanitizeConnectionName(wan1Name);
+        var wan2LogName = Sqm.InputSanitizer.SanitizeConnectionName(wan2Name);
+
+        var sb = new StringBuilder();
+        sb.AppendLine("#!/bin/sh");
+        sb.AppendLine("# UniFi on_boot.d script for SQM Monitor");
+        sb.AppendLine("# Auto-generated by Network Optimizer");
+        sb.AppendLine("# Exposes SQM status, TC rates, and speedtest/ping data via HTTP");
+        sb.AppendLine();
+        sb.AppendLine("SQM_MONITOR_DIR=\"/data/sqm-monitor\"");
+        sb.AppendLine("LOG_FILE=\"/var/log/sqm-monitor.log\"");
+        sb.AppendLine("SERVICE_NAME=\"sqm-monitor\"");
+        sb.AppendLine("SERVICE_FILE=\"/etc/systemd/system/${SERVICE_NAME}.service\"");
+        sb.AppendLine($"PORT=\"{port}\"");
+        sb.AppendLine();
+        sb.AppendLine("echo \"$(date): Setting up SQM Monitor systemd service...\" >> \"$LOG_FILE\"");
+        sb.AppendLine();
+        sb.AppendLine("mkdir -p \"$SQM_MONITOR_DIR\"");
+        sb.AppendLine();
+        sb.AppendLine("# Create the SQM monitor handler script (outputs raw JSON, CGI wrapper adds headers)");
+        sb.AppendLine("cat > \"$SQM_MONITOR_DIR/sqm-monitor.sh\" << 'HANDLER_EOF'");
+        sb.AppendLine("#!/bin/sh");
+        sb.AppendLine();
+        sb.AppendLine("# WAN Configuration");
+        sb.AppendLine($"WAN1_INTERFACE=\"{wan1Interface}\"");
+        sb.AppendLine($"WAN1_NAME=\"{Sqm.InputSanitizer.EscapeForShellDoubleQuote(wan1Name)}\"");
+        sb.AppendLine($"WAN1_LOG_NAME=\"{wan1LogName}\"");
+        sb.AppendLine($"WAN2_INTERFACE=\"{wan2Interface}\"");
+        sb.AppendLine($"WAN2_NAME=\"{Sqm.InputSanitizer.EscapeForShellDoubleQuote(wan2Name)}\"");
+        sb.AppendLine($"WAN2_LOG_NAME=\"{wan2LogName}\"");
+        sb.AppendLine();
+        sb.AppendLine("# Get current TC rate for an interface");
+        sb.AppendLine("get_tc_rate() {");
+        sb.AppendLine("    local interface=$1");
+        sb.AppendLine("    tc class show dev \"$interface\" 2>/dev/null | grep \"class htb 1:1 root\" | grep -o 'rate [0-9.]*[MGK]bit' | head -n1 | awk '{print $2}'");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("# Convert rate to Mbps");
+        sb.AppendLine("rate_to_mbps() {");
+        sb.AppendLine("    local rate=$1");
+        sb.AppendLine("    if echo \"$rate\" | grep -q \"Mbit\"; then");
+        sb.AppendLine("        echo \"$rate\" | sed 's/Mbit//'");
+        sb.AppendLine("    elif echo \"$rate\" | grep -q \"Gbit\"; then");
+        sb.AppendLine("        echo \"$rate\" | sed 's/Gbit//' | awk '{print $1 * 1000}'");
+        sb.AppendLine("    elif echo \"$rate\" | grep -q \"Kbit\"; then");
+        sb.AppendLine("        echo \"$rate\" | sed 's/Kbit//' | awk '{print $1 / 1000}'");
+        sb.AppendLine("    else");
+        sb.AppendLine("        echo \"0\"");
+        sb.AppendLine("    fi");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("# Get last speedtest data from log");
+        sb.AppendLine("get_speedtest_data() {");
+        sb.AppendLine("    local log_name=$1");
+        sb.AppendLine("    local log_file=\"/var/log/sqm-${log_name}.log\"");
+        sb.AppendLine("    ");
+        sb.AppendLine("    if [ ! -f \"$log_file\" ]; then");
+        sb.AppendLine("        echo 'null'");
+        sb.AppendLine("        return");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # Find last speedtest entry (look for \"Measured:\" line)");
+        sb.AppendLine("    local measured_line=$(grep 'Measured:' \"$log_file\" | tail -1)");
+        sb.AppendLine("    local adjusted_line=$(grep 'Adjusted to' \"$log_file\" | tail -1)");
+        sb.AppendLine("    ");
+        sb.AppendLine("    if [ -z \"$measured_line\" ]; then");
+        sb.AppendLine("        echo 'null'");
+        sb.AppendLine("        return");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # Extract timestamp, measured, adjusted");
+        sb.AppendLine("    local ts=$(echo \"$measured_line\" | grep -oE '\\[[^]]+\\]' | tr -d '[]')");
+        sb.AppendLine("    local measured=$(echo \"$measured_line\" | grep -oE 'Measured: [0-9]+' | awk '{print $2}')");
+        sb.AppendLine("    local adjusted=$(echo \"$adjusted_line\" | grep -oE 'Adjusted to [0-9]+' | awk '{print $3}')");
+        sb.AppendLine("    ");
+        sb.AppendLine("    echo \"{\\\"timestamp\\\": \\\"$ts\\\", \\\"measured_mbps\\\": ${measured:-0}, \\\"adjusted_mbps\\\": ${adjusted:-0}}\"");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("# Get last ping adjustment data from log");
+        sb.AppendLine("get_ping_data() {");
+        sb.AppendLine("    local log_name=$1");
+        sb.AppendLine("    local log_file=\"/var/log/sqm-${log_name}.log\"");
+        sb.AppendLine("    ");
+        sb.AppendLine("    if [ ! -f \"$log_file\" ]; then");
+        sb.AppendLine("        echo 'null'");
+        sb.AppendLine("        return");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # Find last ping adjustment entry");
+        sb.AppendLine("    local ping_line=$(grep 'Ping adjusted to' \"$log_file\" | tail -1)");
+        sb.AppendLine("    ");
+        sb.AppendLine("    if [ -z \"$ping_line\" ]; then");
+        sb.AppendLine("        echo 'null'");
+        sb.AppendLine("        return");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # Extract timestamp, rate, latency");
+        sb.AppendLine("    local ts=$(echo \"$ping_line\" | grep -oE '\\[[^]]+\\]' | tr -d '[]')");
+        sb.AppendLine("    local rate=$(echo \"$ping_line\" | grep -oE 'Ping adjusted to [0-9.]+' | awk '{print $4}')");
+        sb.AppendLine("    local latency=$(echo \"$ping_line\" | grep -oE 'latency: [0-9.]+' | awk '{print $2}')");
+        sb.AppendLine("    ");
+        sb.AppendLine("    echo \"{\\\"timestamp\\\": \\\"$ts\\\", \\\"rate_mbps\\\": ${rate:-0}, \\\"latency_ms\\\": ${latency:-0}}\"");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("# Get baseline rate from result file");
+        sb.AppendLine("get_baseline() {");
+        sb.AppendLine("    local log_name=$1");
+        sb.AppendLine("    local result_file=\"/data/sqm/${log_name}-result.txt\"");
+        sb.AppendLine("    ");
+        sb.AppendLine("    if [ -f \"$result_file\" ]; then");
+        sb.AppendLine("        grep -oE '[0-9]+' \"$result_file\" | head -1");
+        sb.AppendLine("    else");
+        sb.AppendLine("        echo \"0\"");
+        sb.AppendLine("    fi");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("# Get last error from SQM log, but only if no successful operation happened after it");
+        sb.AppendLine("get_last_error() {");
+        sb.AppendLine("    local log_name=$1");
+        sb.AppendLine("    local log_file=\"/var/log/sqm-${log_name}.log\"");
+        sb.AppendLine("    [ ! -f \"$log_file\" ] && echo 'null' && return");
+        sb.AppendLine("    local last_error=$(grep -n 'ERROR:' \"$log_file\" | tail -1)");
+        sb.AppendLine("    [ -z \"$last_error\" ] && echo 'null' && return");
+        sb.AppendLine("    local error_num=$(echo \"$last_error\" | cut -d: -f1)");
+        sb.AppendLine("    # Check if a successful operation happened after the error");
+        sb.AppendLine("    local last_success=$(grep -n -i 'adjusted to' \"$log_file\" | tail -1)");
+        sb.AppendLine("    if [ -n \"$last_success\" ]; then");
+        sb.AppendLine("        local success_num=$(echo \"$last_success\" | cut -d: -f1)");
+        sb.AppendLine("        [ \"$success_num\" -gt \"$error_num\" ] && echo 'null' && return");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    local error_line=$(echo \"$last_error\" | cut -d: -f2-)");
+        sb.AppendLine("    local ts=$(echo \"$error_line\" | grep -oE '\\[[^]]+\\]' | tr -d '[]')");
+        sb.AppendLine("    local msg=$(echo \"$error_line\" | sed 's/.*ERROR: //' | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')");
+        sb.AppendLine("    echo \"{\\\"timestamp\\\": \\\"$ts\\\", \\\"message\\\": \\\"$msg\\\"}\"");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("# Check if speedtest is currently running (started but not finished)");
+        sb.AppendLine("# Returns \"true\" or \"false\"");
+        sb.AppendLine("is_speedtest_running() {");
+        sb.AppendLine("    local log_name=$1");
+        sb.AppendLine("    local log_file=\"/var/log/sqm-${log_name}.log\"");
+        sb.AppendLine("    ");
+        sb.AppendLine("    [ ! -f \"$log_file\" ] && echo \"false\" && return");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # Get line numbers of last \"Starting\" and last \"Adjusted to\"");
+        sb.AppendLine("    local last_start_line=$(grep -n 'Starting speedtest adjustment' \"$log_file\" | tail -1)");
+        sb.AppendLine("    local last_end_line=$(grep -n 'Adjusted to' \"$log_file\" | tail -1)");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # If no start ever, not running");
+        sb.AppendLine("    [ -z \"$last_start_line\" ] && echo \"false\" && return");
+        sb.AppendLine("    ");
+        sb.AppendLine("    local start_num=$(echo \"$last_start_line\" | cut -d: -f1)");
+        sb.AppendLine("    local end_num=$(echo \"$last_end_line\" | cut -d: -f1)");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # If end exists and is after start, test completed");
+        sb.AppendLine("    [ -n \"$end_num\" ] && [ \"$end_num\" -ge \"$start_num\" ] && echo \"false\" && return");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # Check if an ERROR occurred after start (script exited on error)");
+        sb.AppendLine("    local last_error_line=$(grep -n 'ERROR:' \"$log_file\" | tail -1)");
+        sb.AppendLine("    if [ -n \"$last_error_line\" ]; then");
+        sb.AppendLine("        local error_num=$(echo \"$last_error_line\" | cut -d: -f1)");
+        sb.AppendLine("        [ \"$error_num\" -ge \"$start_num\" ] && echo \"false\" && return");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    ");
+        sb.AppendLine("    # Start with no end (or end before start) - check if stale (>3 min = crashed)");
+        sb.AppendLine("    # Extract timestamp: [Mon Jan 27 10:30:45 UTC 2025] Starting...");
+        sb.AppendLine("    local start_ts=$(echo \"$last_start_line\" | grep -oE '\\[[^]]+\\]' | tr -d '[]')");
+        sb.AppendLine("    local start_epoch=$(date -d \"$start_ts\" +%s 2>/dev/null)");
+        sb.AppendLine("    local now_epoch=$(date +%s)");
+        sb.AppendLine("    ");
+        sb.AppendLine("    if [ -n \"$start_epoch\" ]; then");
+        sb.AppendLine("        local age=$((now_epoch - start_epoch))");
+        sb.AppendLine("        # If older than 180 seconds (3 min), consider crashed");
+        sb.AppendLine("        [ \"$age\" -gt 180 ] && echo \"false\" && return");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    ");
+        sb.AppendLine("    echo \"true\"");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("# Collect all data");
+        sb.AppendLine("wan1_rate=$(get_tc_rate \"$WAN1_INTERFACE\")");
+        sb.AppendLine("wan2_rate=$(get_tc_rate \"$WAN2_INTERFACE\")");
+        sb.AppendLine("wan1_mbps=$(rate_to_mbps \"$wan1_rate\")");
+        sb.AppendLine("wan2_mbps=$(rate_to_mbps \"$wan2_rate\")");
+        sb.AppendLine("wan1_baseline=$(get_baseline \"$WAN1_LOG_NAME\")");
+        sb.AppendLine("wan2_baseline=$(get_baseline \"$WAN2_LOG_NAME\")");
+        sb.AppendLine("wan1_speedtest=$(get_speedtest_data \"$WAN1_LOG_NAME\")");
+        sb.AppendLine("wan2_speedtest=$(get_speedtest_data \"$WAN2_LOG_NAME\")");
+        sb.AppendLine("wan1_ping=$(get_ping_data \"$WAN1_LOG_NAME\")");
+        sb.AppendLine("wan2_ping=$(get_ping_data \"$WAN2_LOG_NAME\")");
+        sb.AppendLine("wan1_speedtest_running=$(is_speedtest_running \"$WAN1_LOG_NAME\")");
+        sb.AppendLine("wan2_speedtest_running=$(is_speedtest_running \"$WAN2_LOG_NAME\")");
+        sb.AppendLine("wan1_error=$(get_last_error \"$WAN1_LOG_NAME\")");
+        sb.AppendLine("wan2_error=$(get_last_error \"$WAN2_LOG_NAME\")");
+        sb.AppendLine("timestamp=$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")");
+        sb.AppendLine();
+        sb.AppendLine("# Check if SQM is active (has TC rules)");
+        sb.AppendLine("wan1_active=\"false\"");
+        sb.AppendLine("wan2_active=\"false\"");
+        sb.AppendLine("[ -n \"$wan1_rate\" ] && wan1_active=\"true\"");
+        sb.AppendLine("[ -n \"$wan2_rate\" ] && wan2_active=\"true\"");
+        sb.AppendLine();
+        sb.AppendLine("# Output JSON");
+        sb.AppendLine("cat <<EOF");
+        sb.AppendLine("{");
+        sb.AppendLine("  \"timestamp\": \"$timestamp\",");
+        sb.AppendLine("  \"wan1\": {");
+        sb.AppendLine("    \"name\": \"$WAN1_NAME\",");
+        sb.AppendLine("    \"interface\": \"$WAN1_INTERFACE\",");
+        sb.AppendLine("    \"active\": $wan1_active,");
+        sb.AppendLine("    \"current_rate_mbps\": ${wan1_mbps:-0},");
+        sb.AppendLine("    \"baseline_mbps\": ${wan1_baseline:-0},");
+        sb.AppendLine("    \"last_speedtest\": $wan1_speedtest,");
+        sb.AppendLine("    \"last_ping\": $wan1_ping,");
+        sb.AppendLine("    \"speedtest_running\": $wan1_speedtest_running,");
+        sb.AppendLine("    \"last_error\": $wan1_error");
+        sb.AppendLine("  },");
+        sb.AppendLine("  \"wan2\": {");
+        sb.AppendLine("    \"name\": \"$WAN2_NAME\",");
+        sb.AppendLine("    \"interface\": \"$WAN2_INTERFACE\",");
+        sb.AppendLine("    \"active\": $wan2_active,");
+        sb.AppendLine("    \"current_rate_mbps\": ${wan2_mbps:-0},");
+        sb.AppendLine("    \"baseline_mbps\": ${wan2_baseline:-0},");
+        sb.AppendLine("    \"last_speedtest\": $wan2_speedtest,");
+        sb.AppendLine("    \"last_ping\": $wan2_ping,");
+        sb.AppendLine("    \"speedtest_running\": $wan2_speedtest_running,");
+        sb.AppendLine("    \"last_error\": $wan2_error");
+        sb.AppendLine("  }");
+        sb.AppendLine("}");
+        sb.AppendLine("EOF");
+        sb.AppendLine("HANDLER_EOF");
+        sb.AppendLine();
+        sb.AppendLine("chmod +x \"$SQM_MONITOR_DIR/sqm-monitor.sh\"");
+        sb.AppendLine();
+        sb.AppendLine("# Create HTTP server script (busybox httpd + CGI)");
+        sb.AppendLine("cat > \"$SQM_MONITOR_DIR/sqm-server.sh\" << 'SERVER_EOF'");
+        sb.AppendLine("#!/bin/sh");
+        sb.AppendLine($"PORT=\"${{SQM_MONITOR_PORT:-{port}}}\"");
+        sb.AppendLine("SCRIPT_DIR=\"$(dirname \"$(readlink -f \"$0\")\")\"");
+        sb.AppendLine("CGI_DIR=\"$SCRIPT_DIR/cgi-bin\"");
+        sb.AppendLine();
+        sb.AppendLine("mkdir -p \"$CGI_DIR\"");
+        sb.AppendLine();
+        sb.AppendLine("# Create CGI handler - all methods return data (read-only endpoint)");
+        sb.AppendLine("cat > \"$CGI_DIR/index.cgi\" << 'CGI_EOF'");
+        sb.AppendLine("#!/bin/sh");
+        sb.AppendLine("echo \"Content-Type: application/json\"");
+        sb.AppendLine("echo \"Access-Control-Allow-Origin: *\"");
+        sb.AppendLine("echo \"\"");
+        sb.AppendLine("/data/sqm-monitor/sqm-monitor.sh");
+        sb.AppendLine("CGI_EOF");
+        sb.AppendLine("chmod +x \"$CGI_DIR/index.cgi\"");
+        sb.AppendLine();
+        sb.AppendLine("# Create httpd config - route all requests to the CGI script");
+        sb.AppendLine("cat > \"$SCRIPT_DIR/httpd.conf\" << 'CONF_EOF'");
+        sb.AppendLine("*.cgi:/data/sqm-monitor/cgi-bin/index.cgi");
+        sb.AppendLine("CONF_EOF");
+        sb.AppendLine();
+        sb.AppendLine("echo \"Starting SQM Monitor HTTP server on port $PORT...\"");
+        sb.AppendLine("exec busybox httpd -f -p \"$PORT\" -h \"$SCRIPT_DIR\" -c \"$SCRIPT_DIR/httpd.conf\"");
+        sb.AppendLine("SERVER_EOF");
+        sb.AppendLine();
+        sb.AppendLine("chmod +x \"$SQM_MONITOR_DIR/sqm-server.sh\"");
+        sb.AppendLine();
+        sb.AppendLine("# Create systemd service with security hardening");
+        sb.AppendLine("cat > \"$SERVICE_FILE\" << 'SERVICE_EOF'");
+        sb.AppendLine("[Unit]");
+        sb.AppendLine("Description=SQM Monitor HTTP Server");
+        sb.AppendLine("After=network.target");
+        sb.AppendLine("Documentation=man:busybox(1)");
+        sb.AppendLine();
+        sb.AppendLine("[Service]");
+        sb.AppendLine("Type=simple");
+        sb.AppendLine($"Environment=\"SQM_MONITOR_PORT={port}\"");
+        sb.AppendLine("ExecStart=/data/sqm-monitor/sqm-server.sh");
+        sb.AppendLine("Restart=always");
+        sb.AppendLine("RestartSec=5");
+        sb.AppendLine("StandardOutput=append:/var/log/sqm-monitor.log");
+        sb.AppendLine("StandardError=append:/var/log/sqm-monitor.log");
+        sb.AppendLine("User=root");
+        sb.AppendLine();
+        sb.AppendLine("# Security hardening");
+        sb.AppendLine("ProtectSystem=strict");
+        sb.AppendLine("ReadWritePaths=/var/log /data/sqm-monitor /data/sqm");
+        sb.AppendLine("PrivateTmp=true");
+        sb.AppendLine();
+        sb.AppendLine("[Install]");
+        sb.AppendLine("WantedBy=multi-user.target");
+        sb.AppendLine("SERVICE_EOF");
+        sb.AppendLine();
+        // Clean up legacy watchdog (nc-based server needed a watchdog; busybox httpd doesn't)
+        sb.AppendLine("# Clean up legacy watchdog timer/service and cron (no longer needed with httpd)");
+        sb.AppendLine("if systemctl is-active sqm-monitor-watchdog.timer >/dev/null 2>&1; then");
+        sb.AppendLine("    systemctl stop sqm-monitor-watchdog.timer 2>/dev/null");
+        sb.AppendLine("    systemctl disable sqm-monitor-watchdog.timer 2>/dev/null");
+        sb.AppendLine("fi");
+        sb.AppendLine("rm -f /etc/systemd/system/sqm-monitor-watchdog.timer /etc/systemd/system/sqm-monitor-watchdog.service");
+        sb.AppendLine("(crontab -l 2>/dev/null | grep -v sqm-watchdog) | crontab -");
+        sb.AppendLine("rm -f \"$SQM_MONITOR_DIR/sqm-watchdog.sh\"");
+        sb.AppendLine("systemctl daemon-reload");
+        sb.AppendLine();
+        sb.AppendLine("systemctl enable \"$SERVICE_NAME\"");
+        sb.AppendLine("systemctl restart \"$SERVICE_NAME\"");
+        sb.AppendLine();
+        sb.AppendLine("if systemctl is-active --quiet \"$SERVICE_NAME\"; then");
+        sb.AppendLine("    echo \"$(date): SQM Monitor started on port $PORT (busybox httpd)\" >> \"$LOG_FILE\"");
+        sb.AppendLine("else");
+        sb.AppendLine("    echo \"$(date): SQM Monitor failed to start\" >> \"$LOG_FILE\"");
+        sb.AppendLine("    exit 1");
+        sb.AppendLine("fi");
+
+        return sb.ToString();
+    }
+}
+
+/// <summary>
+/// Per-WAN SQM status from gateway logs
+/// </summary>
+public class SqmWanStatus
+{
+    public string Name { get; set; } = "";
+    public string Interface { get; set; } = "";
+    public double CurrentRateMbps { get; set; }
+    public DateTime? LastSpeedtest { get; set; }
+    public double? LastSpeedtestMeasured { get; set; }
+    public double? LastSpeedtestAdjusted { get; set; }
+    public DateTime? LastPingAdjustment { get; set; }
+    public double? LastLatencyMs { get; set; }
+    public double? LastPingRate { get; set; }
+    public bool HasRecentActivity => LastSpeedtest.HasValue || LastPingAdjustment.HasValue;
+}
+
+/// <summary>
+/// Status of SQM deployment on the gateway
+/// </summary>
+public class SqmDeploymentStatus
+{
+    public bool IsDeployed { get; set; }
+    public bool UdmBootInstalled { get; set; }
+    public bool UdmBootEnabled { get; set; }
+    public bool SpeedtestScriptDeployed { get; set; }
+    public bool PingScriptDeployed { get; set; }
+    public bool TcMonitorDeployed { get; set; }
+    public bool WatchdogTimerRunning { get; set; }
+    public int CronJobsConfigured { get; set; }
+    public bool SpeedtestCliInstalled { get; set; }
+    public bool BcInstalled { get; set; }
+    public bool JqInstalled { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>
+    /// Deployed ping scripts that predate the probe lock and so keep adjusting during a congestion
+    /// learning sample. Zero once Adaptive SQM has been redeployed from a build that has the guard.
+    /// </summary>
+    public int PingScriptsWithoutProbeGuard { get; set; }
+
+    /// <summary>Deployed scripts still calculating rates with bc, which every upgrade removes.</summary>
+    public int ScriptsUsingBc { get; set; }
+
+    /// <summary>
+    /// True when the gateway is unreachable only because this site's on-site agent
+    /// isn't online yet (a transient startup state on an agent-routed site), not a
+    /// real connection failure. The UI shows a neutral "waiting" note rather than a
+    /// connection error. Always false for a directly-reached site.
+    /// </summary>
+    public bool AwaitingAgent { get; set; }
+}
+
+/// <summary>
+/// Result of SQM deployment operation
+/// </summary>
+public class SqmDeploymentResult
+{
+    public bool Success { get; set; }
+    public string? Message { get; set; }
+    public string? Error { get; set; }
+    public List<string> Steps { get; set; } = new();
+
+    /// <summary>
+    /// Non-fatal warnings that occurred during deployment.
+    /// Scripts are deployed but may not have activated correctly.
+    /// </summary>
+    public List<string> Warnings { get; set; } = new();
+
+    /// <summary>
+    /// True if there are warnings the user should be aware of.
+    /// </summary>
+    public bool HasWarnings => Warnings.Count > 0;
+}

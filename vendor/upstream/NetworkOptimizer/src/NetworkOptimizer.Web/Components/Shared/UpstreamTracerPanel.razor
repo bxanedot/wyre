@@ -1,0 +1,1140 @@
+@using Microsoft.EntityFrameworkCore
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Web.Services.Monitoring
+@implements IDisposable
+@inject UpstreamTracerService Tracer
+@inject NetworkOptimizer.Web.Services.Monitoring.UpstreamTracerRegistry TracerRegistry
+@inject NetworkOptimizer.Web.Services.Monitoring.MonitoringPathView PathView
+@inject NetworkOptimizer.Web.Services.IUpstreamDiscoveryService Discovery
+@inject ILogger<UpstreamTracerPanel> Logger
+@inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject SiteContextService SiteCtx
+@inject NetworkOptimizer.Web.Services.Monitoring.ProbeExecutorFactory ExecutorFactory
+@inject IJSRuntime JS
+@inject NetworkOptimizer.Web.Services.LanFlowMap.LanFlowMapCache FlowMapCache
+@inject Microsoft.AspNetCore.Authorization.IAuthorizationService Authz
+@using NetworkOptimizer.Web.Services.Authorization
+@using Microsoft.AspNetCore.Components.Authorization
+
+<div class="card">
+    <div class="card-header card-header-collapsible" @onclick="ToggleCollapse">
+        <h2 class="card-title">Upstream Path Discovery</h2>
+        @if (_wanChoices.Count > 1)
+        {
+            <div class="time-range-selector wan-selector @(_wanChoices.Count > 3 ? "wan-selector-many" : "")" @onclick:stopPropagation>
+                @foreach (var w in _wanChoices)
+                {
+                    <button class="time-btn @(string.Equals(w.Key, _selectedTracerWanKey, StringComparison.OrdinalIgnoreCase) ? "active" : "")"
+                            @onclick="() => PickTracerWanAsync(w.Key)" @onclick:stopPropagation
+                            data-tooltip="@(w.IsPrimary && _needsReview ? "Discovery review pending" : null)" data-tooltip-hover-only>
+                        @{
+                            var wp = NetworkOptimizer.UniFi.GatewayWanHelper.SplitWanLabel(
+                                w.Label, NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(w.Key));
+                        }@(wp.Name ?? w.Label)@if (wp.WanToken != null && wp.Name != null)
+                        {<span class="wan-pill-token">@wp.WanToken</span>}@if (w.IsPrimary && _needsReview)
+                        {<span style="color: var(--warning-color);">&#9679;</span>}
+                    </button>
+                }
+            </div>
+        }
+        <div class="card-header-badges">
+            <span class="status-badge @StateBadgeClass(_state.Step)" @onclick:stopPropagation="true">@StateLabel(_state.Step)</span>
+            <span class="issue-type-chevron">@(_collapsed ? "▼" : "▲")</span>
+        </div>
+    </div>
+    <div class="expand-wrapper @(!_collapsed ? "expanded" : "")">
+        <div class="expand-content">
+    <div class="card-body">
+        @if (_needsReview && _state.Step != TracerStep.ReviewingResults && _state.Step != TracerStep.Done)
+        {
+            <div class="alert alert-warning" style="margin-bottom: 1rem;">
+                <strong>Upstream path may have changed.</strong>
+                The scheduled 7-day re-discovery found a different set of hops or ASNs
+                than the targets currently saved. Run discovery to see what changed and
+                update your targets.
+            </div>
+        }
+        @if (!CanDiscover)
+        {
+            <div class="alert alert-info" style="margin-bottom: 0;">
+                <strong>Deploy an On-Site Agent first.</strong>
+                Upstream discovery traces the path from inside this site's network, so it needs a
+                connected Agent at the site. Enroll one from <a href="@($"/settings?tab=multisite&configure={SiteCtx.Slug}")">Settings &gt; Multi-Site</a>, then
+                run discovery here.
+            </div>
+        }
+        else if (_state.Step == TracerStep.Idle)
+        {
+            <p class="section-description">
+                Trace your network's path from the gateway to common internet destinations
+                so we can monitor each upstream ISP and transit ASN for outages or path
+                changes. The wizard runs traceroutes in both ICMP and UDP modes,
+                identifies your access ISP's first-mile device, attributes each transit
+                hop to an ASN, and proposes monitoring targets for review.
+            </p>
+            <div class="action-buttons">
+                <SiteOperatorOnly>
+                    <button class="btn btn-primary" @onclick="StartAsync">Discover upstream path</button>
+                </SiteOperatorOnly>
+            </div>
+        }
+        else if (_state.Step == TracerStep.Failed)
+        {
+            <div class="alert alert-warning">
+                <strong>Discovery stopped.</strong>
+                @_state.FailureMessage
+            </div>
+            <div class="action-buttons">
+                <SiteOperatorOnly>
+                    <button class="btn btn-primary" @onclick="StartAsync">Try again</button>
+                </SiteOperatorOnly>
+            </div>
+        }
+        else
+        {
+            <div class="form-group">
+                <label class="form-label">Step</label>
+                <div class="form-value">@StateLabel(_state.Step)</div>
+            </div>
+            @if (!string.IsNullOrEmpty(_state.CurrentActivity))
+            {
+                <div class="form-group">
+                    <label class="form-label">Activity</label>
+                    <div class="form-value">@_state.CurrentActivity</div>
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(_state.WanIpAddress))
+            {
+                <div class="form-group">
+                    <label class="form-label">WAN IP</label>
+                    <div class="form-value">
+                        <code>@_state.WanIpAddress</code>
+                        @if (_state.IsCgnat)
+                        {
+                            <span class="status-badge status-active" style="margin-left: 0.5rem;">CGNAT</span>
+                        }
+                        @if (_state.IsDoubleNat)
+                        {
+                            <span class="status-badge status-disconnected" style="margin-left: 0.5rem;">Double-NAT</span>
+                        }
+                    </div>
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(_state.WanNeighborMac))
+            {
+                <div class="form-group">
+                    <label class="form-label">L2 neighbor</label>
+                    <div class="form-value">
+                        <code>@_state.WanNeighborMac</code>
+                        @if (!string.IsNullOrEmpty(_state.WanNeighborOuiVendor))
+                        {
+                            <span style="margin-left: 0.5rem;">@_state.WanNeighborOuiVendor</span>
+                        }
+                    </div>
+                </div>
+            }
+
+            @if (_state.Step == TracerStep.ReviewingResults)
+            {
+                @if (_state.IspChange != null)
+                {
+                    var change = _state.IspChange;
+                    <div class="alert alert-warning isp-change-review">
+                        <strong>Did you switch internet providers?</strong>
+                        <p>
+                            This discovery reached the internet through
+                            <code>AS@(change.NewAsnNumber)</code> <span class="text-muted">(@change.NewAsnName)</span>,
+                            but your upstream monitoring is set up for
+                            <code>AS@(change.OldAsnNumber)</code> <span class="text-muted">(@change.OldAsnName)</span>.
+                            Pick an answer below, then save.
+                        </p>
+                        <div class="isp-change-choices">
+                            <label class="isp-change-choice">
+                                <input type="radio" name="isp-change" checked="@(change.Confirmed == true)"
+                                       @onchange="() => change.Confirmed = true" />
+                                <span>
+                                    <strong>Yes, I switched providers - start fresh.</strong>
+                                    Saving pauses @(change.TargetCount == 1 ? "your 1 current upstream monitoring target" : $"all {change.TargetCount} current upstream monitoring targets")@(change.ManualCount > 0 ? $" (including {change.ManualCount} hand-added)" : "") for this connection
+                                    and the results below become your new baseline. Nothing is deleted.
+                                </span>
+                            </label>
+                            <label class="isp-change-choice">
+                                <input type="radio" name="isp-change" checked="@(change.Confirmed == false)"
+                                       @onchange="() => change.Confirmed = false" />
+                                <span>
+                                    <strong>No, keep monitoring my current targets.</strong>
+                                    Everything stays as it is, and we won't ask again about this network.
+                                </span>
+                            </label>
+                        </div>
+                    </div>
+                }
+
+                <div class="form-group">
+                    <label class="form-label">Access network technology</label>
+                    <select class="form-control upstream-tech-select @AccessTechAttentionClass"
+                            value="@((int)_state.AccessTechnology)" disabled="@(!_canOperate)"
+                            @onchange="OnAccessTechChangedAsync">
+                        @foreach (var tech in AccessTechOptions)
+                        {
+                            <option value="@((int)tech)">@FormatTechName(tech)</option>
+                        }
+                    </select>
+                    @if (_state.AccessTechnologyInferred)
+                    {
+                        <p class="form-help upstream-tech-inferred-help">
+                            Guessed from the first upstream device
+                            (@(_state.WanNeighborOuiVendor ?? "its vendor")). Change it if that's wrong -
+                            it sets the thresholds your connection is graded against.
+                        </p>
+                    }
+                </div>
+
+                @if (_state.Traces.Count > 0)
+                {
+                    <div class="form-group">
+                        <label class="form-label">Trace results</label>
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Destination</th>
+                                        <th>Mode</th>
+                                        <th>Hops</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var trace in _state.Traces)
+                                    {
+                                        <tr>
+                                            <td>@trace.CdnLabel <span class="text-muted">(@trace.CdnEndpoint)</span></td>
+                                            <td>@trace.Mode.ToDisplayName()</td>
+                                            <td>@trace.HopsResponding / @trace.HopsRecorded</td>
+                                            <td>
+                                                @if (trace.Reached)
+                                                {
+                                                    <span class="status-badge status-connected">Reached</span>
+                                                }
+                                                else if (trace.HopsResponding > 0)
+                                                {
+                                                    <span class="status-badge status-active">Partial</span>
+                                                }
+                                                else
+                                                {
+                                                    <span class="status-badge status-disconnected">No reply</span>
+                                                }
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                }
+
+                @if (_state.AccessHops.Count > 0)
+                {
+                    <div class="form-group">
+                        <label class="form-label">Access ISP hops</label>
+                        <p class="section-description">First-mile hops on @AccessAsnDisplay(). Rename or disable any row before saving.</p>
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 40px;"></th>
+                                        <th>Label</th>
+                                        <th>Address</th>
+                                        <th>Source</th>
+                                        <th>Role</th>
+                                        <th>RTT</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var hop in _state.AccessHops)
+                                    {
+                                        <tr class="@(hop.Unreachable ? "row-disabled" : hop.Enabled ? "" : "row-disabled")">
+                                            <td>
+                                                <input type="checkbox" checked="@hop.Enabled"
+                                                       disabled="@hop.Unreachable"
+                                                       @onchange="e => hop.Enabled = (bool)e.Value!" />
+                                            </td>
+                                            <td>
+                                                <input type="text" class="form-control form-control-sm"
+                                                       @bind="hop.Label" @bind:event="oninput"
+                                                       disabled="@hop.Unreachable" />
+                                            </td>
+                                            <td><code>@hop.Address</code> @(string.IsNullOrEmpty(hop.PtrHostname) ? "" : $"({hop.PtrHostname})")</td>
+                                            <td>@(hop.Method == DiscoveryMethod.L2Neighbor ? "L2 neighbor" : hop.Method == DiscoveryMethod.ConfiguredFallback ? "Curated" : $"Hop {hop.HopNumber}")</td>
+                                            <td>@hop.Role.ToDisplayName()</td>
+                                            <td>@(hop.Unreachable ? "Unreachable" : hop.VerifiedRttMs.HasValue ? $"{hop.VerifiedRttMs:F1} ms" : "-")</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                }
+
+                @if (TransitRouters.Count > 0)
+                {
+                    <div class="form-group">
+                        <label class="form-label">Transit networks</label>
+                        <p class="section-description">Distinct networks between your ISP and the destinations (each one's ASN shown for reference).</p>
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 40px;"></th>
+                                        <th>Label</th>
+                                        <th>Address</th>
+                                        <th>ASN</th>
+                                        <th>RTT</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var asn in TransitRouters)
+                                    {
+                                        <tr class="@(asn.Unreachable ? "row-disabled" : asn.Enabled ? "" : "row-disabled")">
+                                            <td>
+                                                <input type="checkbox" checked="@asn.Enabled"
+                                                       disabled="@asn.Unreachable"
+                                                       @onchange="e => asn.Enabled = (bool)e.Value!" />
+                                            </td>
+                                            <td>
+                                                <input type="text" class="form-control form-control-sm"
+                                                       @bind="asn.Label" @bind:event="oninput"
+                                                       disabled="@asn.Unreachable" />
+                                            </td>
+                                            <td><code>@asn.HopAddress</code></td>
+                                            <td><code>AS@(asn.AsnNumber)</code> <span class="text-muted">@asn.AsnName</span></td>
+                                            @if (asn.OffPath)
+                                            {
+                                                <td>Different route <span class="tooltip-icon tooltip-icon-sm" data-tooltip="This router answers ping, but by a different route than your traffic takes through it. Its latency would not reflect your connection's path, so it is not monitored.">?</span></td>
+                                            }
+                                            else
+                                            {
+                                                <td>@(asn.Unreachable ? "Unreachable" : asn.VerifiedRttMs.HasValue ? $"{asn.VerifiedRttMs:F1} ms" : "-")</td>
+                                            }
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                }
+
+                @if (_state.RemovedTransitAsns.Count > 0)
+                {
+                    <div class="form-group">
+                        <label class="form-label">No longer on your path</label>
+                        <p class="section-description">These transit networks were being monitored but haven't appeared in the last several discovery runs - your ISP no longer routes through them, so their targets would report false problems. They'll be paused when you save; re-check any you want to keep. Nothing is deleted.</p>
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 115px;">Keep Active</th>
+                                        <th>ASN</th>
+                                        <th>Targets to pause</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var removed in _state.RemovedTransitAsns)
+                                    {
+                                        <tr class="@(removed.Keep ? "" : "row-disabled")">
+                                            <td>
+                                                <input type="checkbox" checked="@removed.Keep"
+                                                       @onchange="e => removed.Keep = (bool)e.Value!" />
+                                            </td>
+                                            <td><code>AS@(removed.AsnNumber)</code> <span class="text-muted">@removed.AsnName</span></td>
+                                            <td>@(removed.TargetCount == 1 ? "1 target" : $"{removed.TargetCount} targets")@(removed.ManualCount > 0 ? $" ({removed.ManualCount} hand-added)" : "")</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                }
+
+                @if (_state.PendingRemovalTransitAsns.Count > 0)
+                {
+                    <div class="form-group">
+                        <label class="form-label">Tracking possible removals</label>
+                        <p class="section-description">These transit networks are no longer on your path this run. We're tracking them - after the remaining discovery runs shown below without them reappearing, we'll help you remove the affected targets. Nothing changes until then.</p>
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>ASN</th>
+                                        <th>Status</th>
+                                        <th>Affected targets</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var pending in _state.PendingRemovalTransitAsns)
+                                    {
+                                        <tr>
+                                            <td><code>AS@(pending.AsnNumber)</code> <span class="text-muted">@pending.AsnName</span></td>
+                                            <td>Absent @pending.MissCount of @(pending.MissCount + pending.RunsRemaining) runs - @(pending.RunsRemaining == 1 ? "1 more run" : $"{pending.RunsRemaining} more runs") to confirm</td>
+                                            <td>@(pending.TargetCount == 1 ? "1 target" : $"{pending.TargetCount} targets")@(pending.ManualCount > 0 ? $" ({pending.ManualCount} hand-added)" : "")</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                }
+
+                @if (PathEndHosts.Count > 0)
+                {
+                    <div class="form-group">
+                        <label class="form-label">Path-end Internet hosts</label>
+                        <p class="section-description">CDN and Internet services reachable through the discovered transit path.</p>
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 40px;"></th>
+                                        <th>Label</th>
+                                        <th>Endpoint</th>
+                                        <th>ASN</th>
+                                        <th>Via</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var host in PathEndHosts)
+                                    {
+                                        <tr class="@(host.Enabled ? "" : "row-disabled")">
+                                            <td>
+                                                <input type="checkbox" checked="@host.Enabled"
+                                                       @onchange="e => host.Enabled = (bool)e.Value!" />
+                                            </td>
+                                            <td>
+                                                <input type="text" class="form-control form-control-sm"
+                                                       @bind="host.Label" @bind:event="oninput" />
+                                            </td>
+                                            <td><code>@host.PathProxyTarget</code></td>
+                                            <td><code>AS@(host.AsnNumber)</code> <span class="text-muted">@host.AsnName</span></td>
+                                            <td>
+                                                @if (host.ViaAsnNumber is int viaAsn)
+                                                {
+                                                    <code>AS@(viaAsn)</code> <span class="text-muted">@host.ViaAsnName</span>
+                                                }
+                                                else if (host.ViaPathComplete)
+                                                {
+                                                    <span class="text-muted">peered</span>
+                                                }
+                                                else
+                                                {
+                                                    <span class="text-muted">&mdash;</span>
+                                                }
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                }
+
+                @if (_state.AccessHops.Count == 0 && _state.TransitAsns.Count == 0
+                     && _state.RemovedTransitAsns.Count == 0 && _state.PendingRemovalTransitAsns.Count == 0)
+                {
+                    <div class="alert alert-info">
+                        No upstream hops responded to either ICMP or UDP traceroute. Your
+                        ISP may be filtering trace probes; nothing to commit on this run.
+                    </div>
+                }
+
+                <div class="action-buttons">
+                    <SiteOperatorOnly>
+                        <button class="btn btn-secondary" @onclick="StartAsync">Re-run discovery</button>
+                    </SiteOperatorOnly>
+                    @if (_state.AccessHops.Any(h => h.Enabled) || _state.TransitAsns.Any(a => a.Enabled) || _state.RemovedTransitAsns.Count > 0)
+                    {
+                        <SiteOperatorOnly>
+                            <button class="btn btn-primary" @onclick="CommitAsync"
+                                disabled="@(_state.IspChange is { Confirmed: null })"
+                                data-tooltip="@(_state.IspChange is { Confirmed: null } ? "Answer the provider question above first" : null)">
+                            Save monitoring targets
+                        </button>
+                        </SiteOperatorOnly>
+                    }
+                </div>
+            }
+            else if (_state.Step == TracerStep.Done)
+            {
+                @if (_justSaved)
+                {
+                    <div class="alert alert-success">
+                        Targets saved. The monitor will start probing them shortly.
+                    </div>
+                }
+                <div class="action-buttons">
+                    <SiteOperatorOnly>
+                        <button class="btn btn-secondary" @onclick="StartAsync">Run discovery again</button>
+                    </SiteOperatorOnly>
+                </div>
+            }
+            else
+            {
+                <div class="loading-state">
+                    <span class="spinner"></span>
+                    <span>Running...</span>
+                </div>
+            }
+        }
+    </div>
+        </div>
+    </div>
+</div>
+
+
+@* Scroll behavior for THIS card only. Deliberately not in shared JS: it is a niche affordance for a
+   long-running discovery, and when it lived alongside the app-wide helpers it reached into the
+   scroller every page shares and broke an unrelated jump. Defined here, it ships with the panel and
+   nothing else can call it. *@
+<script suppress-error="BL9992">
+    window.noUpstreamPin = (function () {
+        var release = null;
+        var goTop = false;
+        var frozen = false;
+
+        // Glide rather than jump, matching the app-wide card expand. That one looks smooth because a
+        // CSS transition feeds it a few pixels per frame; here the content arrives in chunks of
+        // several hundred pixels at a time, so applying the whole correction in one frame is exactly
+        // the snap this replaces. Easing a fraction of what remains each frame reads as the view
+        // following the work, and re-targets for free every time another section lands.
+        var EASE = 0.18;
+        var SETTLED = 1;
+        // A correction that cannot move (already at the top or bottom of the scroller) would
+        // otherwise ease forever against a clamp.
+        var MAX_STALLED_FRAMES = 12;
+
+        function start(id) {
+            stop();
+            if (!document.getElementById(id)) return;
+            goTop = false;
+            frozen = false;
+
+            var scrollerOf = function (node) {
+                for (var n = node.parentElement; n && n !== document.body; n = n.parentElement) {
+                    var oy = getComputedStyle(n).overflowY;
+                    if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 4) return n;
+                }
+                return document.scrollingElement || document.documentElement;
+            };
+
+            // How far the view is from where it should be right now, or 0 when it is close enough.
+            var correction = function (cur, sc) {
+                var isDoc = sc === document.scrollingElement || sc === document.documentElement;
+                var paneTop = isDoc ? 0 : sc.getBoundingClientRect().top;
+                var r = cur.getBoundingClientRect();
+                var drift = r.top - paneTop;
+
+                // AT THE END: land on the TOP, not wherever the follow had got to. Following the
+                // edge is right while sections are still arriving; at the end it parks you past all
+                // the detail you came for, so the last move is to the start of the card.
+                if (goTop) return Math.abs(drift) > 2 ? drift : 0;
+
+                // WHILE RUNNING: show the newest work. If the card still fits the pane, holding its
+                // top does that already; once it is taller, follow the bottom edge so each section
+                // appears as it lands.
+                //
+                // No spacer either way. Adding one below this card pushed the Latency targets panel
+                // off screen, and adding it to the pane wrote to layout every page shares; the
+                // write is simply allowed to clamp when there is nowhere further to go.
+                if (r.height <= sc.clientHeight) return Math.abs(drift) > 2 ? drift : 0;
+                var paneBottom = isDoc ? window.innerHeight : sc.getBoundingClientRect().bottom;
+                // Both directions. A section that measures tall while it is building and settles
+                // shorter a frame later leaves the view parked past the end of the card, and a
+                // downward-only follow has no way back - it reads as scrolling below the results and
+                // staying there until the run ends. Correcting upward too means an overshoot is
+                // undone as soon as the layout settles, which is the frame after it happens.
+                var below = r.bottom - paneBottom;
+                // Never past the card's own top. Following the newest section is worth doing while
+                // the card grows a screen at a time; the terminal render arrives all at once and is
+                // the largest of the run, so an unbounded follow throws the view to the end of a
+                // review nobody has read. Freezing before that render is a race - this is not one:
+                // however big the jump, the header stays at the top of the pane, which is where the
+                // state and the controls are. Upward corrections are unbounded, since those only
+                // ever undo an overshoot.
+                if (below > 0) below = Math.min(below, Math.max(0, r.top - paneTop));
+                return Math.abs(below) > 2 ? below : 0;
+            };
+
+            var raf = 0;
+            var stalled = 0;
+            var frame = function () {
+                var cur = document.getElementById(id);
+                if (!cur) { stop(); return; }
+
+                // Hold position while the terminal render lands. It is the largest one of the run -
+                // the whole review UI arrives at once - and following it drags the view to the
+                // bottom of results we are about to leave, so the landing that follows reads as a
+                // long scroll back up rather than a single move.
+                if (frozen) { raf = requestAnimationFrame(frame); return; }
+
+                var sc = scrollerOf(cur);
+                var delta = correction(cur, sc);
+
+                if (Math.abs(delta) <= SETTLED) {
+                    stalled = 0;
+                    // Nothing left to do and nothing more coming: the run is over.
+                    if (goTop) { stop(); return; }
+                } else {
+                    var step = delta * EASE;
+                    // Cover the last pixel or two outright rather than crawling at them.
+                    if (Math.abs(step) < 0.5) step = delta;
+                    var before = sc.scrollTop;
+                    sc.scrollTop += step;
+                    if (sc.scrollTop === before && ++stalled >= MAX_STALLED_FRAMES) {
+                        if (goTop) { stop(); return; }
+                    } else if (sc.scrollTop !== before) {
+                        stalled = 0;
+                    }
+                }
+                raf = requestAnimationFrame(frame);
+            };
+            // Wheel, touch and the scrolling keys are unambiguous intent; a scroll event would also
+            // catch our own corrections.
+            var give = function () { stop(); };
+            var keys = { PageDown: 1, PageUp: 1, ArrowDown: 1, ArrowUp: 1, Home: 1, End: 1, ' ': 1 };
+            var onKey = function (e) { if (keys[e.key]) give(); };
+            window.addEventListener('wheel', give, { passive: true });
+            window.addEventListener('touchmove', give, { passive: true });
+            window.addEventListener('keydown', onKey, true);
+
+            release = function () {
+                if (raf) cancelAnimationFrame(raf);
+                window.removeEventListener('wheel', give);
+                window.removeEventListener('touchmove', give);
+                window.removeEventListener('keydown', onKey, true);
+                release = null;
+                goTop = false;
+                frozen = false;
+            };
+            raf = requestAnimationFrame(frame);
+        }
+
+        function stop() { if (release) release(); }
+
+        // The run finishing is not the same as the card having finished growing: the render that
+        // carries the terminal state is the one that adds the review UI, so stopping on it leaves
+        // that last, largest addition unfollowed. Give the layout a moment, follow once more, then
+        // let go. A scroll of the reader's own still stops immediately via stop().
+        // Stop following, without deciding anything else yet. Called the moment the terminal state
+        // is OBSERVED - before Blazor renders it - because the render that carries the review UI is
+        // the largest of the run, and the follow loop only needs one frame with it to drag the view
+        // to the bottom of results nobody has read. Freezing from OnAfterRender was always a frame
+        // too late for exactly that reason.
+        function freeze() {
+            if (!release) return;
+            frozen = true;
+        }
+
+        function finish() {
+            if (!release) return;
+            // Belt and braces: freeze() has normally run already, but a run that reached its
+            // terminal state without passing through the poll still has to stop following here.
+            frozen = true;
+            setTimeout(function () {
+                // Layout has settled. Switch the loop's target to the card's top and let it ease
+                // there; it stops itself once it arrives. Setting the flag rather than jumping is
+                // what keeps the final move as smooth as the following that preceded it.
+                frozen = false;
+                goTop = true;
+            }, 400);
+        }
+
+        return { start: start, stop: stop, freeze: freeze, finish: finish };
+    })();
+</script>
+
+@code {
+    [Parameter] public bool ForceExpand { get; set; }
+
+    /// <summary>
+    /// A WAN this panel should open on, from a link that named one. Anything arriving here already
+    /// knows which WAN it meant - a WAN-scoped ISP Health report, say - so honouring it saves the
+    /// user landing on the primary's discovery and having to find the pill themselves.
+    /// </summary>
+    [Parameter] public string? SelectWanKey { get; set; }
+
+    /// <summary>Raised when the user picks a WAN here, so the tab's other filters can follow.</summary>
+    [Parameter] public EventCallback<string> OnWanSelected { get; set; }
+
+    private string? _appliedSelectWanKey;
+    [Parameter] public EventCallback OnSaved { get; set; }
+
+    // Discovery must trace from inside the site's network. On an external (non-default) site
+    // that requires the site's agent to own path measurement - otherwise the trace would run from
+    // the central server and mis-attribute its path as this site's. That is now decided by
+    // configuration rather than by an agent being connected this second.
+    //
+    // So a secondary site offers Discover even with no agent enrolled yet, and the run fails with
+    // "No on-site agent is online to run the probe". Deliberate (TJ, 2026-08-03): a button that
+    // says why beats a button that is missing. Do not re-gate this on the agent being live.
+    private bool CanDiscover => SiteCtx.IsDefault || ExecutorFactory.ServerVantageIsAgent;
+
+    private UpstreamTracerState _state = new();
+    private System.Threading.Timer? _pollTimer;
+    private bool _needsReview;
+    // Group by ASN so every hop in the same transit network lists together (including an injected
+    // witness like 4.2.2.2 for AS3356, which is added last). Networks are ordered nearest-first by
+    // their best RTT, and within each network by RTT ascending; unreachable hops sort to the end.
+    private List<TransitAsnCandidate> TransitRouters =>
+        _state.TransitAsns.Where(a => a.Method == DiscoveryMethod.DirectRouter)
+            .GroupBy(a => a.AsnNumber)
+            .OrderBy(g => g.Min(a => a.VerifiedRttMs ?? double.MaxValue))
+            .SelectMany(g => g.OrderBy(a => a.VerifiedRttMs ?? double.MaxValue))
+            .ToList();
+    private List<TransitAsnCandidate> PathEndHosts => _state.TransitAsns.Where(a => a.Method == DiscoveryMethod.PathProxy).ToList();
+    private bool _collapsed;
+    private DateTime _lastReviewCheck = DateTime.MinValue;
+    private bool _justSaved;
+    /// <summary>Whether this run has already told the pin to stop following. Once per run.</summary>
+    private bool _pinFrozen;
+
+    private static bool IsTerminalStep(TracerStep step) =>
+        step is TracerStep.Done or TracerStep.ReviewingResults or TracerStep.Failed;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        // Applied once per distinct value: re-selecting on every parameter set would fight the
+        // user's own pill clicks for as long as the link's parameter stayed in the URL. The
+        // choices may not be loaded on the first pass, so an unmatched key is left for a later
+        // one rather than discarded.
+        if (!string.IsNullOrEmpty(SelectWanKey)
+            && !string.Equals(SelectWanKey, _appliedSelectWanKey, StringComparison.OrdinalIgnoreCase)
+            && _wanChoices.Any(w => string.Equals(w.Key, SelectWanKey, StringComparison.OrdinalIgnoreCase)))
+        {
+            _appliedSelectWanKey = SelectWanKey;
+            await SelectTracerWanAsync(SelectWanKey!);
+        }
+
+        if (ForceExpand && _collapsed)
+            _collapsed = false;
+    }
+
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>
+    /// Running a discovery, committing its targets and setting the access technology are all Operator
+    /// on this site: they are part of running the network, and a mistake is fixed by running it again.
+    /// The wrapper components handle the buttons; this covers the technology select, which stays
+    /// visible so a Viewer can read what the site is scored as, and backs every handler below - the
+    /// wrappers decide what renders, not what may be invoked.
+    /// </summary>
+    private bool _canOperate;
+
+    // Per-WAN discovery view: the injected tracer is the site's primary; a context-bound WAN
+    // opens its own tracer instance (cached for the panel's lifetime so run state survives
+    // switching pills). Review remains an affordance, not a gate: unreviewed context runs
+    // keep auto-committing exactly as Phase 2 shipped - this only lets the user OPEN a
+    // context WAN's discovery, inspect it, and re-run/edit it like the primary's.
+    private UpstreamTracerService? _wanTracer;
+    private UpstreamTracerService Svc => _wanTracer ?? Tracer;
+    private sealed record TracerWanChoice(string Key, string Label, bool IsPrimary, WanContext? Context);
+    private List<TracerWanChoice> _wanChoices = new();
+    private string _selectedTracerWanKey = "";
+    private bool _tracerWanRestored;
+    private readonly Dictionary<string, UpstreamTracerService> _contextTracers = new(StringComparer.OrdinalIgnoreCase);
+    private string SharedWanScopeKey => SiteCtx.ScopeStorageKey("monitoringWanScope");
+
+    /// <summary>
+    /// Choices: the primary plus every context-bound WAN (per-WAN discovery exists only via a
+    /// context). Labels come from the live WAN list when the console offers one.
+    /// </summary>
+    private async Task LoadTracerWanChoicesAsync()
+    {
+        var choices = new List<TracerWanChoice>();
+        var liveWans = new List<NetworkOptimizer.Web.Services.Monitoring.WanSummary>();
+        try { liveWans = (await PathView.GetWansAsync()).ToList(); }
+        catch { }
+        List<WanContext> contexts = new();
+        try
+        {
+            await using var db = SiteDb.CreateForSite(SiteCtx.Slug, SiteCtx.IsDefault);
+            contexts = await db.WanContexts.AsNoTracking()
+                .Where(c => c.WanInterface != null && c.WanInterface != "")
+                .OrderBy(c => c.Name).ToListAsync();
+        }
+        catch { }
+        string LabelFor(string key, string? fallbackName)
+        {
+            var live = liveWans.FirstOrDefault(w => string.Equals(w.WanInterface, key, StringComparison.OrdinalIgnoreCase));
+            return NetworkOptimizer.UniFi.GatewayWanHelper.FormatWanLabel(
+                live?.FriendlyName ?? fallbackName,
+                NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(key), null, null);
+        }
+        // The console names the primary; the literal is the fallback for when it is unreachable.
+        // WAN group names carry no role information in UniFi Network, so that fallback is a guess
+        // and is wrong on a site whose primary is not the first group - it picks which WAN the
+        // panel opens on, and a reachable console corrects it on the next load.
+        var primaryKey = (liveWans.FirstOrDefault(w => w.IsPrimary)?.WanInterface ?? NetworkOptimizer.UniFi.GatewayWanHelper.DefaultWanKey).ToLowerInvariant();
+        choices.Add(new TracerWanChoice(primaryKey, LabelFor(primaryKey, null), IsPrimary: true, Context: null));
+        foreach (var ctx in contexts)
+        {
+            var key = ctx.WanInterface!.ToLowerInvariant();
+            if (choices.Any(c => c.Key == key)) continue;
+            choices.Add(new TracerWanChoice(key, LabelFor(key, ctx.Name), IsPrimary: false, Context: ctx));
+        }
+        // WAN order, not the order the vantages came back in - those are read by name, which put
+        // these pills out of sequence against every other WAN bar on the page.
+        _wanChoices = choices.Count > 1
+            ? choices.OrderBy(c => NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(c.Key)).ToList()
+            : new List<TracerWanChoice>();
+        _selectedTracerWanKey = primaryKey;
+    }
+
+    /// <summary>
+    /// Rebuilds the WAN choice bar. The choices are read once at init, so a WAN that gained a
+    /// vantage while the page was open had no pill to select and discovery could not be started
+    /// for it at all - on a site whose first vantage was just added, the bar did not exist yet.
+    /// </summary>
+    public async Task RefreshWanChoicesAsync()
+    {
+        var wasSelected = _selectedTracerWanKey;
+        await LoadTracerWanChoicesAsync();
+        // The reload lands on the primary, which is what init wants and not what this wants: a
+        // vantage being added elsewhere is no reason to move someone off the WAN they were on.
+        if (!string.IsNullOrEmpty(wasSelected)
+            && _wanChoices.Any(c => string.Equals(c.Key, wasSelected, StringComparison.OrdinalIgnoreCase)))
+        {
+            _selectedTracerWanKey = wasSelected;
+        }
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// A pill click here: select it, then tell the tab so its other filters follow. Separate from
+    /// <see cref="SelectTracerWanAsync"/>, which is also how an inbound selection is applied - going
+    /// through this one there would echo it straight back out.
+    /// </summary>
+    private async Task PickTracerWanAsync(string key)
+    {
+        // Same as the targets list: picking a WAN on a closed panel should show what was picked.
+        _collapsed = false;
+        await SelectTracerWanAsync(key);
+        _appliedSelectWanKey = key;
+        if (OnWanSelected.HasDelegate) await OnWanSelected.InvokeAsync(key);
+    }
+
+    private async Task SelectTracerWanAsync(string key)
+    {
+        var choice = _wanChoices.FirstOrDefault(c => string.Equals(c.Key, key, StringComparison.OrdinalIgnoreCase));
+        if (choice == null || string.Equals(key, _selectedTracerWanKey, StringComparison.OrdinalIgnoreCase)) return;
+        // The save notice belongs to the WAN it was saved for; carrying it onto another one says
+        // something happened here that did not.
+        _justSaved = false;
+        _selectedTracerWanKey = choice.Key;
+        if (choice.IsPrimary)
+        {
+            _wanTracer = null;
+        }
+        else
+        {
+            if (!_contextTracers.TryGetValue(choice.Key, out var tracer))
+            {
+                tracer = TracerRegistry.GetForContext(SiteCtx.Slug, choice.Context!);
+                _contextTracers[choice.Key] = tracer;
+            }
+            _wanTracer = tracer;
+        }
+        await Svc.RehydrateFromDbAsync();
+        _state = Svc.State;
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Opens the panel on the focused WAN from the shared analysis scope (view default only -
+    /// this panel never writes that key), once interop is reachable.
+    /// </summary>
+    private async Task RestoreTracerWanSelectionAsync()
+    {
+        if (_tracerWanRestored || _wanChoices.Count <= 1) return;
+        _tracerWanRestored = true;
+        try
+        {
+            var stored = await JS.InvokeAsync<string?>("localStorage.getItem", SharedWanScopeKey);
+            if (!string.IsNullOrEmpty(stored)
+                && _wanChoices.Any(c => !c.IsPrimary && string.Equals(c.Key, stored, StringComparison.OrdinalIgnoreCase)))
+            {
+                await SelectTracerWanAsync(stored);
+            }
+        }
+        catch { }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        _canOperate = AuthState is null
+            || (await Authz.AuthorizeAsync((await AuthState).User, SiteCtx.Slug, Policies.SiteOperator)).Succeeded;
+
+        await Svc.RehydrateFromDbAsync();
+        _state = Svc.State;
+        _collapsed = !ForceExpand && _state.Step == TracerStep.Done;
+        await RefreshReviewFlagAsync();
+        await LoadTracerWanChoicesAsync();
+        // Poll the tracer state every 1.5s while a run is active; the state machine
+        // runs in the background and the UI just observes. Re-check the rediscovery
+        // review flag less often (every minute) since it only changes from the
+        // background scheduler.
+        _pollTimer = new System.Threading.Timer(_ =>
+        {
+            try
+            {
+                _ = InvokeAsync(async () =>
+                {
+                    var wasRunning = !IsTerminalStep(_state.Step);
+                    _state = Svc.State;
+                    // Before StateHasChanged, so the follow loop is already stopped when the render
+                    // carrying the review UI lands.
+                    if (wasRunning && IsTerminalStep(_state.Step) && !_pinFrozen)
+                    {
+                        _pinFrozen = true;
+                        try { await JS.InvokeVoidAsync("noUpstreamPin.freeze"); }
+                        catch (Exception ex) { Logger.LogDebug(ex, "Could not freeze the discovery card pin"); }
+                    }
+                    if (DateTime.UtcNow - _lastReviewCheck > TimeSpan.FromMinutes(1))
+                        await RefreshReviewFlagAsync();
+                    StateHasChanged();
+                });
+            }
+            catch { }
+        }, null, TimeSpan.FromSeconds(1.5), TimeSpan.FromSeconds(1.5));
+    }
+
+    private async Task RefreshReviewFlagAsync()
+    {
+        try
+        {
+            await using var db = SiteDb.CreateForSite(SiteCtx.Slug, SiteCtx.IsDefault);
+            var settings = await db.MonitoringSettings.FirstOrDefaultAsync();
+            _needsReview = settings?.UpstreamDiscoveryNeedsReview == true;
+            _lastReviewCheck = DateTime.UtcNow;
+        }
+        catch { _needsReview = false; }
+    }
+
+    /// <summary>
+    /// Lets the card pin go once the run has settled. StartAsync returns while the run is still
+    /// going, so the release cannot live beside it - this fires on the render that carries the
+    /// terminal state instead.
+    /// </summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await RestoreTracerWanSelectionAsync();
+        if (_state.Step is TracerStep.Done or TracerStep.ReviewingResults or TracerStep.Failed)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("noUpstreamPin.finish");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Could not release the discovery card pin");
+            }
+        }
+    }
+
+    private async Task StartAsync()
+    {
+        if (!_canOperate) return;
+        _justSaved = false;
+        // Discovery adds sections to this card for a minute or so; keep its top in view rather than
+        // making the reader follow them down the page. Released when it finishes, or sooner if they
+        // scroll for themselves.
+        try
+        {
+            _pinFrozen = false;
+            await JS.InvokeVoidAsync("noUpstreamPin.start", "upstream-discovery");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not pin the discovery card while it runs");
+        }
+        // Deliberately NOT released here. StartAsync returns as soon as the run is under way, not
+        // when it finishes, so releasing in a finally killed the pin about a tick after it started -
+        // one correction, then nothing, with no scroll from the reader to explain it. The pin ends
+        // when the run reaches a terminal step (below), or the moment they scroll for themselves.
+        // Through the audited service, onto the SELECTED WAN's tracer - the reads above
+        // already follow Svc, and a run that silently hit the primary would trace the wrong WAN.
+        await Discovery.StartAsync(_wanTracer);
+        _state = Svc.State;
+        StateHasChanged();
+    }
+
+    private async Task CommitAsync()
+    {
+        if (!_canOperate) return;
+        await Discovery.CommitAsync(_wanTracer);
+        _state = Svc.State;
+        _justSaved = true;
+        await OnSaved.InvokeAsync();
+        StateHasChanged();
+
+        // Server side: invalidate the cached map snapshot so the next read
+        // rebuilds with the freshly committed monitoring targets. Client
+        // side: ask the LAN flow map module to re-fetch its snapshot and
+        // tear down + rebuild the scene so the new access cloud labels
+        // appear immediately without waiting for the cache TTL.
+        FlowMapCache.Invalidate();
+        try
+        {
+            await JS.InvokeVoidAsync(
+                "eval",
+                "if (window.__lanFlowMap?.reload) { window.__lanFlowMap.reload(); }");
+        }
+        catch { /* map not mounted on this page, fine */ }
+    }
+
+    private static string StateLabel(TracerStep step) => step switch
+    {
+        TracerStep.Idle => "Ready",
+        TracerStep.DetectingPublicIp => "Detecting public IP",
+        TracerStep.DiscoveringL2Neighbor => "Discovering L2 neighbor",
+        TracerStep.TracingAccessIsp => "Tracing your ISP",
+        TracerStep.TracingTransitAsns => "Tracing intermediate networks",
+        TracerStep.VerifyingReachability => "Verifying reachability",
+        TracerStep.ReviewingResults => "Review",
+        TracerStep.Done => "Done",
+        TracerStep.Failed => "Stopped",
+        _ => step.ToString()
+    };
+
+    private static string StateBadgeClass(TracerStep step) => step switch
+    {
+        TracerStep.Done => "status-connected",
+        TracerStep.ReviewingResults => "status-active",
+        TracerStep.Failed => "status-disconnected",
+        TracerStep.Idle => "status-disconnected",
+        _ => "status-active"
+    };
+
+    /// <summary>
+    /// Ring on the technology field: blue when nothing is set and the user has to pick one,
+    /// amber when this run guessed it from the upstream device's vendor and wants that
+    /// confirmed. Neither once the value is theirs.
+    /// </summary>
+    private string AccessTechAttentionClass =>
+        _state.AccessTechnologyInferred ? "upstream-tech-inferred"
+        : _state.AccessTechnology == AccessTechnology.Unknown ? "upstream-tech-unset"
+        : "";
+
+    private async Task OnAccessTechChangedAsync(ChangeEventArgs e)
+    {
+        if (!_canOperate) return;
+        _state.AccessTechnology = (AccessTechnology)int.Parse((string)e.Value!);
+        // Touching the field is the confirmation the highlight was asking for, whether they
+        // changed the value or re-picked the same one.
+        _state.AccessTechnologyInferred = false;
+        Svc.RecomputeL2NeighborLabel();
+        // How many targets arrive ticked depends on this field, and the run that proposed them
+        // may have had it wrong - naming a metered medium here has to narrow the selection now,
+        // not on some later run.
+        await Svc.ReapplyProbeBudgetAsync();
+    }
+
+    private void ToggleCollapse() => _collapsed = !_collapsed;
+
+    /// <summary>
+    /// Dropdown display order, deliberately the same set and order as the ISP Health
+    /// technology selector (IspHealthPanel.ProfileTechOptions) plus Unknown for the
+    /// not-yet-picked state, so one field offers one set of choices wherever it appears.
+    /// The enum's numeric values are persisted and append-only, so new technologies are
+    /// slotted here instead of renumbering the enum.
+    ///
+    /// PppoE and Other are absent on purpose. Neither names an access medium, so picking
+    /// either costs the user the medium-specific thresholds their line would otherwise be
+    /// graded against - IspHealthProfiles.GetProfile maps both to the same wide NeutralProfile
+    /// today. PPPoE is expected to earn scoring behavior of its own once there is enough field
+    /// data to calibrate it, and that is exactly why it does not belong here: it is an
+    /// encapsulation riding GPON, DSL or Active Ethernet, so the medium and the encapsulation
+    /// are two facts, not one choice. ISP Health can read the encapsulation without asking -
+    /// a PPPoE WAN's uplink interface is named ppp* (uplink_ifname "ppp0", already read into
+    /// UpstreamTracerService._wanUplinkIfName) and the network config carries wan_type "pppoe" -
+    /// so this selector asks only for the medium.
+    /// </summary>
+    private static readonly AccessTechnology[] AccessTechDisplayOrder =
+    [
+        AccessTechnology.Unknown,
+        AccessTechnology.Gpon,
+        AccessTechnology.XgsPon,
+        AccessTechnology.Docsis,
+        AccessTechnology.Dsl,
+        AccessTechnology.DirectEthernet,
+        AccessTechnology.FixedWireless,
+        AccessTechnology.Cellular,
+        AccessTechnology.Satellite
+    ];
+
+    /// <summary>
+    /// What the select actually renders: the display order, plus the stored value when it is
+    /// no longer offered - a WAN saved as PPPoE or Other before those were dropped. Without
+    /// the carry-over the select would find no matching option, render the first one, and
+    /// report a stored PPPoE as "Not detected". The stale entry disappears once the user
+    /// picks something current.
+    /// </summary>
+    private IEnumerable<AccessTechnology> AccessTechOptions =>
+        AccessTechDisplayOrder.Contains(_state.AccessTechnology)
+            ? AccessTechDisplayOrder
+            : AccessTechDisplayOrder.Append(_state.AccessTechnology);
+
+    private static string FormatTechName(AccessTechnology tech) => tech switch
+    {
+        AccessTechnology.Unknown => "Not detected",
+        AccessTechnology.Gpon => "GPON",
+        AccessTechnology.XgsPon => "XGS-PON",
+        AccessTechnology.Docsis => "DOCSIS (Cable)",
+        AccessTechnology.PppoE => "PPPoE",
+        AccessTechnology.DirectEthernet => "Active Ethernet",
+        AccessTechnology.FixedWireless => "Fixed Wireless",
+        AccessTechnology.Satellite => "Satellite",
+        AccessTechnology.Cellular => "Cellular",
+        AccessTechnology.Other => "Other",
+        AccessTechnology.Dsl => "DSL (ADSL/VDSL)",
+        _ => tech.ToString()
+    };
+
+    private string AccessAsnDisplay()
+    {
+        var first = _state.AccessHops.FirstOrDefault(h => h.AsnNumber.HasValue);
+        if (first == null) return "your access ISP";
+        return string.IsNullOrEmpty(first.AsnName)
+            ? $"AS{first.AsnNumber}"
+            : $"AS{first.AsnNumber} ({first.AsnName})";
+    }
+
+    private static string? FormatPtrLabel(string? hostname, string? ip)
+    {
+        if (string.IsNullOrEmpty(hostname) || hostname == ip) return null;
+        var parts = hostname.Split('.');
+        if (parts.Length <= 1) return hostname;
+        var ipOctets = (ip ?? "").Split('.');
+        if (ipOctets.Length == 4)
+        {
+            int matches = 0;
+            foreach (var part in parts)
+                foreach (var octet in ipOctets)
+                    if (part == octet || part == "h" + octet || part.Contains("-" + octet + "-")
+                        || part.StartsWith(octet + "-") || part.EndsWith("-" + octet))
+                    { matches++; break; }
+            if (matches >= 2) return null;
+        }
+        return string.Join('.', parts.Take(parts.Length - 1));
+    }
+
+    public void Dispose() => _pollTimer?.Dispose();
+}
+
+<style>
+    .row-disabled { opacity: 0.45; }
+    .form-control-sm { padding: 0.25rem 0.5rem; font-size: 0.875rem; }
+    .isp-change-review { margin-bottom: 1rem; }
+    .isp-change-review p { margin: 0.5rem 0 0; }
+    .isp-change-choices { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
+    .isp-change-choice { display: flex; align-items: baseline; gap: 0.5rem; cursor: pointer; }
+</style>

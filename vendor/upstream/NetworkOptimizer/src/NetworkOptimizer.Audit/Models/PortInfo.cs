@@ -1,0 +1,238 @@
+using NetworkOptimizer.UniFi.Models;
+
+namespace NetworkOptimizer.Audit.Models;
+
+/// <summary>
+/// Represents a switch port configuration
+/// </summary>
+public class PortInfo
+{
+    /// <summary>
+    /// Port index/number
+    /// </summary>
+    public required int PortIndex { get; init; }
+
+    /// <summary>
+    /// Port name/label
+    /// </summary>
+    public string? Name { get; init; }
+
+    /// <summary>
+    /// Whether the port is administratively enabled (hardware-level enable/disable).
+    /// Defaults to true when not present in the API response.
+    /// </summary>
+    public bool IsEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Whether the port link is up
+    /// </summary>
+    public bool IsUp { get; init; }
+
+    /// <summary>
+    /// Link speed in Mbps (e.g., 1000 = 1G)
+    /// </summary>
+    public int Speed { get; init; }
+
+    /// <summary>
+    /// Forward mode (native, all/trunk, disabled, custom)
+    /// </summary>
+    public string? ForwardMode { get; init; }
+
+    /// <summary>
+    /// Tagged VLAN management mode: "custom" = trunk (allows tagged VLANs), "block_all" = access (blocks all tagged VLANs).
+    /// Used together with ForwardMode to determine if a port is truly a trunk.
+    /// </summary>
+    public string? TaggedVlanMgmt { get; init; }
+
+    /// <summary>
+    /// Port operational mode from the UniFi API's op_mode field.
+    /// Values include "switch" (normal switching), "mirror" (mirror destination),
+    /// "aggregate" (LAG parent), and others. Null if not present in the API response.
+    /// </summary>
+    public string? OpMode { get; init; }
+
+    /// <summary>
+    /// Whether this port is configured as a mirror destination (port mirroring/SPAN).
+    /// Mirror destinations cannot accept port profiles and must receive frames at L2
+    /// regardless of VLAN tags, so access-port audit rules should skip them.
+    /// </summary>
+    public bool IsMirrorDestination => string.Equals(OpMode, "mirror", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Whether this port is a LAG (Link Aggregation Group) parent/aggregate port.
+    /// Used to propagate uplink/fabric metadata from child ports to the parent
+    /// so that trunk audit rules evaluate the aggregate with complete context.
+    /// </summary>
+    public bool IsLagParent => string.Equals(OpMode, "aggregate", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Whether this is an uplink port
+    /// </summary>
+    public bool IsUplink { get; set; }
+
+    /// <summary>
+    /// Whether this is a WAN port
+    /// </summary>
+    public bool IsWan { get; init; }
+
+    /// <summary>
+    /// Native network ID (for access ports)
+    /// </summary>
+    public string? NativeNetworkId { get; init; }
+
+    /// <summary>
+    /// Excluded network IDs (for trunk ports)
+    /// </summary>
+    public List<string>? ExcludedNetworkIds { get; init; }
+
+    /// <summary>
+    /// Whether port security is enabled
+    /// </summary>
+    public bool PortSecurityEnabled { get; init; }
+
+    /// <summary>
+    /// MAC addresses allowed on this port (MAC filtering)
+    /// </summary>
+    public List<string>? AllowedMacAddresses { get; init; }
+
+    /// <summary>
+    /// MAC of the UniFi device this port is locked to (Lock Port to UniFi Device).
+    /// From the port's trusted_port_mac field. Null when the port is not locked.
+    /// </summary>
+    public string? LockedToDeviceMac { get; init; }
+
+    /// <summary>
+    /// Whether the port is locked to a UniFi device (Lock Port to UniFi Device).
+    /// </summary>
+    public bool IsPortLocked => !string.IsNullOrEmpty(LockedToDeviceMac);
+
+    /// <summary>
+    /// Whether the device on this port is a UniFi device: any device in the stat/device uplink
+    /// table (Network gear, power devices), or a client a UniFi app owns (Protect, Network, Drive, ...).
+    /// Lock Port to UniFi Device locks to all of them.
+    /// </summary>
+    public bool HasUniFiDevice =>
+        !string.IsNullOrEmpty(ConnectedDeviceType) ||
+        (ConnectedClientIsUniFiDevice ?? ConnectedClient?.IsUniFiDevice ?? false);
+
+    /// <summary>
+    /// Whether this console's UniFi apps own the connected client, from the v2 client list's unifi_device.
+    /// A separate UniFi OS console (a CloudKey running its own apps) reads false even though stat/sta gives it
+    /// a product_line, and UniFi Network refuses to lock a port to it. Null when that list was unavailable,
+    /// in which case the client's product_line decides.
+    /// </summary>
+    public bool? ConnectedClientIsUniFiDevice { get; init; }
+
+    /// <summary>
+    /// Whether port isolation is enabled
+    /// </summary>
+    public bool IsolationEnabled { get; init; }
+
+    /// <summary>
+    /// Whether PoE is enabled on this port
+    /// </summary>
+    public bool PoeEnabled { get; init; }
+
+    /// <summary>
+    /// PoE power draw in watts
+    /// </summary>
+    public double PoePower { get; init; }
+
+    /// <summary>
+    /// PoE mode (auto, off, pasv24, passthrough)
+    /// </summary>
+    public string? PoeMode { get; init; }
+
+    /// <summary>
+    /// Whether this port supports PoE
+    /// </summary>
+    public bool SupportsPoe { get; init; }
+
+    /// <summary>
+    /// The switch this port belongs to
+    /// </summary>
+    public required SwitchInfo Switch { get; init; }
+
+    /// <summary>
+    /// The UniFi client connected to this port (if any).
+    /// Used for enhanced device type detection via fingerprint and MAC OUI.
+    /// </summary>
+    public UniFiClientResponse? ConnectedClient { get; set; }
+
+    /// <summary>
+    /// MAC address of the last device connected to this port (for down ports).
+    /// From the UniFi API's last_connection.mac field.
+    /// </summary>
+    public string? LastConnectionMac { get; init; }
+
+    /// <summary>
+    /// Timestamp when the last device was seen on this port.
+    /// From the UniFi API's last_connection.last_seen field.
+    /// </summary>
+    public long? LastConnectionSeen { get; init; }
+
+    /// <summary>
+    /// Historical client that was last seen on this port.
+    /// Populated from client history by matching switch MAC and port number.
+    /// </summary>
+    public UniFi.Models.UniFiClientDetailResponse? HistoricalClient { get; init; }
+
+    /// <summary>
+    /// Distinct client MACs seen on this port within PortSecurityAnalyzer.SharedPortWindowDays:
+    /// the connected client, the last connection, and client-history entries. Tells single-device
+    /// ports from shared ones.
+    /// </summary>
+    public IReadOnlySet<string> SeenDeviceMacs { get; init; } = new HashSet<string>();
+
+    /// <summary>
+    /// Whether more than one distinct client has used this port within the shared-port window.
+    /// </summary>
+    public bool IsSharedPort => SeenDeviceMacs.Count > 1;
+
+    /// <summary>
+    /// Type of UniFi device connected to this port (e.g., "uap" for AP, "usw" for switch).
+    /// Determined by matching device uplink info to this port. Null for regular clients.
+    /// May be propagated from a LAG child to the LAG parent during post-parse.
+    /// </summary>
+    public string? ConnectedDeviceType { get; set; }
+
+    /// <summary>
+    /// Name of the UniFi device connected to this port (e.g., "[AP] Back Yard"), from the same uplink
+    /// match as ConnectedDeviceType. Null for regular clients or an unnamed device.
+    /// </summary>
+    public string? ConnectedDeviceName { get; set; }
+
+    /// <summary>
+    /// 802.1X control mode from the assigned port profile.
+    /// Values: "auto" (802.1X), "mac_based" (RADIUS MAC auth),
+    /// "force_authorized" (bypass), "force_unauthorized" (block), or null.
+    /// </summary>
+    public string? Dot1xCtrl { get; init; }
+
+    /// <summary>
+    /// Whether this port is secured via 802.1X/RADIUS authentication.
+    /// True when Dot1xCtrl is "auto" (802.1X), "mac_based" (RADIUS MAC auth),
+    /// or "multi_host" (802.1X authenticates first MAC, then allows subsequent MACs).
+    /// </summary>
+    public bool IsDot1xSecured => Dot1xCtrl is "auto" or "mac_based" or "multi_host";
+
+    /// <summary>
+    /// The port profile (portconf) assigned to this port, if any.
+    /// Used to detect intentional configurations like unrestricted access ports.
+    /// </summary>
+    public UniFiPortProfile? AssignedPortProfile { get; init; }
+
+    /// <summary>
+    /// Raw portconf_id of the assigned profile, kept even when the profile itself was not
+    /// resolved. A profile assignment blocks Lock Port to UniFi Device (see PortLockSupport).
+    /// </summary>
+    public string? PortProfileId { get; init; }
+
+    /// <summary>
+    /// Whether this port is a LAG (Link Aggregation Group) child port.
+    /// Child ports are assimilated into a parent LAG port and their individual
+    /// configuration is irrelevant for most audit rules. Only specific rules
+    /// (like unused port detection) should evaluate LAG child ports.
+    /// </summary>
+    public bool IsLagChild { get; init; }
+}

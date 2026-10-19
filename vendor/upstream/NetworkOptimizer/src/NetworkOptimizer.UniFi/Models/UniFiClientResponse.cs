@@ -1,0 +1,393 @@
+using System.Text.Json.Serialization;
+
+namespace NetworkOptimizer.UniFi.Models;
+
+/// <summary>
+/// Response from GET /api/s/{site}/stat/sta
+/// Represents a connected client (wireless or wired)
+/// </summary>
+public class UniFiClientResponse
+{
+    [JsonPropertyName("_id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("mac")]
+    public string Mac { get; set; } = string.Empty;
+
+    [JsonPropertyName("site_id")]
+    public string SiteId { get; set; } = string.Empty;
+
+    [JsonPropertyName("is_guest")]
+    public bool IsGuest { get; set; }
+
+    [JsonPropertyName("is_wired")]
+    public bool IsWired { get; set; }
+
+    [JsonPropertyName("oui")]
+    public string Oui { get; set; } = string.Empty;
+
+    [JsonPropertyName("hostname")]
+    public string Hostname { get; set; } = string.Empty;
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("ip")]
+    public string Ip { get; set; } = string.Empty;
+
+    [JsonPropertyName("network")]
+    public string Network { get; set; } = string.Empty;
+
+    [JsonPropertyName("network_id")]
+    public string NetworkId { get; set; } = string.Empty;
+
+    // Virtual network override (client assigned to different VLAN than SSID's native network)
+    [JsonPropertyName("virtual_network_override_enabled")]
+    public bool VirtualNetworkOverrideEnabled { get; set; }
+
+    [JsonPropertyName("virtual_network_override_id")]
+    public string? VirtualNetworkOverrideId { get; set; }
+
+    /// <summary>
+    /// The actual VLAN number the client is assigned to.
+    /// This is the most reliable indicator of VLAN assignment.
+    /// </summary>
+    [JsonPropertyName("vlan")]
+    public int? Vlan { get; set; }
+
+    /// <summary>
+    /// Gets the effective network ID for this client.
+    /// Uses virtual_network_override_id when override is enabled, otherwise falls back to network_id.
+    /// </summary>
+    [JsonIgnore]
+    public string EffectiveNetworkId =>
+        VirtualNetworkOverrideEnabled && !string.IsNullOrEmpty(VirtualNetworkOverrideId)
+            ? VirtualNetworkOverrideId
+            : NetworkId;
+
+    [JsonPropertyName("use_fixedip")]
+    public bool UseFixedIp { get; set; }
+
+    [JsonPropertyName("fixed_ip")]
+    public string? FixedIp { get; set; }
+
+    [JsonPropertyName("local_dns_record_enabled")]
+    public bool LocalDnsRecordEnabled { get; set; }
+
+    [JsonPropertyName("local_dns_record")]
+    public string? LocalDnsRecord { get; set; }
+
+    [JsonPropertyName("network_members_group_ids")]
+    public List<string>? NetworkMembersGroupIds { get; set; }
+
+    [JsonPropertyName("last_ip")]
+    public string? LastIp { get; set; }
+
+    /// <summary>
+    /// Gets the best available IP address (ip > last_ip > fixed_ip)
+    /// </summary>
+    [JsonIgnore]
+    public string? BestIp =>
+        !string.IsNullOrEmpty(Ip) ? Ip :
+        !string.IsNullOrEmpty(LastIp) ? LastIp :
+        FixedIp;
+
+    // Connection info
+    [JsonPropertyName("ap_mac")]
+    public string? ApMac { get; set; }
+
+    [JsonPropertyName("sw_mac")]
+    public string? SwMac { get; set; }
+
+    [JsonPropertyName("sw_port")]
+    public int? SwPort { get; set; }
+
+    [JsonPropertyName("sw_depth")]
+    public int? SwDepth { get; set; }
+
+    /// <summary>
+    /// Seconds since the access point last heard from this client. Compared against uptime it
+    /// separates a quiet client from one that negotiated and left without being torn down.
+    /// </summary>
+    [JsonPropertyName("idletime")]
+    public long IdleTime { get; set; }
+
+    [JsonPropertyName("uptime")]
+    public long Uptime { get; set; }
+
+    [JsonPropertyName("last_seen")]
+    public long LastSeen { get; set; }
+
+    [JsonPropertyName("first_seen")]
+    public long FirstSeen { get; set; }
+
+    // Wireless-specific
+    [JsonPropertyName("essid")]
+    public string? Essid { get; set; }
+
+    [JsonPropertyName("bssid")]
+    public string? Bssid { get; set; }
+
+    [JsonPropertyName("channel")]
+    public int? Channel { get; set; }
+
+    [JsonPropertyName("channel_width")]
+    public int? ChannelWidth { get; set; }
+
+    [JsonPropertyName("radio")]
+    public string? Radio { get; set; }
+
+    [JsonPropertyName("radio_proto")]
+    public string? RadioProto { get; set; }
+
+    [JsonPropertyName("rssi")]
+    public int? Rssi { get; set; }
+
+    [JsonPropertyName("signal")]
+    public int? Signal { get; set; }
+
+    [JsonPropertyName("noise")]
+    public int? Noise { get; set; }
+
+    // Traffic stats
+    [JsonPropertyName("tx_bytes")]
+    public long TxBytes { get; set; }
+
+    [JsonPropertyName("rx_bytes")]
+    public long RxBytes { get; set; }
+
+    [JsonPropertyName("tx_packets")]
+    public long TxPackets { get; set; }
+
+    [JsonPropertyName("rx_packets")]
+    public long RxPackets { get; set; }
+
+    [JsonPropertyName("tx_rate")]
+    public long TxRate { get; set; }
+
+    [JsonPropertyName("rx_rate")]
+    public long RxRate { get; set; }
+
+    [JsonPropertyName("tx_bytes-r")]
+    public double TxBytesRate { get; set; }
+
+    [JsonPropertyName("rx_bytes-r")]
+    public double RxBytesRate { get; set; }
+
+    [JsonPropertyName("wired-tx_bytes")]
+    public long WiredTxBytes { get; set; }
+
+    [JsonPropertyName("wired-rx_bytes")]
+    public long WiredRxBytes { get; set; }
+
+    [JsonPropertyName("wired-tx_bytes-r")]
+    public double WiredTxBytesRate { get; set; }
+
+    [JsonPropertyName("wired-rx_bytes-r")]
+    public double WiredRxBytesRate { get; set; }
+
+    // QoS and experience
+    [JsonPropertyName("qos_policy_applied")]
+    public bool QosPolicyApplied { get; set; }
+
+    [JsonPropertyName("satisfaction")]
+    public int? Satisfaction { get; set; }
+
+    [JsonPropertyName("anomalies")]
+    public int Anomalies { get; set; }
+
+    // User info
+    [JsonPropertyName("user_id")]
+    public string? UserId { get; set; }
+
+    [JsonPropertyName("usergroup_id")]
+    public string? UsergroupId { get; set; }
+
+    [JsonPropertyName("noted")]
+    public bool Noted { get; set; }
+
+    [JsonPropertyName("note")]
+    public string? Note { get; set; }
+
+    // Device fingerprinting (all nullable as API can return null)
+    // UniFi API sometimes returns these as floats (e.g. 4.0) so use FlexibleIntConverter
+    [JsonPropertyName("fingerprint_source")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? FingerprintSource { get; set; }
+
+    [JsonPropertyName("dev_id_override")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? DevIdOverride { get; set; }
+
+    [JsonPropertyName("dev_cat")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? DevCat { get; set; }
+
+    [JsonPropertyName("dev_family")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? DevFamily { get; set; }
+
+    [JsonPropertyName("os_class")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? OsClass { get; set; }
+
+    [JsonPropertyName("os_name")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? OsName { get; set; }
+
+    [JsonPropertyName("dev_vendor")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? DevVendor { get; set; }
+
+    // Blocked/allowed status
+    [JsonPropertyName("blocked")]
+    public bool Blocked { get; set; }
+
+    // Wi-Fi 7 MLO (Multi-Link Operation)
+    [JsonPropertyName("is_mlo")]
+    public bool? IsMlo { get; set; }
+
+    [JsonPropertyName("mlo_details")]
+    public List<MloLinkDetail>? MloDetails { get; set; }
+
+    // AP Lock settings
+    /// <summary>
+    /// Whether the client is locked/pinned to a specific AP.
+    /// When true, the client will not roam to other APs.
+    /// </summary>
+    [JsonPropertyName("fixed_ap_enabled")]
+    public bool? FixedApEnabled { get; set; }
+
+    /// <summary>
+    /// MAC address of the AP this client is locked to.
+    /// Only relevant when FixedApEnabled is true.
+    /// </summary>
+    [JsonPropertyName("fixed_ap_mac")]
+    public string? FixedApMac { get; set; }
+
+    /// <summary>
+    /// Number of times this client has roamed between APs.
+    /// High values indicate a mobile device that moves around.
+    /// </summary>
+    [JsonPropertyName("roam_count")]
+    public int? RoamCount { get; set; }
+
+    /// <summary>
+    /// UniFi ecosystem device metadata surfaced by the console (ucore) for an adopted/bridged
+    /// device that shows up as a client - e.g. a UniFi Protect camera bridged onto the LAN via a
+    /// UniFi Device Bridge, or a UNAS. Carries the friendly device name and product line/model.
+    /// Null for ordinary clients.
+    /// </summary>
+    [JsonPropertyName("unifi_device_info_from_ucore")]
+    public UniFiUcoreDeviceInfo? UnifiDeviceInfoFromUcore { get; set; }
+
+    /// <summary>
+    /// UniFi app that owns this client when it is a UniFi device, e.g. "unifi-protect",
+    /// "unifi-network". Set on the client record itself (a Protect AI Key, a CloudKey+),
+    /// separate from the ucore block. Null for ordinary clients.
+    /// </summary>
+    [JsonPropertyName("product_line")]
+    public string? ProductLine { get; set; }
+
+    /// <summary>
+    /// UniFi product name for a UniFi device client, e.g. "AI Key", "CloudKey+". Null for ordinary clients.
+    /// </summary>
+    [JsonPropertyName("product_model")]
+    public string? ProductModel { get; set; }
+
+    /// <summary>
+    /// UniFi app that owns this device, normalized to lowercase without the "unifi-" prefix
+    /// ("protect", "network", "drive", ...). The client's own product_line is "unifi-protect" style;
+    /// the ucore block's is "PROTECT" style. Both normalize to the same value. Null when the client
+    /// is not a UniFi device.
+    /// </summary>
+    public string? UniFiProductLine
+    {
+        get
+        {
+            var raw = !string.IsNullOrEmpty(ProductLine) ? ProductLine : UnifiDeviceInfoFromUcore?.ProductLine;
+            if (string.IsNullOrEmpty(raw))
+                return null;
+            var line = raw.Trim().ToLowerInvariant();
+            return line.StartsWith("unifi-") ? line["unifi-".Length..] : line;
+        }
+    }
+
+    /// <summary>
+    /// Whether this client is a UniFi device (owned by a UniFi app) rather than an ordinary client.
+    /// </summary>
+    public bool IsUniFiDevice => UniFiProductLine != null;
+}
+
+/// <summary>
+/// UniFi ecosystem device info (from the console's ucore) for an adopted/bridged device that
+/// appears as a client - e.g. a UniFi Protect camera on a UniFi Device Bridge. The friendly
+/// <see cref="Name"/> is what UniFi shows for the device; the product fields are kept for
+/// identifying the device line/model.
+/// </summary>
+public class UniFiUcoreDeviceInfo
+{
+    /// <summary>Friendly device name as configured in the owning app, e.g. "[Camera] Front Door".</summary>
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    /// <summary>Product line, e.g. "PROTECT", "NETWORK", "UNAS".</summary>
+    [JsonPropertyName("product_line")]
+    public string? ProductLine { get; set; }
+
+    /// <summary>Short product/model name, e.g. "UVC G6 Pro Bullet".</summary>
+    [JsonPropertyName("product_shortname")]
+    public string? ProductShortname { get; set; }
+}
+
+/// <summary>
+/// Details for each link in a Wi-Fi 7 MLO (Multi-Link Operation) connection
+/// </summary>
+public class MloLinkDetail
+{
+    [JsonPropertyName("mac")]
+    public string? Mac { get; set; }
+
+    [JsonPropertyName("radio")]
+    public string? Radio { get; set; }  // "ng", "na", "6e"
+
+    [JsonPropertyName("radio_name")]
+    public string? RadioName { get; set; }  // "wifi0", "wifi1", "wifi2"
+
+    [JsonPropertyName("radio_proto")]
+    public string? RadioProto { get; set; }  // "be" for Wi-Fi 7
+
+    [JsonPropertyName("channel")]
+    public int? Channel { get; set; }
+
+    [JsonPropertyName("channel_width")]
+    public int? ChannelWidth { get; set; }  // 20, 40, 80, 160, 320
+
+    [JsonPropertyName("signal")]
+    public int? Signal { get; set; }  // dBm
+
+    [JsonPropertyName("noise")]
+    public int? Noise { get; set; }  // dBm
+
+    [JsonPropertyName("rssi")]
+    public int? Rssi { get; set; }
+
+    [JsonPropertyName("nss")]
+    public int? Nss { get; set; }  // Number of spatial streams
+
+    [JsonPropertyName("tx_rate")]
+    public long? TxRate { get; set; }  // Kbps
+
+    [JsonPropertyName("rx_rate")]
+    public long? RxRate { get; set; }  // Kbps
+
+    [JsonPropertyName("satisfaction")]
+    public int? Satisfaction { get; set; }
+
+    /// <summary>
+    /// Whether this is the link carrying traffic, when the source states it outright. The console
+    /// does not, so it stays null there and the reader infers activity from the rates.
+    /// </summary>
+    [JsonIgnore]
+    public bool? ActiveLink { get; set; }
+}

@@ -1,0 +1,2245 @@
+@using NetworkOptimizer.Web.Services.Monitoring.IspHealth
+@* The PDF export renders from these same helpers - keep them shared, not inlined here. *@
+@using static NetworkOptimizer.Web.Services.Monitoring.IspHealth.IspHealthPresentation
+@using NetworkOptimizer.Storage.Models
+@using System.Globalization
+@implements IDisposable
+@inject IspHealthService IspHealth
+@inject IspHealthRegistry IspHealthRegistry
+@inject NetworkOptimizer.Web.Services.Monitoring.MonitoringPathView PathView
+@inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject NavigationManager NavigationManager
+@inject IJSRuntime JS
+@inject Microsoft.AspNetCore.Mvc.ViewFeatures.IFileVersionProvider FileVersionProvider
+@inject NetworkOptimizer.Web.Services.PullToRefreshState PtrState
+@inject NetworkOptimizer.Web.Services.ISystemSettingsService SettingsService
+@inject NetworkOptimizer.Web.Services.SiteContextService SiteContext
+@inject Microsoft.AspNetCore.Authorization.IAuthorizationService Authz
+@inject ILogger<IspHealthPanel> Logger
+@using NetworkOptimizer.Web.Services.Authorization
+@using Microsoft.AspNetCore.Components.Authorization
+
+@* Date/time filter (left) + Refresh. The live/cached view (the effective auto-computed window, which
+   auto-fallback may have reduced below the configured target) is the only state where Refresh is
+   enabled; any other selection recomputes off-cache and locks Refresh. Always rendered (once past
+   initial load) so a custom window with no data can still be switched back. *@
+@if (!_loading)
+{
+    <div class="isp-health-toolbar">
+        @if (_showCustomPopover)
+        {
+            <div class="isp-popover-backdrop" @onclick="() => _showCustomPopover = false"></div>
+        }
+        @{
+            var effWin = Svc.EffectiveWindowHours;
+            var cfgWin = Svc.ConfiguredWindowHours;
+            var windowReduced = effWin > 0 && cfgWin > 0 && effWin < cfgWin;
+        }
+        @if (windowReduced)
+        {
+            <button class="isp-window-reduced" @onclick="RetryFullWindowAsync" disabled="@(_refreshing || _windowComputing)"
+                    data-tooltip="ISP Health is slow-running on your box, so we dropped the default window to @(effWin)h. Tap to retry, and adjust if your hardware has changed." data-tooltip-hover-only>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>
+                <span>@(effWin)h</span>
+            </button>
+        }
+        @if (_wanOptions.Count > 1)
+        {
+            <div class="time-range-selector wan-selector @(_wanOptions.Count > 3 ? "wan-selector-many" : "")">
+                @foreach (var w in _wanOptions)
+                {
+                    <button class="time-btn @(string.Equals(w.Key, _selectedWanKey, StringComparison.OrdinalIgnoreCase) ? "active" : "")"
+                            @onclick="() => SelectWanAsync(w.Key)" disabled="@(_refreshing || _windowComputing)">@{
+                                    var wp = NetworkOptimizer.UniFi.GatewayWanHelper.SplitWanLabel(
+                                        w.Label, NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(w.Key));
+                                }@(wp.Name ?? w.Label)@if (wp.WanToken != null && wp.Name != null)
+                                {<span class="wan-pill-token">@wp.WanToken</span>}</button>
+                }
+            </div>
+        }
+        <div class="time-range-selector @(_showCustomPopover ? "isp-filter-raised" : "")" style="position: relative;">
+            @foreach (var p in FilterPresets)
+            {
+                <button class="time-btn @(!_isCustom && _selectedPreset == p.Hours ? "active" : "")"
+                        @onclick="() => SelectPresetAsync(p.Hours)" disabled="@_windowComputing">@p.Label</button>
+            }
+            <button class="time-btn custom-range-btn @(_isCustom ? "active" : "")" @onclick="ToggleCustomPopover"
+                    data-tooltip="Custom date range (max 1 month)" data-tooltip-hover-only>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2" /><line x1="16" y1="2" x2="16" y2="6" /><line x1="8" y1="2" x2="8" y2="6" /><line x1="3" y1="10" x2="21" y2="10" /></svg>
+            </button>
+            <div class="custom-range-popover @(_showCustomPopover ? "open" : "")">
+                <div class="custom-range-form">
+                    <div class="custom-range-title">Custom Range</div>
+                    <div class="custom-range-field">
+                        <label>From</label>
+                        <input type="datetime-local" data-input="from" class="custom-range-input" @bind="_customFrom" />
+                    </div>
+                    <div class="custom-range-field">
+                        <label>To</label>
+                        <input type="datetime-local" data-input="to" class="custom-range-input" @bind="_customTo" />
+                    </div>
+                    <div class="custom-range-actions">
+                        <button class="btn btn-sm btn-secondary" @onclick="() => _showCustomPopover = false">Cancel</button>
+                        @* Not gated: choosing a window is a READ. Every other time control here (the
+                           presets, the shift arrows) is open to a Viewer, so gating only the custom
+                           range left them able to look at any period except the one they picked. *@
+                        <button class="btn btn-sm btn-primary" @onclick="ApplyCustomAsync">Apply</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        @{
+            var refreshBusy = _refreshing || _windowComputing;
+        }
+        <button class="btn btn-sm btn-secondary" @onclick="RefreshAsync" disabled="@refreshBusy"
+                data-tooltip="Recompute ISP Health for the selected window" data-tooltip-hover-only>
+            <span class="btn-state-stack">
+                <span class="@(refreshBusy ? "is-hidden" : "")">Refresh</span>
+                <span class="@(refreshBusy ? "" : "is-hidden")">
+                    <span class="spinner-sm"></span>
+                    <span class="btn-label-wide">@(_refreshing ? "Refreshing" : "Loading")</span>
+                </span>
+            </span>
+        </button>
+        <button class="btn btn-sm btn-primary" @onclick="ExportPdfAsync" data-tour="isp-health-pdf-export"
+                disabled="@(_report == null || _exportingPdf || _refreshing || _windowComputing)">
+            <span class="btn-state-stack">
+                <span class="@(_exportingPdf ? "is-hidden" : "")">
+                    <span class="btn-label-wide">Export PDF</span>
+                    <span class="btn-label-narrow">Export</span>
+                </span>
+                <span class="@(_exportingPdf ? "" : "is-hidden")">
+                    <span class="spinner-sm"></span>
+                    <span class="btn-label-wide">Building</span>
+                </span>
+            </span>
+        </button>
+    </div>
+}
+
+@if (_loading)
+{
+    <div class="isp-health-loading card">
+        <div class="isp-health-loading-spinner"></div>
+        <p class="isp-health-loading-text">Analyzing recent ISP and transit data...</p>
+    </div>
+}
+else if (_report == null)
+{
+    @if (ProbesViaDefaultRoute && Svc.Status != IspHealthStatus.NeedsDiscovery)
+    {
+        <div class="alert alert-warning" style="margin-bottom: 0.75rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-warning">!</span>
+                <div class="banner-text" style="flex: 1;">
+                    @SelectedWanLabel's Vantage has no binding, so its probes follow the default route and reflect its performance. Assign an Agent or bind a Policy-Routed source address to actually measure this connection.
+                </div>
+                <div class="banner-actions">
+                    <button class="btn btn-sm btn-primary" @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=performance&contexts=1"))">Configure Vantage</button>
+                </div>
+            </div>
+        </div>
+    }
+    @if (Svc.Status == IspHealthStatus.Computing)
+    {
+        <div class="isp-health-loading card">
+            <div class="isp-health-loading-spinner"></div>
+            <p class="isp-health-loading-text">Analyzing recent ISP and transit data...</p>
+        </div>
+    }
+    else if (Svc.Status == IspHealthStatus.NeedsDiscovery)
+    {
+        <div class="alert alert-info" style="margin-bottom: 1rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-info">i</span>
+                <div class="banner-text" style="flex: 1;">
+                    @if (NeedsContextFirst)
+                    {
+                        <text>@SelectedWanLabel has no Vantage yet, so nothing probes it. Give it one, then discovery can trace its path.</text>
+                    }
+                    else
+                    {
+                        <text>ISP Health needs your ISP and transit hops. Run Upstream Discovery on the Network Performance tab to identify them.</text>
+                    }
+                </div>
+                <div class="banner-actions">
+                    @if (NeedsContextFirst)
+                    {
+                        <button class="btn btn-sm btn-primary" @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=performance&contexts=1"))">Add a WAN Vantage</button>
+                    }
+                    else
+                    {
+                        <button class="btn btn-sm btn-primary" @onclick="@(() => NavigationManager.NavigateTo($"/monitoring?tab=performance&discover=1{WanLinkQuery()}"))">Run Upstream Discovery</button>
+                    }
+                </div>
+            </div>
+        </div>
+    }
+    else if (Svc.Status == IspHealthStatus.NeedsTechnology)
+    {
+        <div class="alert alert-info" style="margin-bottom: 1rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-info">i</span>
+                <div class="banner-text" style="flex: 1;">
+                    <span>Pick your access network technology so ISP Health can grade against the right expectations. You can also set it during <a href="/monitoring?tab=performance&discover=1@(WanLinkQuery())">Upstream Discovery</a>.</span>
+                </div>
+                <div class="banner-actions">
+                    <select class="form-control" style="max-width: 240px;" aria-label="Access technology" disabled="@(!_canOperate)" @onchange="OnAccessTechnologyChanged">
+                        <option value="" selected disabled>Select technology...</option>
+                        @foreach (var tech in ProfileTechOptions)
+                        {
+                            <option value="@((int)tech)">@FormatTechName(tech)</option>
+                        }
+                    </select>
+                </div>
+            </div>
+        </div>
+    }
+    else if (Svc.Status == IspHealthStatus.InsufficientData)
+    {
+        <div class="alert alert-info" style="margin-bottom: 1rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-info">i</span>
+                <div class="banner-text" style="flex: 1;">
+                    Collecting monitoring data. ISP Health needs a few hours of latency history before it can grade your connection; check back soon.
+                    @if (ShowScheduleNudge)
+                    {
+                        <text> No speed tests are scheduled for this WAN yet - schedule recurring tests and run one now, so throughput history builds alongside.</text>
+                    }
+                </div>
+                @if (ShowScheduleNudge)
+                {
+                    <div class="banner-actions">
+                        <a href="/alerts" class="btn btn-sm btn-primary">Set up schedule</a>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+    else if (Svc.Status == IspHealthStatus.AwaitingConnection)
+    {
+        <div class="alert alert-info" style="margin-bottom: 1rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-info">i</span>
+                <div class="banner-text" style="flex: 1;">
+                    Waiting for this site's console connection. ISP Health reads your expected ISP speeds from the console; it will compute once the connection is up.
+                </div>
+            </div>
+        </div>
+    }
+    else if (Svc.Status == IspHealthStatus.NotConfigured)
+    {
+        <div class="alert alert-warning" style="margin-bottom: 1rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-warning">!</span>
+                <div class="banner-text" style="flex: 1;">
+                    ISP Health could not compute a score. Check that monitoring and InfluxDB are set up and collecting data.
+                </div>
+                <div class="banner-actions">
+                    <button class="btn btn-sm btn-primary" @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=setup"))">Open Setup</button>
+                </div>
+            </div>
+        </div>
+    }
+    else
+    {
+        @* Every status above is handled, so this is a completed compute that produced no report
+           for the window asked for - a range predating collection, most often. It used to share
+           the NotConfigured banner, which sent someone to check an InfluxDB that was working
+           fine. *@
+        <div class="alert alert-info" style="margin-bottom: 1rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-info">i</span>
+                <div class="banner-text" style="flex: 1;">
+                    No ISP Health data for the selected time range. Try a more recent window.
+                </div>
+            </div>
+        </div>
+    }
+}
+else
+{
+    var r = _report;
+    @if (ProbesViaDefaultRoute)
+    {
+        <div class="alert alert-warning" style="margin-bottom: 0.75rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-warning">!</span>
+                <div class="banner-text" style="flex: 1;">
+                    @SelectedWanLabel's Vantage has no binding, so its probes follow the default route and reflect its performance. Assign an Agent or bind a Policy-Routed source address to actually measure this connection.
+                </div>
+                <div class="banner-actions">
+                    <button class="btn btn-sm btn-primary" @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=performance&contexts=1"))">Configure Vantage</button>
+                </div>
+            </div>
+        </div>
+    }
+    @if (!r.HasUpstreamTraceMap)
+    {
+        <div class="alert alert-info" style="margin-bottom: 0.75rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-info">i</span>
+                <div class="banner-text" style="flex: 1;">
+                    Re-run Upstream Discovery to map your trace path, so ISP Health can tell a genuinely congested hop from one that just deprioritizes ICMP.
+                </div>
+                <div class="banner-actions">
+                    <button class="btn btn-sm btn-primary" @onclick="@(() => NavigationManager.NavigateTo($"/monitoring?tab=performance&discover=1{WanLinkQuery()}"))">Re-run Upstream Discovery</button>
+                </div>
+            </div>
+        </div>
+    }
+    @* While an explicit recompute is in flight (Refresh, a time-window change, or an access-tech
+       change) swap just the hero for the same area spinner shown on initial load, so the headline
+       score never displays a stale number mid-recompute. The detail cards below stay put. *@
+    @if (_refreshing || _windowComputing)
+    {
+        @* Reuse the hero's exact card + card-body chain so the spinner box matches the score box to
+           the pixel (a single min-height on .isp-health-hero-body governs both); only the inner layout
+           differs, which doesn't affect the outer height. *@
+        <div class="isp-health-hero card">
+            <div class="card-body isp-health-hero-body isp-health-hero-body-loading">
+                <div class="isp-health-loading-spinner"></div>
+                <p class="isp-health-loading-text">Analyzing ISP and transit data...</p>
+            </div>
+        </div>
+    }
+    else
+    {
+    <div class="isp-health-hero card">
+        <span class="isp-health-updated">Last updated: @TimeFormatHelper.FormatRelativeTimeShort(r.ComputedAt)</span>
+        <div class="card-body isp-health-hero-body">
+            <div class="isp-health-hero-gauge">
+                <IspHealthScoreGauge Score="r.OverallScore" Label="ISP Health" />
+                <div class="isp-health-profile-chip isp-health-profile-chip-selectable"
+                     data-tooltip="@(_canOperate ? "Thresholds are tuned per access technology; change it to re-score." : "Thresholds are tuned per access technology. A Site Operator or Admin can change it.")" data-tooltip-hover-only>
+                    Scored as @r.Profile.DisplayName@PppoeSuffix(r) &middot; @ScoredWindowLabel(r)
+                    <span class="isp-profile-chip-caret"></span>
+                    <select class="isp-profile-chip-select" aria-label="Access technology" disabled="@(!_canOperate)"
+                            value="@((int)r.AccessTechnology)" @onchange="OnAccessTechnologyChanged">
+                        @foreach (var tech in ProfileTechOptions)
+                        {
+                            <option value="@((int)tech)" selected="@(tech == r.AccessTechnology)">@TechLabel(tech, r)</option>
+                        }
+                    </select>
+                </div>
+            </div>
+            <a href="@WanSpeedTestHref()" class="isp-health-hero-speed">
+                <div class="isp-speed-label">Speed vs Plan</div>
+                <div class="isp-speed-headline" data-tooltip="Best download and best upload from your recent WAN speed tests; each may come from a different test."
+                     data-tooltip-click data-tooltip-wide>
+                    <span class="isp-speed-measured">@FormatSpeed(r.MeasuredDownloadMbps) / @FormatSpeed(r.MeasuredUploadMbps)</span>
+                    <span class="isp-speed-unit">Mbps</span>
+                </div>
+                @if (r.SpeedTestTime.HasValue)
+                {
+                    <div class="isp-speed-tested">Best &middot; @TimeFormatHelper.FormatRelativeTimeShort(r.SpeedTestTime.Value)</div>
+                }
+                else
+                {
+                    <div class="isp-speed-tested">No recent WAN speed test</div>
+                }
+                @if (r.TypicalDownloadMbps.HasValue || r.TypicalUploadMbps.HasValue)
+                {
+                    <div class="isp-speed-sub">
+                        <span class="isp-speed-sub-label">Typical</span>
+                        <span>@FormatSpeed(r.TypicalDownloadMbps) / @FormatSpeed(r.TypicalUploadMbps) Mbps</span>
+                    </div>
+                }
+                @if (r.ExpectedDownloadMbps.HasValue || r.ExpectedUploadMbps.HasValue)
+                {
+                    <div class="isp-speed-sub">
+                        <span class="isp-speed-sub-label">Plan</span>
+                        <span>@FormatSpeed(r.ExpectedDownloadMbps) / @FormatSpeed(r.ExpectedUploadMbps) Mbps</span>
+                    </div>
+                }
+                else if (!(r.TypicalDownloadMbps.HasValue || r.TypicalUploadMbps.HasValue))
+                {
+                    <div class="isp-speed-sub">Set your ISP speeds in UniFi Network to grade throughput</div>
+                }
+            </a>
+            <div class="isp-health-hero-side">
+                <div class="isp-health-uptime" data-tour="isp-uptime"
+                     data-tooltip="Share of the window the internet was reachable. Excludes your own LAN drops and &quot;that was me&quot; events."
+                     data-tooltip-click data-tooltip-wide>
+                    <div class="isp-uptime-label">Uptime</div>
+                    <div class="isp-uptime-value">@FormatUptime(r)</div>
+                    <div class="isp-uptime-sub">@FormatDowntime(r.Downtime) &middot; @WindowLabel(r)</div>
+                </div>
+                <div class="isp-health-hero-dimensions">
+                    <IspHealthScoreGauge Score="r.AccessDimension.Score" Label="Access Layer" Small="true" />
+                    <IspHealthScoreGauge Score="r.IspAsnDimension.Score" Label="ISP Network" Small="true" />
+                    <IspHealthScoreGauge Score="r.TransitDimension.Score" Label="Transit" Small="true" />
+                </div>
+            </div>
+        </div>
+    </div>
+    }
+
+    @if (!_planHintDismissed)
+    {
+        <IspPlanSpeedHint OnDismiss="DismissPlanHintAsync" />
+    }
+
+    @if (r.Issues.Count > 0)
+    {
+        <div class="card isp-health-card">
+            <div class="card-header"><h2 class="card-title">Findings</h2></div>
+            <div class="card-body">
+                @foreach (var issue in r.Issues)
+                {
+                    <div class="issue-item @IssueClass(issue.Severity)">
+                        <div class="issue-content">
+                            <span class="issue-severity">@issue.Severity</span>
+                            <div class="issue-title">@issue.Title</div>
+                            <div class="issue-description">@issue.Description</div>
+                            @if (!string.IsNullOrEmpty(issue.Recommendation))
+                            {
+                                <div class="issue-recommendation">
+                                    @issue.Recommendation
+                                    @if (!string.IsNullOrEmpty(issue.LinkUrl))
+                                    {
+                                        @if (issue.LinkUrl!.StartsWith("#"))
+                                        {
+                                            <a href="javascript:void(0)" onclick="window.noHighlightTarget('@(issue.LinkUrl.TrimStart('#'))');" style="margin-left: 0.4rem;">@(issue.LinkText ?? "Open")</a>
+                                        }
+                                        else
+                                        {
+                                            <a href="@issue.LinkUrl" style="margin-left: 0.4rem;">@(issue.LinkText ?? "Open")</a>
+                                        }
+                                    }
+                                </div>
+                            }
+                            @if (!string.IsNullOrEmpty(issue.InvestigateUrl))
+                            {
+                                <div class="issue-investigate">
+                                    <a class="isp-factor-link" href="@(issue.InvestigateUrl + WanLinkQuery())"
+                                       data-tooltip="Jump to the most recent matching loss event on the Network Performance charts" data-tooltip-hover-only>@(issue.InvestigateText ?? "Investigate on the charts")</a>
+                                </div>
+                            }
+                            @if (issue.OutageStarts.Count > 0)
+                            {
+                                @* The question goes with the answer. Gating only the link left a Viewer
+                                   being asked whether this was their doing with no way to say so. *@
+                                <SiteOperatorOnly>
+                                    <div class="issue-ack">
+                                        <span>Caused by something you did (pulled a cable, swapped equipment)?</span>
+                                        @foreach (var start in issue.OutageStarts)
+                                        {
+                                            @if (_ackPending.Contains(start))
+                                            {
+                                                <span class="isp-outage-ack">excluding...</span>
+                                            }
+                                            else
+                                            {
+                                                <a class="isp-outage-ack @AckLockClass" href="javascript:void(0)"
+                                                   data-tooltip="Exclude this event from ISP Health scoring"
+                                                   data-tooltip-hover-only
+                                                   @onclick="() => AcknowledgeOutageAsync(start)">that was me@(issue.OutageStarts.Count > 1 ? $" ({EventTimeLabel(start)})" : "")</a>
+                                            }
+                                        }
+                                    </div>
+                                </SiteOperatorOnly>
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
+    <div class="isp-health-dimension-grid">
+        @foreach (var dimension in new[] { r.AccessDimension, r.IspAsnDimension, r.TransitDimension })
+        {
+            <div class="card isp-health-card">
+                <div class="card-header isp-dimension-header">
+                    <h2 class="card-title@(dimension == r.AccessDimension ? " isp-access-tech-title" : "")">
+                        @dimension.Name
+                        @if (dimension == r.AccessDimension)
+                        {
+                            <select class="isp-access-tech-select" aria-label="Access technology" disabled="@(!_canOperate)"
+                                    data-tooltip="@(_canOperate ? "Thresholds are tuned per access technology; change it to re-score." : "Thresholds are tuned per access technology. A Site Operator or Admin can change it.")" data-tooltip-hover-only
+                                    value="@((int)r.AccessTechnology)" @onchange="OnAccessTechnologyChanged">
+                                @foreach (var tech in ProfileTechOptions)
+                                {
+                                    <option value="@((int)tech)" selected="@(tech == r.AccessTechnology)">@TechLabel(tech, r)</option>
+                                }
+                            </select>
+                        }
+                    </h2>
+                    <span class="isp-dimension-score @ScoreTextClass(dimension.Score)">@(dimension.Score?.ToString() ?? "--")</span>
+                </div>
+                <div class="card-body isp-card-body-tight-top" data-tour="@(dimension == r.IspAsnDimension ? "isp-network-hops" : null)">
+                    @if (dimension == r.IspAsnDimension)
+                    {
+                        var ispTargets = r.IspTargets.OrderBy(t => t.RttMs ?? double.MaxValue).ToList();
+                        var hiddenIspHopCount = ispTargets.Count - NetworkPreviewCount;
+                        RenderFragment<IspTargetHealth> hopRow = target =>
+                            @<div class="isp-hop">
+                                <div class="isp-hop-row">
+                                    <div class="isp-hop-main">
+                                        @* The label is the ASN name, so several hops read as "Provider 1,
+                                           2, 5" and none of them says which router answered. The address on
+                                           hover is what lets someone line our reading up against their own
+                                           traceroute (#1070). *@
+                                        <div class="isp-hop-name">
+                                            @if (!string.IsNullOrWhiteSpace(target.Address))
+                                            {
+                                                @* No hover-only: the address is worth reading at leisure, and clicking to pin it is the only
+                                                   way on touch. The name is not a link, so a click has nothing else to do. *@
+                                                <span class="isp-hop-name-text" data-tooltip="@target.Address">@target.Name</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="isp-hop-name-text">@target.Name</span>
+                                            }
+                                            @if (target.IsGradedHop)
+                                            {
+                                                <span class="isp-target-badge isp-target-graded" data-tooltip="The lowest-RTT ISP hop; access-layer idle latency is measured from it">Lowest RTT</span>
+                                            }
+                                            @if (target.SuggestDisable)
+                                            {
+                                                <button type="button" class="isp-target-badge isp-target-disable-hint"
+                                                        data-tooltip="Not on your traced path but adding jitter - review in Latency Targets to disable"
+                                                        @onclick="() => OnReviewTarget.InvokeAsync(target.TargetId)">Not on path &#9888;</button>
+                                            }
+                                        </div>
+                                        <div class="isp-factor-bar-track">
+                                            <div class="isp-factor-bar @BarClass(target.OverallScore)" style="width: @(target.OverallScore ?? 0)%"></div>
+                                        </div>
+                                    </div>
+                                    <span class="isp-factor-score @ScoreTextClass(target.OverallScore)">@(target.OverallScore?.ToString() ?? "--")</span>
+                                </div>
+                                <div class="isp-hop-stats">
+                                    <span class="isp-target-stat"><span class="isp-target-stat-label">RTT</span>@FormatRtt(target.RttMs)</span>
+                                    <span class="isp-target-stat">
+                                        <span class="isp-target-stat-label">P90 Jitter</span>
+                                        <span class="isp-target-stat-value">
+                                            @FormatJitter(target.ScoredJitterMs)
+                                            @if (target.JitterAssimilated)
+                                            {
+                                                <span class="tooltip-icon tooltip-icon-sm isp-jitter-tip" data-tooltip="@JitterAssimilationTooltip(target)">i</span>
+                                            }
+                                        </span>
+                                    </span>
+                                    <span class="isp-target-stat"><span class="isp-target-stat-label">Loss</span>@FormatLossPct(target.LossPct)</span>
+                                    @{
+                                        var hopLimit = LimitingAspect(target.LatencyStabilityScore, target.CongestionScore,
+                                            target.CongestionEventCount, Svc.Options.AsnLatencyStabilityWeight,
+                                            Svc.Options.AsnCongestionWeight);
+                                    }
+                                    @if (hopLimit is not null)
+                                    {
+                                        <span class="isp-target-stat">
+                                            <span class="isp-target-stat-label">@hopLimit.Value.Label</span>
+                                            @if (hopLimit.Value.Label == "Congestion")
+                                            {
+                                                <span class="isp-target-stat-value isp-events-jump @ScoreTextClass(hopLimit.Value.Score)"
+                                                      data-tooltip="Show these events" data-tooltip-hover @onclick="ScrollToEventsAsync">@hopLimit.Value.Value</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="isp-target-stat-value @ScoreTextClass(hopLimit.Value.Score)">@hopLimit.Value.Value</span>
+                                            }
+                                        </span>
+                                    }
+                                    @if (target.ReachDeltaMs is > 0.15)
+                                    {
+                                        <span class="isp-target-stat"><span class="isp-target-stat-label">Beyond nearest</span>+@FormatMs(target.ReachDeltaMs)</span>
+                                    }
+                                </div>
+                            </div>;
+                        @if (ispTargets.Count == 0)
+                        {
+                            <p class="page-description">No ISP hop data in the window.</p>
+                        }
+                        <div class="isp-hop-list">
+                            @foreach (var target in ispTargets.Take(NetworkPreviewCount))
+                            {
+                                @hopRow(target)
+                            }
+                        </div>
+                        @if (hiddenIspHopCount > 0)
+                        {
+                            <div class="expand-wrapper @(_showAllIspHops ? "expanded" : "")">
+                                <div class="expand-content">
+                                    <div class="isp-hop-list isp-hop-list-overflow">
+                                        @foreach (var target in ispTargets.Skip(NetworkPreviewCount))
+                                        {
+                                            @hopRow(target)
+                                        }
+                                    </div>
+                                </div>
+                            </div>
+                            <button type="button" class="isp-network-toggle" aria-expanded="@_showAllIspHops"
+                                    @onclick="() => _showAllIspHops = !_showAllIspHops">
+                                <span>@(_showAllIspHops ? "Show less" : $"Show {hiddenIspHopCount} more")</span>
+                                <span class="isp-network-toggle-chevron @(_showAllIspHops ? "expanded" : "")">▼</span>
+                            </button>
+                        }
+                    }
+                    else
+                    {
+                        @if (dimension.Factors.Count == 0)
+                        {
+                            <p class="page-description">No data for this dimension in the window.</p>
+                        }
+                        @foreach (var factor in dimension.Factors)
+                        {
+                            <div class="isp-factor-row">
+                                <div class="isp-factor-label">
+                                    @{
+                                        var isPhysicalLink = factor.Name == "Physical Link";
+                                        var investigateUrl = isPhysicalLink
+                                            ? PhysicalLinkInvestigateUrl(r.PhysicalLinkSelectedKey)
+                                            : FactorInvestigateUrl(factor.Name);
+                                        var investigateTooltip = isPhysicalLink
+                                            ? PhysicalLinkInvestigateTooltip(r.PhysicalLinkSelectedKey, r.PhysicalLinkMedium)
+                                            : "Jump to the most recent matching loss event on the Network Performance charts";
+                                    }
+                                    <div class="isp-factor-name-row">
+                                        @if (investigateUrl != null)
+                                        {
+                                            <a class="isp-factor-name isp-factor-link" href="@investigateUrl"
+                                               data-tooltip="@investigateTooltip" data-tooltip-hover-only>@factor.Name</a>
+                                        }
+                                        else
+                                        {
+                                            <span class="isp-factor-name">@factor.Name</span>
+                                        }
+                                        @if (!string.IsNullOrEmpty(factor.InvolvementTooltip))
+                                        {
+                                            @InvolvementPie(factor.Weight, factor.InvolvementTooltip!)
+                                        }
+                                    </div>
+                                    @if (!string.IsNullOrEmpty(factor.ValueText))
+                                    {
+                                        <span class="isp-factor-value">@factor.ValueText</span>
+                                    }
+                                </div>
+                                <div class="isp-factor-bar-track">
+                                    <div class="isp-factor-bar @BarClass(factor.Score)" style="width: @(factor.Score ?? 0)%"></div>
+                                </div>
+                                <span class="isp-factor-score @(ScoreTextClass(factor.Score) + CaveatClass(factor.LowReachScoreCaveat))" data-tooltip="@factor.LowReachScoreCaveat">@(factor.Score?.ToString() ?? "--")</span>
+                            </div>
+                            @if (!string.IsNullOrEmpty(factor.Description)
+                                 && !(factor.Name == "Physical Link" && r.PhysicalLinkCandidates.Count > 1))
+                            {
+                                <div class="isp-factor-description">@factor.Description</div>
+                            }
+                            @if (factor.Name == "Speed vs Plan" && !_planHintDismissed)
+                            {
+                                <IspPlanSpeedHint Compact="true" OnDismiss="DismissPlanHintAsync" />
+                            }
+                            @if (factor.Name == "Physical Link" && r.PhysicalLinkCandidates.Count > 1)
+                            {
+                                <div class="isp-factor-description">
+                                    @(r.PhysicalLinkAmbiguous
+                                        ? "More than one monitored access-link device matches this WAN. Choose which one feeds the score:"
+                                        : "Scoring the selected access-link device. Change it here if needed:")
+                                </div>
+                                <select class="form-control isp-physical-link-source"
+                                        value="@(r.PhysicalLinkSelectedKey ?? "")" @onchange="OnPhysicalLinkSourceChanged">
+                                    <option value="">Choose a source...</option>
+                                    @foreach (var cand in r.PhysicalLinkCandidates)
+                                    {
+                                        <option value="@cand.Key" selected="@(cand.Key == r.PhysicalLinkSelectedKey)">@cand.Label</option>
+                                    }
+                                </select>
+                            }
+                        }
+                    }
+                </div>
+            </div>
+        }
+    </div>
+
+    @if (r.TransitAsns.Count > 0 || r.IspAsns.Count > 0)
+    {
+        <div class="card isp-health-card">
+            <div class="card-header"><h2 class="card-title">Networks on Your Path</h2></div>
+            <div class="card-body">
+                <div class="isp-asn-grid">
+                    @foreach (var asn in r.IspAsns.Concat(r.TransitAsns))
+                    {
+                        var isIspAsn = r.IspAsns.Contains(asn);
+                        var showRange = isIspAsn && asn.MinRttMs.HasValue && asn.MaxRttMs.HasValue
+                            && asn.MaxRttMs.Value - asn.MinRttMs.Value > 0.05;
+                        <div class="isp-asn-card">
+                            <div class="isp-asn-card-header">
+                                <div>
+                                    <div class="isp-asn-name-row">
+                                        <div class="isp-asn-name">@(string.IsNullOrEmpty(asn.AsnName) ? $"AS{asn.AsnNumber}" : asn.AsnName)</div>
+                                        @if (!string.IsNullOrEmpty(asn.InvolvementTooltip))
+                                        {
+                                            @InvolvementPie(asn.InvolvementWeight ?? 1.0, asn.InvolvementTooltip!)
+                                        }
+                                    </div>
+                                    <div class="isp-asn-sub">@(isIspAsn ? "ISP network" : asn.AsnNumber < 0 ? "Direct peering" : "Transit") @(asn.AsnNumber > 0 ? $"· AS{asn.AsnNumber}" : "")</div>
+                                </div>
+                                <span class="isp-asn-grade @(ScoreTextClass(asn.OverallScore) + CaveatClass(asn.LowReachScoreCaveat))" data-tooltip="@asn.LowReachScoreCaveat">@(asn.OverallScore?.ToString() ?? "--")</span>
+                            </div>
+                            <div class="isp-asn-stats">
+                                @if (showRange)
+                                {
+                                    <div class="isp-asn-stat"><span class="detail-label">RTT Range</span><span class="detail-value">@FormatRttRange(asn.MinRttMs, asn.MaxRttMs)</span></div>
+                                }
+                                else
+                                {
+                                    <div class="isp-asn-stat"><span class="detail-label">Mean RTT</span><span class="detail-value">@FormatRtt(asn.MeanRttMs)</span></div>
+                                }
+                                <div class="isp-asn-stat">
+                                    <span class="detail-label">P90 Jitter</span>
+                                    <span class="detail-value">
+                                        @FormatJitter(asn.ScoredJitterMs)
+                                        @if (asn.JitterAssimilated)
+                                        {
+                                            <span class="tooltip-icon tooltip-icon-sm isp-jitter-tip" data-tooltip="@JitterAssimilationTooltip(asn, isIspAsn)">i</span>
+                                        }
+                                    </span>
+                                </div>
+                                <div class="isp-asn-stat"><span class="detail-label">Loss</span><span class="detail-value">@FormatLossPct(asn.LossPct)</span></div>
+                                @{
+                                    var asnLimit = LimitingAspect(asn.LatencyStabilityScore, asn.CongestionScore,
+                                        asn.CongestionEventCount, Svc.Options.AsnLatencyStabilityWeight,
+                                        Svc.Options.AsnCongestionWeight);
+                                }
+                                @if (asnLimit is not null)
+                                {
+                                    <div class="isp-asn-stat">
+                                        <span class="detail-label">@asnLimit.Value.Label</span>
+                                        @if (asnLimit.Value.Label == "Congestion")
+                                        {
+                                            <span class="detail-value isp-events-jump @ScoreTextClass(asnLimit.Value.Score)"
+                                                  data-tooltip="Show these events" data-tooltip-hover @onclick="ScrollToEventsAsync">@asnLimit.Value.Value</span>
+                                        }
+                                        else
+                                        {
+                                            <span class="detail-value @ScoreTextClass(asnLimit.Value.Score)">@asnLimit.Value.Value</span>
+                                        }
+                                    </div>
+                                }
+                                @if (asn.ReachDeltaMs.HasValue)
+                                {
+                                    <div class="isp-asn-stat"><span class="detail-label">Beyond ISP</span><span class="detail-value">+@FormatMs(asn.ReachDeltaMs)</span></div>
+                                }
+                            </div>
+                            <div class="isp-asn-score-track">
+                                <div class="isp-factor-bar @BarClass(asn.OverallScore)" style="width: @(asn.OverallScore ?? 0)%"></div>
+                            </div>
+                            @if (asn.CongestionEventCount > 0)
+                            {
+                                <span class="isp-event-badge isp-event-badge-warning">@asn.CongestionEventCount congestion event@(asn.CongestionEventCount == 1 ? "" : "s")</span>
+                            }
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+    }
+
+    @if (r.Outages.Count > 0)
+    {
+        <div class="card isp-health-card" id="isp-outages">
+            <div class="card-header"><h2 class="card-title">@OutageSectionTitle(r) (@WindowLabel(r))</h2></div>
+            <div class="card-body">
+                <div class="isp-outage-list">
+                    @foreach (var outage in r.Outages)
+                    {
+                        <div class="isp-outage">
+                            <div class="isp-outage-head">
+                                <span class="isp-event-badge @OutageBadgeClass(outage)" data-tooltip="@OutageScoreTooltip(outage)">@OutageBadgeText(outage)</span>
+                                <span class="isp-outage-duration">@FormatDuration(outage.Duration)</span>
+                                <span class="isp-outage-window">@outage.Start.ToLocalTime().ToString("MMM d, HH:mm:ss") &ndash; @outage.End.ToLocalTime().ToString("HH:mm:ss")</span>
+                                <span class="isp-outage-scope" data-tooltip="@OutageScoreTooltip(outage)">@OutageScopeLabel(outage)</span>
+                                @if (outage.IsPartial)
+                                {
+                                    <span class="isp-outage-window">peak @outage.PeakLossPct.ToString("0")% &middot; @outage.DegradedTargetCount/@outage.PathTargetCount targets</span>
+                                }
+                                @if (_ackPending.Contains(outage.Start))
+                                {
+                                    <span class="isp-outage-ack">@(outage.Acknowledged ? "restoring..." : "excluding...")</span>
+                                }
+                                else if (outage.Acknowledged)
+                                {
+                                    <span class="isp-outage-ack isp-outage-ack-done">that was me &middot; not scored
+                                        <SiteOperatorOnly>
+                                            <a href="javascript:void(0)" class="@AckLockClass" @onclick="() => UnacknowledgeOutageAsync(outage.Start)">undo</a>
+                                        </SiteOperatorOnly>
+                                    </span>
+                                }
+                                else if (outage.Scope != OutageScope.Local)
+                                {
+                                    <SiteOperatorOnly>
+                                        <a class="isp-outage-ack @AckLockClass" href="javascript:void(0)"
+                                       data-tooltip="Your own doing (pulled a cable, re-seated a connector, swapped equipment)? Click to exclude this event from ISP Health scoring."
+                                       data-tooltip-hover-only
+                                       @onclick="() => AcknowledgeOutageAsync(outage.Start)">that was me</a>
+                                    </SiteOperatorOnly>
+                                }
+                            </div>
+                            @{
+                                var shapeDark = outage.Tiers.Any(t => t.WentDark);
+                            }
+                            @if (shapeDark || (outage.IsPartial && outage.Tiers.Count > 0))
+                            {
+                                RenderFragment<OutageTierState> hopRow;
+                                if (shapeDark)
+                                {
+                                    hopRow = tier =>
+                                        @<div class="isp-outage-hop">
+                                            <span class="isp-outage-hop-name" data-tooltip="@OutageHopTooltip(tier)">@tier.Name</span>
+                                            <div class="isp-outage-hop-track">
+                                                <div class="isp-outage-hop-dark" style="width: @(OutageHopDarkPercent(outage, tier).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture))%"></div>
+                                            </div>
+                                            <span class="isp-outage-hop-status @(tier.WentDark ? "" : "isp-outage-hop-up")">@OutageHopStatus(tier)</span>
+                                        </div>;
+                                }
+                                else
+                                {
+                                    hopRow = tier =>
+                                        @<div class="isp-outage-hop">
+                                            <span class="isp-outage-hop-name">@tier.Name</span>
+                                            <div class="isp-outage-hop-track">
+                                                <div class="isp-outage-hop-loss" style="width: @(tier.PeakLossPct.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture))%"></div>
+                                            </div>
+                                            <span class="isp-outage-hop-status">peak @tier.PeakLossPct.ToString("0")% loss</span>
+                                        </div>;
+                                }
+                                @* Long waterfalls collapse to the first and last three rows - the ends carry the
+                                   story (where the break sat, what stayed reachable) - with the hidden middle
+                                   drawn as a clickable fault line. Both the middle rows and the fault line sit in
+                                   expand-wrappers with opposite states so one grows as the other collapses; the
+                                   negative top margin cancels the parent flex gap around whichever is at 0fr. *@
+                                var tiers = outage.Tiers;
+                                var collapsible = tiers.Count > OutageShapeCollapseThreshold;
+                                var shapeExpanded = _expandedOutageShapes.Contains(outage.Start);
+                                var hiddenCount = tiers.Count - OutageShapeEdgeRows * 2;
+                                <div class="isp-outage-shape">
+                                    @* The fault line is the only way in; the toggle exists only as the way
+                                       back down, sitting right above the rows. *@
+                                    @if (collapsible && shapeExpanded)
+                                    {
+                                        <div class="isp-outage-shape-toggle">
+                                            <button type="button" aria-expanded="true" @onclick="() => ToggleOutageShape(outage.Start)">
+                                                Collapse <span class="isp-outage-fault-chevron">▲</span>
+                                            </button>
+                                        </div>
+                                    }
+                                    @foreach (var tier in collapsible ? tiers.Take(OutageShapeEdgeRows) : tiers)
+                                    {
+                                        @hopRow(tier)
+                                    }
+                                    @if (collapsible)
+                                    {
+                                        <div class="expand-wrapper isp-outage-seam @(shapeExpanded ? "" : "expanded")">
+                                            <div class="expand-content">
+                                                <button type="button" class="isp-outage-fault" aria-expanded="false" @onclick="() => ToggleOutageShape(outage.Start)">
+                                                    <span class="isp-outage-fault-pill">@hiddenCount more targets <span class="isp-outage-fault-chevron">▼</span></span>
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div class="expand-wrapper isp-outage-seam @(shapeExpanded ? "expanded" : "")">
+                                            <div class="expand-content">
+                                                <div class="isp-outage-shape-middle">
+                                                    @foreach (var tier in tiers.Skip(OutageShapeEdgeRows).Take(hiddenCount))
+                                                    {
+                                                        @hopRow(tier)
+                                                    }
+                                                </div>
+                                            </div>
+                                        </div>
+                                        @foreach (var tier in tiers.Skip(tiers.Count - OutageShapeEdgeRows))
+                                        {
+                                            @hopRow(tier)
+                                        }
+                                    }
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+    }
+
+    <div class="card isp-health-card" id="isp-events">
+        <div class="card-header isp-events-header">
+            <h2 class="card-title">Path &amp; Congestion Events (@EventsWindowLabel(r))</h2>
+            <div class="time-range-selector isp-event-filter">
+                <button class="time-btn evt-congestion @(_visibleEventCats.Contains(EventCategory.Congestion) ? "active" : "")" @onclick="e => ToggleEventFilterAsync(EventCategory.Congestion, e)">Congestion</button>
+                <button class="time-btn evt-shift @(_visibleEventCats.Contains(EventCategory.Shift) ? "active" : "")" @onclick="e => ToggleEventFilterAsync(EventCategory.Shift, e)">Path shifts</button>
+                <button class="time-btn evt-change @(_visibleEventCats.Contains(EventCategory.Change) ? "active" : "")" @onclick="e => ToggleEventFilterAsync(EventCategory.Change, e)">Path changes</button>
+            </div>
+        </div>
+        <div class="card-body">
+            @{
+                var allEvents = EventTimeline(r).Where(InZoomWindow).Where(InVisibleSeries).ToList();
+                var timeline = allEvents.Where(CategoryVisible).ToList();
+            }
+            @if (timeline.Count == 0)
+            {
+                <p class="page-description">@(allEvents.Count > 0 ? "All events in this range are hidden by the filters above." : _visibleSeriesTargets != null ? "No congestion events or path shifts on the selected chart lines. Clear the chart's filter to see the rest." : IsZoomed ? "No congestion events or path shifts in this range. Reset the chart zoom to see the full window." : "No congestion events or path shifts detected in the window.")</p>
+            }
+            else
+            {
+                <div class="isp-event-timeline">
+                    @foreach (var (entry, i) in timeline.Select((e, i) => (e, i)))
+                    {
+                        @* Keyed so filter/report re-renders never reuse a badge span across entries -
+                           Tippy caches its content per node, so attribute-swapped reuse shows a stale
+                           tooltip (e.g. a congestion tooltip on a Path shift badge). The index is part
+                           of the key because records compare by value and duplicate keys throw. *@
+                        <div class="isp-event-item" @key="(entry, i)">
+                            <span class="isp-event-badge @entry.BadgeClass" data-tooltip="@entry.BadgeTooltip">@entry.Badge</span>
+                            <span class="isp-event-time">@EventTimeLabel(entry.Time)</span>
+                            <span class="isp-event-text">
+                                @entry.Text
+                                @if (entry.Members is { Count: > 0 })
+                                {
+                                    var key = EventMemberKey(entry);
+                                    var open = _expandedEvents.Contains(key);
+                                    @* Razor trims the whitespace between the sentence and this block,
+                                       so the separating space must be emitted explicitly. *@
+                                    @(" ")
+                                    <button type="button" class="isp-event-members-toggle" aria-expanded="@open"
+                                            @onclick="() => ToggleEventMembers(key)">@(open ? $"Hide {entry.MemberNoun}s" : $"Show {entry.Members.Count} {entry.MemberNoun}s")</button>
+                                    @if (open)
+                                    {
+                                        <div class="isp-event-members">
+                                            @foreach (var member in entry.Members)
+                                            {
+                                                <div>@member</div>
+                                            }
+                                        </div>
+                                    }
+                                }
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+    </div>
+
+    <div class="card isp-health-card isp-health-chart-card">
+        <div class="card-header">
+            <h2 class="card-title">Per-Network RTT (@WindowLabel(r))</h2>
+            <div class="card-header-right">
+                <MonitoringJumpButton Icon="MonitoringJumpButton.JumpIcon.Analyze"
+                                      Tooltip="Analyze this window in Latency &amp; Packet Loss"
+                                      OnClick="JumpToAnalysisAsync" />
+            </div>
+        </div>
+        <div class="card-body isp-card-body-tight-top">
+            <div id="isp-health-asn-chart"></div>
+
+            @{ var ispAsn = r.IspAsns.FirstOrDefault(a => a.AsnNumber > 0); }
+            @if (ispAsn != null)
+            {
+                <details class="setup-guide" style="margin-top: 1.25rem;">
+                    <summary>Dig deeper with BGP tools</summary>
+                    <div class="setup-guide-content">
+                        <p>The chart above tracks latency to the networks (autonomous systems) your traffic passes through. Your ISP is <strong>@(string.IsNullOrEmpty(ispAsn.AsnName) ? $"AS{ispAsn.AsnNumber}" : ispAsn.AsnName) (AS@(ispAsn.AsnNumber))</strong>. Transit networks are the backbone providers your ISP peers with to reach the rest of the internet.</p>
+                        <p>BGP (Border Gateway Protocol) is how these networks decide where to send your traffic. A path shift in the chart above means your ISP or a transit provider changed the route. These tools let you explore peering, prefixes, and routing for any AS:</p>
+                        <ul>
+                            <li><a href="https://bgp.he.net/AS@(ispAsn.AsnNumber)" target="_blank" rel="noopener">HE BGP Toolkit</a> - Peering, prefixes, and routing details. The go-to tool for most network engineers.</li>
+                            <li><a href="https://bgp.tools/as/@(ispAsn.AsnNumber)" target="_blank" rel="noopener">bgp.tools</a> - Clean overview of upstreams, downstreams, peers, and historical routing in one page.</li>
+                            <li><a href="https://stat.ripe.net/app/launchpad/AS@(ispAsn.AsnNumber)" target="_blank" rel="noopener">RIPE RIPEstat</a> - Authoritative data from RIPE NCC. Routing status, prefix announcements, and historical BGP data for any ASN worldwide.</li>
+                        </ul>
+                    </div>
+                </details>
+            }
+        </div>
+    </div>
+}
+
+@* One jump behavior for the panel: a finding's Open link and a hop's event count both scroll to
+   their section and mark it with the standard card highlight, so the two cannot drift apart. *@
+@code {
+    private const int NetworkPreviewCount = 5;
+
+    // Raised when the user clicks the disable hint on an off-path, jittery ISP hop; the parent jumps
+    // to the Latency targets card so they can pause it. Argument is the hop's TargetId.
+    [Parameter] public EventCallback<string> OnReviewTarget { get; set; }
+
+    // Arm 4: pie-slice icon showing a transit ASN's internet-host involvement weight (0.25-1.0).
+    private RenderFragment InvolvementPie(double weight, string tooltip) => @<span class="isp-involvement-pie" data-tooltip="@tooltip">
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <circle cx="8" cy="8" r="6" fill="var(--bg-tertiary)" stroke="var(--text-muted)" stroke-width="1"></circle>
+            @if (weight >= 0.999)
+            {
+                <circle cx="8" cy="8" r="6" fill="var(--primary-color)"></circle>
+            }
+            else
+            {
+                <path d="@PieSlicePath(weight)" fill="var(--primary-color)"></path>
+            }
+        </svg>
+    </span>;
+
+    // SVG path for a pie wedge filled from 12 o'clock clockwise by `fraction` of a full turn, on a
+    // 16x16 viewBox, radius 6. Empty for fraction <= 0; the full-circle case is handled by the caller.
+    private static string PieSlicePath(double fraction)
+    {
+        fraction = Math.Clamp(fraction, 0, 1);
+        if (fraction <= 0) return string.Empty;
+        var theta = 2 * Math.PI * fraction;
+        var ex = 8 + 6 * Math.Sin(theta);
+        var ey = 8 - 6 * Math.Cos(theta);
+        var large = fraction > 0.5 ? 1 : 0;
+        return string.Create(CultureInfo.InvariantCulture, $"M8,8 L8,2 A6,6 0 {large} 1 {ex:0.##},{ey:0.##} Z");
+    }
+
+    private IspHealthReport? _report;
+    private bool _loading = true;
+
+    // "Where do the plan speeds come from" hint. Starts hidden so it can't flash in and then
+    // vanish for someone who already dismissed it; the load below reveals it if they haven't.
+    // The dismissal is global rather than per-site: it's operator knowledge, not site state.
+    private bool _planHintDismissed = true;
+    private bool _chartMounted;
+    private bool _refreshing;
+    private bool _autoReloading;
+    private bool _showAllIspHops;
+    private System.Threading.Timer? _ageTimer;
+
+    // Path & Congestion Events category filters (display-only - scoring is untouched). All on by
+    // default and deliberately NOT persisted, like the date/time filter above: a saved filter would
+    // silently suppress new events on the next visit. Click semantics match the LAN flow map band
+    // chips: all on -> click solos that category, only-it-on -> click restores all, otherwise a
+    // plain toggle.
+    private static readonly EventCategory[] AllEventCategories =
+        { EventCategory.Congestion, EventCategory.Shift, EventCategory.Change };
+    private HashSet<EventCategory> _visibleEventCats = new(AllEventCategories);
+
+    // Which grouped congestion lines have their per-hop readings open. Not by index, which the
+    // category filters renumber, and not by the rendered sentence: it carries the load percentage
+    // and the magnitudes, so a recompute that only moved those would close what the reader had open.
+    private readonly HashSet<string> _expandedEvents = new();
+
+    private static string EventMemberKey(TimelineEntry e) => $"{e.Time:O}|{e.Badge}|{e.Members?.Count}";
+
+    private void ToggleEventMembers(string key)
+    {
+        if (!_expandedEvents.Remove(key)) _expandedEvents.Add(key);
+    }
+
+    // Date/time filter. Never persisted: OnInitializedAsync starts on the live window (the effective
+    // auto-computed window, which auto-fallback may have reduced below the configured target), so
+    // leaving and returning to the tab - and every auto-computed path - resets to the live view.
+    private static readonly (string Label, int Hours)[] BasePresets =
+    {
+        ("24h", 24), ("48h", 48), ("7d", 168), ("14d", 336), ("30d", 720)
+    };
+    private const int DefaultPresetHours = 48;
+    private const int MaxRangeHours = 720;   // 30-day / 1-month hard cap
+    private const int MinRangeHours = 4;     // smallest custom window
+    private int _selectedPreset = DefaultPresetHours;
+    // True while the selection follows the live/cached auto-computed report (rather than a preset or
+    // custom window computed off-cache). While set, _selectedPreset is kept in sync with the effective
+    // (possibly reduced) window so the matching button stays highlighted.
+    private bool _followLive = true;
+
+    // The live/cached window in hours: the effective auto-computed window (reduced by auto-fallback
+    // when the box can't finish the configured target in time), else the configured target, else 48.
+    private int LiveWindowHours => Svc.EffectiveWindowHours > 0
+        ? Svc.EffectiveWindowHours
+        : (Svc.ConfiguredWindowHours > 0 ? Svc.ConfiguredWindowHours : DefaultPresetHours);
+
+    // Presets shown in the selector: the base set plus the live window when auto-fallback landed on a
+    // value that isn't already a preset (e.g. the 16 h rung), so the active default always has a button.
+    private IEnumerable<(string Label, int Hours)> FilterPresets
+    {
+        get
+        {
+            var live = LiveWindowHours;
+            if (BasePresets.Any(p => p.Hours == live))
+                return BasePresets;
+            return BasePresets.Append((Label: FormatPresetLabel(live), Hours: live)).OrderBy(p => p.Hours);
+        }
+    }
+
+    private static string FormatPresetLabel(int hours) =>
+        hours % 24 == 0 ? $"{hours / 24}d" : $"{hours}h";
+    private bool _isCustom;
+    private bool _showCustomPopover;
+    private bool _windowComputing;
+    private DateTime? _windowStart;
+    private DateTime? _windowEnd;
+    private DotNetObjectReference<IspHealthPanel>? _selfRef;
+    // Chart drag-zoom range (UTC) the events list is filtered to; null = show the whole window.
+    private DateTime? _zoomFrom;
+    private DateTime? _zoomTo;
+    private bool IsZoomed => _zoomFrom.HasValue && _zoomTo.HasValue;
+    // Set when something above the chart changes the events list's length (reset-zoom, a series
+    // filter); scrolls the chart back into view after the next render so it isn't pushed
+    // off-screen.
+    private bool _scrollChartAfterRender;
+    // Last report the absolved-jitter tooltips were refreshed against; a new report means their
+    // data-tooltip changed and the cached Tippy content needs rebuilding.
+    private IspHealthReport? _lastTooltipReport;
+    private DateTime _customFrom = DateTime.Now.AddDays(-2);
+    private DateTime _customTo = DateTime.Now;
+
+    private bool IsLiveWindow => !_isCustom && _followLive;
+
+    /// <summary>
+    /// User asked to retry the full configured window from the "reduced window" badge (e.g. after a
+    /// hardware upgrade). Reset the auto-fallback so the next compute re-probes the target, then force
+    /// a recompute; if the box still can't finish it in time it simply drops back and the badge
+    /// returns. Only swaps the displayed report when on the live view.
+    /// </summary>
+    private async Task RetryFullWindowAsync()
+    {
+        if (_refreshing || _windowComputing) return;
+        Svc.RetryConfiguredWindow();
+        _refreshing = true;
+        StateHasChanged();
+        try
+        {
+            var report = await Svc.GetReportAsync(forceRefresh: true);
+            if (IsLiveWindow)
+            {
+                _report = report;
+                try { await JS.InvokeVoidAsync("eval", "window.__ispHealthCharts?.reload?.();"); }
+                catch { /* chart not mounted yet */ }
+            }
+        }
+        finally
+        {
+            _refreshing = false;
+        }
+        // The retry may restore the full window or drop again; re-sync the highlighted button.
+        if (_followLive) _selectedPreset = LiveWindowHours;
+        StateHasChanged();
+    }
+
+    [CascadingParameter] private Task<AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>
+    /// Whether the caller may change the scored access technology. Operator, not Admin: it retunes
+    /// how this site is judged rather than changing anything the network does, and a wrong choice is
+    /// corrected by choosing again. Viewers see the current technology and cannot move it - the
+    /// setting is stored per site, so it changes the score everyone reads, not just their own view.
+    /// </summary>
+    private bool _canOperate;
+
+    // Per-WAN report selection: the panel talks to the selected WAN's own IspHealthService
+    // instance; the injected (primary) service is the default and the only one a single-WAN
+    // site ever uses.
+    private IspHealthService? _wanSvc;
+    private IspHealthService Svc => _wanSvc ?? IspHealth;
+    private sealed record WanChoice(string Key, string Label, bool IsPrimary);
+    private List<WanChoice> _wanOptions = new();
+    // Which WANs a context names. A secondary WAN without one is not "not discovered yet" - it is
+    // not probed at all, and discovery cannot change that.
+    private HashSet<string> _wansWithContext = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _wansWithProbeBinding = new(StringComparer.OrdinalIgnoreCase);
+    private string _selectedWanKey = "";
+
+    /// <summary>
+    /// Whether the selected WAN has an enabled scheduled WAN speed test. Read alongside the
+    /// report so the collecting-data banner can point a freshly monitored WAN at Alerts &amp;
+    /// Schedule while its latency history builds. Defaults to true so the nudge never shows
+    /// on an unknown answer.
+    /// </summary>
+    private bool _wanHasSpeedTestSchedule = true;
+
+    /// <summary>
+    /// Whether this user could act on the schedule nudge. Creating a scheduled speed test is a
+    /// site administrator's to do, so anyone else is left with the plain collecting-data line
+    /// rather than being sent to a page that will not let them do it.
+    /// </summary>
+    private bool _canConfigureSchedules;
+
+    /// <summary>Whether to offer the schedule nudge: this WAN has none, and the user could add one.</summary>
+    private bool ShowScheduleNudge => !_wanHasSpeedTestSchedule && _canConfigureSchedules;
+    private string SharedWanScopeKey => SiteContext.ScopeStorageKey("monitoringWanScope");
+
+    /// <summary>
+    /// WAN choices for the selector: the live WAN list, plus any context-bound WAN the console
+    /// currently omits (a down WAN's history is still worth reading). One entry = gate closed.
+    /// </summary>
+    private async Task LoadWanChoicesAsync()
+    {
+        var options = new List<WanChoice>();
+        try
+        {
+            foreach (var wan in await PathView.GetSelectableWansAsync())
+                options.Add(new WanChoice(NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(wan.WanInterface),
+                    NetworkOptimizer.UniFi.GatewayWanHelper.FormatWanLabel(
+                        wan.FriendlyName, NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(wan.WanInterface), null, null),
+                    wan.IsPrimary));
+        }
+        catch { }
+        try
+        {
+            await using var db = SiteDb.CreateForSite(SiteContext.Slug, SiteContext.IsDefault);
+            var contexts = await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync(
+                Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AsNoTracking(db.WanContexts));
+            _wansWithContext = contexts
+                .Where(c => !string.IsNullOrEmpty(c.WanInterface))
+                .Select(c => NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(c.WanInterface!))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            _wansWithProbeBinding = contexts
+                .Where(c => !string.IsNullOrEmpty(c.WanInterface)
+                    && (c.AgentId != null || !string.IsNullOrEmpty(c.ProbeSourceIp)))
+                .Select(c => NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(c.WanInterface!))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var ctx in contexts)
+            {
+                if (string.IsNullOrEmpty(ctx.WanInterface)) continue;
+                var key = NetworkOptimizer.UniFi.GatewayWanHelper.WanInterfaceKeyFromKey(ctx.WanInterface!);
+                if (!options.Any(o => o.Key == key))
+                    options.Add(new WanChoice(key,
+                        NetworkOptimizer.UniFi.GatewayWanHelper.FormatWanLabel(
+                            ctx.Name, NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(key), null, null),
+                        IsPrimary: false));
+            }
+        }
+        catch { }
+        _wanOptions = options;
+        _selectedWanKey = options.FirstOrDefault(o => o.IsPrimary)?.Key ?? options.FirstOrDefault()?.Key ?? "";
+    }
+
+    /// <summary>Loads the selected WAN's report, leaving it null on a transient query failure.</summary>
+    /// <summary>
+    /// Waits out the first compute for a WAN the user just switched to, then shows it. Bounded and
+    /// abandoned if the selection moves on - a compute that outlives the user's interest in it
+    /// should not redraw the panel underneath whatever they are looking at now.
+    /// </summary>
+    private async Task PollForFirstReportAsync(string forWanKey)
+    {
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3));
+            if (!string.Equals(_selectedWanKey, forWanKey, StringComparison.OrdinalIgnoreCase)) return;
+            try
+            {
+                var report = await Svc.GetReportAsync();
+                if (report == null) continue;
+                if (!string.Equals(_selectedWanKey, forWanKey, StringComparison.OrdinalIgnoreCase)) return;
+                _report = report;
+                await InvokeAsync(StateHasChanged);
+                return;
+            }
+            catch { return; }
+        }
+    }
+
+    private async Task LoadReportAsync()
+    {
+        try
+        {
+            _report = _windowStart.HasValue && _windowEnd.HasValue
+                ? await Svc.GetReportForWindowAsync(_windowStart.Value, _windowEnd.Value)
+                : await Svc.GetReportAsync();
+        }
+        catch
+        {
+            // A transient InfluxDB/query failure must not fault the circuit; leave the report null
+            // and let the status funnels render the fallback message.
+            _report = null;
+        }
+        await RefreshWanScheduleHintAsync();
+    }
+
+    /// <summary>
+    /// Rereads whether the selected WAN is covered by an enabled scheduled WAN speed test. A
+    /// gateway schedule carries its network group(s) in TargetConfig ("WAN", "WAN+WAN2"); a
+    /// server-vantage schedule carries none and rides the default route, so it counts for the
+    /// primary. Any failure reads as covered - the banner nudge must never appear on a guess.
+    /// </summary>
+    private async Task RefreshWanScheduleHintAsync()
+    {
+        try
+        {
+            var choice = _wanOptions.FirstOrDefault(w => string.Equals(w.Key, _selectedWanKey, StringComparison.OrdinalIgnoreCase));
+            var wanKey = string.IsNullOrEmpty(_selectedWanKey) ? NetworkOptimizer.UniFi.GatewayWanHelper.DefaultWanKey : _selectedWanKey;
+            var wanGroup = NetworkOptimizer.UniFi.GatewayWanHelper.WanNetworkGroupFromKey(wanKey);
+            var isPrimary = choice?.IsPrimary ?? true;
+
+            await using var db = SiteDb.CreateForSite(SiteContext.Slug, SiteContext.IsDefault);
+            var configs = await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync(
+                System.Linq.Queryable.Select(
+                    System.Linq.Queryable.Where(db.ScheduledTasks,
+                        t => t.Enabled && t.TaskType == "wan_speedtest"),
+                    t => t.TargetConfig));
+            // An Agent-run schedule names its WAN by context id, so those are resolved to a WAN key
+            // here. Schedules made before that field existed carry neither, and still fall back to
+            // "the primary is what an unnamed test measures".
+            var contextWans = await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToDictionaryAsync(
+                System.Linq.Queryable.Where(db.WanContexts, c => c.WanInterface != null && c.WanInterface != ""),
+                c => c.Id, c => c.WanInterface!);
+            _wanHasSpeedTestSchedule = configs.Any(c => ScheduleCoversWan(c, wanGroup, isPrimary, contextWans));
+        }
+        catch
+        {
+            _wanHasSpeedTestSchedule = true;
+        }
+    }
+
+    private static bool ScheduleCoversWan(
+        string? targetConfig, string wanGroup, bool wanIsPrimary, IReadOnlyDictionary<int, string> contextWans)
+    {
+        if (string.IsNullOrEmpty(targetConfig)) return wanIsPrimary;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(targetConfig);
+            // A vantage that still exists answers outright; one since deleted falls through to the
+            // WAN group the schedule also records, rather than reading as uncovered.
+            if (doc.RootElement.TryGetProperty("wanContextId", out var ctx)
+                && ctx.TryGetInt32(out var contextId)
+                && contextWans.TryGetValue(contextId, out var contextWan))
+            {
+                return string.Equals(NetworkOptimizer.UniFi.GatewayWanHelper.WanNetworkGroupFromKey(contextWan),
+                    wanGroup, StringComparison.OrdinalIgnoreCase);
+            }
+            if (!doc.RootElement.TryGetProperty("wanGroup", out var g) || g.ValueKind != System.Text.Json.JsonValueKind.String)
+                return wanIsPrimary;
+            return (g.GetString() ?? "").Split('+')
+                .Any(part => string.Equals(part.Trim(), wanGroup, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return wanIsPrimary;
+        }
+    }
+
+    private async Task SelectWanAsync(string key, bool persist = true)
+    {
+        // Same WAN AND a report already in hand is the no-op this guard is for. Without the
+        // second half it also swallowed the first selection of the WAN the panel opens on, which
+        // is the primary: _selectedWanKey is seeded with it, so ?wan=<primary> matched and
+        // returned before fetching anything. The render then found no report, read a status of
+        // Ready rather than Computing, and fell through to the catch-all telling the operator
+        // their monitoring was broken - repeatably, and only ever for the primary.
+        if (string.Equals(key, _selectedWanKey, StringComparison.OrdinalIgnoreCase) && _report != null) return;
+        var choice = _wanOptions.FirstOrDefault(w => string.Equals(w.Key, key, StringComparison.OrdinalIgnoreCase));
+        if (choice == null) return;
+        _selectedWanKey = choice.Key;
+        _wanSvc = choice.IsPrimary ? null : IspHealthRegistry.GetFor(SiteContext.Slug, choice.Key);
+        // Held across the fetch: the moment Svc points at the new WAN, every status funnel below
+        // is answering for a WAN whose report has not been read yet, and the catch-all among them
+        // says the site's monitoring is broken.
+        _loading = true;
+        // The whole report - the chart element with it - is behind @if (!_loading), so showing the
+        // spinner tears that div out of the DOM and leaves ApexCharts holding a detached node. The
+        // mount flag has to come off with it, or the after-render path sees "already mounted",
+        // skips the re-mount, and the WAN switch lands on an empty chart area. Pushing a new WAN
+        // to the old instance cannot help: the element it drew into is gone.
+        await DropChartMountAsync();
+        StateHasChanged();
+        if (persist)
+        {
+            try { await JS.InvokeVoidAsync("localStorage.setItem", SharedWanScopeKey, choice.IsPrimary ? "" : choice.Key); }
+            catch { }
+        }
+        try
+        {
+            _report = _windowStart.HasValue && _windowEnd.HasValue
+                ? await Svc.GetReportForWindowAsync(_windowStart.Value, _windowEnd.Value)
+                : await Svc.GetReportAsync();
+        }
+        catch { _report = null; }
+        await RefreshWanScheduleHintAsync();
+        // The chart fetches its own series and scopes them by WAN, so it has to be told. The
+        // chart itself is dropped right now (the content render below re-mounts it), but the WAN
+        // key is module-level JS state that survives the remount - pushing it here means the
+        // fresh mount's very first fetch is already scoped to the new WAN.
+        await PushChartWanAsync();
+        _loading = false;
+        // A WAN that has never been scored comes back null with a compute now running behind it.
+        // Waiting for the 30 s age tick to notice leaves the user on a spinner-less funnel for
+        // most of a minute, so poll briefly for the result the switch just asked for.
+        if (_report == null && Svc.Status == IspHealthStatus.Computing)
+            _ = PollForFirstReportAsync(choice.Key);
+        StateHasChanged();
+    }
+
+    /// <summary>Applies the WAN remembered for this site once localStorage is reachable.</summary>
+
+    /// <summary>
+    /// The WAN named by a <c>?wan=</c> query parameter, or null. Unknown values are ignored by the
+    /// caller rather than erroring: a stale link to a WAN the site no longer has should land on
+    /// the default report, not on nothing.
+    /// </summary>
+    /// <summary>
+    /// The WAN Speed Test link for the report on screen, filtered to the same WAN. The speeds in
+    /// this tile are that WAN's, so the history behind them should be too rather than every WAN's
+    /// results mixed together. Single-WAN sites get the plain page: the parameter resolves to the
+    /// one series there and the filter bar does not render at all.
+    /// </summary>
+    private string WanSpeedTestHref() =>
+        string.IsNullOrEmpty(_selectedWanKey)
+            ? "/wan-speedtest"
+            : $"/wan-speedtest?wan={Uri.EscapeDataString(_selectedWanKey)}";
+
+    private string? LinkedWanKey()
+    {
+        try
+        {
+            var query = new Uri(NavigationManager.Uri).Query;
+            var value = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(query)
+                .TryGetValue("wan", out var v) ? v.ToString() : null;
+            if (string.IsNullOrWhiteSpace(value)) return null;
+
+            var key = value.Trim().ToLowerInvariant();
+            // "primary" names the role rather than a WAN group, for links from somewhere that
+            // shows the primary's figures without knowing which WAN holds that role - it is a
+            // role in UniFi Network and any group can hold it, so those links cannot spell a key.
+            return string.Equals(key, Services.Monitoring.LiveWanScope.PrimaryWanToken, StringComparison.Ordinal)
+                ? _wanOptions.FirstOrDefault(w => w.IsPrimary)?.Key
+                : key;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// A secondary WAN is discovered THROUGH its context - that is what binds a probe to it - so a
+    /// WAN without one cannot be traced no matter how many times discovery is run. Saying "run
+    /// discovery" there would send the user somewhere that cannot help them.
+    /// </summary>
+    private bool NeedsContextFirst
+    {
+        get
+        {
+            var wan = _wanOptions.FirstOrDefault(
+                w => string.Equals(w.Key, _selectedWanKey, StringComparison.OrdinalIgnoreCase));
+            return wan is { IsPrimary: false } && !_wansWithContext.Contains(wan.Key);
+        }
+    }
+
+    /// <summary>
+    /// The selected WAN has a vantage but no probe binding (no agent, no source IP), so the
+    /// server probes its targets via the default route - which is the primary WAN's path. The
+    /// readings and scores reflect the primary connection, not this one.
+    /// </summary>
+    private bool ProbesViaDefaultRoute
+    {
+        get
+        {
+            var wan = _wanOptions.FirstOrDefault(
+                w => string.Equals(w.Key, _selectedWanKey, StringComparison.OrdinalIgnoreCase));
+            return wan is { IsPrimary: false }
+                && _wansWithContext.Contains(wan.Key)
+                && !_wansWithProbeBinding.Contains(wan.Key);
+        }
+    }
+
+    /// <summary>The selected WAN in prose, for a sentence that names it.</summary>
+    private string SelectedWanLabel
+    {
+        get
+        {
+            var wan = _wanOptions.FirstOrDefault(w => string.Equals(w.Key, _selectedWanKey, StringComparison.OrdinalIgnoreCase));
+            return wan == null
+                ? "This WAN"
+                : NetworkOptimizer.UniFi.GatewayWanHelper.FormatWanLabelInProse(
+                    wan.Label, NetworkOptimizer.UniFi.GatewayWanHelper.WanIndexFromKey(wan.Key));
+        }
+    }
+
+    /// <summary>
+    /// Carries the report's WAN into a link out of this panel, so the destination opens filtered to
+    /// the WAN the report was about. Empty on a single-WAN site, where the parameter says nothing.
+    /// </summary>
+    private sealed record IspChartView(string AtIso, long SpanMs);
+
+    /// <summary>
+    /// Opens Latency and Packet Loss on what this chart is showing: Transit, which is where those
+    /// same per-ASN clusters are charted, framed on the window in view rather than on a fixed 15
+    /// minutes - a reader who zoomed into an evening did that to say which evening.
+    /// </summary>
+    private async Task JumpToAnalysisAsync()
+    {
+        try
+        {
+            var view = await JS.InvokeAsync<IspChartView?>("__ispHealthCharts.currentView");
+            if (view == null || string.IsNullOrEmpty(view.AtIso)) return;
+            var at = new DateTimeOffset(
+                DateTime.Parse(view.AtIso, null, System.Globalization.DateTimeStyles.RoundtripKind)
+                    .ToUniversalTime()).ToUnixTimeMilliseconds();
+            NavigationManager.NavigateTo(NetworkOptimizer.Web.Services.Monitoring.MonitoringLinks.Analysis(
+                NetworkOptimizer.Web.Services.Monitoring.MonitoringLinks.TransitCategory,
+                at, view.SpanMs, _selectedWanKey));
+        }
+        catch (Exception ex)
+        {
+            // The chart owns the window; with it not mounted there is nothing to frame on.
+            Logger.LogDebug(ex, "ISP Health analyze jump skipped; chart view unavailable");
+        }
+    }
+
+    private string WanLinkQuery() =>
+        string.IsNullOrEmpty(_selectedWanKey) || _wanOptions.Count <= 1
+            ? "" : $"&wan={Uri.EscapeDataString(_selectedWanKey)}";
+
+    /// <returns>True when the selection moved, in which case the report has been loaded with it.</returns>
+    private async Task<bool> RestoreWanSelectionAsync()
+    {
+        if (_wanOptions.Count <= 1) return false;
+
+        // An explicit ?wan= beats the stored selection for this visit: arriving by a link that
+        // names a WAN is a statement about which report you want, where the stored value is only
+        // where you happened to be last. NOT persisted - following a link is not the same as
+        // choosing a filter, and writing it meant one click from a tile silently became the WAN
+        // this panel opened on from then on. Coming back without the link reads the stored one
+        // again, the same rule the Network Performance filter follows.
+        var linked = LinkedWanKey();
+        if (!string.IsNullOrEmpty(linked)
+            && _wanOptions.Any(w => string.Equals(w.Key, linked, StringComparison.OrdinalIgnoreCase)))
+        {
+            await SelectWanAsync(linked!, persist: false);
+            return true;
+        }
+
+        try
+        {
+            var stored = await JS.InvokeAsync<string?>("localStorage.getItem", SharedWanScopeKey);
+            if (!string.IsNullOrEmpty(stored)
+                && !string.Equals(stored, _selectedWanKey, StringComparison.OrdinalIgnoreCase)
+                && _wanOptions.Any(w => string.Equals(w.Key, stored, StringComparison.OrdinalIgnoreCase)))
+            {
+                await SelectWanAsync(stored, persist: false);
+                return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        _canOperate = AuthState is null
+            || (await Authz.AuthorizeAsync((await AuthState).User, SiteContext.Slug, Policies.SiteOperator)).Succeeded;
+        // Scheduled speed tests are a site administrator's to create (Alerts & Schedule gates the
+        // whole section on it), so only an administrator is pointed at them.
+        _canConfigureSchedules = AuthState is null
+            || (await Authz.AuthorizeAsync((await AuthState).User, SiteContext.Slug, Policies.SiteAdmin)).Succeeded;
+
+        // Pull-to-refresh on this tab recomputes the scorecard (the Refresh button's action)
+        // instead of the layout's full-page-reload fallback.
+        PtrState.RefreshCallback = RefreshAsync;
+        PtrState.NotifyStateChanged = StateHasChanged;
+
+        await LoadWanChoicesAsync();
+
+        // The report is NOT loaded here. Which WAN it should be for lives in localStorage, which
+        // needs interop, which is unavailable until after the first render - so loading now would
+        // compute the primary in the foreground, and on a site where the primary is due a
+        // recompute that is a long wait for a report the user did not ask for, followed by a
+        // switch to the one they did. It loads in OnAfterRenderAsync once the WAN is known.
+
+        // Highlight the button for the effective (possibly auto-reduced) live window.
+        if (_followLive) _selectedPreset = LiveWindowHours;
+
+        await LoadPlanHintStateAsync();
+
+        // Re-render every 30 s so "Last updated: N min ago" ages on its own, and - on the live
+        // 48 h view - pull the latest cached snapshot so the tab follows the background recompute
+        // instead of sitting on a stale "Last updated" until a manual refresh.
+        _ageTimer = new System.Threading.Timer(_ =>
+        {
+            try { _ = InvokeAsync(AutoReloadTickAsync); }
+            catch { /* never let a render fault kill the timer */ }
+        }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+    }
+
+    /// <summary>
+    /// Periodic tick: always re-render so the relative "Last updated" ages, and on the live 48 h
+    /// view fetch the latest snapshot. This is a non-forced GetReportAsync - it serves the cache
+    /// and recomputes at most once per CacheTtl when stale, never the heavy forced refresh (which
+    /// clears caches and recomputes unconditionally). The display only swaps when a newer snapshot
+    /// actually arrives, so the chart isn't reloaded on every tick. Custom windows are left alone.
+    /// </summary>
+    private async Task AutoReloadTickAsync()
+    {
+        if (IsLiveWindow && !_autoReloading && !_loading && !_refreshing && !_windowComputing)
+        {
+            _autoReloading = true;
+            try
+            {
+                var latest = await Svc.GetReportAsync();
+                if (latest != null && (_report == null || latest.ComputedAt != _report.ComputedAt))
+                {
+                    _report = latest;
+                    try { await JS.InvokeVoidAsync("eval", "window.__ispHealthCharts?.reload?.();"); }
+                    catch { /* chart not mounted yet */ }
+                }
+            }
+            catch { /* never let a fetch fault kill the timer */ }
+            finally { _autoReloading = false; }
+        }
+        // Follow a background auto-fallback: keep the live button on the effective window.
+        if (_followLive) _selectedPreset = LiveWindowHours;
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Reads the persisted dismissal for the plan-speed hint. A read failure leaves the hint
+    /// hidden: a nag that can't remember being dismissed is worse than one nobody sees.
+    /// </summary>
+    private async Task LoadPlanHintStateAsync()
+    {
+        try
+        {
+            var dismissed = await SettingsService.GetGlobalAsync(SystemSettingKeys.IspPlanSpeedHintDismissed);
+            _planHintDismissed = string.Equals(dismissed, "true", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            _planHintDismissed = true;
+        }
+    }
+
+    // True while the PDF is being built server-side. The interop below awaits the fetch, so
+    // the button's spinner tracks the real work rather than guessing at it.
+    private bool _exportingPdf;
+
+    /// <summary>
+    /// Downloads the scorecard for the window currently on screen. Fetched as a blob rather
+    /// than linked with `download`, because a Safari PWA opens a linked PDF inline instead of
+    /// saving it (same reason the Security Audit export does this).
+    /// </summary>
+    private async Task ExportPdfAsync()
+    {
+        if (_exportingPdf || _report == null) return;
+        _exportingPdf = true;
+        StateHasChanged();
+        try
+        {
+            var url = "/api/monitoring/isp-health/pdf";
+            // An explicit window exports exactly what's displayed; the live view exports the
+            // cached report, which is what the tab is showing.
+            if (_windowStart.HasValue && _windowEnd.HasValue)
+                url += $"?from={Uri.EscapeDataString(_windowStart.Value.ToString("o"))}&to={Uri.EscapeDataString(_windowEnd.Value.ToString("o"))}";
+            if (_wanSvc != null && !string.IsNullOrEmpty(_selectedWanKey))
+                url += (url.Contains('?') ? "&" : "?") + $"wan={Uri.EscapeDataString(_selectedWanKey)}";
+            if (!SiteContext.IsDefault)
+                url = SiteContextService.WithSiteParam(url, SiteContext.Slug);
+
+            await JS.InvokeVoidAsync("eval",
+                "(async () => { const r = await fetch('" + url + "'); if (!r.ok) return; "
+                + "const b = await r.blob(); const d = r.headers.get('content-disposition') || ''; "
+                + "const m = d.match(/filename=\"?([^\";]+)\"?/); const a = document.createElement('a'); "
+                + "a.href = URL.createObjectURL(b); a.download = m ? m[1] : 'ISPHealth.pdf'; "
+                + "a.click(); URL.revokeObjectURL(a.href); })()");
+        }
+        catch
+        {
+            // A failed download is visible to the user in the browser; nothing to recover here.
+        }
+        finally
+        {
+            _exportingPdf = false;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>Hides the hint everywhere it appears and remembers that across sites and sessions.</summary>
+    private async Task DismissPlanHintAsync()
+    {
+        _planHintDismissed = true;
+        try
+        {
+            await SettingsService.SetGlobalAsync(SystemSettingKeys.IspPlanSpeedHintDismissed, "true");
+        }
+        catch
+        {
+            // Hidden for this session regardless; it comes back next visit if the write failed.
+        }
+        StateHasChanged();
+    }
+
+    private async Task RefreshAsync()
+    {
+        if (_refreshing || _windowComputing) return;
+        _refreshing = true;
+        // Rendered explicitly: pull-to-refresh invokes this as a plain delegate (not a Blazor
+        // event), so without it nothing repaints the button/hero spinners until the recompute
+        // finishes. Redundant but harmless on the button path.
+        StateHasChanged();
+        try
+        {
+            if (IsLiveWindow)
+            {
+                _report = await Svc.GetReportAsync(forceRefresh: true);
+                // The chart fetches its own series from the freshly cached report.
+                try { await JS.InvokeVoidAsync("eval", "window.__ispHealthCharts?.reload?.();"); }
+                catch { /* chart not mounted yet */ }
+            }
+            else if (_windowStart.HasValue && _windowEnd.HasValue)
+            {
+                // Recompute the current window, bypassing the custom-window cache; the chart's
+                // follow-up fetch then hits the freshly recomputed result for the same window.
+                _report = await Svc.GetReportForWindowAsync(_windowStart.Value, _windowEnd.Value, forceRefresh: true);
+                await ChartSetWindowAsync(_windowStart, _windowEnd);
+            }
+        }
+        finally
+        {
+            _refreshing = false;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// Persists the user's chosen physical-link source (the ambiguity dropdown) and reloads the
+    /// report for the current window so the Physical Link factor reflects the pick.
+    /// </summary>
+    private async Task OnPhysicalLinkSourceChanged(ChangeEventArgs e)
+    {
+        var key = e.Value?.ToString();
+        await Svc.SetPhysicalLinkSourceAsync(string.IsNullOrEmpty(key) ? null : key);
+        if (IsLiveWindow)
+            _report = await Svc.GetReportAsync();
+        else if (_windowStart.HasValue && _windowEnd.HasValue)
+            _report = await Svc.GetReportForWindowAsync(_windowStart.Value, _windowEnd.Value, forceRefresh: true);
+        StateHasChanged();
+    }
+
+    // The outage start whose ack/undo is in flight. While set, every ack link (outage rows
+    // and findings alike) is locked out and the pressed one shows a busy label - the persist +
+    // forced recompute behind the reload takes seconds, and without visible feedback the press
+    // reads as if it didn't register.
+    private readonly HashSet<DateTime> _ackPending = new();
+    private string AckLockClass => _ackPending.Count > 0 ? "isp-outage-ack-locked" : "";
+
+    // A waterfall with more targets than this collapses to its first and last
+    // OutageShapeEdgeRows rows with the hidden middle drawn as a fault line.
+    // Seven shows all seven: collapsing to six would hide a single row, and a
+    // one-row fault line is sillier than the row itself.
+    private const int OutageShapeCollapseThreshold = 7;
+    private const int OutageShapeEdgeRows = 3;
+
+    // Keyed by outage onset (stable across recomputes, same key the ack flow uses),
+    // so an expanded waterfall stays open through report refreshes.
+    private readonly HashSet<DateTime> _expandedOutageShapes = new();
+
+    private void ToggleOutageShape(DateTime outageStartUtc)
+    {
+        if (!_expandedOutageShapes.Remove(outageStartUtc)) _expandedOutageShapes.Add(outageStartUtc);
+    }
+
+    /// <summary>Marks an outage "that was me" (user-caused, excluded from scoring) and reloads
+    /// the report for the current window so the score and findings drop it.</summary>
+    private Task AcknowledgeOutageAsync(DateTime outageStartUtc) => ToggleOutageAckAsync(outageStartUtc, true);
+
+    /// <summary>Removes a "that was me" mark so the outage scores normally again.</summary>
+    private Task UnacknowledgeOutageAsync(DateTime outageStartUtc) => ToggleOutageAckAsync(outageStartUtc, false);
+
+    private async Task ToggleOutageAckAsync(DateTime outageStartUtc, bool acknowledged)
+    {
+        if (_refreshing || _windowComputing || _ackPending.Count > 0 || !_ackPending.Add(outageStartUtc)) return;
+        // Drive the same busy state as the Refresh button: the ack runs the identical forced
+        // recompute, so the button and hero spinners should say so.
+        _refreshing = true;
+        StateHasChanged();
+        try
+        {
+            if (acknowledged)
+                await Svc.AcknowledgeOutageAsync(outageStartUtc);
+            else
+                await Svc.UnacknowledgeOutageAsync(outageStartUtc);
+            await ReloadAfterOutageAckAsync();
+        }
+        finally
+        {
+            _ackPending.Remove(outageStartUtc);
+            _refreshing = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task ReloadAfterOutageAckAsync()
+    {
+        if (IsLiveWindow)
+            _report = await Svc.GetReportAsync();
+        else if (_windowStart.HasValue && _windowEnd.HasValue)
+            _report = await Svc.GetReportForWindowAsync(_windowStart.Value, _windowEnd.Value, forceRefresh: true);
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Overrides the scored access technology from the pill selector and reloads the report for the
+    /// current window so the score and thresholds reflect the new technology immediately.
+    /// </summary>
+    private async Task OnAccessTechnologyChanged(ChangeEventArgs e)
+    {
+        // The selects are disabled for a Viewer, but a disabled control is a statement to the browser
+        // and the browser is not the thing being trusted. Refused here as well.
+        if (!_canOperate)
+            return;
+        if (!int.TryParse(e.Value?.ToString(), out var techValue))
+            return;
+        if (_refreshing || _windowComputing)
+            return;
+        // Drive the Refresh button's "Loading" spinner while the override re-scores,
+        // the same as a time-window change.
+        _windowComputing = true;
+        StateHasChanged();
+        try
+        {
+            await Svc.SetAccessTechnologyAsync((AccessTechnology)techValue);
+            if (IsLiveWindow)
+                _report = await Svc.GetReportAsync();
+            else if (_windowStart.HasValue && _windowEnd.HasValue)
+                _report = await Svc.GetReportForWindowAsync(_windowStart.Value, _windowEnd.Value, forceRefresh: true);
+        }
+        finally
+        {
+            _windowComputing = false;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// Access technologies offered by the pill selector - only those with a medium-specific
+    /// scoring profile (<see cref="IspHealthProfiles.GetProfile"/>), since the pill is only
+    /// shown when scoring is active. Unknown is excluded because it nulls the profile and
+    /// collapses the pill into the "needs technology" empty state. PppoE and Other are excluded
+    /// because neither names a medium: both resolve to the same wide neutral profile, so picking
+    /// one only loses the thresholds the line should be graded against. Upstream Discovery's
+    /// selector offers this same set (plus Unknown) - keep the two in step.
+    /// </summary>
+    private static readonly AccessTechnology[] ProfileTechOptions =
+    [
+        AccessTechnology.Gpon,
+        AccessTechnology.XgsPon,
+        AccessTechnology.Docsis,
+        AccessTechnology.Dsl,
+        AccessTechnology.DirectEthernet,
+        AccessTechnology.FixedWireless,
+        AccessTechnology.Cellular,
+        AccessTechnology.Satellite
+    ];
+
+    /// <summary>
+    /// " (PPPoE)" when the WAN runs a PPPoE session, otherwise nothing. The session is detected
+    /// from the gateway rather than picked, and it shifts the scored thresholds materially, so
+    /// the two places that state what the line is graded as have to say it.
+    /// </summary>
+    private static string PppoeSuffix(IspHealthReport r) => r.PppoeSession ? " (PPPoE)" : "";
+
+    /// <summary>
+    /// Technology label for the selectors. Only the CURRENT value carries the PPPoE suffix: a
+    /// native select shows the selected option's own text, so this is what puts "GPON (PPPoE)"
+    /// on the collapsed control, while the alternatives stay plain - they name media to switch
+    /// to, and the session rides whichever one is picked.
+    /// </summary>
+    private static string TechLabel(AccessTechnology tech, IspHealthReport r) =>
+        tech == r.AccessTechnology ? FormatTechName(tech) + PppoeSuffix(r) : FormatTechName(tech);
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Interop is unavailable during prerender, so the remembered WAN can only be applied here -
+        // and the report waits for it. Restoring first means one compute, for the WAN the user
+        // actually left the tab on, and the toolbar stays hidden behind _loading until the right
+        // pill is the lit one, so the selection never visibly jumps.
+        if (firstRender)
+        {
+            var switched = await RestoreWanSelectionAsync();
+            if (!switched) await LoadReportAsync();
+            _loading = false;
+            StateHasChanged();
+        }
+        if (_scrollChartAfterRender)
+        {
+            _scrollChartAfterRender = false;
+            try { await JS.InvokeVoidAsync("__ispHealthCharts.scrollChartIntoView"); }
+            catch { /* chart not mounted */ }
+        }
+        if (_report == null)
+        {
+            // The content (and the chart element) is gone; drop the chart so it re-mounts
+            // cleanly when a report shows again (e.g. switching back to 48 h from an empty window).
+            if (_chartMounted)
+            {
+                _chartMounted = false;
+                try { await JS.InvokeVoidAsync("eval", "window.__ispHealthCharts?.unmount?.();"); }
+                catch { /* nothing mounted */ }
+            }
+            return;
+        }
+        // TODO: the shared half-second scan in App.razor now refreshes every icon tooltip whose
+        // data-tooltip changed, so this per-panel refresh is redundant.
+        // Absolved-jitter tooltip-icons cache their content when Tippy first builds them; on a window
+        // recompute Blazor swaps only their data-tooltip attribute (no node re-add, so the global
+        // observer never re-fires) and the value goes stale. When the report changes, push the current
+        // attribute into each icon's existing Tippy with setContent - scoped to these icons only, and
+        // it leaves all other tooltips and the shared init untouched.
+        if (!ReferenceEquals(_report, _lastTooltipReport))
+        {
+            _lastTooltipReport = _report;
+            try
+            {
+                await JS.InvokeVoidAsync("eval",
+                    "document.querySelectorAll('.isp-jitter-tip').forEach(function(el){" +
+                    "if(el._tippy&&el.dataset.tooltip&&el._tippy.props.content!==el.dataset.tooltip)" +
+                    "el._tippy.setContent(el.dataset.tooltip);});");
+            }
+            catch { /* tooltip refresh is best-effort */ }
+        }
+        // A WAN switch renders the spinner state while the new report is fetched, and the report
+        // body - the chart's element with it - is behind @if (!_loading), so during that render
+        // there is nothing to mount into. This after-render still fires (the old report is still
+        // in hand, and DropChartMountAsync just lowered the flag), and mounting here is exactly
+        // what broke WAN switching: mount() found no element and returned WITHOUT throwing, the
+        // optimistic flag below stayed raised, and when the body came back the "already mounted"
+        // guard skipped the real mount - an empty chart area on every WAN switched to in-page,
+        // permanent because the unmount had also stopped the poll timer. The element only exists
+        // when !_loading, so leave the mount to that render's own after-render pass.
+        if (_loading) return;
+        if (_chartMounted) return;
+        // Raised before the awaits, not after: renders interleave with them, and a second
+        // after-render must not start a second mount while this one is in flight.
+        _chartMounted = true;
+        var fromArg = _windowStart.HasValue ? $"'{_windowStart.Value:o}'" : "null";
+        var toArg = _windowEnd.HasValue ? $"'{_windowEnd.Value:o}'" : "null";
+        try
+        {
+            _selfRef ??= DotNetObjectReference.Create(this);
+            // mount reports whether it found the element and built the chart. A miss returns
+            // false rather than throwing, so it cannot be left to the catch below: the flag must
+            // come back down on a miss or no later render will ever retry the mount.
+            var mounted = await JS.InvokeAsync<bool>("eval",
+                $"(async () => {{ const m = await import('{VersionedJs("/js/isp-health-charts.js")}'); " +
+                $"window.__ispHealthCharts = m; return await m.mount('isp-health-asn-chart', {fromArg}, {toArg}, {HiddenChartTypesJson()}); }})();");
+            if (!mounted) { _chartMounted = false; return; }
+            // Hand the chart a callback so its drag-zoom can filter the events list to the visible window.
+            await JS.InvokeVoidAsync("__ispHealthCharts.setDotNetRef", _selfRef);
+            await PushChartWanAsync();
+        }
+        catch { _chartMounted = false; }
+    }
+
+    /// <summary>
+    /// Tells the per-network chart which WAN to fetch. Null for the primary, matching how the
+    /// report itself is sourced - the primary's series are the unscoped ones.
+    /// </summary>
+    /// <summary>
+    /// Forgets the mounted chart so the next render builds a new one. Called whenever the report
+    /// content is about to be replaced, since the chart's element goes with it.
+    /// </summary>
+    private async Task DropChartMountAsync()
+    {
+        if (!_chartMounted) return;
+        _chartMounted = false;
+        try { await JS.InvokeVoidAsync("eval", "window.__ispHealthCharts?.unmount?.();"); }
+        catch { /* nothing mounted, or the circuit is going away */ }
+    }
+
+    private async Task PushChartWanAsync()
+    {
+        // Deliberately NOT gated on _chartMounted: the WAN key is module-level JS state that
+        // survives an unmount, so pushing it while the chart is dropped mid-switch is how the
+        // upcoming re-mount fetches the right WAN on its first load. setWan itself no-ops the
+        // fetch while unmounted.
+        var wan = _wanSvc == null ? "null" : $"'{System.Text.Encodings.Web.JavaScriptEncoder.Default.Encode(_selectedWanKey)}'";
+        try { await JS.InvokeVoidAsync("eval", $"window.__ispHealthCharts?.setWan({wan});"); }
+        catch { /* module not imported yet (first page load) - the post-mount push covers that */ }
+    }
+
+    private void ToggleCustomPopover()
+    {
+        _showCustomPopover = !_showCustomPopover;
+        if (_showCustomPopover)
+        {
+            // Seed both pickers from the active window so they reflect the current filter.
+            _customTo = (_windowEnd ?? DateTime.UtcNow).ToLocalTime();
+            _customFrom = (_windowStart ?? DateTime.UtcNow.AddHours(-LiveWindowHours)).ToLocalTime();
+        }
+    }
+
+    private async Task SelectPresetAsync(int hours)
+    {
+        _showCustomPopover = false;
+        _isCustom = false;
+        _selectedPreset = hours;
+        // Selecting the live window follows the cached auto-computed report; anything else computes
+        // that window off-cache.
+        _followLive = hours == LiveWindowHours;
+        if (_followLive)
+            await LoadWindowAsync(null, null);   // back to the live/cached report
+        else
+        {
+            var end = DateTime.UtcNow;
+            await LoadWindowAsync(end.AddHours(-hours), end);
+        }
+    }
+
+    private async Task ApplyCustomAsync()
+    {
+        _showCustomPopover = false;
+        // datetime-local binds local wall-clock (Kind=Unspecified); treat it as local -> UTC.
+        var startUtc = _customFrom.ToUniversalTime();
+        var endUtc = _customTo.ToUniversalTime();
+        // A start after the end is a typo, not a request for nothing. Collapsing it onto the end
+        // lets the minimum-window rule below open it back up, so the user gets the shortest real
+        // window instead of a popover that closes and leaves the previous one on screen with no
+        // sign the input was rejected.
+        if (startUtc > endUtc) startUtc = endUtc;
+        if (endUtc - startUtc < TimeSpan.FromHours(MinRangeHours))
+            startUtc = endUtc.AddHours(-MinRangeHours);   // enforce the minimum window
+        if (endUtc - startUtc > TimeSpan.FromHours(MaxRangeHours))
+            startUtc = endUtc.AddHours(-MaxRangeHours);   // clamp to the 1-month cap
+        _isCustom = true;
+        _selectedPreset = -1;
+        await LoadWindowAsync(startUtc, endUtc);
+    }
+
+    private async Task LoadWindowAsync(DateTime? fromUtc, DateTime? toUtc)
+    {
+        _windowComputing = true;
+        _windowStart = fromUtc;
+        _windowEnd = toUtc;
+        StateHasChanged();
+        try
+        {
+            // Default (null window) serves the cached 48 h report; an explicit window computes
+            // off-cache and never disturbs it. Stale report stays on screen until the swap.
+            _report = fromUtc.HasValue && toUtc.HasValue
+                ? await Svc.GetReportForWindowAsync(fromUtc.Value, toUtc.Value)
+                : await Svc.GetReportAsync();
+        }
+        catch { _report = null; }
+        finally { _windowComputing = false; }
+
+        if (_report != null) await ChartSetWindowAsync(fromUtc, toUtc);
+    }
+
+    private async Task ChartSetWindowAsync(DateTime? fromUtc, DateTime? toUtc)
+    {
+        if (!_chartMounted) return;
+        var fromArg = fromUtc.HasValue ? $"'{fromUtc.Value:o}'" : "null";
+        var toArg = toUtc.HasValue ? $"'{toUtc.Value:o}'" : "null";
+        try { await JS.InvokeVoidAsync("eval", $"window.__ispHealthCharts?.setWindow?.({fromArg}, {toArg});"); }
+        catch { /* chart not mounted yet */ }
+    }
+
+    /// <summary>
+    /// Called by the per-network RTT chart when its series chips change: the target ids of the
+    /// lines still drawn, or null when nothing is filtered. An event was measured on specific
+    /// lines, so isolating a line here narrows the list to what happened on it.
+    /// </summary>
+    [JSInvokable]
+    public Task OnSeriesFilter(string[]? visibleTargets)
+    {
+        var next = visibleTargets == null
+            ? null
+            : new HashSet<string>(visibleTargets, StringComparer.OrdinalIgnoreCase);
+        var changed = (next == null) != (_visibleSeriesTargets == null)
+            || (next != null && !next.SetEquals(_visibleSeriesTargets!));
+        _visibleSeriesTargets = next;
+        // The list sits above the chart, so a filter that changes its length carries the chips out
+        // from under the pointer. Only on a real change: this also arrives on every poll.
+        if (changed) _scrollChartAfterRender = true;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    private HashSet<string>? _visibleSeriesTargets;
+
+    // Entries with no targets (nothing to match a line on) always show.
+    private bool InVisibleSeries(TimelineEntry e) =>
+        _visibleSeriesTargets == null
+        || e.TargetIds is not { Count: > 0 }
+        || e.TargetIds.Any(_visibleSeriesTargets.Contains);
+
+    /// <summary>
+    /// Called by the per-network RTT chart on drag-zoom (epoch ms, or null/null on reset/window
+    /// change) so the Path &amp; Congestion Events list filters to the visible range.
+    /// </summary>
+    [JSInvokable]
+    public Task OnChartZoom(double? minMs, double? maxMs, bool scrollToChart)
+    {
+        _zoomFrom = minMs.HasValue ? DateTimeOffset.FromUnixTimeMilliseconds((long)minMs.Value).UtcDateTime : null;
+        _zoomTo = maxMs.HasValue ? DateTimeOffset.FromUnixTimeMilliseconds((long)maxMs.Value).UtcDateTime : null;
+        // On reset the list above the chart expands; keep the chart the user was on in view.
+        if (scrollToChart) _scrollChartAfterRender = true;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    // An event shows when its span overlaps the zoom window (instant events: when the instant is in it).
+    private bool InZoomWindow(TimelineEntry e) =>
+        !IsZoomed || ((e.End ?? e.Time) >= _zoomFrom!.Value && e.Time <= _zoomTo!.Value);
+
+    private string EventsWindowLabel(IspHealthReport r) =>
+        IsZoomed
+            ? $"zoomed: {_zoomFrom!.Value.ToLocalTime():MMM d, HH:mm} to {_zoomTo!.Value.ToLocalTime():MMM d, HH:mm}"
+            : WindowLabel(r);
+
+    private bool CategoryVisible(TimelineEntry e) => _visibleEventCats.Contains(e.Category);
+
+    // Hidden categories as the chart's annotation type names, as a JS array literal for the
+    // mount/setHiddenTypes calls.
+    private string HiddenChartTypesJson()
+    {
+        var hidden = new List<string>();
+        if (!_visibleEventCats.Contains(EventCategory.Congestion)) hidden.Add("'congestion'");
+        if (!_visibleEventCats.Contains(EventCategory.Shift)) hidden.Add("'path-shift'");
+        if (!_visibleEventCats.Contains(EventCategory.Change)) hidden.Add("'unreachable'");
+        return "[" + string.Join(",", hidden) + "]";
+    }
+
+    // Ctrl+Click (Cmd+Click on macOS) bypasses the solo/restore semantics and just toggles the one
+    // category, so a single category can be hidden straight from the all-on state.
+    /// <summary>
+    /// Jumps to Path &amp; Congestion Events. The event count on a hop or network row is only useful
+    /// next to the events it counts, and they sit far enough down the page to be worth a shortcut.
+    /// </summary>
+    private async Task ScrollToEventsAsync() => await JS.InvokeVoidAsync("noHighlightTarget", "isp-events");
+
+    private async Task ToggleEventFilterAsync(EventCategory cat, MouseEventArgs e)
+    {
+        if (e.CtrlKey || e.MetaKey)
+        {
+            if (!_visibleEventCats.Remove(cat))
+                _visibleEventCats.Add(cat);
+        }
+        else if (_visibleEventCats.Count == AllEventCategories.Length)
+            _visibleEventCats = new HashSet<EventCategory> { cat };
+        else if (_visibleEventCats.Count == 1 && _visibleEventCats.Contains(cat))
+            _visibleEventCats = new HashSet<EventCategory>(AllEventCategories);
+        else if (!_visibleEventCats.Remove(cat))
+            _visibleEventCats.Add(cat);
+
+        if (_chartMounted)
+        {
+            try { await JS.InvokeVoidAsync("eval", $"window.__ispHealthCharts?.setHiddenTypes?.({HiddenChartTypesJson()});"); }
+            catch { /* chart not mounted yet */ }
+        }
+    }
+
+    private static string OutageBadgeClass(OutageEvent o) =>
+        o.IsPartial ? (o.IsNearTotal ? "isp-event-badge-warning" : "isp-event-badge-info")
+        : o.IsBrief ? "isp-event-badge-warning"
+        : "isp-event-badge-danger";
+
+    // Share of the outage window this hop spent dark (red), for the recovery-waterfall bar.
+    // Capped at 95% so a sliver of the blue "up" track always shows on even the longest bars -
+    // making it obvious the path came back when the outage ended.
+    private static double OutageHopDarkPercent(OutageEvent o, OutageTierState t)
+    {
+        if (!t.WentDark) return 0;
+        var span = (o.End - o.Start).TotalSeconds;
+        if (span <= 0) return 95;
+        var dark = t.RecoveredAt.HasValue ? (t.RecoveredAt.Value - o.Start).TotalSeconds : span;
+        return Math.Clamp(dark / span * 100, 0, 95);
+    }
+
+    /// <summary>
+    /// Where a factor's name links to. The report's WAN rides along, so the charts open filtered to
+    /// the same WAN the factor was graded on rather than to whatever the last visit left selected.
+    /// </summary>
+    private string? FactorInvestigateUrl(string factorName) => factorName switch
+    {
+        "Packet Loss" => $"/monitoring?tab=performance&investigate=packet-loss{WanLinkQuery()}",
+        "Loaded Loss" => $"/monitoring?tab=performance&investigate=loaded-loss{WanLinkQuery()}",
+        _ => null
+    };
+
+    /// <summary>
+    /// Deep-link for the Physical Link factor to the monitoring tab for the matched access-link
+    /// device. The selected-source key encodes the source type and id ("cm:3", "ont:2",
+    /// "modem:1", "sfp:&lt;mac&gt;/&lt;port&gt;"), which maps directly to the CM / ONT / SFP /
+    /// Cellular stats tabs and their solo-device query params.
+    /// </summary>
+    private static string? PhysicalLinkInvestigateUrl(string? selectedKey)
+    {
+        if (string.IsNullOrEmpty(selectedKey))
+            return null;
+        var idx = selectedKey.IndexOf(':');
+        if (idx <= 0 || idx == selectedKey.Length - 1)
+            return null;
+        var prefix = selectedKey[..idx];
+        var raw = selectedKey[(idx + 1)..];
+        return prefix switch
+        {
+            "cm" => $"/monitoring?tab=cm&cm={Uri.EscapeDataString(raw)}",
+            "ont" => $"/monitoring?tab=ont&ont={Uri.EscapeDataString(raw)}",
+            // The SFP charts solo on the "mac:port" module key (MAC colon-normalized,
+            // lowercased) the device panels emit, not the resolver's "mac/port" token.
+            "sfp" => $"/monitoring?tab=sfp&sfp={Uri.EscapeDataString(SfpModuleKey(raw))}",
+            "modem" => $"/monitoring?tab=cellular&modem={Uri.EscapeDataString(raw)}",
+            _ => null
+        };
+    }
+
+    /// <summary>Converts a resolver SFP token ("&lt;mac&gt;/&lt;port&gt;") to the chart module
+    /// key ("&lt;mac&gt;:&lt;port&gt;" with the MAC colon-normalized and lowercased).</summary>
+    private static string SfpModuleKey(string macSlashPort)
+    {
+        var slash = macSlashPort.IndexOf('/');
+        if (slash < 0)
+            return macSlashPort;
+        var mac = macSlashPort[..slash].Replace("-", ":").ToLowerInvariant();
+        var port = macSlashPort[(slash + 1)..];
+        return $"{mac}:{port}";
+    }
+
+    private static string PhysicalLinkInvestigateTooltip(string? selectedKey, PhysicalMedium? medium)
+    {
+        var idx = selectedKey?.IndexOf(':') ?? -1;
+        var prefix = idx > 0 ? selectedKey![..idx] : "";
+        return prefix switch
+        {
+            "cm" => "Jump to the CM Stats charts for this cable modem",
+            "ont" => "Jump to the ONT Stats charts for this ONT",
+            // A PON SFP is an ONT; an Active Ethernet SFP is just a transceiver.
+            "sfp" => medium == PhysicalMedium.Pon
+                ? "Jump to the SFP Stats charts for this ONT"
+                : "Jump to the SFP Stats charts for this transceiver",
+            "modem" => "Jump to the Cellular Stats charts for this modem",
+            _ => "Jump to the monitoring charts for this access link"
+        };
+    }
+
+    private static string IssueClass(IspIssueSeverity severity) => severity switch
+    {
+        IspIssueSeverity.Critical => "issue-critical",
+        IspIssueSeverity.Warning => "issue-warning",
+        _ => "issue-info"
+    };
+
+    private static string ScoreTextClass(int? score) => score switch
+    {
+        null => "isp-score-none",
+        >= 90 => "isp-score-excellent",
+        >= 75 => "isp-score-good",
+        >= 60 => "isp-score-fair",
+        _ => "isp-score-poor"
+    };
+
+    // Appended to a score's class list (with a leading space) when it carries a caveat tooltip.
+    private static string CaveatClass(string? caveat) => caveat != null ? " isp-score-caveat" : "";
+
+    private static string BarClass(int? score) => score switch
+    {
+        null => "isp-bar-none",
+        >= 90 => "isp-bar-excellent",
+        >= 75 => "isp-bar-good",
+        >= 60 => "isp-bar-fair",
+        _ => "isp-bar-poor"
+    };
+
+    private string VersionedJs(string path) => FileVersionProvider.AddFileVersionToPath("", path);
+
+    public void Dispose()
+    {
+        // Restore the default pull-to-refresh (full reload) when leaving the tab, but only
+        // if no later page/tab has already registered its own callback.
+        if (PtrState.RefreshCallback == (Func<Task>)RefreshAsync)
+        {
+            PtrState.RefreshCallback = null;
+            PtrState.NotifyStateChanged = null;
+        }
+        _ageTimer?.Dispose();
+        if (_chartMounted)
+        {
+            try { _ = JS.InvokeVoidAsync("eval", "window.__ispHealthCharts?.unmount();"); }
+            catch { }
+        }
+        _selfRef?.Dispose();
+    }
+}

@@ -1,0 +1,909 @@
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Monitoring.Models
+@using Microsoft.JSInterop
+@inject ICellularModemService ModemService
+@inject IJSRuntime JS
+@implements IDisposable
+
+<div class="cellular-stats-panel" data-tour="cellular-radio-reset">
+    @if (isLoading)
+    {
+        <div class="loading-state">
+            <span class="spinner"></span>
+            <span>Loading cellular stats...</span>
+        </div>
+    }
+    else if (modemStats == null && hasConfiguredModems)
+    {
+        <div class="sqm-header">
+            <div class="sqm-status">
+                <span class="status-indicator status-disconnected"></span>
+                <span class="status-label">@configuredModems[currentModemIndex].Name</span>
+            </div>
+        </div>
+
+        <div class="signal-quality-section">
+            <div class="signal-bars">
+                @for (int i = 1; i <= 5; i++)
+                {
+                    <div class="signal-bar"></div>
+                }
+            </div>
+            <div class="signal-quality-text">
+                <span class="quality-value">-</span>
+                <span class="quality-label">Signal Quality</span>
+            </div>
+            <div class="modem-nav">
+                @if (configuredModems.Count > 1)
+                {
+                    <button class="nav-btn" @onclick="PreviousModem" @onclick:stopPropagation disabled="@(currentModemIndex == 0)">&#x2039;</button>
+                    <span class="modem-counter">@(currentModemIndex + 1)/@configuredModems.Count</span>
+                    <button class="nav-btn" @onclick="NextModem" @onclick:stopPropagation disabled="@(currentModemIndex >= configuredModems.Count - 1)">&#x203A;</button>
+                }
+            </div>
+        </div>
+
+        <div class="cellular-metrics">
+            <div class="metric-box metric-5g">
+                <div class="metric-header">5G NR</div>
+                <div class="metric-content">
+                    <div class="metric-row"><span class="metric-label">RSRP:</span><span class="metric-value">-</span></div>
+                    <div class="metric-row"><span class="metric-label">RSRQ:</span><span class="metric-value">-</span></div>
+                    <div class="metric-row"><span class="metric-label">SNR:</span><span class="metric-value">-</span></div>
+                </div>
+            </div>
+            <div class="metric-box metric-lte">
+                <div class="metric-header">LTE</div>
+                <div class="metric-content">
+                    <div class="metric-row"><span class="metric-label">RSRP:</span><span class="metric-value">-</span></div>
+                    <div class="metric-row"><span class="metric-label">RSRQ:</span><span class="metric-value">-</span></div>
+                    <div class="metric-row"><span class="metric-label">SNR:</span><span class="metric-value">-</span></div>
+                </div>
+            </div>
+        </div>
+
+        @if (!string.IsNullOrEmpty(pollError))
+        {
+            <div class="poll-error">@pollError</div>
+        }
+
+        <div class="sqm-actions">
+            @* Tooltip lives on the wrapper: a disabled button has pointer-events none and never fires the hover *@
+            <span data-tooltip="@(CurrentEnabled ? null : "Monitoring is disabled for this device. Enable it in Cellular Modem Settings.")" @onclick:stopPropagation>
+                <button class="btn btn-secondary" @onclick="RefreshStats" @onclick:stopPropagation disabled="@(isRefreshing || !CurrentEnabled)">
+                    @if (isRefreshing) { <span class="spinner-sm"></span> } else { <span>Refresh</span> }
+                </button>
+            </span>
+            <SiteAdminOnly><a href="/settings#cellular-modem" class="btn btn-primary" @onclick:stopPropagation>Modem Settings</a></SiteAdminOnly>
+        </div>
+    }
+    else if (modemStats == null)
+    {
+        <div class="sqm-unavailable">
+            <div class="sqm-status">
+                <span class="status-indicator status-disconnected"></span>
+                <span class="status-label">No Data</span>
+            </div>
+            <p class="status-message">No cellular modem configured.</p>
+            <div class="sqm-actions">
+                <SiteAdminOnly><a href="/settings#cellular-modem" class="btn btn-primary" @onclick:stopPropagation>Configure Modem</a></SiteAdminOnly>
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="sqm-header">
+            <div class="sqm-status">
+                <span class="status-indicator status-@GetConnectionStatus().ToLower()"></span>
+                <span class="status-label">@modemStats.ModemName</span>
+            </div>
+            <div class="tc-timestamp">
+                <small>Updated: @modemStats.Timestamp.ToLocalTime().ToString("HH:mm:ss")</small>
+            </div>
+        </div>
+
+        <!-- Signal Quality Bar -->
+        <div class="signal-quality-section">
+            <div class="signal-bars">
+                @for (int i = 1; i <= 5; i++)
+                {
+                    <div class="signal-bar @(i <= GetSignalBars() ? "active" : "")"></div>
+                }
+            </div>
+            <div class="signal-quality-text">
+                <span class="quality-value">@modemStats.SignalQuality%</span>
+                <span class="quality-label">Signal Quality</span>
+            </div>
+            <div class="modem-nav">
+                @if (configuredModems.Count > 1)
+                {
+                    <button class="nav-btn" @onclick="PreviousModem" @onclick:stopPropagation disabled="@(currentModemIndex == 0)">‹</button>
+                    <span class="modem-counter">@(currentModemIndex + 1)/@configuredModems.Count</span>
+                    <button class="nav-btn" @onclick="NextModem" @onclick:stopPropagation disabled="@(currentModemIndex >= configuredModems.Count - 1)">›</button>
+                }
+            </div>
+            <div class="modem-identity" data-tour="cellular-identity" data-tooltip="@DeviceTooltip()" data-tooltip-wide @onclick:stopPropagation>
+                @if (DeviceBrand() != null)
+                {
+                    <div class="cm-model">
+                        <span class="cm-model-name">@DeviceBrand()</span>
+                        @if (!string.IsNullOrWhiteSpace(modemStats.ModemModel))
+                        {
+                            <span class="cm-model-number">@modemStats.ModemModel</span>
+                        }
+                    </div>
+                }
+                @if (IsUniFiModem())
+                {
+                    <div class="device-icon">
+                        <img src="@GetDeviceIconPath()" alt="@(modemStats.ModemModel) icon" class="device-image" onerror="this.style.display='none'" />
+                    </div>
+                }
+            </div>
+        </div>
+
+        <!-- Carrier Info -->
+        @if (modemStats.NetworkMode == CellularNetworkMode.Unknown)
+        {
+            <div class="carrier-info">
+                <span class="carrier-name" style="color: var(--text-muted);">No signal - modem may be connecting</span>
+            </div>
+        }
+        else
+        {
+            <div class="carrier-info">
+                <span class="carrier-name">@modemStats.Carrier</span>
+                <span class="network-mode-badge @GetNetworkModeBadgeClass()">@modemStats.NetworkModeLabel</span>
+                @if (modemStats.IsRoaming)
+                {
+                    <span class="roaming-badge">Roaming</span>
+                }
+                @if (ShowRadioReset)
+                {
+                    @* Admin, not Operator: this drops the cellular connection for several seconds,
+                       so it sits with the destructive actions rather than the routine ones. *@
+                    <SiteAdminOnly>
+                    @* Tooltip lives on the wrapper: a disabled button has pointer-events none and never fires the hover *@
+                    <span class="radio-reset" data-tooltip="@RadioResetTooltip" @onclick:stopPropagation>
+                        <button class="radio-reset-btn" @onclick="ResetRadio" @onclick:stopPropagation
+                                disabled="@(isResettingRadio || modemStats.EnDc != EnDcState.AnchorMissing)"
+                                aria-label="Reset Radio">
+                            @if (isResettingRadio)
+                            {
+                                <span class="spinner-sm"></span>
+                            }
+                            else
+                            {
+                                <span>&#x21bb;</span>
+                            }
+                        </button>
+                    </span>
+                    </SiteAdminOnly>
+                }
+            </div>
+            <div class="network-mode-description">
+                @modemStats.NetworkModeDescription
+            </div>
+        }
+
+        <!-- Signal Metrics Grid -->
+        <div class="cellular-metrics">
+            @if (modemStats.Nr5g != null && (modemStats.Nr5g.Rsrp.HasValue || modemStats.Nr5g.Rsrq.HasValue || modemStats.Nr5g.Snr.HasValue))
+            {
+                <div class="metric-box metric-5g">
+                    <div class="metric-header">5G NR</div>
+                    <div class="metric-content">
+                        <div class="metric-row">
+                            <span class="metric-label">RSRP:</span>
+                            <span class="metric-value @GetRsrpClass(modemStats.Nr5g.Rsrp, is5g: true)">@modemStats.Nr5g.Rsrp?.ToString("F1") dBm</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">RSRQ:</span>
+                            <span class="metric-value">@modemStats.Nr5g.Rsrq?.ToString("F1") dB</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">SNR:</span>
+                            <span class="metric-value @GetSnrClass(modemStats.Nr5g.Snr)">@modemStats.Nr5g.Snr?.ToString("F1") dB</span>
+                        </div>
+                    </div>
+                </div>
+            }
+            else if (ShowNr5gPlaceholder)
+            {
+                <div class="metric-box metric-5g">
+                    <div class="metric-header">5G NR</div>
+                    <div class="metric-content">
+                        <p class="metric-empty-text">@Nr5gPlaceholderText</p>
+                    </div>
+                </div>
+            }
+            @if (modemStats.Lte != null && (modemStats.Lte.Rsrp.HasValue || modemStats.Lte.Rsrq.HasValue || modemStats.Lte.Snr.HasValue))
+            {
+                <div class="metric-box metric-lte">
+                    <div class="metric-header">LTE</div>
+                    <div class="metric-content">
+                        <div class="metric-row">
+                            <span class="metric-label">RSRP:</span>
+                            <span class="metric-value @GetRsrpClass(modemStats.Lte.Rsrp, is5g: false)">@modemStats.Lte.Rsrp?.ToString("F1") dBm</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">RSRQ:</span>
+                            <span class="metric-value">@modemStats.Lte.Rsrq?.ToString("F1") dB</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">SNR:</span>
+                            <span class="metric-value @GetSnrClass(modemStats.Lte.Snr)">@modemStats.Lte.Snr?.ToString("F1") dB</span>
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+
+        <!-- Band and Cell Info -->
+        @if (modemStats.ActiveBand != null || modemStats.ServingCell != null)
+        {
+            <div class="cell-info">
+                @if (modemStats.ActiveBand != null)
+                {
+                    <div class="info-item">
+                        <span class="info-label">Band:</span>
+                        <span class="info-value">@modemStats.ActiveBand.BandClass (@modemStats.ActiveBand.RadioInterface)</span>
+                    </div>
+                }
+                @if (ModuleName() != null)
+                {
+                    <div class="info-item" data-tour="cellular-module">
+                        <span class="info-label">Module:</span>
+                        <span class="info-value" data-tooltip="@ModuleTooltip()" data-tooltip-wide @onclick:stopPropagation>@ModuleName()</span>
+                    </div>
+                }
+                @if (modemStats.ServingCell != null)
+                {
+                    <div class="info-item">
+                        <span class="info-label">Cell:</span>
+                        <span class="info-value">PCI @modemStats.ServingCell.PhysicalCellId, EARFCN @modemStats.ServingCell.Earfcn</span>
+                    </div>
+                    @if (!string.IsNullOrEmpty(modemStats.ServingCell.BandDescription))
+                    {
+                        <div class="info-item">
+                            <span class="info-label">Freq:</span>
+                            <span class="info-value">@modemStats.ServingCell.BandDescription</span>
+                        </div>
+                    }
+                    @if (modemStats.ServingCell.EnbId.HasValue)
+                    {
+                        <div class="info-item">
+                            <span class="info-label">Site:</span>
+                            <span class="info-value">@modemStats.ServingCell.EnbId, sector @modemStats.ServingCell.SectorId</span>
+                        </div>
+                    }
+                    @if (modemStats.ServingCell.TimingAdvance.HasValue)
+                    {
+                        <div class="info-item">
+                            <span class="info-label">Tower:</span>
+                            <span class="info-value">~@(modemStats.ServingCell.TimingAdvance.Value * 150) m</span>
+                        </div>
+                    }
+                }
+                @if (modemStats.NeighborCells?.Count > 0)
+                {
+                    <div class="info-item">
+                        <span class="info-label">Neighbors:</span>
+                        <span class="info-value">@modemStats.NeighborCells.Count cells visible</span>
+                    </div>
+                }
+            </div>
+        }
+
+        @if (!string.IsNullOrEmpty(pollError))
+        {
+            <div class="poll-error">@pollError</div>
+        }
+
+        <div class="sqm-actions">
+            @* Tooltip lives on the wrapper: a disabled button has pointer-events none and never fires the hover *@
+            <span data-tooltip="@(CurrentEnabled ? null : "Monitoring is disabled for this device. Enable it in Cellular Modem Settings.")" @onclick:stopPropagation>
+                <button class="btn btn-secondary" @onclick="RefreshStats" @onclick:stopPropagation disabled="@(isRefreshing || !CurrentEnabled)">
+                    @if (isRefreshing)
+                    {
+                        <span class="spinner-sm"></span>
+                    }
+                    else
+                    {
+                        <span>Refresh</span>
+                    }
+                </button>
+            </span>
+            <SiteAdminOnly><a href="/settings#cellular-modem" class="btn btn-primary" @onclick:stopPropagation>Modem Settings</a></SiteAdminOnly>
+        </div>
+    }
+</div>
+
+<style>
+    .cellular-stats-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+    }
+
+    .modem-identity {
+        display: flex;
+        align-items: center;
+    }
+
+    .device-icon {
+        display: flex;
+        align-items: center;
+    }
+
+    .device-image {
+        width: 48px;
+        height: 48px;
+        object-fit: contain;
+    }
+
+    .signal-bars {
+        display: flex;
+        align-items: flex-end;
+        gap: 3px;
+        height: 28px;
+    }
+
+    .signal-bar {
+        width: 6px;
+        background: var(--text-muted, #666);
+        border-radius: 2px;
+    }
+
+    .signal-bar:nth-child(1) { height: 20%; }
+    .signal-bar:nth-child(2) { height: 40%; }
+    .signal-bar:nth-child(3) { height: 60%; }
+    .signal-bar:nth-child(4) { height: 80%; }
+    .signal-bar:nth-child(5) { height: 100%; }
+
+    .signal-bar.active {
+        background: var(--success-color, #22c55e);
+    }
+
+    .signal-quality-text {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .quality-value {
+        font-size: 1.5rem;
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+
+    .quality-label {
+        font-size: 0.75rem;
+        color: var(--text-muted, #888);
+    }
+
+    .carrier-info {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        flex-wrap: wrap;
+    }
+
+    .carrier-name {
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+
+    .network-mode-badge {
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+
+    .network-mode-badge.mode-5g-sa {
+        background: linear-gradient(135deg, #22c55e, #16a34a);
+        color: #fff;
+    }
+
+    .network-mode-badge.mode-5g-nsa {
+        background: linear-gradient(135deg, #3b82f6, #2563eb);
+        color: #fff;
+    }
+
+    .network-mode-badge.mode-lte {
+        background: linear-gradient(135deg, #0ea5e9, #0284c7);
+        color: #fff;
+    }
+
+    .network-mode-badge.mode-unknown {
+        background: var(--text-muted, #666);
+        color: #fff;
+    }
+
+    .network-mode-description {
+        font-size: 0.75rem;
+        color: var(--text-muted, #888);
+        font-style: italic;
+    }
+
+    .roaming-badge {
+        padding: 2px 8px;
+        background: var(--warning-color, #f59e0b);
+        color: #000;
+        border-radius: 4px;
+        font-size: 0.7rem;
+        font-weight: 600;
+    }
+
+    .metric-empty-text {
+        margin: 0;
+        color: var(--text-muted);
+        font-size: 0.78rem;
+        line-height: 1.35;
+    }
+
+    .radio-reset {
+        margin-left: auto;
+    }
+
+    .radio-reset-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: 1px solid var(--border-color);
+        border-radius: 4px;
+        background: var(--bg-tertiary);
+        color: var(--text-secondary);
+        font-size: 1rem;
+        cursor: pointer;
+    }
+
+    .radio-reset-btn:hover:not(:disabled) {
+        background: var(--bg-hover);
+        color: var(--text-primary);
+    }
+
+    .radio-reset-btn:disabled {
+        opacity: 0.4;
+        cursor: default;
+    }
+
+    .registration-state {
+        color: var(--text-muted, #888);
+        font-size: 0.85rem;
+    }
+
+    .metric-header {
+        min-width: 50px;
+        flex-shrink: 0;
+    }
+
+    .metric-5g .metric-header {
+        color: var(--success-color, #22c55e);
+    }
+
+    .metric-lte .metric-header {
+        color: var(--info-color, #0ea5e9);
+    }
+
+    .metric-label {
+        color: var(--text-muted, #888);
+        flex-shrink: 0;
+    }
+
+    .metric-value {
+        font-family: monospace;
+        color: var(--text-primary);
+        text-align: right;
+    }
+
+    .metric-value.good { color: var(--success-color, #22c55e); }
+    .metric-value.fair { color: var(--warning-color, #f59e0b); }
+    .metric-value.poor { color: var(--danger-color, #ef4444); }
+
+    @@media (max-width: 768px) {
+        .metric-header {
+            font-size: 1rem;
+            margin-bottom: 0.75rem;
+            min-width: 40%;
+        }
+    }
+
+    .cell-info {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        padding: 0.75rem;
+        background: var(--bg-tertiary);
+        border-radius: 8px;
+        font-size: 0.8rem;
+    }
+
+    .info-item {
+        display: flex;
+        gap: 0.5rem;
+    }
+
+    .info-label {
+        color: var(--text-muted, #888);
+        min-width: 20%;
+    }
+
+    @@media (max-width: 768px) {
+        .info-label {
+            min-width: 25%;
+        }
+    }
+
+    .info-value {
+        color: var(--text-primary);
+        font-family: monospace;
+    }
+</style>
+
+@code {
+    private CellularModemStats? modemStats;
+    private bool isLoading = true;
+    private bool isRefreshing = false;
+    private bool isResettingRadio = false;
+    private bool hasConfiguredModems = false;
+    private List<NetworkOptimizer.Storage.Models.ModemConfiguration> configuredModems = new();
+    private int currentModemIndex = 0;
+    private System.Threading.Timer? _refreshTimer;
+
+    /// <summary>
+    /// The modem ID of the currently displayed modem, for deep-linking to charts.
+    /// </summary>
+    public string? CurrentModemId => configuredModems.Count > 0 && currentModemIndex < configuredModems.Count
+        ? configuredModems[currentModemIndex].Id.ToString()
+        : null;
+
+    /// <summary>Raised after the initial load so the dashboard card can re-evaluate
+    /// whether there is a device to link to.</summary>
+    [Parameter] public EventCallback OnDataLoaded { get; set; }
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadStats();
+        await OnDataLoaded.InvokeAsync();
+
+        // Auto-refresh timer: picks up cached stats from background polling, and reloads the
+        // configs so a Disable/Enable toggle in Settings reaches the card without a page refresh.
+        _refreshTimer = new System.Threading.Timer(
+            async _ => await InvokeAsync(async () =>
+            {
+                try
+                {
+                    if (isRefreshing || isLoading) return;
+                    configuredModems = (await ModemService.GetModemsAsync()).ToList();
+                    hasConfiguredModems = configuredModems.Any();
+                    if (currentModemIndex >= configuredModems.Count) currentModemIndex = 0;
+                    if (configuredModems.Count > 0)
+                    {
+                        // Just fetch cached stats for current modem - don't force a poll
+                        var modem = configuredModems[currentModemIndex];
+                        var newStats = await ModemService.GetCachedStatsAsync(modem.Id);
+                        if (newStats != null)
+                        {
+                            modemStats = newStats;
+                            pollError = null;
+                        }
+                    }
+                    StateHasChanged();
+                }
+                catch { }
+            }),
+            null,
+            TimeSpan.FromSeconds(10),
+            TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>Why the last poll produced nothing, shown on the card until one succeeds.</summary>
+    private string? pollError;
+
+    private async Task LoadStats()
+    {
+        isLoading = true;
+        try
+        {
+            configuredModems = (await ModemService.GetModemsAsync()).ToList();
+            hasConfiguredModems = configuredModems.Any();
+
+            if (hasConfiguredModems)
+            {
+                // Find index of first enabled modem, or default to first
+                var enabledIndex = configuredModems.FindIndex(m => m.Enabled);
+                currentModemIndex = enabledIndex >= 0 ? enabledIndex : 0;
+
+                var modem = configuredModems[currentModemIndex];
+
+                // Use cached stats if available, otherwise poll
+                var cachedStats = await ModemService.GetCachedStatsAsync(modem.Id);
+                if (cachedStats != null)
+                {
+                    modemStats = cachedStats;
+                }
+                else
+                {
+                    // No cached stats - do initial poll
+                    var (success, message) = await ModemService.PollModemAsync(modem);
+                    pollError = success ? null : message;
+                    if (success)
+                    {
+                        modemStats = await ModemService.GetCachedStatsAsync(modem.Id);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            isLoading = false;
+        }
+    }
+
+    /// <summary>Whether polling is enabled for the currently shown modem (disabled configs
+    /// keep their card but lose the manual Refresh - polling would be rejected anyway).</summary>
+    private bool CurrentEnabled => configuredModems.Count == 0
+        || currentModemIndex >= configuredModems.Count
+        || configuredModems[currentModemIndex].Enabled;
+
+    private async Task RefreshStats()
+    {
+        if (!CurrentEnabled) return;
+        isRefreshing = true;
+        StateHasChanged();
+
+        try
+        {
+            if (configuredModems.Count > 0 && currentModemIndex < configuredModems.Count)
+            {
+                var modem = configuredModems[currentModemIndex];
+                var (success, message) = await ModemService.PollModemAsync(modem);
+                pollError = success ? null : message;
+                if (success)
+                {
+                    modemStats = await ModemService.GetCachedStatsAsync(modem.Id);
+                }
+            }
+        }
+        finally
+        {
+            isRefreshing = false;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// A 5G modem with no NR leg otherwise leaves a single box in a two-box grid, which
+    /// reads as a broken card rather than an absent connection. The EN-DC flags double as
+    /// the capability test: an LTE-only modem never reports them, so it never gets the box.
+    /// </summary>
+    private bool ShowNr5gPlaceholder => modemStats?.EnDc
+        is EnDcState.AnchorMissing or EnDcState.AnchorCapable or EnDcState.NetworkRestricted;
+
+    private string Nr5gPlaceholderText => modemStats?.EnDc switch
+    {
+        EnDcState.NetworkRestricted => "Not connected. Your carrier is not offering 5G on this connection.",
+        EnDcState.AnchorCapable => "Not connected. 5G is available here and should attach with traffic.",
+        _ => "Not connected. This tower is not offering 5G. Try the Reset Radio icon above.",
+    };
+
+    /// <summary>
+    /// Only offered when the EN-DC flags say something about it: hidden when 5G is
+    /// already attached, and when the modem reported no flags at all.
+    /// </summary>
+    private bool ShowRadioReset => modemStats?.EnDc
+        is EnDcState.AnchorMissing or EnDcState.AnchorCapable or EnDcState.NetworkRestricted;
+
+    private string RadioResetTooltip => modemStats?.EnDc switch
+    {
+        EnDcState.AnchorCapable => "Anchor is fine and the 5G leg is still connecting. Resetting now would undo it.",
+        EnDcState.NetworkRestricted => "Your carrier is not offering 5G on this connection right now, so resetting the radio will not bring it back.",
+        _ => "Reset Radio: cycles the radio off and on for about 7 seconds to force a fresh tower selection. Use when the modem is stuck on LTE and will not pick up 5G again.",
+    };
+
+    private async Task ResetRadio()
+    {
+        if (modemStats?.EnDc != EnDcState.AnchorMissing) return;
+        if (configuredModems.Count == 0 || currentModemIndex >= configuredModems.Count) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "Resetting the radio drops the cellular connection for about 7 seconds while the modem re-selects a tower.\n\nAre you sure?");
+        if (!confirmed) return;
+
+        var modem = configuredModems[currentModemIndex];
+        isResettingRadio = true;
+        StateHasChanged();
+
+        try
+        {
+            var (success, _) = await ModemService.ResetRadioAsync(modem.Id);
+            if (success)
+            {
+                modemStats = await ModemService.GetCachedStatsAsync(modem.Id);
+            }
+        }
+        finally
+        {
+            isResettingRadio = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task PreviousModem()
+    {
+        if (currentModemIndex > 0)
+        {
+            currentModemIndex--;
+            await ShowStatsForCurrentModem();
+        }
+    }
+
+    private async Task NextModem()
+    {
+        if (currentModemIndex < configuredModems.Count - 1)
+        {
+            currentModemIndex++;
+            await ShowStatsForCurrentModem();
+        }
+    }
+
+    private async Task ShowStatsForCurrentModem()
+    {
+        if (configuredModems.Count > 0 && currentModemIndex < configuredModems.Count)
+        {
+            var modem = configuredModems[currentModemIndex];
+            var cached = await ModemService.GetCachedStatsAsync(modem.Id);
+            modemStats = cached;
+            pollError = null;
+            StateHasChanged();
+
+            if (cached == null)
+            {
+                // No cached stats - try polling, but don't block paging
+                var (success, message) = await ModemService.PollModemAsync(modem);
+                pollError = success ? null : message;
+                if (success)
+                {
+                    modemStats = await ModemService.GetCachedStatsAsync(modem.Id);
+                    StateHasChanged();
+                }
+            }
+        }
+    }
+
+    /// <summary>Provider key of the modem being shown, which decides the brand and the icon.</summary>
+    private string? CurrentProvider =>
+        configuredModems.Count > 0 && currentModemIndex < configuredModems.Count
+            ? configuredModems[currentModemIndex].Provider
+            : null;
+
+    private bool IsUniFiModem() => CurrentProvider == "qmicli";
+
+    /// <summary>
+    /// The brand the owner bought, which is not the module maker inside it. Taken from the
+    /// provider rather than the model string, which carries no brand on any of them.
+    /// </summary>
+    private string? DeviceBrand() => CurrentProvider switch
+    {
+        "qmicli" => "UniFi",
+        "quectel-at" => "GL.iNet",
+        "netgear-nighthawk-hotspot" => "Netgear",
+        "inseego-fx" => "Inseego",
+        "zyxel-cpe" => "Zyxel",
+        _ => null,
+    };
+
+    private string? DeviceTooltip() =>
+        string.IsNullOrWhiteSpace(modemStats?.HostVersion) ? null : $"Device firmware {modemStats.HostVersion}";
+
+    private string? ModuleName()
+    {
+        var vendor = modemStats?.ModuleVendor;
+        var model = modemStats?.ModuleModel;
+
+        if (string.IsNullOrWhiteSpace(model))
+            return string.IsNullOrWhiteSpace(vendor) ? null : vendor;
+
+        return string.IsNullOrWhiteSpace(vendor) ? model : $"{vendor} {model}";
+    }
+
+    private string? ModuleTooltip() =>
+        string.IsNullOrWhiteSpace(modemStats?.SoftwareVersion) ? null : $"Module firmware {modemStats.SoftwareVersion}";
+
+    private string? GetDeviceIconPath()
+    {
+        var model = modemStats?.ModemModel;
+        if (string.IsNullOrEmpty(model))
+        {
+            // Fallback to current config if stats don't have model yet
+            if (configuredModems.Count > 0 && currentModemIndex < configuredModems.Count)
+                model = configuredModems[currentModemIndex].ModemType;
+        }
+        return DeviceIcon.GetIconPath(model) ?? "/images/devices/u5g-max.png";
+    }
+
+    private string GetConnectionStatus()
+    {
+        if (modemStats == null) return "disconnected";
+        if (modemStats.RegistrationState?.Contains("registered", StringComparison.OrdinalIgnoreCase) == true)
+            return "active";
+        return "warning";
+    }
+
+    /// <summary>
+    /// Get CSS class for RSRP signal strength based on industry-standard thresholds.
+    /// 5G NR has tighter thresholds than LTE due to higher frequency bands.
+    ///
+    /// 5G NR RSRP:
+    ///   Excellent/Good: >= -90 dBm (green)
+    ///   Fair: -90 to -100 dBm (yellow)
+    ///   Poor: < -100 dBm (red)
+    ///
+    /// LTE RSRP:
+    ///   Excellent/Good: >= -100 dBm (green)
+    ///   Fair: -100 to -110 dBm (yellow)
+    ///   Poor: < -110 dBm (red)
+    /// </summary>
+    private string GetRsrpClass(double? rsrp, bool is5g)
+    {
+        if (!rsrp.HasValue) return "";
+
+        if (is5g)
+        {
+            // 5G NR has tighter thresholds (higher frequencies)
+            if (rsrp >= -90) return "good";
+            if (rsrp >= -100) return "fair";
+            return "poor";
+        }
+        else
+        {
+            // LTE has more relaxed thresholds
+            if (rsrp >= -100) return "good";
+            if (rsrp >= -110) return "fair";
+            return "poor";
+        }
+    }
+
+    private string GetSnrClass(double? snr)
+    {
+        if (!snr.HasValue) return "";
+        if (snr >= 20) return "good";
+        if (snr >= 10) return "fair";
+        return "poor";
+    }
+
+    private int GetSignalBars()
+    {
+        if (modemStats == null) return 0;
+        // Derive bars directly from SignalQuality percentage (0-100 -> 0-5 bars)
+        var quality = modemStats.SignalQuality;
+        if (quality >= 80) return 5;
+        if (quality >= 60) return 4;
+        if (quality >= 40) return 3;
+        if (quality >= 20) return 2;
+        if (quality > 0) return 1;
+        return 0;
+    }
+
+    private string GetNetworkModeBadgeClass()
+    {
+        if (modemStats == null) return "mode-unknown";
+
+        return modemStats.NetworkMode switch
+        {
+            CellularNetworkMode.Nr5gSa => "mode-5g-sa",
+            CellularNetworkMode.Nr5gNsa => "mode-5g-nsa",
+            CellularNetworkMode.Lte => "mode-lte",
+            _ => "mode-unknown"
+        };
+    }
+
+    public void Dispose()
+    {
+        _refreshTimer?.Dispose();
+    }
+}

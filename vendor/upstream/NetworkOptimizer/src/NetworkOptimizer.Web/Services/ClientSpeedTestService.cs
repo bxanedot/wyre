@@ -1,0 +1,1161 @@
+using Microsoft.EntityFrameworkCore;
+using NetworkOptimizer.Alerts.Events;
+using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Core.Helpers;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.UniFi;
+using NetworkOptimizer.UniFi.Models;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// Service for managing client-initiated speed tests (browser-based and iperf3 clients).
+/// Uses the unified Iperf3Result table with Direction field to distinguish test types.
+/// One instance exists per site, owned by <see cref="SpeedTestServiceRegistry"/>:
+/// results land in that site's database and enrichment (client lookup, path
+/// analysis, topology snapshots) runs against that site's console connection.
+/// </summary>
+public class ClientSpeedTestService : IClientSpeedTestService
+{
+    private readonly ILogger<ClientSpeedTestService> _logger;
+    private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
+    private readonly UniFiConnectionService _connectionService;
+    private readonly INetworkPathAnalyzer _pathAnalyzer;
+    private readonly ITopologySnapshotService _snapshotService;
+    private readonly IConfiguration _configuration;
+    private readonly IAlertEventBus? _alertEventBus;
+
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
+    private readonly NetworkOptimizer.Storage.Services.MonitoringInfluxClient? _influx;
+    private readonly ApAgent.ApAgentTargetDirectory? _apAgents;
+    private readonly Licensing.LicenseStateService? _licenseState;
+    private readonly Monitoring.SiteVantageDnsResolver? _dnsResolver;
+    private readonly SiteSpeedTestHostSelector? _hostSelector;
+    private readonly Ssh.GatewayNeighborTable? _neighborTable;
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
+    private readonly string _siteSuffix;
+
+    /// <summary>
+    /// Throws when this site is license-restricted. New client speed test
+    /// results count as new operations; historic result reads stay open.
+    /// </summary>
+    private void EnsureLicenseOperational()
+    {
+        if (_licenseState != null)
+            Licensing.LicenseGuard.EnsureOperational(_licenseState, _siteSlug);
+    }
+
+    public ClientSpeedTestService(
+        ILogger<ClientSpeedTestService> logger,
+        IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+        SiteConnectionRegistry siteConnections,
+        INetworkPathAnalyzer pathAnalyzer,
+        ITopologySnapshotService snapshotService,
+        IConfiguration configuration,
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+        MonitoringInfluxRegistry? influxRegistry = null,
+        ApAgent.ApAgentTargetDirectory? apAgents = null,
+        Licensing.LicenseStateService? licenseState = null,
+        IAlertEventBus? alertEventBus = null,
+        Monitoring.SiteVantageDnsResolver? dnsResolver = null,
+        SiteSpeedTestHostSelector? hostSelector = null,
+        GatewaySshRegistry? gatewaySshRegistry = null,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
+    {
+        _licenseState = licenseState;
+        _dnsResolver = dnsResolver;
+        _hostSelector = hostSelector;
+        _logger = logger;
+        _dbFactory = dbFactory;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
+        _siteSuffix = _isDefault ? "" : $" (site {_siteSlug})";
+        _connectionService = siteConnections.GetFor(_siteSlug);
+        _pathAnalyzer = pathAnalyzer;
+        _snapshotService = snapshotService;
+        _configuration = configuration;
+        _alertEventBus = alertEventBus;
+        _siteDbFactory = siteDbFactory;
+        _influx = influxRegistry?.GetFor(_siteSlug);
+        _apAgents = apAgents;
+        _neighborTable = gatewaySshRegistry?.GetNeighborTableFor(_siteSlug);
+    }
+
+    /// <summary>
+    /// Ties a result from an IPv6 source to its device. UniFi Network usually lists a client by
+    /// its IPv4 address only, so an IPv6 source matched nothing: the result showed the raw
+    /// address and traced out through the WAN. The gateway's neighbor table gives the MAC, which
+    /// enrichment and path analysis then use. IPv4 results are left alone.
+    /// </summary>
+    private async Task ResolveIpv6ClientMacAsync(Iperf3Result result)
+    {
+        if (_neighborTable == null || !string.IsNullOrEmpty(result.ClientMac)
+            || !Ssh.GatewayNeighborTable.IsResolvable(result.DeviceHost))
+            return;
+
+        var mac = await _neighborTable.ResolveMacAsync(result.DeviceHost);
+        if (mac != null)
+        {
+            result.ClientMac = mac;
+            _logger.LogDebug("Resolved IPv6 speed test client {Ip} to {Mac} from the gateway neighbor table",
+                result.DeviceHost, mac);
+        }
+    }
+
+    /// <summary>
+    /// What path analysis traces to. For an IPv6 source, the IPv4 address UniFi Network lists the
+    /// device under, so the topology match and the snapshot's WiFiman data (both keyed by that
+    /// IPv4) line up; the MAC when it lists none. Otherwise the address the test came from.
+    /// </summary>
+    private async Task<string> PathTargetAsync(Iperf3Result result)
+    {
+        if (_neighborTable == null || !Ssh.GatewayNeighborTable.IsResolvable(result.DeviceHost))
+            return result.DeviceHost;
+
+        var resolved = await _neighborTable.ResolveClientAsync(result.DeviceHost, _connectionService.Client);
+        if (resolved is { } client)
+        {
+            if (string.IsNullOrEmpty(result.ClientMac))
+                result.ClientMac = client.Mac;
+            return client.Ipv4 ?? client.Mac;
+        }
+        return !string.IsNullOrEmpty(result.ClientMac) ? result.ClientMac : result.DeviceHost;
+    }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct = default)
+    {
+        if (!_isDefault)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
+    }
+
+    /// <summary>
+    /// The local endpoint the client actually connected to, for path analysis. The site's
+    /// speed test target override wins when set: it is where clients are sent, so a trace
+    /// anchored anywhere else describes a path the test never took. Otherwise the endpoint
+    /// the site advertises (<see cref="ResolveAdvertisedEndpointAsync"/>).
+    /// </summary>
+    private async Task<string?> ResolveServerIpAsync()
+        => await GetTargetOverrideIpAsync() ?? await ResolveAdvertisedEndpointAsync();
+
+    /// <summary>
+    /// The endpoint the site advertises to clients when no override is set: the agent
+    /// <see cref="SiteSpeedTestHostSelector"/> sends clients to, wherever one is selected (every
+    /// secondary site, and the default site once configured for its agent to cover it). The
+    /// client hit that agent's nginx / iperf3, not this server, so the trace runs client to
+    /// agent on the site's own topology. Otherwise HOST_IP on the default site, where this
+    /// server is the host; a managed site with no host has nothing on its topology to anchor at.
+    /// </summary>
+    private async Task<string?> ResolveAdvertisedEndpointAsync()
+    {
+        if (_hostSelector != null)
+        {
+            try
+            {
+                var selection = await _hostSelector.SelectAsync(_siteSlug);
+                if (selection.Host != null)
+                    return selection.Host.LanIp;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to select the speed test host for site {Site} path analysis", _siteSlug);
+            }
+        }
+        return _isDefault ? _configuration["HOST_IP"] : null;
+    }
+
+    /// <summary>
+    /// The site's client speed test target override as an IP, or null when unset or
+    /// unresolvable. Parsed the same way <see cref="SiteSpeedTestTargetResolver"/> treats the
+    /// override: full URLs yield their host, anything else is the host itself. A hostname is
+    /// resolved from the site's own vantage (cached), since the name is what the site's
+    /// clients see and this server's resolver may not know it.
+    /// </summary>
+    private async Task<string?> GetTargetOverrideIpAsync()
+    {
+        try
+        {
+            await using var db = await CreateSiteDbAsync();
+            var value = (await db.SystemSettings.FindAsync(SystemSettingKeys.ClientSpeedTestTargetOverride))?.Value?.Trim();
+            if (string.IsNullOrEmpty(value))
+                return null;
+
+            var host = value;
+            if ((value.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                    || value.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                && Uri.TryCreate(value, UriKind.Absolute, out var uri))
+            {
+                host = uri.Host;
+            }
+            if (System.Net.IPAddress.TryParse(host, out _))
+                return host;
+            return _dnsResolver != null ? await _dnsResolver.ResolveAsync(_siteSlug, host) : null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to read client speed test target override for site {Site}", _siteSlug);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Record a speed test result from OpenSpeedTest browser client.
+    /// </summary>
+    public async Task<Iperf3Result> RecordOpenSpeedTestResultAsync(
+        string clientIp,
+        double downloadMbps,
+        double uploadMbps,
+        double? pingMs,
+        double? jitterMs,
+        double? downloadDataMb,
+        double? uploadDataMb,
+        string? userAgent,
+        double? latitude = null,
+        double? longitude = null,
+        int? locationAccuracy = null,
+        int? durationSeconds = null,
+        string? externalServerId = null)
+    {
+        EnsureLicenseOperational();
+
+        // An IPv4 client on a dual-stack socket arrives as ::ffff:a.b.c.d. Normalize before it
+        // becomes DeviceHost so client-info enrichment matches the console list (populating
+        // ClientMac, the stable correlation key) and the result stores/displays as a real IP.
+        clientIp = NetworkUtilities.NormalizeToIPv4String(clientIp) ?? clientIp;
+
+        // Determine direction based on whether this came from an external server
+        var isWan = !string.IsNullOrWhiteSpace(externalServerId);
+
+        // Local endpoint the client hit, for path analysis (agent LAN IP on agent sites).
+        var serverIp = await ResolveServerIpAsync();
+
+        // LAN (BrowserToServer): Store from SERVER's perspective (consistent with SSH-based tests):
+        //   DownloadBitsPerSecond = data server received FROM client = client's upload
+        //   UploadBitsPerSecond = data server sent TO client = client's download
+        // WAN (OpenSpeedTestWan): Store from CLIENT's perspective (consistent with other WAN tests):
+        //   DownloadBitsPerSecond = client's WAN download speed
+        //   UploadBitsPerSecond = client's WAN upload speed
+        var result = new Iperf3Result
+        {
+            Direction = isWan ? SpeedTestDirection.OpenSpeedTestWan : SpeedTestDirection.BrowserToServer,
+            ExternalServerName = isWan ? externalServerId : null,
+            DeviceHost = clientIp,
+            LocalIp = serverIp,
+            DownloadBitsPerSecond = isWan ? downloadMbps * 1_000_000.0 : uploadMbps * 1_000_000.0,
+            UploadBitsPerSecond = isWan ? uploadMbps * 1_000_000.0 : downloadMbps * 1_000_000.0,
+            DownloadBytes = isWan ? (long)((downloadDataMb ?? 0) * 1_048_576) : (long)((uploadDataMb ?? 0) * 1_048_576),
+            UploadBytes = isWan ? (long)((uploadDataMb ?? 0) * 1_048_576) : (long)((downloadDataMb ?? 0) * 1_048_576),
+            PingMs = pingMs,
+            JitterMs = jitterMs,
+            UserAgent = userAgent,
+            TestTime = DateTime.UtcNow,
+            Success = true,
+            DurationSeconds = durationSeconds ?? 12,  // Default 12s matches OpenSpeedTest default
+            ParallelStreams = 6,  // OpenSpeedTest default: 6 parallel HTTP connections
+            // Geolocation (if provided)
+            Latitude = latitude,
+            Longitude = longitude,
+            LocationAccuracyMeters = locationAccuracy
+        };
+
+        // Save immediately so client doesn't wait
+        await using var db = await CreateSiteDbAsync();
+        db.Iperf3Results.Add(result);
+        await db.SaveChangesAsync();
+        var resultId = result.Id;
+
+        _logger.LogInformation(
+            "Recorded OpenSpeedTest{Wan} result (site {Site}): {ClientIp} - Down: {Download:F1} Mbps, Up: {Upload:F1} Mbps{Server}",
+            isWan ? " WAN" : "", _siteSlug, result.DeviceHost, result.DownloadMbps, result.UploadMbps,
+            isWan ? $" (server: {externalServerId})" : "");
+
+        // Publish speed test alert event
+        await PublishSpeedTestAlertAsync(result);
+
+        // Enrich and analyze in background (client IP is known, trace internal path)
+        _ = Task.Run(async () => await EnrichAndAnalyzeInBackgroundAsync(resultId));
+
+        return result;
+    }
+
+    /// <summary>
+    /// Record a speed test result from an iperf3 client.
+    /// Merges with recent result from same client if one direction is missing.
+    /// </summary>
+    public async Task<Iperf3Result> RecordIperf3ClientResultAsync(
+        string clientIp,
+        double downloadBitsPerSecond,
+        double uploadBitsPerSecond,
+        long downloadBytes,
+        long uploadBytes,
+        int? downloadRetransmits,
+        int? uploadRetransmits,
+        int durationSeconds,
+        int parallelStreams,
+        string? rawJson,
+        string? serverLocalIp = null)
+    {
+        EnsureLicenseOperational();
+
+        var now = DateTime.UtcNow;
+        // Use the actual server IP from iperf3, else the local endpoint the client hit
+        // (agent LAN IP on agent sites, HOST_IP on the default site).
+        var serverIp = serverLocalIp ?? await ResolveServerIpAsync();
+
+        await using var db = await CreateSiteDbAsync();
+
+        // Check for recent result from same client that we can merge with
+        // (within 60 seconds, one has download but no upload, or vice versa)
+        var mergeWindow = now.AddSeconds(-60);
+        var recentResult = await db.Iperf3Results
+            .Where(r => r.Direction == SpeedTestDirection.ClientToServer
+                     && r.DeviceHost == clientIp
+                     && r.TestTime > mergeWindow)
+            .OrderByDescending(r => r.TestTime)
+            .FirstOrDefaultAsync();
+
+        // Determine if we can merge: one result has download only, the other has upload only
+        bool canMerge = recentResult != null
+            && ((recentResult.DownloadBitsPerSecond > 0 && recentResult.UploadBitsPerSecond == 0 && uploadBitsPerSecond > 0 && downloadBitsPerSecond == 0)
+             || (recentResult.UploadBitsPerSecond > 0 && recentResult.DownloadBitsPerSecond == 0 && downloadBitsPerSecond > 0 && uploadBitsPerSecond == 0));
+
+        if (canMerge && recentResult != null)
+        {
+            // Merge: fill in the missing direction
+            if (downloadBitsPerSecond > 0)
+            {
+                recentResult.DownloadBitsPerSecond = downloadBitsPerSecond;
+                recentResult.DownloadBytes = downloadBytes;
+                recentResult.DownloadRetransmits = downloadRetransmits ?? 0;
+            }
+            if (uploadBitsPerSecond > 0)
+            {
+                recentResult.UploadBitsPerSecond = uploadBitsPerSecond;
+                recentResult.UploadBytes = uploadBytes;
+                recentResult.UploadRetransmits = uploadRetransmits ?? 0;
+            }
+
+            // Use max parallel streams from either test
+            if (parallelStreams > recentResult.ParallelStreams)
+                recentResult.ParallelStreams = parallelStreams;
+
+            // Get snapshot captured during first direction test (if available)
+            var snapshot = _snapshotService.GetSnapshot(_siteSlug, clientIp);
+
+            // Re-analyze path with updated bidirectional data (using snapshot for max rates)
+            await AnalyzePathAsync(recentResult, snapshot);
+
+            // Backfill any fields still missing after merge re-analysis
+            BackfillFromPathAnalysis(recentResult);
+
+            // Series first, path analysis only if nothing there explains the measurement.
+            await SettleWifiRatesAsync(recentResult);
+
+            // Clean up snapshot after use
+            if (snapshot != null)
+                _snapshotService.RemoveSnapshot(_siteSlug, clientIp);
+
+            await db.SaveChangesAsync();
+
+            _logger.LogInformation(
+                "Merged iperf3 result: {ClientIp} ({ClientName}) - Down: {Download:F1} Mbps, Up: {Upload:F1} Mbps ({Streams} streams)",
+                recentResult.DeviceHost, recentResult.DeviceName ?? "Unknown",
+                recentResult.DownloadMbps, recentResult.UploadMbps, recentResult.ParallelStreams);
+
+            return recentResult;
+        }
+
+        // No merge - create new result
+        var result = new Iperf3Result
+        {
+            Direction = SpeedTestDirection.ClientToServer,
+            DeviceHost = clientIp,
+            LocalIp = serverIp,
+            DownloadBitsPerSecond = downloadBitsPerSecond,
+            UploadBitsPerSecond = uploadBitsPerSecond,
+            DownloadBytes = downloadBytes,
+            UploadBytes = uploadBytes,
+            DownloadRetransmits = downloadRetransmits ?? 0,
+            UploadRetransmits = uploadRetransmits ?? 0,
+            DurationSeconds = durationSeconds,
+            ParallelStreams = parallelStreams,
+            RawDownloadJson = rawJson, // Store in RawDownloadJson for client tests
+            TestTime = now,
+            Success = true
+        };
+
+        // Save immediately so client doesn't wait
+        db.Iperf3Results.Add(result);
+        await db.SaveChangesAsync();
+        var resultId = result.Id;
+
+        _logger.LogInformation(
+            "Recorded iperf3 client result: {ClientIp} - Down: {Download:F1} Mbps, Up: {Upload:F1} Mbps ({Streams} streams)",
+            result.DeviceHost, result.DownloadMbps, result.UploadMbps, parallelStreams);
+
+        // Capture snapshot now (during active test) for use when second direction merges
+        // Fire-and-forget - don't block the response
+        _ = _snapshotService.CaptureSnapshotAsync(_siteSlug, clientIp);
+
+        // Enrich and analyze in background (after WiFi rates stabilize)
+        _ = Task.Run(async () => await EnrichAndAnalyzeInBackgroundAsync(resultId));
+
+        return result;
+    }
+
+    /// <summary>
+    /// Get recent client speed test results (ClientToServer and BrowserToServer directions).
+    /// Retries path analysis for results missing valid paths.
+    /// </summary>
+    /// <param name="count">Maximum number of results (0 = no limit)</param>
+    /// <param name="hours">Filter to results within the last N hours (0 = all time)</param>
+    public async Task<List<Iperf3Result>> GetResultsAsync(int count = 50, int hours = 0)
+    {
+        await using var db = await CreateSiteDbAsync();
+        var query = db.Iperf3Results
+            .Where(r => r.Direction == SpeedTestDirection.ClientToServer
+                     || r.Direction == SpeedTestDirection.BrowserToServer);
+
+        // Apply date filter if specified
+        if (hours > 0)
+        {
+            var cutoff = DateTime.UtcNow.AddHours(-hours);
+            query = query.Where(r => r.TestTime >= cutoff);
+        }
+
+        query = query.OrderByDescending(r => r.TestTime);
+
+        // Apply count limit if specified
+        if (count > 0)
+        {
+            query = query.Take(count);
+        }
+
+        var results = await query.ToListAsync();
+
+        // Retry path analysis for recent results (last 30 min) without a valid path
+        var retryWindow = DateTime.UtcNow.AddMinutes(-30);
+        var needsRetry = results.Where(r =>
+            r.TestTime > retryWindow &&
+            (r.PathAnalysis == null ||
+             r.PathAnalysis.Path == null ||
+             !r.PathAnalysis.Path.IsValid))
+            .Where(r => PathAnalysisRetryGate.TryClaim(nameof(ClientSpeedTestService), r.Id))
+            .ToList();
+
+        if (needsRetry.Count > 0)
+        {
+            _logger.LogInformation("Retrying path analysis for {Count} results without valid paths", needsRetry.Count);
+            foreach (var result in needsRetry)
+            {
+                await AnalyzePathAsync(result);
+                BackfillFromPathAnalysis(result);
+                await SettleWifiRatesAsync(result);
+            }
+            await db.SaveChangesAsync();
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Get recent WAN speed test results from external OpenSpeedTest servers.
+    /// </summary>
+    public async Task<List<Iperf3Result>> GetWanResultsAsync(int count = 50, int hours = 0)
+    {
+        await using var db = await CreateSiteDbAsync();
+        var query = db.Iperf3Results
+            .Where(r => r.Direction == SpeedTestDirection.OpenSpeedTestWan);
+
+        if (hours > 0)
+        {
+            var cutoff = DateTime.UtcNow.AddHours(-hours);
+            query = query.Where(r => r.TestTime >= cutoff);
+        }
+
+        query = query.OrderByDescending(r => r.TestTime);
+
+        if (count > 0)
+            query = query.Take(count);
+
+        var results = await query.ToListAsync();
+
+        // Retry path analysis for results without valid paths
+        var retryWindow = DateTime.UtcNow.AddMinutes(-30);
+        var needsRetry = results.Where(r =>
+            r.TestTime > retryWindow &&
+            (r.PathAnalysis == null ||
+             r.PathAnalysis.Path == null ||
+             !r.PathAnalysis.Path.IsValid))
+            .Where(r => PathAnalysisRetryGate.TryClaim(nameof(ClientSpeedTestService), r.Id))
+            .ToList();
+
+        if (needsRetry.Count > 0)
+        {
+            _logger.LogInformation("Retrying path analysis for {Count} WAN results without valid paths", needsRetry.Count);
+            foreach (var result in needsRetry)
+            {
+                await AnalyzePathAsync(result);
+                BackfillFromPathAnalysis(result);
+                await SettleWifiRatesAsync(result);
+            }
+            await db.SaveChangesAsync();
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Get client speed test results for a specific IP.
+    /// </summary>
+    public async Task<List<Iperf3Result>> GetResultsByIpAsync(string clientIp, int count = 20)
+    {
+        await using var db = await CreateSiteDbAsync();
+        return await db.Iperf3Results
+            .Where(r => (r.Direction == SpeedTestDirection.ClientToServer
+                      || r.Direction == SpeedTestDirection.BrowserToServer)
+                     && r.DeviceHost == clientIp)
+            .OrderByDescending(r => r.TestTime)
+            .Take(count)
+            .ToListAsync();
+    }
+
+    /// <summary>
+    /// Get client speed test results for a specific MAC.
+    /// </summary>
+    public async Task<List<Iperf3Result>> GetResultsByMacAsync(string clientMac, int count = 20)
+    {
+        await using var db = await CreateSiteDbAsync();
+        return await db.Iperf3Results
+            .Where(r => (r.Direction == SpeedTestDirection.ClientToServer
+                      || r.Direction == SpeedTestDirection.BrowserToServer)
+                     && r.ClientMac == clientMac)
+            .OrderByDescending(r => r.TestTime)
+            .Take(count)
+            .ToListAsync();
+    }
+
+    /// <summary>
+    /// Delete a speed test result by ID.
+    /// </summary>
+    /// <returns>True if the result was deleted, false if not found.</returns>
+    public async Task<bool> DeleteResultAsync(int id)
+    {
+        await using var db = await CreateSiteDbAsync();
+        var result = await db.Iperf3Results.FindAsync(id);
+        if (result == null)
+        {
+            return false;
+        }
+
+        db.Iperf3Results.Remove(result);
+        await db.SaveChangesAsync();
+        _logger.LogInformation("Deleted speed test result {Id} for {DeviceHost}", id, result.DeviceHost);
+        return true;
+    }
+
+    /// <summary>
+    /// Updates the notes for a speed test result.
+    /// </summary>
+    public async Task<bool> UpdateNotesAsync(int id, string? notes)
+    {
+        await using var db = await CreateSiteDbAsync();
+        var result = await db.Iperf3Results.FindAsync(id);
+        if (result == null)
+        {
+            return false;
+        }
+
+        result.Notes = string.IsNullOrWhiteSpace(notes) ? null : notes.Trim();
+        await db.SaveChangesAsync();
+        _logger.LogDebug("Updated notes for speed test result {Id}", id);
+        return true;
+    }
+
+    /// <summary>
+    /// Analyze network path for the speed test result.
+    /// For client tests, the path is from server (LocalIp) to client (DeviceHost).
+    /// Retry logic is built into CalculatePathAsync.
+    /// </summary>
+    /// <param name="result">The speed test result to analyze</param>
+    /// <param name="priorSnapshot">Optional wireless rate snapshot captured during the test</param>
+    private async Task AnalyzePathAsync(
+        Iperf3Result result, WirelessRateSnapshot? priorSnapshot = null, string? forceApMac = null)
+    {
+        try
+        {
+            _logger.LogDebug("Analyzing network path to {Client} from {Server}{Snapshot}",
+                result.DeviceHost, result.LocalIp ?? "auto",
+                priorSnapshot != null ? " (with snapshot)" : "");
+
+            // When comparing with a snapshot, invalidate cache to get fresh "current" rates
+            if (priorSnapshot != null)
+            {
+                _pathAnalyzer.InvalidateTopologyCache();
+            }
+
+            NetworkPath path;
+            var target = await PathTargetAsync(result);
+            if (result.Direction == SpeedTestDirection.OpenSpeedTestWan)
+            {
+                // WAN speed test: path is WAN → Gateway → ... → Client
+                // Pass snapshot for stable WiFi rates (same as LAN tests)
+                path = await _pathAnalyzer.CalculateWanClientPathAsync(
+                    target, result.LocalIp, priorSnapshot);
+            }
+            else
+            {
+                // LAN speed test: path from server to client
+                path = await _pathAnalyzer.CalculatePathAsync(
+                    target,
+                    result.LocalIp,
+                    retryOnFailure: true,
+                    priorSnapshot,
+                    forceApMac: forceApMac);
+
+                // An iperf3 result's LocalIp is the listener's socket address, which
+                // can be off-topology (Docker bridge networking, or a multi-NIC agent
+                // box picking the wrong interface). When the server endpoint wasn't
+                // found, retry anchored at the site's target override (where clients are
+                // actually sent), then at the advertised endpoint (agent LAN IP / HOST_IP).
+                if (!path.IsValid && path.ErrorMessage == NetworkPath.ServerPositionNotFoundError)
+                {
+                    var candidates = new[] { await GetTargetOverrideIpAsync(), await ResolveAdvertisedEndpointAsync() };
+                    foreach (var fallbackIp in candidates.Where(ip => !string.IsNullOrEmpty(ip)).Distinct())
+                    {
+                        if (fallbackIp == result.LocalIp)
+                            continue;
+                        _logger.LogDebug("Server position not found from {LocalIp}; retrying with site endpoint {FallbackIp}",
+                            result.LocalIp ?? "auto", fallbackIp);
+                        path = await _pathAnalyzer.CalculatePathAsync(
+                            target, fallbackIp, retryOnFailure: false, priorSnapshot,
+                            forceApMac: forceApMac);
+                        if (path.IsValid)
+                        {
+                            result.LocalIp = fallbackIp;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            var analysis = _pathAnalyzer.AnalyzeSpeedTest(
+                path,
+                result.DownloadMbps,
+                result.UploadMbps,
+                result.DownloadRetransmits,
+                result.UploadRetransmits,
+                result.DownloadBytes,
+                result.UploadBytes);
+
+            result.PathAnalysis = analysis;
+
+            if (analysis.Path.IsValid)
+            {
+                _logger.LogDebug("Path analysis complete: {Hops} hops", analysis.Path.Hops.Count);
+            }
+            else
+            {
+                _logger.LogDebug("Path analysis: path not found or invalid");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to analyze path for {Client}", result.DeviceHost);
+        }
+    }
+
+    /// <summary>
+    /// How far either side of the test's finish to look. Deliberately tight: the association is
+    /// whatever held the client as the test ended, and reaching further back only admits ones it
+    /// had already left. A 45 s window took a point 30 s before the finish, from an access point
+    /// the client had roamed off, and scored it as a candidate.
+    /// </summary>
+    private static readonly TimeSpan SeriesWindow = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// When to try again after an empty window, stopping at the first that fits. Several short
+    /// attempts rather than one long wait: collection and polling both run at ten seconds, and a
+    /// single guess either fires before the point exists or leaves a wrong value up too long.
+    /// </summary>
+    private static readonly TimeSpan[] SeriesRetryDelays =
+    [
+        TimeSpan.FromSeconds(5),
+        TimeSpan.FromSeconds(15),
+        TimeSpan.FromSeconds(30),
+    ];
+
+    /// <summary>
+    /// Replaces the trace's wireless rates with the association that actually explains the measured
+    /// throughput, taken from the time series rather than a single-instant topology fetch.
+    ///
+    /// The snapshot is one sample at an uncertain moment, so a client that roams mid-test can leave
+    /// it describing the wrong access point - and on a meshed one, carrying the mesh uplink's PHY
+    /// instead of the client's. The series is timestamped and carries the access point per point,
+    /// so it can answer which one served these seconds.
+    ///
+    /// Returns true when it applied, leaving the caller's own path unused. No series, or nothing that
+    /// fits, changes nothing.
+    /// </summary>
+    private async Task<(bool Applied, bool Plausible)> ReconcileWifiFromSeriesAsync(
+        Iperf3Result result, string attempt = "initial")
+    {
+        if (_influx is not { IsConfigured: true }) return (false, false);
+        if (string.IsNullOrEmpty(result.ClientMac)) return (false, false);
+
+        if (IsWiredClient(result)) return (false, false);
+
+        try
+        {
+            // Never hand the Influx client a raw stored timestamp: see DateTimeUtilities.AsUtc.
+            var anchor = DateTimeUtilities.AsUtc(result.TestTime);
+            // Anchored on the finish, not the whole test: TestTime is when the result was recorded,
+            // and the association that matters is the one holding the client at that moment.
+            var to = anchor + SeriesWindow;
+            var from = anchor - SeriesWindow;
+
+            var points = await _influx.QueryWifiClientSamplesAsync(result.ClientMac, from, to);
+            if (points.Count == 0)
+            {
+                // Expected on the trace that runs during the test: the window reaches past now, so
+                // the points do not exist yet. The post-test trace is the one that should find them.
+                _logger.LogDebug("Wi-Fi fit [{Attempt} #{Id}] {Mac}: no series points in {From:yyyy-MM-dd HH:mm:ss}Z-{To:HH:mm:ss}Z",
+                    attempt, result.Id, result.ClientMac, from, to);
+                return (false, false);
+            }
+
+            var candidates = points
+                .Where(p => !string.IsNullOrEmpty(p.ApMac))
+                .GroupBy(p => p.ApMac!, StringComparer.OrdinalIgnoreCase)
+                .Select(g => new WifiFitCandidate(
+                    ApMac: g.Key,
+                    Band: g.Select(p => p.Band).FirstOrDefault(b => !string.IsNullOrEmpty(b)),
+                    // The best the link reached, not its middle value: a link ramping through a test
+                    // is under-described by the median, and the ceiling is what bounds throughput.
+                    TxRateKbps: g.Max(p => p.TxRateKbps),
+                    RxRateKbps: g.Max(p => p.RxRateKbps),
+                    SignalDbm: g.Where(p => p.SignalDbm.HasValue).Select(p => p.SignalDbm!.Value)
+                        .DefaultIfEmpty().Average(),
+                    Points: g.Count(),
+                    NoiseDbm: g.Where(p => p.NoiseDbm.HasValue).Select(p => p.NoiseDbm!.Value)
+                        .Cast<double?>().LastOrDefault(),
+                    Channel: g.Select(p => p.Channel).LastOrDefault(c => c.HasValue),
+                    ChannelWidth: g.Select(p => p.ChannelWidth).LastOrDefault(c => c.HasValue),
+                    ObservedThroughputBps: g.Max(p => Math.Max(p.TxThroughputBps ?? 0, p.RxThroughputBps ?? 0))))
+                .ToList();
+
+            // Download is From Device and is bounded by RX; upload is To Device and is bounded by TX.
+            double? fromDeviceBps = result.DownloadBitsPerSecond > 0 ? result.DownloadBitsPerSecond : null;
+            double? toDeviceBps = result.UploadBitsPerSecond > 0 ? result.UploadBitsPerSecond : null;
+
+            var scored = SpeedTestWifiFit.Score(candidates, fromDeviceBps, toDeviceBps);
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                foreach (var sc in scored)
+                {
+                    _logger.LogDebug(
+                        "Wi-Fi fit [{Attempt} #{Id}] {Mac} on {Ap} ({Band}, {Points} pts): FromDevice {Down:F1}Mbps / RX {Rx}Mbps = {FromEff}, ToDevice {Up:F1}Mbps / TX {Tx}Mbps = {ToEff}, score {Score:F3}{Verdict}",
+                        attempt, result.Id, result.ClientMac, sc.Candidate.ApMac, sc.Candidate.Band ?? "?", sc.Candidate.Points,
+                        (fromDeviceBps ?? 0) / 1e6, sc.Candidate.RxRateKbps / 1000 ?? 0, Pct(sc.FromDeviceEfficiency),
+                        (toDeviceBps ?? 0) / 1e6, sc.Candidate.TxRateKbps / 1000 ?? 0, Pct(sc.ToDeviceEfficiency),
+                        sc.Score, sc.Rejected == null ? "" : $" - REJECTED: {sc.Rejected}");
+                }
+            }
+
+            var best = scored.FirstOrDefault(x => x.IsViable);
+            if (best == null)
+            {
+                _logger.LogDebug("Wi-Fi fit [{Attempt} #{Id}] {Mac}: no candidate fits, keeping the realtime result ({Tx}/{Rx} Kbps)",
+                    attempt, result.Id, result.ClientMac, result.WifiTxRateKbps, result.WifiRxRateKbps);
+                return (false, false);
+            }
+
+            _logger.LogDebug(
+                "Wi-Fi fit [{Attempt} #{Id}] {Mac}: took {Ap} from the series, TX {Tx}{TxHeld} / RX {Rx}{RxHeld} Kbps (was {OldTx}/{OldRx} from realtime)",
+                attempt, result.Id, result.ClientMac, best.Candidate.ApMac,
+                best.Candidate.TxRateKbps, best.TxIsPlausible ? "" : " HELD",
+                best.Candidate.RxRateKbps, best.RxIsPlausible ? "" : " HELD",
+                result.WifiTxRateKbps, result.WifiRxRateKbps);
+
+            // The whole association, not just the rates: band, channel and signal all describe the
+            // access point the client was actually on, and leaving them behind keeps the result
+            // half-describing the one it was not.
+            // Per direction: TX and RX are sampled independently, so a dip in one must not withhold
+            // the other. The direction that is still implausible keeps what it had and a later
+            // attempt fills it in.
+            if (best.TxIsPlausible && best.Candidate.TxRateKbps is > 0) result.WifiTxRateKbps = best.Candidate.TxRateKbps;
+            if (best.RxIsPlausible && best.Candidate.RxRateKbps is > 0) result.WifiRxRateKbps = best.Candidate.RxRateKbps;
+            if (best.Candidate.SignalDbm is < 0) result.WifiSignalDbm = (int)Math.Round(best.Candidate.SignalDbm.Value);
+            if (best.Candidate.NoiseDbm is < 0) result.WifiNoiseDbm = (int)Math.Round(best.Candidate.NoiseDbm.Value);
+            if (best.Candidate.Channel is > 0) result.WifiChannel = best.Candidate.Channel;
+            if (best.Candidate.ChannelWidth is > 0) result.WifiChannelWidthMhz = best.Candidate.ChannelWidth;
+            if (RadioTokenFor(best.Candidate.Band) is { } radio) result.WifiRadio = radio;
+
+            // A different access point means a different path above it, so the trace is rebuilt
+            // through the one the series names rather than relabelled - the hops after it belong to
+            // that access point's uplink, not the one topology guessed.
+            var tracedAp = result.PathAnalysis?.Path?.Hops?
+                .FirstOrDefault(h => h.Type == HopType.AccessPoint)?.DeviceMac;
+            if (!string.IsNullOrEmpty(tracedAp)
+                && !string.Equals(tracedAp, best.Candidate.ApMac, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogDebug("Wi-Fi fit [{Attempt} #{Id}] {Mac}: re-tracing through {Fit}, trace had {Traced}",
+                    attempt, result.Id, result.ClientMac, best.Candidate.ApMac, tracedAp);
+                await AnalyzePathAsync(result, forceApMac: best.Candidate.ApMac);
+            }
+
+            // The wireless hop is what the trace renders. Ingress is TX (To Device), egress is RX.
+            // The bottleneck, max, and grades were derived from the trace-time rate, so they are
+            // re-derived from the re-rated hop or the stored path keeps describing a link that
+            // was never the one tested.
+            //
+            // Assigned back deliberately: PathAnalysis caches the deserialized object, and only its
+            // setter rewrites PathAnalysisJson. Mutating the hop alone changes what this instance
+            // holds and nothing that is stored.
+            var analysis = result.PathAnalysis;
+            var hop = analysis?.Path?.Hops?.FirstOrDefault(h => h.Type == HopType.WirelessClient);
+            if (hop != null)
+            {
+                if (best.TxIsPlausible && best.Candidate.TxRateKbps is > 0) hop.IngressSpeedMbps = (int)(best.Candidate.TxRateKbps.Value / 1000);
+                if (best.RxIsPlausible && best.Candidate.RxRateKbps is > 0) hop.EgressSpeedMbps = (int)(best.Candidate.RxRateKbps.Value / 1000);
+                // Band and channel too, or the hop's tooltip keeps the realtime source's while the result shows the series'
+                if (best.Candidate.Channel is > 0) hop.WirelessChannel = best.Candidate.Channel;
+                if (RadioTokenFor(best.Candidate.Band) is { } hopRadio)
+                {
+                    hop.WirelessIngressBand = hopRadio;
+                    hop.WirelessEgressBand = hopRadio;
+                }
+                NetworkPathAnalyzer.RecalculateBottleneck(analysis!.Path);
+                analysis.CalculateEfficiency();
+                analysis.GenerateInsights();
+                result.PathAnalysis = analysis;
+            }
+
+            return (true, best.IsPlausible);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Wi-Fi fit failed for {Mac}; keeping the realtime result", result.ClientMac);
+            return (false, false);
+        }
+    }
+
+    /// <summary>
+    /// Whether the trace shows a wired endpoint. A wired client has nothing in wifi_client, so the
+    /// query and the retries after it are waste. Positive evidence only: a wireless client missing
+    /// from the console list has no radio fields either and must not be skipped. A VPN client's
+    /// ClientMac resolves to the gateway, which is never in wifi_client either.
+    /// </summary>
+    private static bool IsWiredClient(Iperf3Result result)
+        => result.PathAnalysis?.Path?.Hops?.Any(h => h.Type == HopType.Client
+            || (h.Type == HopType.Gateway
+                && string.Equals(h.DeviceMac, result.ClientMac, StringComparison.OrdinalIgnoreCase))) == true;
+
+    private static string Pct(double? efficiency) => efficiency.HasValue ? $"{efficiency.Value * 100:F1}%" : "n/a";
+
+    /// <summary>The series band tag as the radio token the result stores. Null leaves the field alone.</summary>
+    private static string? RadioTokenFor(string? band) => band?.ToLowerInvariant() switch
+    {
+        "2.4ghz" => "ng",
+        "5ghz" => "na",
+        "6ghz" => "6e",
+        _ => null,
+    };
+
+    /// <summary>
+    /// Settles the result's wireless rates. The time series wins when an association there explains
+    /// the measured throughput; otherwise the realtime path stands, unchanged.
+    /// </summary>
+    private async Task SettleWifiRatesAsync(Iperf3Result result, int retryResultId = 0)
+    {
+        var (applied, plausible) = await ReconcileWifiFromSeriesAsync(result);
+        if (applied && plausible) return;
+        if (!applied) UpdateWifiRatesFromPathAnalysis(result);
+
+        if (IsWiredClient(result)) return;
+
+        // The series can be behind the client: an access point it has just moved to takes a few
+        // collection passes to appear, so the association that actually served the test may not be a
+        // candidate yet. One later attempt catches it. retryResultId is 0 on the retry itself, which
+        // is what stops it repeating.
+        if (retryResultId > 0) ScheduleSeriesRetry(retryResultId);
+    }
+
+    /// <summary>
+    /// Re-runs the fit once the collector has had time to write the client's current association.
+    ///
+    /// Only where the AP Agent is running. Without it the series is written from the console - the
+    /// same source the realtime result already used - so waiting could not produce a better answer,
+    /// and delaying a result to re-read what we already have would be wrong.
+    /// </summary>
+    private void ScheduleSeriesRetry(int resultId)
+    {
+        if (_influx is not { IsConfigured: true } || _apAgents == null) return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                if (!await _apAgents.IsSiteEnabledAsync(_siteSlug))
+                {
+                    _logger.LogDebug("Wi-Fi fit [retry #{Id}]: skipped, no AP Agent on this site", resultId);
+                    return;
+                }
+
+                var elapsed = TimeSpan.Zero;
+                for (var i = 0; i < SeriesRetryDelays.Length; i++)
+                {
+                    var wait = SeriesRetryDelays[i] - elapsed;
+                    if (wait > TimeSpan.Zero) await Task.Delay(wait);
+                    elapsed = SeriesRetryDelays[i];
+
+                    await using var db = await CreateSiteDbAsync();
+                    var result = await db.Iperf3Results.FindAsync(resultId);
+                    if (result == null)
+                    {
+                        _logger.LogDebug("Wi-Fi fit [retry #{Id}]: result no longer exists", resultId);
+                        return;
+                    }
+
+                    var (applied, plausible) = await ReconcileWifiFromSeriesAsync(
+                        result, attempt: $"retry {elapsed.TotalSeconds:0}s");
+
+                    // A last attempt takes the best it has; an earlier one holds out for a sample
+                    // the rates are believable in, because the PHY moves through a test and one
+                    // point can catch a dip.
+                    var last = i == SeriesRetryDelays.Length - 1;
+                    if (applied && (plausible || last))
+                    {
+                        await db.SaveChangesAsync();
+                        _logger.LogDebug("Wi-Fi fit [retry #{Id}]: applied and saved after {Elapsed}s{Caveat}",
+                            resultId, elapsed.TotalSeconds, plausible ? "" : " (rates still implausible)");
+                        return;
+                    }
+                }
+
+                _logger.LogDebug("Wi-Fi fit [retry #{Id}]: gave up after {Elapsed}s, realtime result stands",
+                    resultId, elapsed.TotalSeconds);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Wi-Fi fit [retry #{Id}]: failed", resultId);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Updates the result's WiFi rate fields with max values from path analysis.
+    /// The hop rates already have max(snapshot, current) applied, so this syncs
+    /// the result fields to match.
+    /// </summary>
+    private static void UpdateWifiRatesFromPathAnalysis(Iperf3Result result)
+    {
+        if (result.PathAnalysis?.Path?.Hops?.Count > 0)
+        {
+            var wirelessHop = result.PathAnalysis.Path.Hops.FirstOrDefault(h =>
+                h.Type == HopType.WirelessClient);
+            if (wirelessHop != null)
+            {
+                // IngressSpeedMbps = Tx (ToDevice), EgressSpeedMbps = Rx (FromDevice)
+                // Wireless hops are NOT swapped during WAN path reversal (physical link properties)
+                var maxTxKbps = (long)(wirelessHop.IngressSpeedMbps * 1000);
+                var maxRxKbps = (long)(wirelessHop.EgressSpeedMbps * 1000);
+
+                // Only update if path analysis has higher values
+                if (maxTxKbps > (result.WifiTxRateKbps ?? 0))
+                    result.WifiTxRateKbps = maxTxKbps;
+                if (maxRxKbps > (result.WifiRxRateKbps ?? 0))
+                    result.WifiRxRateKbps = maxRxKbps;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Backfills missing result fields from path analysis data.
+    /// Covers the case where the client wasn't in the UniFi client list during
+    /// initial enrichment (e.g., freshly reconnected to Wi-Fi) but the path
+    /// analyzer found the device via topology discovery.
+    /// </summary>
+    private void BackfillFromPathAnalysis(Iperf3Result result)
+    {
+        var path = result.PathAnalysis?.Path;
+        if (path == null)
+            return;
+
+        // Backfill ClientMac from path destination
+        if (string.IsNullOrEmpty(result.ClientMac) && !string.IsNullOrEmpty(path.DestinationMac))
+            result.ClientMac = path.DestinationMac;
+
+        // Backfill DeviceName from the wireless client hop
+        var wirelessHop = path.Hops?.FirstOrDefault(h => h.Type == HopType.WirelessClient);
+        if (wirelessHop == null)
+            return;
+
+        if (string.IsNullOrEmpty(result.DeviceName) && !string.IsNullOrEmpty(wirelessHop.DeviceName))
+            result.DeviceName = wirelessHop.DeviceName;
+
+        // Backfill Wi-Fi details from the wireless hop
+        if (result.WifiChannel == null && wirelessHop.WirelessChannel != null)
+            result.WifiChannel = wirelessHop.WirelessChannel;
+
+        if (result.WifiSignalDbm == null && wirelessHop.WirelessSignalDbm != null)
+            result.WifiSignalDbm = wirelessHop.WirelessSignalDbm;
+
+        if (result.WifiNoiseDbm == null && wirelessHop.WirelessNoiseDbm != null)
+            result.WifiNoiseDbm = wirelessHop.WirelessNoiseDbm;
+
+        // Backfill radio band (WirelessClient hop: IngressBand = EgressBand = client's band)
+        if (string.IsNullOrEmpty(result.WifiRadio) && !string.IsNullOrEmpty(wirelessHop.WirelessEgressBand))
+            result.WifiRadio = wirelessHop.WirelessEgressBand;
+
+        if (result.ClientMac != null || result.DeviceName != null)
+        {
+            _logger.LogDebug("Backfilled from path analysis for {Ip}: MAC={Mac}, Name={Name}, Channel={Channel}, Radio={Radio}",
+                result.DeviceHost, result.ClientMac, result.DeviceName, result.WifiChannel, result.WifiRadio);
+        }
+    }
+
+    /// <summary>
+    /// Background task to enrich and analyze a speed test result after WiFi rates stabilize.
+    /// Loads the result from DB, enriches with UniFi data, analyzes path, and saves.
+    /// </summary>
+    private async Task EnrichAndAnalyzeInBackgroundAsync(int resultId)
+    {
+        try
+        {
+            // Let WiFi link rates stabilize after the speed test
+            await Task.Delay(TimeSpan.FromSeconds(2));
+
+            await using var db = await CreateSiteDbAsync();
+            var result = await db.Iperf3Results.FindAsync(resultId);
+            if (result == null)
+            {
+                _logger.LogWarning("Result {Id} not found for background enrichment", resultId);
+                return;
+            }
+
+            // An IPv6 source is matched to its device first, so the lookup below can go by MAC
+            await ResolveIpv6ClientMacAsync(result);
+
+            // Try to look up client info from UniFi
+            await _connectionService.EnrichSpeedTestWithClientInfoAsync(result);
+
+            // Get snapshot if available (captured during test by client callback)
+            // For iperf3 client tests (ClientToServer), don't use snapshot here - preserve it for the merge path
+            // The snapshot will be used when the second direction arrives and triggers a merge
+            WirelessRateSnapshot? snapshot = null;
+            if (result.Direction != SpeedTestDirection.ClientToServer)
+            {
+                snapshot = _snapshotService.GetSnapshot(_siteSlug, result.DeviceHost);
+            }
+
+            // Perform path analysis (using snapshot to pick max wireless rates)
+            await AnalyzePathAsync(result, snapshot);
+
+            // Backfill any fields that initial enrichment missed (e.g., client wasn't in
+            // UniFi client list yet but path analysis found it via topology)
+            BackfillFromPathAnalysis(result);
+
+            // Series first, path analysis only if nothing there explains the measurement.
+            await SettleWifiRatesAsync(result, retryResultId: resultId);
+
+            // Clean up snapshot after use (iperf3 client snapshots cleaned up in merge path or auto-expire)
+            if (snapshot != null)
+                _snapshotService.RemoveSnapshot(_siteSlug, result.DeviceHost);
+
+            await db.SaveChangesAsync();
+
+            _logger.LogDebug("Background enrichment complete for result {Id}: {DeviceName}",
+                resultId, result.DeviceName ?? result.DeviceHost);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to enrich result {Id} in background", resultId);
+        }
+    }
+
+    private async Task PublishSpeedTestAlertAsync(Iperf3Result result)
+    {
+        if (_alertEventBus == null) return;
+
+        try
+        {
+            var downloadMbps = result.DownloadMbps;
+            var uploadMbps = result.UploadMbps;
+
+            await _alertEventBus.PublishAsync(new AlertEvent
+            {
+                EventType = "speedtest.client_completed",
+                Severity = AlertSeverity.Info,
+                Source = "speedtest",
+                Title = $"Speed test: {downloadMbps:F0} / {uploadMbps:F0} Mbps{_siteSuffix}",
+                Message = $"Client {result.DeviceHost}: Download {downloadMbps:F1} Mbps, Upload {uploadMbps:F1} Mbps",
+                DeviceIp = result.DeviceHost,
+                DeviceName = result.DeviceName,
+                MetricValue = downloadMbps,
+                SourceUrl = $"/client-speedtest?result={result.Id}",
+                Context = new Dictionary<string, string>
+                {
+                    ["downloadMbps"] = downloadMbps.ToString("F1"),
+                    ["uploadMbps"] = uploadMbps.ToString("F1")
+                }
+            });
+
+            // Check for regression vs recent average for same device
+            try
+            {
+                await using var db = await CreateSiteDbAsync();
+                var recent = await db.Iperf3Results
+                    .AsNoTracking()
+                    .Where(r => r.DeviceHost == result.DeviceHost && r.Id != result.Id && r.Success
+                        && r.Direction == result.Direction
+                        && r.DownloadBitsPerSecond > 0)
+                    .OrderByDescending(r => r.TestTime)
+                    .Take(5)
+                    .ToListAsync();
+
+                if (recent.Count >= 3)
+                {
+                    var avgDownload = recent.Average(r => r.DownloadMbps);
+                    var dropPercent = avgDownload > 0 ? (avgDownload - downloadMbps) / avgDownload * 100 : 0;
+
+                    if (dropPercent > 0)
+                    {
+                        var deviceLabel = result.DeviceName ?? result.DeviceHost;
+                        await _alertEventBus.PublishAsync(new AlertEvent
+                        {
+                            EventType = "speedtest.client_regression",
+                            Severity = dropPercent >= 50 ? AlertSeverity.Error
+                                : dropPercent >= 25 ? AlertSeverity.Warning : AlertSeverity.Info,
+                            Source = "speedtest",
+                            Title = $"Speed regression: {deviceLabel} at {downloadMbps:F0} Mbps ({dropPercent:F0}% below average){_siteSuffix}",
+                            Message = $"{deviceLabel} download is {dropPercent:F0}% below the recent average of {avgDownload:F0} Mbps",
+                            DeviceIp = result.DeviceHost,
+                            DeviceName = result.DeviceName,
+                            MetricValue = downloadMbps,
+                            ThresholdValue = avgDownload,
+                            SourceUrl = $"/client-speedtest?result={result.Id}",
+                            Context = new Dictionary<string, string>
+                            {
+                                ["current_mbps"] = downloadMbps.ToString("F1"),
+                                ["average_mbps"] = avgDownload.ToString("F1"),
+                                ["drop_percent"] = dropPercent.ToString("F0"),
+                                ["sample_count"] = recent.Count.ToString()
+                            }
+                        });
+                    }
+                }
+            }
+            catch (Exception regressEx)
+            {
+                _logger.LogDebug(regressEx, "Failed to check speed test regression");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to publish speed test alert event");
+        }
+    }
+}

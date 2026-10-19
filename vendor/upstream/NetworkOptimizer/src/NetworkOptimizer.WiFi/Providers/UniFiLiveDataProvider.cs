@@ -1,0 +1,2081 @@
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using NetworkOptimizer.UniFi;
+using NetworkOptimizer.UniFi.Models;
+using NetworkOptimizer.WiFi.Helpers;
+using NetworkOptimizer.WiFi.Models;
+
+namespace NetworkOptimizer.WiFi.Providers;
+
+/// <summary>
+/// Wi-Fi data provider that fetches live data from UniFi API.
+/// Uses UniFiDiscovery for centralized device classification.
+/// </summary>
+public class UniFiLiveDataProvider : IWiFiDataProvider
+{
+    private readonly UniFiApiClient _client;
+    private readonly UniFiDiscovery _discovery;
+    private readonly ILogger<UniFiLiveDataProvider> _logger;
+
+    /// <summary>
+    /// Optional, and absent everywhere the AP Agent is not in play. The console path below is
+    /// unconditional; this only lays measured readings over the access points an agent covers.
+    /// </summary>
+    private readonly IMeasuredWirelessClientSource? _measuredClients;
+
+    /// <summary>
+    /// Optional for the same reason. Lets an agent's answer about who its access point holds beat
+    /// the Console's idle tolerance when the roster judges a client online.
+    /// </summary>
+    private readonly NetworkOptimizer.Core.Interfaces.IAgentClientPresenceSource? _agentPresence;
+
+    public UniFiLiveDataProvider(
+        UniFiApiClient client,
+        UniFiDiscovery discovery,
+        ILogger<UniFiLiveDataProvider> logger,
+        IMeasuredWirelessClientSource? measuredClients = null,
+        NetworkOptimizer.Core.Interfaces.IAgentClientPresenceSource? agentPresence = null)
+    {
+        _client = client ?? throw new ArgumentNullException(nameof(client));
+        _discovery = discovery ?? throw new ArgumentNullException(nameof(discovery));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _measuredClients = measuredClients;
+        _agentPresence = agentPresence;
+    }
+
+    public string ProviderName => "UniFi Live";
+    public bool SupportsHistoricalData => true; // Via stat/report endpoints
+
+    /// <inheritdoc />
+    public Task<bool> TriggerQuickScanAsync(string apMac, string bandCode, int bandwidthMhz, CancellationToken cancellationToken = default)
+        => _client.TriggerQuickScanAsync(apMac, bandCode, bandwidthMhz, cancellationToken);
+
+    /// <inheritdoc />
+    public async Task<bool> IsQuickScanInProgressAsync(string apMac, CancellationToken cancellationToken = default)
+    {
+        var scan = await _client.GetSpectrumScanAsync(apMac, cancellationToken);
+        return scan?.QuickScanState?.InProgress == true;
+    }
+
+    public async Task<List<AccessPointSnapshot>> GetAccessPointsAsync(CancellationToken cancellationToken = default, bool useCache = true)
+    {
+        // Use UniFiDiscovery for centralized device classification (same as Audit and Speed Test)
+        var aps = await _discovery.DiscoverAccessPointsAsync(cancellationToken, useCache);
+        var timestamp = DateTimeOffset.UtcNow;
+
+        // Build a set of AP MACs for mesh parent detection
+        var apMacs = new HashSet<string>(aps.Select(ap => ap.Mac.ToLowerInvariant()));
+
+        // One absent half must not hide the pair from both APs, and with it the re-pair action.
+        var parentByChild = UniFiDiscovery.BuildMeshParentByChild(aps);
+
+        var snapshots = aps.Select(ap => MapToAccessPointSnapshot(ap, timestamp, apMacs, parentByChild)).ToList();
+
+        // Post-process: resolve mesh parent names and populate mesh children lists
+        // Use the parent's downlink_table for signal/rates (parent's perspective),
+        // falling back to the child's uplink data if downlink_table is unavailable.
+        var snapshotsByMac = snapshots.ToDictionary(s => s.Mac, StringComparer.OrdinalIgnoreCase);
+        var devicesByMac = aps.ToDictionary(d => d.Mac.ToLowerInvariant(), StringComparer.OrdinalIgnoreCase);
+        foreach (var snapshot in snapshots)
+        {
+            if (snapshot.IsMeshChild && snapshot.MeshParentMac != null &&
+                snapshotsByMac.TryGetValue(snapshot.MeshParentMac, out var parent))
+            {
+                snapshot.MeshParentName = parent.Name;
+
+                // The parent's view from its downlink_table: one entry PER LINK on an MLO
+                // backhaul, each with the PARENT's signal reading. This is the parent card's
+                // account; the child card reads the child's own mlo_links below.
+                int? parentSignal = null;
+                int? parentTxRateMbps = null;
+                int? parentRxRateMbps = null;
+                var isMlo = false;
+                var parentLinks = new List<MeshLinkInfo>();
+                if (devicesByMac.TryGetValue(snapshot.MeshParentMac, out var parentDevice) &&
+                    parentDevice.DownlinkTable != null)
+                {
+                    var matches = parentDevice.DownlinkTable
+                        .Where(d => string.Equals(d.SerialNo ?? d.MldMac, snapshot.Mac, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    // Aggregate ONLY is_mlo-flagged entries; a non-MLO child keeps the original
+                    // single-entry read so nothing about existing mesh pairs changes.
+                    var mloEntries = matches.Where(e => e.IsMlo == true).ToList();
+                    isMlo = mloEntries.Count > 0;
+                    var entries = isMlo ? mloEntries : matches.Take(1).ToList();
+                    if (isMlo)
+                    {
+                        parentLinks = mloEntries.Select(e => new MeshLinkInfo
+                        {
+                            Band = RadioBandExtensions.FromUniFiCode(e.Radio),
+                            Channel = e.Channel,
+                            SignalDbm = e.Signal,
+                            TxRateMbps = e.TxRate > 0 ? (int)(e.TxRate / 1000) : null,
+                            RxRateMbps = e.RxRate > 0 ? (int)(e.RxRate / 1000) : null,
+                        }).ToList();
+                    }
+                    if (entries.Count > 0)
+                    {
+                        // STR MLO runs its links concurrently, so the pair's capacity is the sum.
+                        parentSignal = entries.Max(e => e.Signal);
+                        var txSum = entries.Sum(e => e.TxRate);
+                        var rxSum = entries.Sum(e => e.RxRate);
+                        parentTxRateMbps = txSum > 0 ? (int)(txSum / 1000) : null;
+                        parentRxRateMbps = rxSum > 0 ? (int)(rxSum / 1000) : null;
+                    }
+                }
+
+                devicesByMac.TryGetValue(snapshot.Mac, out var selfDevice);
+                snapshot.MeshUplinkIsMlo = isMlo || selfDevice?.UplinkIsMlo == true;
+                // The child's own mlo_links are its side of the backhaul: every link, signal as
+                // the child measures it, rates already child-perspective. Only when the child
+                // names this parent do they describe this link; a claim-derived parent means the
+                // child's uplink block is about something else.
+                var selfLinks = selfDevice != null
+                    && string.Equals(selfDevice.UplinkMac, snapshot.MeshParentMac, StringComparison.OrdinalIgnoreCase)
+                    ? selfDevice.UplinkMloLinks
+                    : [];
+                if (selfLinks.Count > 0 && snapshot.MeshUplinkIsMlo)
+                {
+                    snapshot.MeshUplinkLinks = selfLinks.Select(l => new MeshLinkInfo
+                    {
+                        Band = RadioBandExtensions.FromUniFiCode(l.Band),
+                        Channel = l.Channel,
+                        SignalDbm = l.SignalDbm,
+                        TxRateMbps = l.TxRateMbps,
+                        RxRateMbps = l.RxRateMbps,
+                    }).ToList();
+                }
+                else
+                {
+                    // Fallback for a child that reports no links: the parent's entries flipped
+                    // to the child's perspective (the parent transmitting is the child
+                    // receiving). The child's own STA-link signal outranks the parent's for
+                    // that link; the other links keep the parent's reading.
+                    snapshot.MeshUplinkLinks = parentLinks.Select(l => new MeshLinkInfo
+                    {
+                        Band = l.Band,
+                        Channel = l.Channel,
+                        SignalDbm = l.Band.HasValue && l.Band == snapshot.MeshUplinkBand && snapshot.MeshUplinkSignalDbm.HasValue
+                            ? snapshot.MeshUplinkSignalDbm
+                            : l.SignalDbm,
+                        TxRateMbps = l.RxRateMbps,
+                        RxRateMbps = l.TxRateMbps,
+                    }).ToList();
+                }
+
+                parent.MeshChildren.Add(new MeshChildInfo
+                {
+                    Mac = snapshot.Mac,
+                    Name = snapshot.Name,
+                    SignalDbm = parentSignal ?? snapshot.MeshUplinkSignalDbm,
+                    TxRateMbps = parentTxRateMbps ?? snapshot.MeshUplinkRxRateMbps, // child RX = parent TX
+                    RxRateMbps = parentRxRateMbps ?? snapshot.MeshUplinkTxRateMbps, // child TX = parent RX
+                    UplinkBand = snapshot.MeshUplinkBand,
+                    IsMlo = snapshot.MeshUplinkIsMlo,
+                    Links = parentLinks
+                });
+            }
+        }
+
+        RadioIntent.ComputeWidthOverrides(snapshots);
+        return snapshots;
+    }
+
+    public async Task<List<WirelessClientSnapshot>> GetWirelessClientsAsync(CancellationToken cancellationToken = default)
+    {
+        var timestamp = DateTimeOffset.UtcNow;
+
+        // Get AP names for lookup using centralized classification
+        var aps = await _discovery.DiscoverAccessPointsAsync(cancellationToken);
+        var apNames = aps
+            .GroupBy(d => d.Mac.ToLowerInvariant())
+            .ToDictionary(g => g.Key, g => g.First().Name);
+
+        // Get active clients from both v1 (wireless stats) and v2 (display names) in parallel
+        var v1ClientsTask = _client.GetClientsAsync(cancellationToken);
+        var v2ClientsTask = _client.GetActiveClientsAsync(cancellationToken);
+        await Task.WhenAll(v1ClientsTask, v2ClientsTask);
+
+        var activeClients = await v1ClientsTask;
+        var activeWireless = activeClients.Where(c => c.IsWired == false).ToList();
+        var onlineMacs = new HashSet<string>(activeWireless.Select(c => c.Mac.ToLowerInvariant()));
+
+        // Build display name lookup from v2 API (has system-selected friendly names)
+        // Use GroupBy to handle potential duplicate MACs from the v2 endpoint
+        var v2Clients = await v2ClientsTask;
+        var displayNames = v2Clients
+            .Where(c => !string.IsNullOrEmpty(c.DisplayName))
+            .GroupBy(c => c.Mac.ToLowerInvariant())
+            .ToDictionary(g => g.Key, g => g.First().DisplayName!);
+
+        var result = activeWireless
+            .Select(c => MapToWirelessClientSnapshot(c, apNames, displayNames, timestamp,
+                isOnline: NetworkOptimizer.Core.Helpers.ClientPresence.IsPresent(
+                    c.IdleTime, c.ApMac, c.Radio, c.Signal,
+                    hasMloLinks: c.MloDetails is { Count: > 0 },
+                    agent: _agentPresence?.PresenceFor(c.ApMac, c.Mac)
+                        ?? NetworkOptimizer.Core.Helpers.AgentClientPresence.Unknown)))
+            .ToList();
+
+        await ApplyMeasuredClientsAsync(result, cancellationToken);
+
+        // Get historical clients (includes offline) - last 30 days
+        try
+        {
+            var history = await _client.GetClientHistoryAsync(withinHours: 720, cancellationToken);
+            var offlineWireless = history
+                .Where(c => !c.IsWired && c.Type == "WIRELESS")
+                .Where(c => !onlineMacs.Contains(c.Mac.ToLowerInvariant())) // Skip already-online clients
+                .ToList();
+
+            _logger.LogDebug("Found {Online} online and {Offline} offline wireless clients",
+                result.Count, offlineWireless.Count);
+
+            var historical = offlineWireless
+                .Select(c => MapHistoricalToWirelessClientSnapshot(c, apNames, timestamp))
+                .ToList();
+
+            // The console lists a returning client minutes after its access point has it, so a
+            // history row is already stale when it is built. Where an agent holds the client the
+            // verdict outranks that row: mark it online and let the measured overlay say which
+            // access point it is on now, rather than the one it left.
+            var returned = historical
+                .Where(c => _agentPresence?.PresenceFor(c.ApMac, c.Mac)
+                    == NetworkOptimizer.Core.Helpers.AgentClientPresence.Present)
+                .ToList();
+            foreach (var c in returned) c.IsOnline = true;
+            if (returned.Count > 0)
+            {
+                _logger.LogDebug("Promoted {Count} client(s) the console still lists as offline; their agents hold them", returned.Count);
+                await ApplyMeasuredClientsAsync(returned, cancellationToken);
+            }
+
+            result.AddRange(historical);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch client history for offline clients, showing online only");
+        }
+
+        return result;
+    }
+
+    public async Task<List<SiteWiFiMetrics>> GetSiteMetricsAsync(
+        DateTimeOffset start,
+        DateTimeOffset end,
+        MetricGranularity granularity = MetricGranularity.FiveMinutes,
+        CancellationToken cancellationToken = default)
+    {
+        // Use the stat/report endpoint for time-series data
+        var reportType = granularity switch
+        {
+            MetricGranularity.FiveMinutes => "5minutes",
+            MetricGranularity.Hourly => "hourly",
+            MetricGranularity.Daily => "daily",
+            _ => "5minutes"
+        };
+
+        var attrs = new[]
+        {
+            "time",  // Must include time to get the timestamp
+            "ap-ng-cu_total", "ap-na-cu_total", "ap-6e-cu_total",
+            "ap-ng-cu_interf", "ap-na-cu_interf", "ap-6e-cu_interf",
+            "ap-ng-tx_retries", "ap-na-tx_retries", "ap-6e-tx_retries",
+            "ap-ng-wifi_tx_attempts", "ap-na-wifi_tx_attempts", "ap-6e-wifi_tx_attempts",
+            "ap-ng-wifi_tx_dropped", "ap-na-wifi_tx_dropped", "ap-6e-wifi_tx_dropped",
+            "ap-ng-tx_packets", "ap-na-tx_packets", "ap-6e-tx_packets",
+            "ap-ng-rx_packets", "ap-na-rx_packets", "ap-6e-rx_packets"
+        };
+
+        try
+        {
+            _logger.LogDebug("Fetching site metrics: {ReportType}, start={Start}, end={End}",
+                reportType, start, end);
+
+            var reportData = await _client.PostSiteReportAsync(
+                reportType,
+                start.ToUnixTimeMilliseconds(),
+                end.ToUnixTimeMilliseconds(),
+                attrs,
+                cancellationToken);
+
+            _logger.LogDebug("Site report response: ValueKind={ValueKind}, ArrayLength={Length}",
+                reportData.ValueKind,
+                reportData.ValueKind == System.Text.Json.JsonValueKind.Array ? reportData.GetArrayLength() : 0);
+
+            var metrics = ParseSiteMetrics(reportData);
+            _logger.LogDebug("Parsed {Count} site metrics data points", metrics.Count);
+            return metrics;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch site metrics report");
+            return new List<SiteWiFiMetrics>();
+        }
+    }
+
+    /// <param name="throwOnFailure">When true, a fetch/parse failure propagates instead of
+    /// returning an empty list - so callers that must distinguish "no data" from "fetch failed"
+    /// (e.g. the outcome-memory collector, which would otherwise misattribute or skip a window)
+    /// can abort cleanly.</param>
+    public async Task<List<SiteWiFiMetrics>> GetApMetricsAsync(
+        string[] apMacs,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        MetricGranularity granularity = MetricGranularity.FiveMinutes,
+        CancellationToken cancellationToken = default,
+        bool throwOnFailure = false)
+    {
+        var reportType = granularity switch
+        {
+            MetricGranularity.FiveMinutes => "5minutes",
+            MetricGranularity.Hourly => "hourly",
+            MetricGranularity.Daily => "daily",
+            _ => "5minutes"
+        };
+
+        // AP endpoint uses ng-* prefix (no 'ap-' prefix like site endpoint)
+        var attrs = new[]
+        {
+            "time",
+            "ng-cu_total", "na-cu_total", "6e-cu_total",
+            "ng-cu_interf", "na-cu_interf", "6e-cu_interf",
+            "ng-tx_retries", "na-tx_retries", "6e-tx_retries",
+            "ng-wifi_tx_attempts", "na-wifi_tx_attempts", "6e-wifi_tx_attempts",
+            "ng-wifi_tx_dropped", "na-wifi_tx_dropped", "6e-wifi_tx_dropped",
+            "ng-tx_packets", "na-tx_packets", "6e-tx_packets",
+            "ng-rx_packets", "na-rx_packets", "6e-rx_packets"
+        };
+
+        try
+        {
+            _logger.LogDebug("Fetching AP metrics: {ReportType}, APs={Macs}, start={Start}, end={End}",
+                reportType, string.Join(",", apMacs), start, end);
+
+            var reportData = await _client.PostApReportAsync(
+                reportType,
+                apMacs,
+                start.ToUnixTimeMilliseconds(),
+                end.ToUnixTimeMilliseconds(),
+                attrs,
+                cancellationToken);
+
+            _logger.LogDebug("AP report response: ValueKind={ValueKind}, ArrayLength={Length}",
+                reportData.ValueKind,
+                reportData.ValueKind == JsonValueKind.Array ? reportData.GetArrayLength() : 0);
+
+            // Parse using AP-specific prefixes (no 'ap-' prefix)
+            var metrics = ParseApMetrics(reportData);
+            _logger.LogDebug("Parsed {Count} AP metrics data points", metrics.Count);
+            return metrics;
+        }
+        catch (Exception ex)
+        {
+            if (throwOnFailure) throw;
+            _logger.LogWarning(ex, "Failed to fetch AP metrics report");
+            return new List<SiteWiFiMetrics>();
+        }
+    }
+
+    /// <summary>
+    /// Get AP channel change events from the v2 system log API.
+    /// </summary>
+    /// <param name="throwOnFailure">When true, a fetch/parse failure propagates instead of
+    /// returning an empty list - an empty result is indistinguishable from "no changes", which
+    /// would silently misattribute samples for callers doing channel-timeline attribution.</param>
+    public async Task<List<ChannelChangeEvent>> GetChannelChangeEventsAsync(
+        DateTimeOffset start,
+        DateTimeOffset end,
+        string? apMac = null,
+        CancellationToken cancellationToken = default,
+        bool throwOnFailure = false)
+    {
+        try
+        {
+            var data = await _client.GetApChannelChangeEventsAsync(start, end, apMac, cancellationToken);
+            var events = ParseChannelChangeEvents(data);
+
+            // Defensive scoping. The controller's system-log query already filters these events to
+            // the requested device via clientDeviceMacs (verified against the console: filtering to
+            // an AP with no channel changes returns no other AP's events). We re-filter by AP MAC
+            // here so every consumer is guaranteed to see only the requested AP's events even if that
+            // controller-side behavior ever changes - a stale value from another AP would otherwise
+            // be misattributed onto this AP's chart/timeline.
+            if (!string.IsNullOrEmpty(apMac))
+                events = events.Where(e => e.ApMac.Equals(apMac, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            return events;
+        }
+        catch (Exception ex)
+        {
+            if (throwOnFailure) throw;
+            _logger.LogWarning(ex, "Failed to fetch channel change events");
+            return new List<ChannelChangeEvent>();
+        }
+    }
+
+    private List<ChannelChangeEvent> ParseChannelChangeEvents(JsonElement data)
+    {
+        var events = new List<ChannelChangeEvent>();
+
+        if (data.ValueKind != JsonValueKind.Object)
+            return events;
+
+        if (!data.TryGetProperty("data", out var dataArray) || dataArray.ValueKind != JsonValueKind.Array)
+            return events;
+
+        foreach (var item in dataArray.EnumerateArray())
+        {
+            if (!item.TryGetProperty("timestamp", out var tsProp) ||
+                !item.TryGetProperty("parameters", out var paramsProp))
+                continue;
+
+            var timestamp = tsProp.GetInt64();
+
+            // Extract CHANNEL info
+            if (!paramsProp.TryGetProperty("CHANNEL", out var channelProp))
+                continue;
+
+            var channelIdStr = channelProp.TryGetProperty("id", out var chId) ? chId.GetString() : null;
+            var radioBand = channelProp.TryGetProperty("radio_band", out var rb) ? rb.GetString() : null;
+
+            if (channelIdStr == null || !int.TryParse(channelIdStr, out var newChannel))
+                continue;
+
+            // Extract PREVIOUS_CHANNEL
+            int previousChannel = 0;
+            if (paramsProp.TryGetProperty("PREVIOUS_CHANNEL", out var prevProp) &&
+                prevProp.TryGetProperty("id", out var prevId) &&
+                int.TryParse(prevId.GetString(), out var prevCh))
+            {
+                previousChannel = prevCh;
+            }
+
+            // Extract AP MAC from DEVICE
+            var apMacStr = "";
+            if (paramsProp.TryGetProperty("DEVICE", out var deviceProp) &&
+                deviceProp.TryGetProperty("id", out var devId))
+            {
+                apMacStr = devId.GetString() ?? "";
+            }
+
+            var bandPrefix = radioBand ?? "";
+            var band = bandPrefix switch
+            {
+                "ng" => RadioBand.Band2_4GHz,
+                "na" => RadioBand.Band5GHz,
+                "6e" => RadioBand.Band6GHz,
+                _ => RadioBand.Band5GHz // default fallback
+            };
+
+            events.Add(new ChannelChangeEvent
+            {
+                Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(timestamp),
+                ApMac = apMacStr,
+                RadioBandPrefix = bandPrefix,
+                Band = band,
+                NewChannel = newChannel,
+                PreviousChannel = previousChannel
+            });
+        }
+
+        _logger.LogDebug("Parsed {Count} channel change events", events.Count);
+        return events;
+    }
+
+    public async Task<List<ClientWiFiMetrics>> GetClientMetricsAsync(
+        string clientMac,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        MetricGranularity granularity = MetricGranularity.FiveMinutes,
+        CancellationToken cancellationToken = default)
+    {
+        var reportType = granularity switch
+        {
+            MetricGranularity.FiveMinutes => "5minutes",
+            MetricGranularity.Hourly => "hourly",
+            MetricGranularity.Daily => "daily",
+            _ => "5minutes"
+        };
+
+        // stat/report/{granularity}.user supported attrs (tested 2026-02-13):
+        // WORKS: time, signal, rssi, tx_rate, rx_rate, satisfaction, anomalies,
+        //        duration, bytes, tx_bytes, rx_bytes, tx_retries, tx_packets,
+        //        rx_packets, wifi_tx_attempts, wifi_tx_dropped,
+        //        radio_protocol_most_common (e.g. "ax"), rx_rate_most_common (kbps string),
+        //        x-set-ap_macs (actual MAC array), duration_map-ap_duration (ms per AP map),
+        //        ap_macs (count only, not actual MAC)
+        // Channel requires dynamic key: {band}-{apMac}-channel_info_most_common (e.g. "6e-84:78:48:c8:48:f1-channel_info_most_common")
+        //   - Returns "channel:width" string (e.g. "133:320")
+        //   - Must know band prefix + AP MAC upfront, so we request it dynamically after getting AP MAC
+        // NOT AVAILABLE as simple attrs: ap_mac, channel, noise, radio, essid, bssid,
+        //        device_mac, network, is_wired, ccq, tx_rate_most_common
+        var attrs = new[]
+        {
+            "time",  // Must include time to get timestamp
+            "signal", "tx_rate", "rx_rate", "satisfaction",
+            "tx_retries", "tx_packets", "rx_packets",
+            "wifi_tx_attempts", "wifi_tx_dropped",
+            "radio_protocol_most_common", "rx_rate_most_common",
+            "x-set-ap_macs", "duration_map-ap_duration",
+            // Band-prefixed signal: whichever returns data reveals the band
+            "6e-signal", "na-signal", "ng-signal"
+        };
+
+        try
+        {
+            _logger.LogDebug("Fetching client metrics for {ClientMac}: {ReportType}, start={Start}, end={End}",
+                clientMac, reportType, start, end);
+
+            var startMs = start.ToUnixTimeMilliseconds();
+            var endMs = end.ToUnixTimeMilliseconds();
+
+            var reportData = await _client.PostUserReportAsync(
+                reportType, clientMac, startMs, endMs, attrs, cancellationToken);
+
+            _logger.LogDebug("Client report response for {ClientMac}: ValueKind={ValueKind}, ArrayLength={Length}",
+                clientMac,
+                reportData.ValueKind,
+                reportData.ValueKind == System.Text.Json.JsonValueKind.Array ? reportData.GetArrayLength() : 0);
+
+            var metrics = ParseClientMetrics(reportData, clientMac);
+
+            // Second query: fetch channel info using dynamic keys
+            // We now know the AP MAC(s) and band(s) from the first query
+            await EnrichWithChannelInfoAsync(metrics, reportType, clientMac, startMs, endMs, cancellationToken);
+
+            await ApplyMeasuredHistoryAsync(metrics, clientMac, start, end, granularity, cancellationToken);
+
+            _logger.LogDebug("Parsed {Count} client metrics data points for {ClientMac}", metrics.Count, clientMac);
+            return metrics;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch client metrics report for {ClientMac}", clientMac);
+            return new List<ClientWiFiMetrics>();
+        }
+    }
+
+    public async Task<List<WlanConfiguration>> GetWlanConfigurationsAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var wlanConfigs = await _client.GetWlanConfigurationsAsync(cancellationToken);
+            return wlanConfigs.Select(w => new WlanConfiguration
+            {
+                Id = w.Id,
+                Name = w.Name,
+                Enabled = w.Enabled,
+                IsGuest = w.IsGuest,
+                HideSsid = w.HideSsid,
+                Security = w.Security,
+                MloEnabled = w.MloEnabled,
+                FastRoamingEnabled = w.FastRoamingEnabled,
+                BssTransitionEnabled = w.BssTransition,
+                L2IsolationEnabled = w.L2Isolation,
+                BandSteeringEnabled = w.No2ghzOui,
+                EnabledBands = ParseBands(w.WlanBands),
+                MinRateSettings = new MinRateSettings
+                {
+                    Enabled2_4GHz = w.MinrateNgEnabled,
+                    MinRate2_4GHz = w.MinrateNgEnabled ? w.MinrateNgDataRateKbps : null,
+                    Enabled5GHz = w.MinrateNaEnabled,
+                    MinRate5GHz = w.MinrateNaEnabled ? w.MinrateNaDataRateKbps : null,
+                    AdvertiseLowerRates = w.MinrateNgAdvertisingRates || w.MinrateNaAdvertisingRates
+                },
+                RoamingAssistant5GHzEnabled = w.RoamingAssistantNaEnabled,
+                RoamingAssistant5GHzRssi = w.RoamingAssistantNaRssi,
+                RoamingAssistant6GHzEnabled = w.RoamingAssistant6eEnabled,
+                RoamingAssistant6GHzRssi = w.RoamingAssistant6eRssi,
+                NetworkId = w.NetworkConfId,
+                PrivatePresharedKeysEnabled = w.PrivatePresharedKeysEnabled,
+                PpskNetworkIds = w.PrivatePresharedKeys?
+                    .Where(p => !string.IsNullOrEmpty(p.NetworkConfId))
+                    .Select(p => p.NetworkConfId!)
+                    .ToList() ?? new List<string>()
+            }).ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch WLAN configurations");
+            return new List<WlanConfiguration>();
+        }
+    }
+
+    private static List<RadioBand> ParseBands(List<string>? bands)
+    {
+        if (bands == null || bands.Count == 0)
+            return new List<RadioBand>();
+
+        var result = new List<RadioBand>();
+        foreach (var band in bands)
+        {
+            switch (band.ToLowerInvariant())
+            {
+                case "2g":
+                    result.Add(RadioBand.Band2_4GHz);
+                    break;
+                case "5g":
+                    result.Add(RadioBand.Band5GHz);
+                    break;
+                case "6g":
+                    result.Add(RadioBand.Band6GHz);
+                    break;
+            }
+        }
+        return result;
+    }
+
+    public async Task<List<RoamingEvent>> GetRoamingEventsAsync(
+        DateTimeOffset start,
+        DateTimeOffset end,
+        string? clientMac = null,
+        CancellationToken cancellationToken = default)
+    {
+        // The roaming topology endpoint provides aggregate stats, not individual events.
+        // Use GetClientConnectionEventsAsync for individual roaming events.
+        _logger.LogDebug("Roaming events not yet implemented - use GetClientConnectionEventsAsync instead");
+        return new List<RoamingEvent>();
+    }
+
+    /// <summary>
+    /// Get client connection events (connects, disconnects, roams) for a specific client
+    /// </summary>
+    public async Task<List<ClientConnectionEvent>> GetClientConnectionEventsAsync(
+        string clientMac,
+        int limit = 200,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            _logger.LogDebug("Fetching client connection events for {ClientMac}", clientMac);
+            var data = await _client.GetClientConnectionEventsAsync(clientMac, limit, cancellationToken);
+            return ParseClientConnectionEvents(data, clientMac);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch client connection events for {ClientMac}", clientMac);
+            return new List<ClientConnectionEvent>();
+        }
+    }
+
+    private List<ClientConnectionEvent> ParseClientConnectionEvents(JsonElement data, string clientMac)
+    {
+        var events = new List<ClientConnectionEvent>();
+
+        if (data.ValueKind != JsonValueKind.Array)
+        {
+            _logger.LogDebug("Client connection events data is not an array");
+            return events;
+        }
+
+        foreach (var item in data.EnumerateArray())
+        {
+            try
+            {
+                var evt = new ClientConnectionEvent
+                {
+                    ClientMac = clientMac
+                };
+
+                if (item.TryGetProperty("id", out var idProp))
+                    evt.Id = idProp.GetString() ?? "";
+
+                if (item.TryGetProperty("key", out var keyProp))
+                    evt.Key = keyProp.GetString() ?? "";
+
+                if (item.TryGetProperty("timestamp", out var tsProp) && tsProp.ValueKind == JsonValueKind.Number)
+                    evt.Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(tsProp.GetInt64());
+
+                // Determine event type from key
+                // Note: Check DISCONNECTED before CONNECTED since "DISCONNECTED" contains "CONNECTED"
+                evt.Type = evt.Key switch
+                {
+                    var k when k.Contains("ROAMED") => ClientConnectionEventType.Roamed,
+                    var k when k.Contains("DISCONNECTED") => ClientConnectionEventType.Disconnected,
+                    var k when k.Contains("CONNECTED") => ClientConnectionEventType.Connected,
+                    _ => ClientConnectionEventType.Unknown
+                };
+
+                // Parse parameters
+                if (item.TryGetProperty("parameters", out var paramsProp))
+                {
+                    // Client info
+                    if (paramsProp.TryGetProperty("CLIENT", out var clientProp))
+                    {
+                        evt.ClientName = GetNestedString(clientProp, "name");
+                    }
+
+                    // WLAN
+                    if (paramsProp.TryGetProperty("WLAN", out var wlanProp))
+                    {
+                        evt.WlanName = GetNestedString(wlanProp, "name");
+                    }
+
+                    // IP
+                    if (paramsProp.TryGetProperty("IP", out var ipProp))
+                    {
+                        evt.IpAddress = GetNestedString(ipProp, "name");
+                    }
+
+                    // WiFi stats summary
+                    if (paramsProp.TryGetProperty("WIFI_STATS", out var wifiStatsProp))
+                    {
+                        evt.WifiStats = GetNestedString(wifiStatsProp, "name");
+                    }
+
+                    // Current signal/band/channel
+                    if (paramsProp.TryGetProperty("SIGNAL_STRENGTH", out var sigProp))
+                    {
+                        var sigStr = GetNestedString(sigProp, "name");
+                        if (int.TryParse(sigStr, out var sig)) evt.Signal = sig;
+                    }
+
+                    if (paramsProp.TryGetProperty("RADIO_BAND", out var bandProp))
+                    {
+                        evt.RadioBand = GetNestedString(bandProp, "name");
+                    }
+
+                    if (paramsProp.TryGetProperty("CHANNEL", out var chanProp))
+                    {
+                        var chanStr = GetNestedString(chanProp, "name");
+                        if (int.TryParse(chanStr, out var chan)) evt.Channel = chan;
+                    }
+
+                    if (paramsProp.TryGetProperty("CHANNEL_WIDTH", out var widthProp))
+                    {
+                        var widthStr = GetNestedString(widthProp, "name");
+                        if (int.TryParse(widthStr, out var width)) evt.ChannelWidth = width;
+                    }
+
+                    // Device (for connect events)
+                    if (paramsProp.TryGetProperty("DEVICE", out var deviceProp))
+                    {
+                        evt.ApMac = GetNestedString(deviceProp, "id");
+                        evt.ApName = GetNestedString(deviceProp, "name");
+                    }
+
+                    // Roaming-specific: DEVICE_FROM, DEVICE_TO, previous signal/band
+                    if (paramsProp.TryGetProperty("DEVICE_FROM", out var fromProp))
+                    {
+                        evt.FromApMac = GetNestedString(fromProp, "id");
+                        evt.FromApName = GetNestedString(fromProp, "name");
+                    }
+
+                    if (paramsProp.TryGetProperty("DEVICE_TO", out var toProp))
+                    {
+                        evt.ToApMac = GetNestedString(toProp, "id");
+                        evt.ToApName = GetNestedString(toProp, "name");
+                    }
+
+                    if (paramsProp.TryGetProperty("PREVIOUS_SIGNAL_STRENGTH", out var prevSigProp))
+                    {
+                        var prevSigStr = GetNestedString(prevSigProp, "name");
+                        if (int.TryParse(prevSigStr, out var prevSig)) evt.PreviousSignal = prevSig;
+                    }
+
+                    if (paramsProp.TryGetProperty("PREVIOUS_RADIO_BAND", out var prevBandProp))
+                    {
+                        evt.PreviousRadioBand = GetNestedString(prevBandProp, "name");
+                    }
+
+                    if (paramsProp.TryGetProperty("PREVIOUS_CHANNEL", out var prevChanProp))
+                    {
+                        var prevChanStr = GetNestedString(prevChanProp, "name");
+                        if (int.TryParse(prevChanStr, out var prevChan)) evt.PreviousChannel = prevChan;
+                    }
+
+                    // Disconnect-specific: DURATION, DATA_UP, DATA_DOWN
+                    if (paramsProp.TryGetProperty("DURATION", out var durProp))
+                    {
+                        evt.Duration = GetNestedString(durProp, "name");
+                    }
+
+                    if (paramsProp.TryGetProperty("DATA_UP", out var dataUpProp))
+                    {
+                        evt.DataUp = GetNestedString(dataUpProp, "name");
+                    }
+
+                    if (paramsProp.TryGetProperty("DATA_DOWN", out var dataDownProp))
+                    {
+                        evt.DataDown = GetNestedString(dataDownProp, "name");
+                    }
+                }
+
+                events.Add(evt);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to parse client connection event");
+            }
+        }
+
+        _logger.LogDebug("Parsed {Count} client connection events", events.Count);
+        return events;
+    }
+
+    private static string? GetNestedString(JsonElement el, string prop)
+    {
+        if (el.TryGetProperty(prop, out var val) && val.ValueKind == JsonValueKind.String)
+            return val.GetString();
+        return null;
+    }
+
+    /// <summary>
+    /// Get roaming topology (aggregate roaming statistics between APs)
+    /// </summary>
+    public async Task<RoamingTopology?> GetRoamingTopologyAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var data = await _client.GetRoamingTopologyAsync(cancellationToken);
+            return ParseRoamingTopology(data);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch roaming topology");
+            return null;
+        }
+    }
+
+    public async Task<List<ChannelScanResult>> GetChannelScanResultsAsync(
+        string? apMac = null,
+        DateTimeOffset? startTime = null,
+        DateTimeOffset? endTime = null,
+        CancellationToken cancellationToken = default)
+    {
+        var aps = await _discovery.DiscoverAccessPointsAsync(cancellationToken);
+
+        if (!string.IsNullOrEmpty(apMac))
+        {
+            aps = aps.Where(d => d.Mac.Equals(apMac, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+
+        // Get our own BSSIDs to identify own networks
+        var ownBssids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ap in aps)
+        {
+            if (ap.VapTable != null)
+            {
+                foreach (var vap in ap.VapTable)
+                {
+                    if (!string.IsNullOrEmpty(vap.Bssid))
+                    {
+                        ownBssids.Add(vap.Bssid);
+                    }
+                }
+            }
+        }
+
+        // Fetch neighboring networks (rogue APs) with time filter
+        var rogueAps = await _client.GetRogueApsAsync(startTime, endTime, cancellationToken);
+        _logger.LogDebug("Fetched {Count} neighboring networks from rogueap endpoint", rogueAps.Count);
+
+        // Group rogue APs by detecting AP MAC and band
+        var rogueApsByApAndBand = rogueAps
+            .GroupBy(r => (ApMac: r.ApMac.ToLowerInvariant(), Band: r.Band ?? r.Radio))
+            .ToDictionary(
+                g => g.Key,
+                g => g.ToList());
+
+        var results = new List<ChannelScanResult>();
+        var timestamp = DateTimeOffset.UtcNow;
+
+        foreach (var ap in aps)
+        {
+            // Get neighbors for each radio band on this AP
+            var apMacLower = ap.Mac.ToLowerInvariant();
+
+            // Create results for each radio (even if no spectrum data)
+            // Use RadioTableStats to get the bands this AP has
+            var radioBands = ap.RadioTableStats?.Select(r => r.Radio).Distinct().ToList()
+                ?? ap.RadioTable?.Select(r => r.Radio).Distinct().ToList()
+                ?? new List<string>();
+
+            // Per-AP cached RF spectrum scan (per-channel utilization/interference across each band).
+            // This is the populated source - ap.ScanRadioTable in /stat/device is typically empty.
+            // A GET only; we never trigger a scan inline (see UniFiApiClient.TriggerQuickScanAsync).
+            UniFiSpectrumScanResponse? spectrumScan = null;
+            try
+            {
+                spectrumScan = await _client.GetSpectrumScanAsync(ap.Mac, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Spectrum scan fetch failed for AP {Mac}", ap.Mac);
+            }
+
+            foreach (var bandCode in radioBands)
+            {
+                var band = RadioBandExtensions.FromUniFiCode(bandCode);
+                var result = new ChannelScanResult
+                {
+                    ApMac = ap.Mac,
+                    ApName = ap.Name,
+                    Band = band,
+                    ScanTime = timestamp,
+                    Channels = new List<ChannelInfo>(),
+                    Neighbors = new List<NeighborNetwork>()
+                };
+
+                // Per-channel measured occupancy from the AP's last RF scan. Prefer the dedicated
+                // spectrum-scan endpoint (the populated source); fall back to scan_radio_table.
+                var scanRadio = spectrumScan?.Scans?.FirstOrDefault(sr => sr.Radio == bandCode)
+                    ?? ap.ScanRadioTable?.FirstOrDefault(sr => sr.Radio == bandCode);
+
+                // True age of the scan (when the radio measured it), distinct from our fetch time.
+                if (scanRadio?.SpectrumTableTime is long stt && stt > 0)
+                    result.SpectrumTableTime = DateTimeOffset.FromUnixTimeSeconds(stt);
+
+                if (scanRadio?.SpectrumTable != null)
+                {
+                    foreach (var spectrum in scanRadio.SpectrumTable)
+                    {
+                        result.Channels.Add(new ChannelInfo
+                        {
+                            Channel = spectrum.Channel,
+                            Width = spectrum.Width,
+                            Utilization = spectrum.Utilization,
+                            // The scan's "interference" is a dBm floor, not a percentage. Keep it out
+                            // of the percentage-based Interference field (the scorer treats that as
+                            // 0-100) and store it as the noise floor; NeighborCount carries the
+                            // detected BSSID count. The measured %-occupancy lives in Utilization.
+                            NoiseFloor = spectrum.Interference,
+                            NeighborCount = spectrum.OtherBssCount ?? 0,
+                            IsDfs = spectrum.IsDfs ?? false,
+                            DfsState = spectrum.DfsState
+                        });
+                    }
+                }
+
+                // Add neighbors from rogueap endpoint, deduplicated by BSSID.
+                // The rogueap API returns one entry per sighting over the time window,
+                // so the same BSSID can appear many times. Keep the strongest signal per BSSID
+                // to avoid inflating external load scores in the channel recommendation engine.
+                if (rogueApsByApAndBand.TryGetValue((apMacLower, bandCode), out var neighbors))
+                {
+                    var deduplicated = neighbors
+                        .GroupBy(n => n.Bssid, StringComparer.OrdinalIgnoreCase)
+                        .Select(g => g.OrderByDescending(n => n.Signal).First());
+
+                    foreach (var neighbor in deduplicated)
+                    {
+                        result.Neighbors.Add(new NeighborNetwork
+                        {
+                            Ssid = neighbor.Essid,
+                            Bssid = neighbor.Bssid,
+                            Channel = neighbor.Channel,
+                            Width = neighbor.Width,
+                            Signal = neighbor.Signal,
+                            IsOwnNetwork = neighbor.IsUbnt || ownBssids.Contains(neighbor.Bssid),
+                            Security = neighbor.Security,
+                            LastSeen = neighbor.LastSeen.HasValue
+                                ? DateTimeOffset.FromUnixTimeSeconds(neighbor.LastSeen.Value)
+                                : null,
+                            Oui = neighbor.Oui
+                        });
+                    }
+                }
+
+                results.Add(result);
+            }
+        }
+
+        // Fix mesh AP neighbor channel reporting bug: meshed APs sometimes report their own
+        // 2.4 GHz channel as the neighbor's channel. Cross-reference with wired AP scans to
+        // get the correct channel for each BSSID.
+        CorrectMeshNeighborChannels(aps, results);
+
+        _logger.LogDebug("Spectrum: Loaded {ApCount} APs, {ResultCount} scan results, Found {NeighborCount} neighboring networks",
+            aps.Count,
+            results.Count,
+            results.Sum(r => r.Neighbors.Count));
+
+        return results;
+    }
+
+    /// <summary>
+    /// Corrects neighbor channel data from mesh APs. Meshed APs sometimes report their own
+    /// operating channel as the neighbor's channel (observed on 2.4 GHz). This cross-references
+    /// the same BSSIDs seen by wired APs to determine the correct channel.
+    /// </summary>
+    private void CorrectMeshNeighborChannels(List<DiscoveredDevice> aps, List<ChannelScanResult> results)
+    {
+        // Identify mesh AP MACs
+        var meshApMacs = new HashSet<string>(
+            aps.Where(a => a.UplinkType?.Equals("wireless", StringComparison.OrdinalIgnoreCase) == true)
+               .Select(a => a.Mac),
+            StringComparer.OrdinalIgnoreCase);
+
+        if (meshApMacs.Count == 0)
+            return;
+
+        // Build BSSID → channel consensus from wired APs only (per band)
+        // Key: (bssid, band), Value: channel from wired AP
+        var wiredChannelLookup = new Dictionary<(string Bssid, RadioBand Band), int>();
+        foreach (var result in results)
+        {
+            if (meshApMacs.Contains(result.ApMac))
+                continue; // Skip mesh APs for the consensus
+
+            foreach (var neighbor in result.Neighbors)
+            {
+                var key = (neighbor.Bssid.ToLowerInvariant(), result.Band);
+                // Keep the first wired AP's report (they should all agree)
+                wiredChannelLookup.TryAdd(key, neighbor.Channel);
+            }
+        }
+
+        if (wiredChannelLookup.Count == 0)
+            return;
+
+        // Correct mesh AP neighbor channels where they differ from wired AP consensus
+        var correctedCount = 0;
+        foreach (var result in results)
+        {
+            if (!meshApMacs.Contains(result.ApMac))
+                continue; // Only fix mesh APs
+
+            foreach (var neighbor in result.Neighbors)
+            {
+                var key = (neighbor.Bssid.ToLowerInvariant(), result.Band);
+                if (wiredChannelLookup.TryGetValue(key, out var correctChannel) &&
+                    neighbor.Channel != correctChannel)
+                {
+                    _logger.LogDebug(
+                        "Correcting mesh AP {ApMac} neighbor {Bssid} channel on {Band}: {Wrong} → {Correct}",
+                        result.ApMac, neighbor.Bssid, result.Band, neighbor.Channel, correctChannel);
+                    neighbor.Channel = correctChannel;
+                    correctedCount++;
+                }
+            }
+        }
+
+        if (correctedCount > 0)
+        {
+            _logger.LogInformation("Corrected {Count} neighbor channel(s) from mesh AP scans using wired AP data",
+                correctedCount);
+        }
+    }
+
+    #region Mapping Helpers
+
+    private AccessPointSnapshot MapToAccessPointSnapshot(
+        DiscoveredDevice ap,
+        DateTimeOffset timestamp,
+        HashSet<string> apMacs,
+        IReadOnlyDictionary<string, UniFiDiscovery.MeshParentClaim> parentByChild)
+    {
+        // Check if this AP has a wireless uplink to another AP (mesh child)
+        var isMeshChild = false;
+        // True only when the child described the uplink itself. The claim branch below leaves it
+        // false so the snapshot never carries ap.Uplink* values that describe a different link.
+        var selfReportedUplink = false;
+        string? meshParentMac = null;
+        RadioBand? meshUplinkBand = null;
+        int? meshUplinkChannel = null;
+        string? meshUplinkInterface = null;
+
+        if (ap.UplinkType?.Equals("wireless", StringComparison.OrdinalIgnoreCase) == true &&
+            !string.IsNullOrEmpty(ap.UplinkMac))
+        {
+            var uplinkMacLower = ap.UplinkMac.ToLowerInvariant();
+            if (apMacs.Contains(uplinkMacLower))
+            {
+                isMeshChild = true;
+                selfReportedUplink = true;
+                meshParentMac = uplinkMacLower;
+                meshUplinkBand = RadioBandExtensions.FromUniFiCode(ap.UplinkRadioBand);
+                meshUplinkChannel = ap.UplinkChannel;
+                // Only the STA backhaul iface (vwiresta*) is a valid wpa_supplicant target;
+                // never the AP-side VAP (vwireap*) or a wired iface.
+                if (ap.UplinkInterface?.StartsWith("vwiresta", StringComparison.OrdinalIgnoreCase) == true)
+                    meshUplinkInterface = ap.UplinkInterface;
+            }
+        }
+        else if (parentByChild.TryGetValue(ap.Mac.ToLowerInvariant(), out var claim))
+        {
+            // The parent claims it and the child says nothing. Band, channel and the STA interface
+            // all live on the missing half, so they stay unknown - the re-pair reads the interface
+            // off the device itself when it is not reported.
+            isMeshChild = true;
+            meshParentMac = claim.ParentMac;
+            _logger.LogDebug(
+                "[Mesh] {Ap} ({Mac}) has no uplink of its own; taking {Parent} as its mesh parent from the parent's downlink table",
+                ap.Name, ap.Mac, claim.ParentMac);
+        }
+
+        var snapshot = new AccessPointSnapshot
+        {
+            Mac = ap.Mac,
+            Name = ap.Name,
+            Model = ap.FriendlyModelName,
+            FirmwareVersion = ap.Firmware,
+            Ip = ap.IpAddress,
+            Satisfaction = ap.Satisfaction,
+            Status = UniFiDeviceStateMap.ToStatus(ap.State),
+            Timestamp = timestamp,
+            Radios = new List<RadioSnapshot>(),
+            Vaps = new List<VapSnapshot>(),
+            HasDedicatedScanRadio = ap.HasDedicatedScanRadio,
+            IsMeshChild = isMeshChild,
+            MeshParentMac = meshParentMac,
+            MeshUplinkBand = meshUplinkBand,
+            MeshUplinkChannel = meshUplinkChannel,
+            MeshUplinkInterface = meshUplinkInterface,
+            // Self-reported only: a claim-derived parent means ap.Uplink* describes a different
+            // link, and the parent's signal is its view of the child, never the child's own.
+            MeshUplinkSignalDbm = selfReportedUplink ? ap.UplinkSignalDbm : null,
+            MeshUplinkTxRateMbps = selfReportedUplink && ap.UplinkTxRateKbps > 0 ? (int)(ap.UplinkTxRateKbps / 1000) : null,
+            MeshUplinkRxRateMbps = selfReportedUplink && ap.UplinkRxRateKbps > 0 ? (int)(ap.UplinkRxRateKbps / 1000) : null,
+            IsAfcEnabled = ap.AfcEnabled ?? false,
+            AfcState = ap.AfcState
+        };
+
+        // Map radio_table_stats (runtime stats)
+        if (ap.RadioTableStats != null)
+        {
+            foreach (var radioStats in ap.RadioTableStats)
+            {
+                var radioConfig = ap.RadioTable?.FirstOrDefault(r => r.Name == radioStats.Name);
+
+                // Calculate interference as total utilization minus self-utilization
+                int? interference = null;
+                if (radioStats.CuTotal.HasValue)
+                {
+                    var selfRx = radioStats.CuSelfRx ?? 0;
+                    var selfTx = radioStats.CuSelfTx ?? 0;
+                    interference = Math.Max(0, radioStats.CuTotal.Value - selfRx - selfTx);
+                }
+
+                // Resolve antenna mode name from antenna_id → antenna_table
+                string? antennaMode = null;
+                var antennaId = radioConfig?.AntennaId;
+                if (antennaId.HasValue && antennaId.Value >= 0 && ap.AntennaTable != null)
+                {
+                    antennaMode = ap.AntennaTable
+                        .FirstOrDefault(a => a.Id == antennaId.Value)?.Name;
+                }
+
+                snapshot.Radios.Add(new RadioSnapshot
+                {
+                    Name = radioStats.Name,
+                    Band = RadioBandExtensions.FromUniFiCode(radioStats.Radio),
+                    Channel = radioStats.Channel,
+                    // Prefer the operating width (radio_table_stats "bw") over the configured
+                    // width (radio_table "ht"). A mesh backhaul radio can be configured for
+                    // 160 MHz but negotiate down to the parent's width (e.g. 80 MHz) on the
+                    // link; "ht" still reads 160 while "bw" reflects the real 80. Fall back to
+                    // the configured width when "bw" is absent (older firmware) or non-positive
+                    // (e.g. an idle radio reporting 0), which "ht" never is for an enabled radio.
+                    ChannelWidth = radioStats.Bw is > 0 ? radioStats.Bw : radioConfig?.ChannelWidth,
+                    ExtChannel = radioStats.ExtChannel,
+                    ChannelIsFixed = RadioIntent.IsFixedChannel(radioConfig?.Channel),
+                    TxPowerIsFixed = radioConfig?.TxPowerMode is { Length: > 0 } powerMode
+                        && !powerMode.Equals("auto", StringComparison.OrdinalIgnoreCase),
+                    TxPower = radioStats.TxPower,
+                    TxPowerMode = radioConfig?.TxPowerMode,
+                    MinTxPower = radioConfig?.MinTxPower,
+                    MaxTxPower = radioConfig?.MaxTxPower,
+                    AntennaGain = radioConfig?.AntennaGain,
+                    Satisfaction = radioStats.Satisfaction,
+                    ClientCount = radioStats.NumSta,
+                    ChannelUtilization = radioStats.CuTotal,
+                    Interference = interference,
+                    TxRetriesPct = radioStats.TxRetriesPct,
+                    MinRssiEnabled = radioConfig?.MinRssiEnabled ?? false,
+                    MinRssi = radioConfig?.MinRssi,
+                    RoamingAssistantEnabled = radioConfig?.AssistedRoamingEnabled ?? false,
+                    RoamingAssistantRssi = radioConfig?.AssistedRoamingRssi,
+                    HasDfs = radioConfig?.HasDfs ?? false,
+                    Is11Be = radioConfig?.Is11Be ?? false,
+                    AntennaMode = antennaMode
+                });
+            }
+        }
+
+        // Map vap_table (per-SSID stats)
+        if (ap.VapTable != null)
+        {
+            foreach (var vap in ap.VapTable)
+            {
+                snapshot.Vaps.Add(new VapSnapshot
+                {
+                    Essid = vap.Essid,
+                    Bssid = vap.Bssid,
+                    Band = RadioBandExtensions.FromUniFiCode(vap.Radio),
+                    Channel = vap.Channel,
+                    ClientCount = vap.NumSta,
+                    Satisfaction = vap.Satisfaction,
+                    AvgClientSignal = vap.AvgClientSignal,
+                    IsGuest = vap.IsGuest ?? false,
+                    TxBytes = vap.TxBytes,
+                    RxBytes = vap.RxBytes,
+                    TxRetries = vap.TxRetries,
+                    WifiTxAttempts = vap.WifiTxAttempts,
+                    WifiTxDropped = vap.WifiTxDropped
+                });
+            }
+        }
+
+        snapshot.TotalClients = snapshot.Radios.Sum(r => r.ClientCount ?? 0);
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Lays AP-measured readings over the console snapshots for the access points an AP Agent
+    /// covers. Anything that goes wrong leaves the console data as it stands: the measured source
+    /// is an enhancement, and the console path must never be worse off for its presence.
+    /// </summary>
+    private async Task ApplyMeasuredClientsAsync(
+        List<WirelessClientSnapshot> clients,
+        CancellationToken cancellationToken)
+    {
+        if (_measuredClients == null || clients.Count == 0) return;
+
+        try
+        {
+            var apMacs = clients
+                .Where(c => !string.IsNullOrEmpty(c.ApMac))
+                .Select(c => c.ApMac.ToLowerInvariant())
+                .Distinct()
+                .ToList();
+            if (apMacs.Count == 0) return;
+
+            var measured = await _measuredClients.GetMeasuredClientsAsync(apMacs, cancellationToken);
+            MeasuredClientOverlay.Apply(clients, measured);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "AP-measured client readings unavailable, using console data");
+        }
+    }
+
+    /// <summary>
+    /// Bucket duration for a report granularity, matching the console report's own resolution.
+    /// </summary>
+    internal static TimeSpan BucketFor(MetricGranularity granularity) => granularity switch
+    {
+        MetricGranularity.Hourly => TimeSpan.FromHours(1),
+        MetricGranularity.Daily => TimeSpan.FromDays(1),
+        _ => TimeSpan.FromMinutes(5)
+    };
+
+    /// <summary>
+    /// Lays AP-measured history over the console's client report. Our own measurements win on every
+    /// bucket we hold; the console report fills the buckets we do not, which is what covers an
+    /// access point that had no agent, a period we were not running for, or data older than we have.
+    /// </summary>
+    private async Task ApplyMeasuredHistoryAsync(
+        List<ClientWiFiMetrics> metrics,
+        string clientMac,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        MetricGranularity granularity,
+        CancellationToken cancellationToken)
+    {
+        if (_measuredClients == null) return;
+
+        try
+        {
+            var bucket = BucketFor(granularity);
+            var measured = await _measuredClients.GetMeasuredClientHistoryAsync(
+                clientMac, start, end, bucket, cancellationToken);
+            if (measured.Count == 0) return;
+
+            var (missing, longestRun) = MeasuredClientOverlay.MeasureGaps(start, end, measured, bucket);
+            if (longestRun >= MeasuredClientOverlay.ReportableGapBuckets)
+            {
+                _logger.LogDebug(
+                    "Client {ClientMac}: {Missing} of the measured buckets are absent, longest run {Run}; the console report fills them",
+                    clientMac, missing, longestRun);
+            }
+
+            MeasuredClientOverlay.ApplyHistory(metrics, measured, bucket);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "AP-measured client history unavailable for {ClientMac}, using console history", clientMac);
+        }
+    }
+
+    internal static WirelessClientSnapshot MapToWirelessClientSnapshot(
+        UniFiClientResponse client,
+        Dictionary<string, string> apNames,
+        Dictionary<string, string> displayNames,
+        DateTimeOffset timestamp,
+        bool isOnline = true)
+    {
+        var apMac = client.ApMac?.ToLowerInvariant() ?? "";
+        apNames.TryGetValue(apMac, out var apName);
+
+        // A client marked offline because the access point stopped hearing from it needs a last-seen
+        // or it cannot be found or ordered anywhere. Idle time is exactly how long ago that was, and
+        // it is a better answer than the Console's own last_seen, which keeps advancing for as long
+        // as the Console believes the stale association.
+        DateTimeOffset? lastSeen = null;
+        if (!isOnline && client.IdleTime > 0)
+        {
+            lastSeen = timestamp.AddSeconds(-client.IdleTime);
+        }
+        else if (!isOnline && client.LastSeen > 0)
+        {
+            lastSeen = DateTimeOffset.FromUnixTimeSeconds(client.LastSeen);
+        }
+
+        // Use v2 display name (system-selected friendly name) first, then fall back to v1 fields
+        displayNames.TryGetValue(client.Mac.ToLowerInvariant(), out var displayName);
+
+        var isMlo = client.IsMlo == true;
+        var mloLinks = MapMloLinks(client.MloDetails);
+
+        // Every scalar below must describe the SAME link, and it has to be the active one: one
+        // client's links measured 56 dB apart, so an idle link renders a healthy client as dying.
+        // The console's own top-level fields already report the active link, so they win here; the
+        // per-link pick below only covers a console that leaves them empty.
+        var activeLink = isMlo && client.Signal is null or 0 ? SelectActiveMloLink(mloLinks) : null;
+
+        return new WirelessClientSnapshot
+        {
+            Mac = client.Mac,
+            Name = !string.IsNullOrEmpty(displayName) ? displayName
+                 : !string.IsNullOrEmpty(client.Name) ? client.Name
+                 : !string.IsNullOrEmpty(client.Hostname) ? client.Hostname
+                 : client.Mac,
+            Ip = client.Ip,
+            FixedIp = client.UseFixedIp && !string.IsNullOrEmpty(client.FixedIp) ? client.FixedIp : null,
+            ApMac = client.ApMac ?? "",
+            ApName = apName,
+            Essid = client.Essid ?? "",
+            Band = activeLink?.Band ?? RadioBandExtensions.FromUniFiCode(client.Radio),
+            Channel = activeLink?.Channel ?? client.Channel,
+            ChannelWidth = activeLink?.ChannelWidth ?? client.ChannelWidth,
+            Signal = activeLink?.Signal ?? client.Signal,
+            Noise = activeLink?.Noise ?? client.Noise,
+            Rssi = activeLink?.Rssi ?? client.Rssi,
+            Satisfaction = client.Satisfaction,
+            WifiProtocol = client.RadioProto,
+            WifiGeneration = ParseWifiGeneration(client.RadioProto),
+            TxRate = activeLink?.TxRate ?? client.TxRate,
+            RxRate = activeLink?.RxRate ?? client.RxRate,
+            TxBytes = client.TxBytes,
+            RxBytes = client.RxBytes,
+            Uptime = client.Uptime,
+            IsAuthorized = !client.Blocked,
+            IsGuest = client.IsGuest,
+            IsOnline = isOnline,
+            LastSeen = lastSeen,
+            FixedApEnabled = client.FixedApEnabled == true,
+            FixedApMac = client.FixedApMac,
+            FixedApName = client.FixedApEnabled == true && !string.IsNullOrEmpty(client.FixedApMac)
+                ? (apNames.TryGetValue(client.FixedApMac.ToLowerInvariant(), out var fixedApName) ? fixedApName : null)
+                : null,
+            Manufacturer = client.Oui,
+            IsMlo = isMlo,
+            MloLinks = mloLinks,
+            Timestamp = timestamp
+        };
+    }
+
+    private static List<MloLinkSnapshot> MapMloLinks(List<MloLinkDetail>? details)
+    {
+        if (details == null || details.Count == 0) return new List<MloLinkSnapshot>();
+
+        return details.Select(d => new MloLinkSnapshot
+        {
+            Mac = d.Mac,
+            Band = RadioBandExtensions.FromUniFiCode(d.Radio),
+            Channel = d.Channel,
+            ChannelWidth = d.ChannelWidth,
+            Signal = d.Signal,
+            Noise = d.Noise,
+            Rssi = d.Rssi,
+            Nss = d.Nss,
+            TxRate = d.TxRate,
+            RxRate = d.RxRate,
+            Satisfaction = d.Satisfaction
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Pick the MLO link that is actually carrying traffic. Rates are the evidence, since an idle
+    /// link reports zero; the strongest signal is the fallback because a client whose links all read
+    /// zero still has to resolve to exactly one link.
+    /// </summary>
+    private static MloLinkSnapshot? SelectActiveMloLink(List<MloLinkSnapshot> links)
+    {
+        if (links.Count == 0) return null;
+
+        var carrying = links
+            .Where(l => (l.TxRate ?? 0) > 0 || (l.RxRate ?? 0) > 0)
+            .OrderByDescending(l => (l.TxRate ?? 0) + (l.RxRate ?? 0))
+            .FirstOrDefault();
+
+        return carrying ?? links.OrderByDescending(l => l.Signal ?? int.MinValue).First();
+    }
+
+    private WirelessClientSnapshot MapHistoricalToWirelessClientSnapshot(
+        UniFiClientDetailResponse client,
+        Dictionary<string, string> apNames,
+        DateTimeOffset timestamp)
+    {
+        var apMac = client.LastUplinkMac?.ToLowerInvariant() ?? "";
+        apNames.TryGetValue(apMac, out var apName);
+
+        return new WirelessClientSnapshot
+        {
+            Mac = client.Mac,
+            Name = !string.IsNullOrEmpty(client.DisplayName) ? client.DisplayName
+                 : !string.IsNullOrEmpty(client.Name) ? client.Name
+                 : !string.IsNullOrEmpty(client.Hostname) ? client.Hostname
+                 : client.Mac,
+            Ip = client.BestIp,
+            FixedIp = client.UseFixedIp && !string.IsNullOrEmpty(client.FixedIp) ? client.FixedIp : null,
+            ApMac = client.LastUplinkMac ?? "",
+            ApName = apName ?? client.LastUplinkName,
+            IsOnline = false,
+            LastSeen = client.LastSeen > 0
+                ? DateTimeOffset.FromUnixTimeSeconds(client.LastSeen)
+                : null,
+            IsAuthorized = !client.Blocked,
+            IsGuest = client.IsGuest,
+            Manufacturer = client.Oui,
+            Timestamp = timestamp
+        };
+    }
+
+    private static int? ParseWifiGeneration(string? radioProto)
+    {
+        if (string.IsNullOrEmpty(radioProto)) return null;
+
+        var proto = radioProto.ToLowerInvariant();
+        return proto switch
+        {
+            "be" => 7,                    // Wi-Fi 7 (802.11be)
+            "ax" => 6,                    // Wi-Fi 6/6E (802.11ax)
+            "ac" => 5,                    // Wi-Fi 5 (802.11ac)
+            "n" or "ng" or "na" => 4,     // Wi-Fi 4 (802.11n)
+            "a" => 2,                     // 802.11a
+            "g" => 3,                     // 802.11g
+            "b" => 1,                     // 802.11b
+            _ => null
+        };
+    }
+
+    private List<SiteWiFiMetrics> ParseSiteMetrics(JsonElement data)
+    {
+        var metrics = new List<SiteWiFiMetrics>();
+
+        if (data.ValueKind != JsonValueKind.Array)
+        {
+            _logger.LogWarning("Site metrics data is not an array: {ValueKind}", data.ValueKind);
+            return metrics;
+        }
+
+        // Log first item properties for debugging
+        if (data.GetArrayLength() > 0)
+        {
+            var first = data[0];
+            var props = first.EnumerateObject().Select(p => p.Name).ToList();
+            _logger.LogDebug("First site metrics item properties (all {Count}): {Properties}", props.Count, string.Join(", ", props));
+
+            // Log the actual value of "o" if present
+            if (first.TryGetProperty("o", out var oVal))
+            {
+                _logger.LogDebug("Value of 'o' field: {Value} (type: {Type})", oVal.ToString(), oVal.ValueKind);
+            }
+        }
+
+        foreach (var item in data.EnumerateArray())
+        {
+            // The "time" field contains the Unix timestamp in milliseconds
+            if (!item.TryGetProperty("time", out var timeProp))
+            {
+                _logger.LogWarning("Site metrics item missing 'time' field");
+                continue;
+            }
+
+            long timestamp;
+            if (timeProp.ValueKind == JsonValueKind.Number)
+            {
+                timestamp = timeProp.GetInt64();
+            }
+            else if (timeProp.ValueKind == JsonValueKind.String && long.TryParse(timeProp.GetString(), out var parsed))
+            {
+                timestamp = parsed;
+            }
+            else
+            {
+                _logger.LogWarning("Site metrics item has invalid 'time' field type: {Type}", timeProp.ValueKind);
+                continue;
+            }
+
+            var metric = new SiteWiFiMetrics
+            {
+                Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(timestamp),
+                ByBand = new Dictionary<RadioBand, BandMetrics>()
+            };
+
+            // Parse 2.4 GHz metrics
+            metric.ByBand[RadioBand.Band2_4GHz] = new BandMetrics
+            {
+                Band = RadioBand.Band2_4GHz,
+                ChannelUtilization = GetDoubleOrNull(item, "ap-ng-cu_total"),
+                Interference = GetDoubleOrNull(item, "ap-ng-cu_interf"),
+                TxRetries = GetLongOrNull(item, "ap-ng-tx_retries"),
+                WifiTxAttempts = GetLongOrNull(item, "ap-ng-wifi_tx_attempts"),
+                WifiTxDropped = GetLongOrNull(item, "ap-ng-wifi_tx_dropped"),
+                TxPackets = GetLongOrNull(item, "ap-ng-tx_packets"),
+                RxPackets = GetLongOrNull(item, "ap-ng-rx_packets")
+            };
+
+            // Parse 5 GHz metrics
+            metric.ByBand[RadioBand.Band5GHz] = new BandMetrics
+            {
+                Band = RadioBand.Band5GHz,
+                ChannelUtilization = GetDoubleOrNull(item, "ap-na-cu_total"),
+                Interference = GetDoubleOrNull(item, "ap-na-cu_interf"),
+                TxRetries = GetLongOrNull(item, "ap-na-tx_retries"),
+                WifiTxAttempts = GetLongOrNull(item, "ap-na-wifi_tx_attempts"),
+                WifiTxDropped = GetLongOrNull(item, "ap-na-wifi_tx_dropped"),
+                TxPackets = GetLongOrNull(item, "ap-na-tx_packets"),
+                RxPackets = GetLongOrNull(item, "ap-na-rx_packets")
+            };
+
+            // Parse 6 GHz metrics
+            metric.ByBand[RadioBand.Band6GHz] = new BandMetrics
+            {
+                Band = RadioBand.Band6GHz,
+                ChannelUtilization = GetDoubleOrNull(item, "ap-6e-cu_total"),
+                Interference = GetDoubleOrNull(item, "ap-6e-cu_interf"),
+                TxRetries = GetLongOrNull(item, "ap-6e-tx_retries"),
+                WifiTxAttempts = GetLongOrNull(item, "ap-6e-wifi_tx_attempts"),
+                WifiTxDropped = GetLongOrNull(item, "ap-6e-wifi_tx_dropped"),
+                TxPackets = GetLongOrNull(item, "ap-6e-tx_packets"),
+                RxPackets = GetLongOrNull(item, "ap-6e-rx_packets")
+            };
+
+            // Calculate TX retry percentages
+            foreach (var band in metric.ByBand.Values)
+            {
+                if (band.WifiTxAttempts > 0 && band.TxRetries.HasValue)
+                {
+                    band.TxRetryPct = (double)band.TxRetries.Value / band.WifiTxAttempts.Value * 100;
+                }
+            }
+
+            metrics.Add(metric);
+        }
+
+        return metrics;
+    }
+
+    private List<SiteWiFiMetrics> ParseApMetrics(JsonElement data)
+    {
+        var metrics = new List<SiteWiFiMetrics>();
+
+        if (data.ValueKind != JsonValueKind.Array)
+        {
+            _logger.LogWarning("AP metrics data is not an array: {ValueKind}", data.ValueKind);
+            return metrics;
+        }
+
+        foreach (var item in data.EnumerateArray())
+        {
+            if (!item.TryGetProperty("time", out var timeProp))
+            {
+                continue;
+            }
+
+            long timestamp;
+            if (timeProp.ValueKind == JsonValueKind.Number)
+            {
+                timestamp = timeProp.GetInt64();
+            }
+            else if (timeProp.ValueKind == JsonValueKind.String && long.TryParse(timeProp.GetString(), out var parsed))
+            {
+                timestamp = parsed;
+            }
+            else
+            {
+                continue;
+            }
+
+            var metric = new SiteWiFiMetrics
+            {
+                Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(timestamp),
+                ByBand = new Dictionary<RadioBand, BandMetrics>()
+            };
+
+            // AP endpoint uses ng-* prefix (no 'ap-' prefix)
+            metric.ByBand[RadioBand.Band2_4GHz] = new BandMetrics
+            {
+                Band = RadioBand.Band2_4GHz,
+                ChannelUtilization = GetDoubleOrNull(item, "ng-cu_total"),
+                Interference = GetDoubleOrNull(item, "ng-cu_interf"),
+                TxRetries = GetLongOrNull(item, "ng-tx_retries"),
+                WifiTxAttempts = GetLongOrNull(item, "ng-wifi_tx_attempts"),
+                WifiTxDropped = GetLongOrNull(item, "ng-wifi_tx_dropped"),
+                TxPackets = GetLongOrNull(item, "ng-tx_packets"),
+                RxPackets = GetLongOrNull(item, "ng-rx_packets")
+            };
+
+            metric.ByBand[RadioBand.Band5GHz] = new BandMetrics
+            {
+                Band = RadioBand.Band5GHz,
+                ChannelUtilization = GetDoubleOrNull(item, "na-cu_total"),
+                Interference = GetDoubleOrNull(item, "na-cu_interf"),
+                TxRetries = GetLongOrNull(item, "na-tx_retries"),
+                WifiTxAttempts = GetLongOrNull(item, "na-wifi_tx_attempts"),
+                WifiTxDropped = GetLongOrNull(item, "na-wifi_tx_dropped"),
+                TxPackets = GetLongOrNull(item, "na-tx_packets"),
+                RxPackets = GetLongOrNull(item, "na-rx_packets")
+            };
+
+            metric.ByBand[RadioBand.Band6GHz] = new BandMetrics
+            {
+                Band = RadioBand.Band6GHz,
+                ChannelUtilization = GetDoubleOrNull(item, "6e-cu_total"),
+                Interference = GetDoubleOrNull(item, "6e-cu_interf"),
+                TxRetries = GetLongOrNull(item, "6e-tx_retries"),
+                WifiTxAttempts = GetLongOrNull(item, "6e-wifi_tx_attempts"),
+                WifiTxDropped = GetLongOrNull(item, "6e-wifi_tx_dropped"),
+                TxPackets = GetLongOrNull(item, "6e-tx_packets"),
+                RxPackets = GetLongOrNull(item, "6e-rx_packets")
+            };
+
+            // Calculate TX retry percentages
+            foreach (var band in metric.ByBand.Values)
+            {
+                if (band.WifiTxAttempts > 0 && band.TxRetries.HasValue)
+                {
+                    band.TxRetryPct = (double)band.TxRetries.Value / band.WifiTxAttempts.Value * 100;
+                }
+            }
+
+            metrics.Add(metric);
+        }
+
+        return metrics;
+    }
+
+    /// <summary>
+    /// Second-pass query: request channel_info_most_common using dynamic keys
+    /// built from the AP MAC(s) and band(s) discovered in the first query.
+    /// </summary>
+    private async Task EnrichWithChannelInfoAsync(
+        List<ClientWiFiMetrics> metrics,
+        string reportType,
+        string clientMac,
+        long startMs,
+        long endMs,
+        CancellationToken cancellationToken)
+    {
+        // Find unique band+AP MAC combos that need channel info
+        var combos = metrics
+            .Where(m => m.Band.HasValue && !string.IsNullOrEmpty(m.ApMac) && !m.Channel.HasValue)
+            .Select(m => (Band: m.Band!.Value, ApMac: m.ApMac!))
+            .Distinct()
+            .ToList();
+
+        if (combos.Count == 0)
+            return;
+
+        // Build dynamic attr keys for each combo
+        var channelAttrs = new List<string> { "time" };
+        foreach (var (band, apMac) in combos)
+        {
+            var bandPrefix = band switch
+            {
+                RadioBand.Band2_4GHz => "ng",
+                RadioBand.Band5GHz => "na",
+                RadioBand.Band6GHz => "6e",
+                _ => null
+            };
+            if (bandPrefix != null)
+                channelAttrs.Add($"{bandPrefix}-{apMac}-channel_info_most_common");
+        }
+
+        if (channelAttrs.Count <= 1)
+            return; // Only "time", no channel keys
+
+        try
+        {
+            var channelData = await _client.PostUserReportAsync(
+                reportType, clientMac, startMs, endMs,
+                channelAttrs.ToArray(), cancellationToken);
+
+            if (channelData.ValueKind != JsonValueKind.Array)
+                return;
+
+            // Build a lookup: timestamp -> (channel, width)
+            var channelByTime = new Dictionary<long, (int Channel, int? Width)>();
+            foreach (var item in channelData.EnumerateArray())
+            {
+                if (!item.TryGetProperty("time", out var timeProp))
+                    continue;
+
+                var ts = (long)timeProp.GetDouble();
+
+                // Check each channel key
+                foreach (var prop in item.EnumerateObject())
+                {
+                    if (!prop.Name.EndsWith("-channel_info_most_common") || prop.Value.ValueKind != JsonValueKind.String)
+                        continue;
+
+                    var parts = prop.Value.GetString()?.Split(':');
+                    if (parts?.Length >= 1 && int.TryParse(parts[0], out var ch))
+                    {
+                        int? width = parts.Length >= 2 && int.TryParse(parts[1], out var w) ? w : null;
+                        channelByTime[ts] = (ch, width);
+                        break;
+                    }
+                }
+            }
+
+            // Merge channel data into metrics
+            foreach (var m in metrics)
+            {
+                var mTs = m.Timestamp.ToUnixTimeMilliseconds();
+                if (!m.Channel.HasValue && channelByTime.TryGetValue(mTs, out var chInfo))
+                {
+                    m.Channel = chInfo.Channel;
+                    m.ChannelWidth = chInfo.Width;
+                }
+            }
+
+            _logger.LogDebug("Enriched {Count} metrics with channel info for {ClientMac}",
+                channelByTime.Count, clientMac);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to fetch channel info for {ClientMac}", clientMac);
+        }
+    }
+
+    private List<ClientWiFiMetrics> ParseClientMetrics(JsonElement data, string clientMac)
+    {
+        var metrics = new List<ClientWiFiMetrics>();
+
+        if (data.ValueKind != JsonValueKind.Array) return metrics;
+
+        // Log first item for debugging
+        if (data.GetArrayLength() > 0)
+        {
+            var first = data[0];
+            var props = first.EnumerateObject().Select(p => $"{p.Name}:{p.Value.ValueKind}").ToList();
+            _logger.LogDebug("First client metrics item properties: {Properties}", string.Join(", ", props));
+        }
+
+        foreach (var item in data.EnumerateArray())
+        {
+            // Parse timestamp (required)
+            if (!item.TryGetProperty("time", out var timeProp))
+            {
+                continue;
+            }
+
+            long timestamp;
+            if (timeProp.ValueKind == JsonValueKind.Number)
+            {
+                // Use GetDouble and cast to handle both integer and decimal values
+                timestamp = (long)timeProp.GetDouble();
+            }
+            else if (timeProp.ValueKind == JsonValueKind.String && long.TryParse(timeProp.GetString(), out var parsed))
+            {
+                timestamp = parsed;
+            }
+            else
+            {
+                _logger.LogDebug("Skipping client metric item with invalid time type: {Type}", timeProp.ValueKind);
+                continue;
+            }
+
+            var metric = new ClientWiFiMetrics
+            {
+                Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(timestamp),
+                ClientMac = clientMac,
+                Signal = GetIntOrNull(item, "signal"),
+                TxRetries = GetLongOrNull(item, "tx_retries"),
+                TxPackets = GetLongOrNull(item, "tx_packets"),
+                RxPackets = GetLongOrNull(item, "rx_packets"),
+                WifiTxAttempts = GetLongOrNull(item, "wifi_tx_attempts"),
+                WifiTxDropped = GetLongOrNull(item, "wifi_tx_dropped"),
+                Satisfaction = GetDoubleOrNull(item, "satisfaction")
+            };
+
+            // tx_rate/rx_rate are averaged values in kbps
+            var txRate = GetDoubleOrNull(item, "tx_rate");
+            if (txRate.HasValue) metric.TxRateKbps = (long)txRate.Value;
+            var rxRate = GetDoubleOrNull(item, "rx_rate");
+            if (rxRate.HasValue) metric.RxRateKbps = (long)rxRate.Value;
+
+            // Protocol from radio_protocol_most_common (e.g. "ax", "be", "ac")
+            if (item.TryGetProperty("radio_protocol_most_common", out var protoProp) &&
+                protoProp.ValueKind == JsonValueKind.String)
+            {
+                metric.Protocol = protoProp.GetString();
+            }
+
+            // AP MAC from x-set-ap_macs array (take first one)
+            if (item.TryGetProperty("x-set-ap_macs", out var apMacsProp) &&
+                apMacsProp.ValueKind == JsonValueKind.Array && apMacsProp.GetArrayLength() > 0)
+            {
+                metric.ApMac = apMacsProp[0].GetString();
+            }
+
+            // Determine band from band-prefixed signal fields
+            // Whichever band has a signal value is the active band
+            if (GetDoubleOrNull(item, "6e-signal").HasValue)
+                metric.Band = RadioBand.Band6GHz;
+            else if (GetDoubleOrNull(item, "na-signal").HasValue)
+                metric.Band = RadioBand.Band5GHz;
+            else if (GetDoubleOrNull(item, "ng-signal").HasValue)
+                metric.Band = RadioBand.Band2_4GHz;
+            else if (metric.Protocol != null)
+            {
+                // Fallback: infer band from protocol + rate
+                var maxRate = Math.Max(metric.TxRateKbps ?? 0, metric.RxRateKbps ?? 0);
+                metric.Band = InferBandFromRate(metric.Protocol, maxRate);
+            }
+
+            // Try to get channel from dynamic key: {band}-{apMac}-channel_info_most_common
+            // or scan all properties for *-channel_info_most_common pattern
+            if (metric.Band.HasValue)
+            {
+                var bandPrefix = metric.Band.Value switch
+                {
+                    RadioBand.Band2_4GHz => "ng",
+                    RadioBand.Band5GHz => "na",
+                    RadioBand.Band6GHz => "6e",
+                    _ => null
+                };
+
+                if (bandPrefix != null)
+                {
+                    // Scan response properties for channel_info_most_common with this band prefix
+                    foreach (var prop in item.EnumerateObject())
+                    {
+                        if (prop.Name.StartsWith(bandPrefix + "-") &&
+                            prop.Name.EndsWith("-channel_info_most_common") &&
+                            prop.Value.ValueKind == JsonValueKind.String)
+                        {
+                            var parts = prop.Value.GetString()?.Split(':');
+                            if (parts?.Length >= 1 && int.TryParse(parts[0], out var ch))
+                                metric.Channel = ch;
+                            if (parts?.Length >= 2 && int.TryParse(parts[1], out var width))
+                                metric.ChannelWidth = width;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (metric.WifiTxAttempts > 0 && metric.TxRetries.HasValue)
+            {
+                metric.TxRetryPct = (double)metric.TxRetries.Value / metric.WifiTxAttempts.Value * 100;
+            }
+
+            metrics.Add(metric);
+        }
+
+        return metrics;
+    }
+
+    private RoamingTopology? ParseRoamingTopology(JsonElement data)
+    {
+        if (data.ValueKind == JsonValueKind.Undefined) return null;
+
+        // Log top-level properties in response
+        var topLevelProps = string.Join(", ", data.EnumerateObject().Select(p => p.Name));
+        _logger.LogDebug("Roaming topology response properties: {Props}", topLevelProps);
+
+        var topology = new RoamingTopology();
+
+        // Parse clients
+        if (data.TryGetProperty("clients", out var clients))
+        {
+            foreach (var client in clients.EnumerateArray())
+            {
+                topology.Clients.Add(new RoamingClient
+                {
+                    Mac = client.GetProperty("mac").GetString() ?? "",
+                    Name = client.TryGetProperty("name", out var name) ? name.GetString() : null
+                });
+            }
+        }
+
+        // Parse edges (AP pairs)
+        if (data.TryGetProperty("edges", out var edges))
+        {
+            _logger.LogDebug("Parsing {EdgeCount} edges from roaming topology", edges.GetArrayLength());
+            foreach (var edge in edges.EnumerateArray())
+            {
+                // Log edge properties
+                var edgeProps = string.Join(", ", edge.EnumerateObject().Select(p => p.Name));
+                _logger.LogDebug("Edge properties: {Props}", edgeProps);
+                var roamingEdge = new RoamingEdge
+                {
+                    Endpoint1Mac = edge.GetProperty("endpoint_1_mac").GetString() ?? "",
+                    Endpoint2Mac = edge.GetProperty("endpoint_2_mac").GetString() ?? "",
+                    TotalRoamAttempts = edge.TryGetProperty("total_roam_attempts", out var tra) ? tra.GetInt32() : 0,
+                    TotalSuccessfulRoams = edge.TryGetProperty("total_successful_roams", out var tsr) ? tsr.GetInt32() : 0
+                };
+
+                if (edge.TryGetProperty("endpoint_1_to_endpoint_2", out var e1to2))
+                {
+                    roamingEdge.Endpoint1ToEndpoint2 = ParseDirectionStats(e1to2);
+                }
+
+                if (edge.TryGetProperty("endpoint_2_to_endpoint_1", out var e2to1))
+                {
+                    roamingEdge.Endpoint2ToEndpoint1 = ParseDirectionStats(e2to1);
+                }
+
+                if (edge.TryGetProperty("top_roaming_clients", out var topClients))
+                {
+                    foreach (var tc in topClients.EnumerateArray())
+                    {
+                        roamingEdge.TopRoamingClients.Add(new ClientRoamingStats
+                        {
+                            Mac = tc.GetProperty("mac").GetString() ?? "",
+                            RoamAttempts = tc.TryGetProperty("roam_attempts", out var ra) ? ra.GetInt32() : 0,
+                            SuccessfulRoams = tc.TryGetProperty("successful_roams", out var sr) ? sr.GetInt32() : 0
+                        });
+                    }
+                }
+
+                topology.Edges.Add(roamingEdge);
+            }
+        }
+
+        // Parse vertices (APs)
+        if (data.TryGetProperty("vertices", out var vertices))
+        {
+            foreach (var vertex in vertices.EnumerateArray())
+            {
+                var v = new RoamingVertex
+                {
+                    Mac = vertex.GetProperty("mac").GetString() ?? "",
+                    Model = vertex.TryGetProperty("model", out var model) ? model.GetString() ?? "" : "",
+                    Name = vertex.TryGetProperty("name", out var name) ? name.GetString() ?? "" : ""
+                };
+
+                if (vertex.TryGetProperty("radios", out var radios))
+                {
+                    foreach (var radio in radios.EnumerateArray())
+                    {
+                        v.Radios.Add(new RoamingRadioInfo
+                        {
+                            Channel = radio.TryGetProperty("channel", out var ch) ? ch.GetInt32() : 0,
+                            RadioBand = radio.TryGetProperty("radio_band", out var rb) ? rb.GetString() ?? "" : "",
+                            UtilizationPercentage = radio.TryGetProperty("utilization_percentage", out var up) ? up.GetInt32() : 0
+                        });
+                    }
+                }
+
+                topology.Vertices.Add(v);
+            }
+        }
+
+        return topology;
+    }
+
+    private RoamingDirectionStats ParseDirectionStats(JsonElement el)
+    {
+        // Debug: log all properties in the direction stats
+        var props = string.Join(", ", el.EnumerateObject().Select(p => $"{p.Name}={p.Value}"));
+        _logger.LogDebug("Direction stats properties: {Props}", props);
+
+        return new RoamingDirectionStats
+        {
+            RoamAttempts = el.TryGetProperty("roam_attempts", out var ra) ? ra.GetInt32() : 0,
+            SuccessfulRoams = el.TryGetProperty("successful_roams", out var sr) ? sr.GetInt32() : 0,
+            FastRoaming = el.TryGetProperty("fast_roaming", out var fr) ? fr.GetInt32() : 0,
+            TriggeredByMinimalRssi = el.TryGetProperty("triggered_by_minimal_rssi", out var mr) ? mr.GetInt32() : 0,
+            TriggeredByRoamingAssistant = el.TryGetProperty("triggered_by_roaming_assistant", out var rass) ? rass.GetInt32() : 0
+        };
+    }
+
+    private static double? GetDoubleOrNull(JsonElement el, string prop)
+    {
+        if (el.TryGetProperty(prop, out var val) && val.ValueKind == JsonValueKind.Number)
+            return val.GetDouble();
+        return null;
+    }
+
+    private static int? GetIntOrNull(JsonElement el, string prop)
+    {
+        if (el.TryGetProperty(prop, out var val) && val.ValueKind == JsonValueKind.Number)
+        {
+            // Use GetDouble and cast to handle potential decimal values
+            return (int)val.GetDouble();
+        }
+        return null;
+    }
+
+    private static long? GetLongOrNull(JsonElement el, string prop)
+    {
+        if (el.TryGetProperty(prop, out var val) && val.ValueKind == JsonValueKind.Number)
+        {
+            // API may return floats, so convert to long via double
+            return (long)val.GetDouble();
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Infer radio band from Wi-Fi protocol and link rate.
+    /// Wi-Fi 6E (ax on 6GHz) and Wi-Fi 7 (be) support higher rates.
+    /// 2.4GHz max is ~600Mbps (ax), 5GHz max is ~2.4Gbps (ax), 6GHz goes higher.
+    /// </summary>
+    private static RadioBand? InferBandFromRate(string protocol, long maxRateKbps)
+    {
+        var proto = protocol.ToLowerInvariant();
+
+        // Wi-Fi 7 (be) is always 6GHz (or 5GHz with 320MHz, but primarily 6GHz)
+        if (proto == "be")
+            return RadioBand.Band6GHz;
+
+        // Convert to Mbps for easier comparison
+        var rateMbps = maxRateKbps / 1000.0;
+
+        if (proto == "ax")
+        {
+            // Wi-Fi 6E on 6GHz typically has rates > 1200 Mbps with 160/320MHz channels
+            // Wi-Fi 6 on 5GHz typically 600-2400 Mbps
+            // Wi-Fi 6 on 2.4GHz maxes out around 574 Mbps (2x2 40MHz)
+            if (rateMbps > 1200) return RadioBand.Band6GHz;
+            if (rateMbps > 400) return RadioBand.Band5GHz;
+            return RadioBand.Band2_4GHz;
+        }
+
+        if (proto == "ac")
+            return RadioBand.Band5GHz; // 802.11ac is 5GHz only
+
+        if (proto == "n" || proto == "a")
+        {
+            // 802.11n can be either band, use rate to guess
+            // 802.11a is 5GHz only
+            if (proto == "a") return RadioBand.Band5GHz;
+            return rateMbps > 150 ? RadioBand.Band5GHz : RadioBand.Band2_4GHz;
+        }
+
+        // b/g are 2.4GHz only
+        if (proto == "b" || proto == "g")
+            return RadioBand.Band2_4GHz;
+
+        return null;
+    }
+
+    #endregion
+}

@@ -1,0 +1,1541 @@
+using FluentAssertions;
+using Microsoft.EntityFrameworkCore;
+using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Monitoring.Probes;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Web.Services.Monitoring;
+using Xunit;
+
+namespace NetworkOptimizer.Web.Tests;
+
+public class CleanAsnNameTests
+{
+    [Theory]
+    [InlineData("Windstream Communications", "Windstream")]
+    [InlineData("AT&T Enterprises", "AT&T")]
+    [InlineData("Level 3 Parent, LLC", "Level 3")]
+    [InlineData("Cox Communications Inc.", "Cox")]
+    [InlineData("EXAMPLE TELEPHONE", "EXAMPLE")]
+    [InlineData("Cisco OpenDNS, LLC", "Cisco OpenDNS")]
+    [InlineData("Akamai International B.V.", "Akamai International")]
+    [InlineData("Fastly, Inc.", "Fastly")]
+    [InlineData("Deutsche Telekom AG", "Deutsche Telekom")]
+    [InlineData("Comcast Cable Communications, LLC", "Comcast")]
+    [InlineData("Charter Communications Inc", "Charter")]
+    [InlineData("Lumen Technologies", "Lumen")]
+    [InlineData("Frontier Communications Corporation", "Frontier")]
+    [InlineData("TDS Telecom", "TDS")]
+    [InlineData("Sievert Larsen Fiber LLC", "Sievert Larsen")]
+    [InlineData("Rural Electric Cooperative", "Rural")]
+    [InlineData("Google", "Google")]
+    [InlineData("Cloudflare", "Cloudflare")]
+    [InlineData(null, "")]
+    [InlineData("", "")]
+    [InlineData("  ", "")]
+    public void Strips_corporate_suffixes(string? input, string expected)
+    {
+        UpstreamTracerService.CleanAsnName(input).Should().Be(expected);
+    }
+
+    [Fact]
+    public void Strips_chained_suffixes()
+    {
+        UpstreamTracerService.CleanAsnName("Acme Telephone Company LLC")
+            .Should().Be("Acme");
+    }
+
+    [Fact]
+    public void Stops_before_emptying_the_name()
+    {
+        UpstreamTracerService.CleanAsnName("Communications LLC")
+            .Should().NotBeEmpty();
+    }
+}
+
+public class FormatTransitHopLabelTests
+{
+    [Theory]
+    [InlineData("ae6-0.agr01.pop01-xx.us.windstream.net", null, "ae6-0.agr01.pop01-xx.us")]
+    [InlineData("lag-101.ear1.Metro2.Level3.net", null, "lag-101.ear1.Metro2")]
+    [InlineData("mcibbrj01.rd.ks.cox.net", null, "mcibbrj01.rd.ks")]
+    [InlineData("ae25.25.ear1.Dallas1.net.lumen.tech", null, "ae25.25.ear1.Dallas1.net")]
+    [InlineData("rtr1-handoff.example.net", null, "rtr1-handoff")]
+    public void Strips_sld_and_tld(string hostname, string? ip, string expected)
+    {
+        UpstreamTracerService.FormatTransitHopLabel(hostname, ip).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("h40.113.0.203.static.ip.example.net", "203.0.113.40")]
+    [InlineData("203.0.113.146", "203.0.113.146")]
+    public void Returns_null_for_ip_derived_hostnames(string hostname, string ip)
+    {
+        UpstreamTracerService.FormatTransitHopLabel(hostname, ip).Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    public void Returns_null_for_empty_input(string? hostname, string? ip)
+    {
+        UpstreamTracerService.FormatTransitHopLabel(hostname, ip).Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData("router.net", null)]
+    [InlineData("single", null)]
+    public void Returns_null_when_too_few_labels(string hostname, string? ip)
+    {
+        UpstreamTracerService.FormatTransitHopLabel(hostname, ip).Should().BeNull();
+    }
+}
+
+public class UpstreamCommitTests : IDisposable
+{
+    private readonly NetworkOptimizerDbContext _db;
+
+    public UpstreamCommitTests()
+    {
+        var options = new DbContextOptionsBuilder<NetworkOptimizerDbContext>()
+            .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
+            .Options;
+        _db = new NetworkOptimizerDbContext(options);
+        _db.Database.EnsureCreated();
+    }
+
+    public void Dispose() => _db.Dispose();
+
+    [Fact]
+    public async Task Enabled_access_hop_creates_new_target()
+    {
+        var hops = new List<AccessHopCandidate>
+        {
+            MakeAccessHop("192.0.2.1", "TestISP bng", enabled: true)
+        };
+        var transits = new List<TransitAsnCandidate>();
+
+        await CommitAsync(hops, transits);
+
+        var target = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == "192.0.2.1");
+        target.Should().NotBeNull();
+        target!.Enabled.Should().BeTrue();
+        target.Name.Should().Be("TestISP bng");
+        target.TargetType.Should().Be(MonitoringTargetType.AccessIsp);
+    }
+
+    [Fact]
+    public async Task Disabled_access_hop_does_not_create_target()
+    {
+        var hops = new List<AccessHopCandidate>
+        {
+            MakeAccessHop("192.0.2.1", "TestISP bng", enabled: false)
+        };
+
+        await CommitAsync(hops, new List<TransitAsnCandidate>());
+
+        var target = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == "192.0.2.1");
+        target.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Unchecking_existing_access_hop_disables_it()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("192.0.2.1", "Old Name", MonitoringTargetType.AccessIsp, enabled: true));
+        await _db.SaveChangesAsync();
+
+        var hops = new List<AccessHopCandidate>
+        {
+            MakeAccessHop("192.0.2.1", "New Name", enabled: false)
+        };
+
+        await CommitAsync(hops, new List<TransitAsnCandidate>());
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1");
+        target.Enabled.Should().BeFalse();
+        target.Name.Should().Be("New Name");
+    }
+
+    [Fact]
+    public async Task Rechecking_disabled_access_hop_enables_it()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("192.0.2.1", "Old Name", MonitoringTargetType.AccessIsp, enabled: false));
+        await _db.SaveChangesAsync();
+
+        var hops = new List<AccessHopCandidate>
+        {
+            MakeAccessHop("192.0.2.1", "New Name", enabled: true)
+        };
+
+        await CommitAsync(hops, new List<TransitAsnCandidate>());
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1");
+        target.Enabled.Should().BeTrue();
+        target.Name.Should().Be("New Name");
+    }
+
+    [Fact]
+    public async Task Enabled_transit_creates_new_target()
+    {
+        var transit = MakeTransitCandidate("198.51.100.1", "Windstream agr01", 7029,
+            method: DiscoveryMethod.DirectRouter, enabled: true);
+
+        await CommitAsync(new List<AccessHopCandidate>(), new List<TransitAsnCandidate> { transit });
+
+        var target = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == "198.51.100.1");
+        target.Should().NotBeNull();
+        target!.Enabled.Should().BeTrue();
+        target.Name.Should().Be("Windstream agr01");
+        target.TargetType.Should().Be(MonitoringTargetType.Transit);
+    }
+
+    [Fact]
+    public async Task Unchecking_existing_transit_disables_it()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("198.51.100.1", "Old Transit", MonitoringTargetType.Transit, enabled: true));
+        await _db.SaveChangesAsync();
+
+        var transit = MakeTransitCandidate("198.51.100.1", "New Transit", 7029,
+            method: DiscoveryMethod.DirectRouter, enabled: false);
+
+        await CommitAsync(new List<AccessHopCandidate>(), new List<TransitAsnCandidate> { transit });
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "198.51.100.1");
+        target.Enabled.Should().BeFalse();
+        target.Name.Should().Be("New Transit");
+    }
+
+    [Fact]
+    public async Task Rechecking_disabled_transit_enables_it()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("198.51.100.1", "Old Transit", MonitoringTargetType.Transit, enabled: false));
+        await _db.SaveChangesAsync();
+
+        var transit = MakeTransitCandidate("198.51.100.1", "New Transit", 7029,
+            method: DiscoveryMethod.DirectRouter, enabled: true);
+
+        await CommitAsync(new List<AccessHopCandidate>(), new List<TransitAsnCandidate> { transit });
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "198.51.100.1");
+        target.Enabled.Should().BeTrue();
+        target.Name.Should().Be("New Transit");
+    }
+
+    [Fact]
+    public async Task Unchecking_pathproxy_disables_it()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("203.0.113.1", "Cloudflare", MonitoringTargetType.InternetService, enabled: true));
+        await _db.SaveChangesAsync();
+
+        var pathProxy = MakeTransitCandidate("203.0.113.1", "Cloudflare", 13335,
+            method: DiscoveryMethod.PathProxy, enabled: false);
+        pathProxy.PathProxyTarget = "203.0.113.1";
+
+        await CommitAsync(new List<AccessHopCandidate>(), new List<TransitAsnCandidate> { pathProxy });
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "203.0.113.1");
+        target.Enabled.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Rechecking_pathproxy_enables_it()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("203.0.113.1", "Cloudflare", MonitoringTargetType.InternetService, enabled: false));
+        await _db.SaveChangesAsync();
+
+        var pathProxy = MakeTransitCandidate("203.0.113.1", "Cloudflare", 13335,
+            method: DiscoveryMethod.PathProxy, enabled: true);
+        pathProxy.PathProxyTarget = "203.0.113.1";
+
+        await CommitAsync(new List<AccessHopCandidate>(), new List<TransitAsnCandidate> { pathProxy });
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "203.0.113.1");
+        target.Enabled.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Upsert_matches_by_address_when_targetid_differs()
+    {
+        var existing = MakeDbTarget("198.51.100.1", "Custom Name", MonitoringTargetType.Transit, enabled: true);
+        existing.TargetId = "custom-abc123";
+        _db.MonitoringTargets.Add(existing);
+        await _db.SaveChangesAsync();
+        var originalId = existing.Id;
+
+        var transit = MakeTransitCandidate("198.51.100.1", "Discovery Name", 7029,
+            method: DiscoveryMethod.DirectRouter, enabled: true);
+        transit.TargetId = "transit-as7029-198-51-100-1";
+
+        await CommitAsync(new List<AccessHopCandidate>(), new List<TransitAsnCandidate> { transit });
+
+        var targets = await _db.MonitoringTargets.Where(t => t.Address == "198.51.100.1").ToListAsync();
+        targets.Should().HaveCount(1);
+        targets[0].Id.Should().Be(originalId);
+        targets[0].Name.Should().Be("Discovery Name");
+    }
+
+    [Fact]
+    public async Task Rename_applies_to_disabled_targets()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("192.0.2.1", "bng01.example", MonitoringTargetType.AccessIsp, enabled: true));
+        await _db.SaveChangesAsync();
+
+        var hop = MakeAccessHop("192.0.2.1", "EXAMPLE bng01", enabled: false);
+
+        await CommitAsync(new List<AccessHopCandidate> { hop }, new List<TransitAsnCandidate>());
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1");
+        target.Enabled.Should().BeFalse();
+        target.Name.Should().Be("EXAMPLE bng01");
+    }
+
+    [Fact]
+    public async Task Asn_name_cleaned_on_save()
+    {
+        var hop = MakeAccessHop("192.0.2.1", "EXAMPLE bng", enabled: true);
+        hop.AsnName = "EXAMPLE TELEPHONE";
+
+        await CommitAsync(new List<AccessHopCandidate> { hop }, new List<TransitAsnCandidate>());
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1");
+        target.AsnName.Should().Be("EXAMPLE");
+    }
+
+    [Fact]
+    public async Task Unreachable_target_disabled_on_save()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("198.51.100.1", "Transit 1", MonitoringTargetType.Transit, enabled: true));
+        await _db.SaveChangesAsync();
+
+        var transit = MakeTransitCandidate("198.51.100.1", "Transit 1", 7029,
+            method: DiscoveryMethod.DirectRouter, enabled: false);
+        transit.Unreachable = true;
+
+        await CommitAsync(new List<AccessHopCandidate>(), new List<TransitAsnCandidate> { transit });
+
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "198.51.100.1");
+        target.Enabled.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Mixed_enable_disable_across_all_types()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("192.0.2.1", "Access A", MonitoringTargetType.AccessIsp, enabled: true));
+        _db.MonitoringTargets.Add(MakeDbTarget("192.0.2.2", "Access B", MonitoringTargetType.AccessIsp, enabled: true));
+        _db.MonitoringTargets.Add(MakeDbTarget("198.51.100.1", "Transit A", MonitoringTargetType.Transit, enabled: true));
+        _db.MonitoringTargets.Add(MakeDbTarget("198.51.100.2", "Transit B", MonitoringTargetType.Transit, enabled: false));
+        _db.MonitoringTargets.Add(MakeDbTarget("203.0.113.1", "CDN A", MonitoringTargetType.InternetService, enabled: true));
+        await _db.SaveChangesAsync();
+
+        var hops = new List<AccessHopCandidate>
+        {
+            MakeAccessHop("192.0.2.1", "Access A New", enabled: true),
+            MakeAccessHop("192.0.2.2", "Access B New", enabled: false),
+        };
+        var transits = new List<TransitAsnCandidate>
+        {
+            MakeTransitCandidate("198.51.100.1", "Transit A New", 7029, DiscoveryMethod.DirectRouter, enabled: false),
+            MakeTransitCandidate("198.51.100.2", "Transit B New", 7029, DiscoveryMethod.DirectRouter, enabled: true),
+            MakeTransitCandidate("203.0.113.1", "CDN A New", 13335, DiscoveryMethod.PathProxy, enabled: false),
+        };
+        transits[2].PathProxyTarget = "203.0.113.1";
+
+        await CommitAsync(hops, transits);
+
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1")).Enabled.Should().BeTrue("Access A stays on");
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.2")).Enabled.Should().BeFalse("Access B turned off");
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "198.51.100.1")).Enabled.Should().BeFalse("Transit A turned off");
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "198.51.100.2")).Enabled.Should().BeTrue("Transit B turned on");
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "203.0.113.1")).Enabled.Should().BeFalse("CDN A turned off");
+
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1")).Name.Should().Be("Access A New");
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "198.51.100.1")).Name.Should().Be("Transit A New");
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "203.0.113.1")).Name.Should().Be("CDN A New");
+    }
+
+    [Fact]
+    public async Task Second_discovery_preserves_user_disable_decision()
+    {
+        _db.MonitoringTargets.Add(MakeDbTarget("192.0.2.1", "Access A", MonitoringTargetType.AccessIsp, enabled: true));
+        _db.MonitoringTargets.Add(MakeDbTarget("198.51.100.1", "Transit A", MonitoringTargetType.Transit, enabled: true));
+        await _db.SaveChangesAsync();
+
+        // First save: user unchecks both
+        await CommitAsync(
+            new List<AccessHopCandidate> { MakeAccessHop("192.0.2.1", "Access A", enabled: false) },
+            new List<TransitAsnCandidate> { MakeTransitCandidate("198.51.100.1", "Transit A", 7029, DiscoveryMethod.DirectRouter, enabled: false) }
+        );
+
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1")).Enabled.Should().BeFalse();
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "198.51.100.1")).Enabled.Should().BeFalse();
+
+        // Second save: user re-checks both
+        await CommitAsync(
+            new List<AccessHopCandidate> { MakeAccessHop("192.0.2.1", "Access A v2", enabled: true) },
+            new List<TransitAsnCandidate> { MakeTransitCandidate("198.51.100.1", "Transit A v2", 7029, DiscoveryMethod.DirectRouter, enabled: true) }
+        );
+
+        var access = await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1");
+        access.Enabled.Should().BeTrue();
+        access.Name.Should().Be("Access A v2");
+
+        var transit = await _db.MonitoringTargets.FirstAsync(t => t.Address == "198.51.100.1");
+        transit.Enabled.Should().BeTrue();
+        transit.Name.Should().Be("Transit A v2");
+    }
+
+    [Fact]
+    public async Task Third_save_after_toggle_cycle()
+    {
+        // Start: enabled
+        _db.MonitoringTargets.Add(MakeDbTarget("192.0.2.1", "Hop A", MonitoringTargetType.AccessIsp, enabled: true));
+        await _db.SaveChangesAsync();
+
+        // Save 1: disable
+        await CommitAsync(
+            new List<AccessHopCandidate> { MakeAccessHop("192.0.2.1", "Hop A", enabled: false) },
+            new List<TransitAsnCandidate>());
+        (await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1")).Enabled.Should().BeFalse();
+
+        // Save 2: re-enable with new name
+        await CommitAsync(
+            new List<AccessHopCandidate> { MakeAccessHop("192.0.2.1", "Hop A Renamed", enabled: true) },
+            new List<TransitAsnCandidate>());
+        var target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1");
+        target.Enabled.Should().BeTrue();
+        target.Name.Should().Be("Hop A Renamed");
+
+        // Save 3: disable again
+        await CommitAsync(
+            new List<AccessHopCandidate> { MakeAccessHop("192.0.2.1", "Hop A Final", enabled: false) },
+            new List<TransitAsnCandidate>());
+        target = await _db.MonitoringTargets.FirstAsync(t => t.Address == "192.0.2.1");
+        target.Enabled.Should().BeFalse();
+        target.Name.Should().Be("Hop A Final");
+    }
+
+    [Fact]
+    public void Reconcile_absorbs_user_edited_name_for_transit()
+    {
+        var candidates = new List<TransitAsnCandidate>
+        {
+            MakeTransitCandidate("198.51.100.1", "Windstream ae6-0.agr01.pop01-xx.us", 7029, DiscoveryMethod.DirectRouter, true)
+        };
+        var existing = MakeDbTarget("198.51.100.1", "Windstream ae6-0.agr01.pop01-xx.us 1", MonitoringTargetType.Transit, enabled: true);
+        _db.MonitoringTargets.Add(existing);
+        _db.SaveChanges();
+
+        var byAddress = new Dictionary<string, MonitoringTarget>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["198.51.100.1"] = existing
+        };
+
+        foreach (var c in candidates)
+        {
+            var addr = c.HopAddress ?? c.PathProxyTarget;
+            if (string.IsNullOrEmpty(addr)) continue;
+            if (byAddress.TryGetValue(addr, out var ex))
+            {
+                c.Enabled = ex.Enabled;
+                if (!string.IsNullOrEmpty(ex.Name))
+                    c.Label = ex.Name;
+            }
+        }
+
+        candidates[0].Label.Should().Be("Windstream ae6-0.agr01.pop01-xx.us 1");
+        candidates[0].Enabled.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Reconcile_absorbs_user_edited_name_for_access()
+    {
+        var hops = new List<AccessHopCandidate>
+        {
+            MakeAccessHop("192.0.2.1", "EXAMPLE border01", enabled: true)
+        };
+        var existing = MakeDbTarget("192.0.2.1", "EXAMPLE border01 1", MonitoringTargetType.AccessIsp, enabled: true);
+        _db.MonitoringTargets.Add(existing);
+        _db.SaveChanges();
+
+        var byAddress = new Dictionary<string, MonitoringTarget>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["192.0.2.1"] = existing
+        };
+
+        foreach (var hop in hops)
+        {
+            if (byAddress.TryGetValue(hop.Address, out var ex))
+            {
+                hop.Enabled = ex.Enabled;
+                if (!string.IsNullOrEmpty(ex.Name))
+                    hop.Label = ex.Name;
+            }
+        }
+
+        hops[0].Label.Should().Be("EXAMPLE border01 1");
+    }
+
+    [Fact]
+    public void Reconcile_absorbs_name_for_pathproxy()
+    {
+        var candidates = new List<TransitAsnCandidate>
+        {
+            MakeTransitCandidate("203.0.113.1", "Cloudflare", 13335, DiscoveryMethod.PathProxy, true)
+        };
+        candidates[0].PathProxyTarget = "203.0.113.1";
+        var existing = MakeDbTarget("203.0.113.1", "Cloudflare Primary", MonitoringTargetType.InternetService, enabled: true);
+        _db.MonitoringTargets.Add(existing);
+        _db.SaveChanges();
+
+        var byAddress = new Dictionary<string, MonitoringTarget>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["203.0.113.1"] = existing
+        };
+
+        foreach (var c in candidates)
+        {
+            var addr = c.HopAddress ?? c.PathProxyTarget;
+            if (string.IsNullOrEmpty(addr)) continue;
+            if (byAddress.TryGetValue(addr, out var ex))
+            {
+                c.Enabled = ex.Enabled;
+                if (!string.IsNullOrEmpty(ex.Name))
+                    c.Label = ex.Name;
+            }
+        }
+
+        candidates[0].Label.Should().Be("Cloudflare Primary");
+    }
+
+    [Fact]
+    public void Reconcile_does_not_overwrite_with_empty_db_name()
+    {
+        var candidates = new List<TransitAsnCandidate>
+        {
+            MakeTransitCandidate("198.51.100.1", "Windstream agr01", 7029, DiscoveryMethod.DirectRouter, true)
+        };
+        var existing = MakeDbTarget("198.51.100.1", "", MonitoringTargetType.Transit, enabled: true);
+        _db.MonitoringTargets.Add(existing);
+        _db.SaveChanges();
+
+        var byAddress = new Dictionary<string, MonitoringTarget>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["198.51.100.1"] = existing
+        };
+
+        foreach (var c in candidates)
+        {
+            var addr = c.HopAddress ?? c.PathProxyTarget;
+            if (string.IsNullOrEmpty(addr)) continue;
+            if (byAddress.TryGetValue(addr, out var ex))
+            {
+                c.Enabled = ex.Enabled;
+                if (!string.IsNullOrEmpty(ex.Name))
+                    c.Label = ex.Name;
+            }
+        }
+
+        candidates[0].Label.Should().Be("Windstream agr01");
+    }
+
+    // ---- Helpers ----
+
+    private async Task CommitAsync(List<AccessHopCandidate> hops, List<TransitAsnCandidate> transits)
+    {
+        var wanInterface = "wan";
+
+        foreach (var hop in hops.Where(h => h.Enabled))
+        {
+            var existing = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.TargetId == hop.TargetId)
+                           ?? await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == hop.Address);
+            if (existing == null)
+            {
+                _db.MonitoringTargets.Add(new MonitoringTarget
+                {
+                    TargetId = hop.TargetId,
+                    Name = hop.Label,
+                    Address = hop.Address,
+                    ProbeMode = hop.RespondedTo,
+                    TargetType = MonitoringTargetType.AccessIsp,
+                    AsnNumber = hop.AsnNumber,
+                    AsnName = UpstreamTracerService.CleanAsnName(hop.AsnName),
+                    VantagePoint = "server",
+                    PollIntervalSeconds = 10,
+                    PingCount = 5,
+                    Enabled = true,
+                    AutoDiscovered = true,
+                    DiscoveryMethod = hop.Method,
+                    WanInterface = wanInterface,
+                    CreatedAt = DateTime.UtcNow,
+                    LastVerified = DateTime.UtcNow
+                });
+            }
+            else
+            {
+                existing.Enabled = true;
+                existing.Name = hop.Label;
+                if (hop.AsnNumber.HasValue) existing.AsnNumber = hop.AsnNumber;
+                if (!string.IsNullOrEmpty(hop.AsnName)) existing.AsnName = UpstreamTracerService.CleanAsnName(hop.AsnName);
+                existing.LastVerified = DateTime.UtcNow;
+            }
+        }
+        foreach (var hop in hops.Where(h => !h.Enabled))
+        {
+            var existing = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == hop.Address);
+            if (existing != null)
+            {
+                existing.Enabled = false;
+                existing.Name = hop.Label;
+                if (!string.IsNullOrEmpty(hop.AsnName)) existing.AsnName = UpstreamTracerService.CleanAsnName(hop.AsnName);
+            }
+        }
+        foreach (var transit in transits.Where(t => t.Enabled))
+        {
+            var targetType = transit.Method == DiscoveryMethod.PathProxy
+                ? MonitoringTargetType.InternetService
+                : MonitoringTargetType.Transit;
+            var address = transit.HopAddress ?? transit.PathProxyTarget;
+            var existing = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.TargetId == transit.TargetId)
+                           ?? (address != null ? await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == address) : null);
+            if (existing == null && !string.IsNullOrEmpty(address))
+            {
+                _db.MonitoringTargets.Add(new MonitoringTarget
+                {
+                    TargetId = transit.TargetId ?? $"transit-{Guid.NewGuid():N}",
+                    Name = transit.Label ?? transit.AsnName,
+                    Address = address,
+                    ProbeMode = transit.RespondedTo ?? ProbeMode.Icmp,
+                    TargetType = targetType,
+                    AsnNumber = transit.AsnNumber,
+                    AsnName = transit.AsnName,
+                    VantagePoint = "server",
+                    PollIntervalSeconds = 15,
+                    PingCount = 5,
+                    Enabled = true,
+                    AutoDiscovered = true,
+                    DiscoveryMethod = transit.Method,
+                    WanInterface = wanInterface,
+                    CreatedAt = DateTime.UtcNow,
+                    LastVerified = DateTime.UtcNow
+                });
+            }
+            else if (existing != null)
+            {
+                existing.Enabled = true;
+                existing.Name = transit.Label ?? transit.AsnName;
+                existing.Address = address ?? existing.Address;
+                if (transit.AsnNumber > 0) existing.AsnNumber = transit.AsnNumber;
+                if (!string.IsNullOrEmpty(transit.AsnName)) existing.AsnName = transit.AsnName;
+                existing.LastVerified = DateTime.UtcNow;
+            }
+        }
+        foreach (var transit in transits.Where(t => !t.Enabled))
+        {
+            var addr = transit.HopAddress ?? transit.PathProxyTarget;
+            if (string.IsNullOrEmpty(addr)) continue;
+            var existing = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == addr);
+            if (existing != null)
+            {
+                existing.Enabled = false;
+                existing.Name = transit.Label ?? transit.AsnName;
+                if (!string.IsNullOrEmpty(transit.AsnName)) existing.AsnName = transit.AsnName;
+            }
+        }
+
+        await _db.SaveChangesAsync();
+    }
+
+    private static AccessHopCandidate MakeAccessHop(string address, string label, bool enabled) => new()
+    {
+        TargetId = $"access-{address.Replace('.', '-')}",
+        Label = label,
+        Address = address,
+        AsnNumber = 64500,
+        AsnName = "TEST ISP",
+        Role = UpstreamRole.Aggregation,
+        HopNumber = 2,
+        RespondedTo = ProbeMode.Icmp,
+        Enabled = enabled
+    };
+
+    private static TransitAsnCandidate MakeTransitCandidate(string address, string label, int asn,
+        DiscoveryMethod method, bool enabled) => new()
+        {
+            AsnNumber = asn,
+            AsnName = $"AS{asn}",
+            Label = label,
+            Method = method,
+            TargetId = $"transit-as{asn}-{address.Replace('.', '-')}",
+            HopAddress = address,
+            RespondedTo = ProbeMode.Icmp,
+            Enabled = enabled
+        };
+
+    private static MonitoringTarget MakeDbTarget(string address, string name,
+        MonitoringTargetType type, bool enabled) => new()
+        {
+            TargetId = $"test-{address.Replace('.', '-')}",
+            Name = name,
+            Address = address,
+            ProbeMode = ProbeMode.Icmp,
+            TargetType = type,
+            VantagePoint = "server",
+            PollIntervalSeconds = 10,
+            PingCount = 5,
+            Enabled = enabled,
+            AutoDiscovered = true,
+            WanInterface = "wan",
+            CreatedAt = DateTime.UtcNow,
+            LastVerified = DateTime.UtcNow
+        };
+}
+
+public class ComputeNearTransitAsnsTests
+{
+    // Generic private-use access ASN (not a real ISP); public tier-1 ASNs are real
+    // because the logic keys on them.
+    private const int Access = 64500;
+    private const int UpstreamA = 64510;
+    private const int UpstreamB = 64520;
+    private const int Lumen = 3356;
+    private const int Cogent = 174;
+    private const int Arelion = 1299;
+    private const int Indatel = 30517;
+    private const int Cloudflare = 13335;
+
+    private static IReadOnlySet<int> AccessSet => new HashSet<int> { Access };
+    private static IReadOnlySet<int> NoDest => new HashSet<int>();
+    private static IReadOnlySet<int> Tier1 => new HashSet<int> { Lumen, Cogent, Arelion };
+
+    private static Dictionary<string, int> Map(params (string Ip, int Asn)[] e)
+        => e.ToDictionary(x => x.Ip, x => x.Asn, StringComparer.OrdinalIgnoreCase);
+
+    [Fact]
+    public void Direct_upstream_is_near_transit()
+    {
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Lumen));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2" } }, map, AccessSet, NoDest, Tier1);
+        near.Should().Contain(Lumen);
+    }
+
+    [Fact]
+    public void Upstreams_upstream_is_near_transit()
+    {
+        // access -> UpstreamA -> Lumen: Lumen is 2nd-degree, still in window.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", UpstreamA), ("192.0.2.3", Lumen));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3" } }, map, AccessSet, NoDest, Tier1);
+        near.Should().BeEquivalentTo(new[] { UpstreamA, Lumen });
+    }
+
+    [Fact]
+    public void Third_degree_asn_is_not_near_transit()
+    {
+        // access -> UpstreamA -> UpstreamB -> Lumen: Lumen is 3rd-degree, dropped.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", UpstreamA),
+                      ("192.0.2.3", UpstreamB), ("192.0.2.4", Lumen));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4" } }, map, AccessSet, NoDest, Tier1);
+        near.Should().BeEquivalentTo(new[] { UpstreamA, UpstreamB });
+        near.Should().NotContain(Lumen);
+    }
+
+    [Fact]
+    public void Every_direct_upstream_of_a_multihomed_isp_is_captured()
+    {
+        // Different traces exit via different upstreams; the per-trace union keeps all.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Lumen),
+                      ("198.51.100.1", Access), ("198.51.100.2", UpstreamA));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[]
+            {
+                new[] { "192.0.2.1", "192.0.2.2" },
+                new[] { "198.51.100.1", "198.51.100.2" }
+            }, map, AccessSet, NoDest, Tier1);
+        near.Should().BeEquivalentTo(new[] { Lumen, UpstreamA });
+    }
+
+    [Fact]
+    public void Per_trace_window_does_not_let_one_trace_crowd_out_another_upstream()
+    {
+        // Regression: a short trace reaching UpstreamA at hop 1 plus a long trace
+        // reaching Lumen only at hop 4. A merged-pool "first two ASNs by hop number"
+        // filled both slots on the low hops and dropped Lumen; per-trace keeps both.
+        var map = Map(("198.51.100.1", UpstreamA),
+                      ("192.0.2.1", Access), ("192.0.2.2", Access),
+                      ("192.0.2.3", Access), ("192.0.2.4", Lumen));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[]
+            {
+                new[] { "198.51.100.1" },
+                new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4" }
+            }, map, AccessSet, NoDest, Tier1);
+        near.Should().Contain(Lumen);
+        near.Should().Contain(UpstreamA);
+    }
+
+    [Fact]
+    public void Destination_asn_does_not_consume_a_degree_slot()
+    {
+        // access -> UpstreamA -> Cloudflare(dest) -> UpstreamB: with dest skipped, the
+        // real 2nd-degree transit (UpstreamB) still fits in the window. Non-tier-1 hops
+        // so the tier-1 horizon stop doesn't interfere with what this test isolates.
+        var dest = new HashSet<int> { Cloudflare };
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", UpstreamA),
+                      ("192.0.2.3", Cloudflare), ("192.0.2.4", UpstreamB));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4" } }, map, AccessSet, dest, Tier1);
+        near.Should().BeEquivalentTo(new[] { UpstreamA, UpstreamB });
+    }
+
+    [Fact]
+    public void Unresolved_hops_are_skipped()
+    {
+        var map = Map(("192.0.2.1", Access), ("192.0.2.3", Lumen)); // .2 has no ASN (gap)
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3" } }, map, AccessSet, NoDest, Tier1);
+        near.Should().Contain(Lumen);
+    }
+
+    [Fact]
+    public void Access_only_path_yields_nothing()
+    {
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Access));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2" } }, map, AccessSet, NoDest, Tier1);
+        near.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void No_traces_yields_nothing()
+    {
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            Array.Empty<IReadOnlyList<string>>(), new Dictionary<string, int>(), AccessSet, NoDest, Tier1);
+        near.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Asn_reached_through_a_tier1_is_not_near_transit()
+    {
+        // access -> Arelion(tier-1) -> INDATEL: the endpoint sits beyond a tier-1, so it
+        // is not adjacent to the ISP and must not be near-transit (the AT&T-via-Arelion
+        // case). The tier-1 itself is the first upstream and stays.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Arelion), ("192.0.2.3", Indatel));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3" } }, map, AccessSet, NoDest, Tier1);
+        near.Should().Contain(Arelion);
+        near.Should().NotContain(Indatel);
+    }
+
+    [Fact]
+    public void Endpoint_one_hop_off_the_access_isp_is_near_transit()
+    {
+        // access -> INDATEL directly: no tier-1 in between, so it stays near-transit
+        // (the directly-adjacent case). Same endpoint ASN as above, opposite verdict.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Indatel));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2" } }, map, AccessSet, NoDest, Tier1);
+        near.Should().Contain(Indatel);
+    }
+
+    [Fact]
+    public void Walk_stops_at_the_first_tier1()
+    {
+        // access -> Lumen(tier-1) -> Cogent(tier-1): only the first tier-1 is near-transit;
+        // a second tier-1 reached through it is core peering, not our transit.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Lumen), ("192.0.2.3", Cogent));
+        var near = UpstreamTracerService.ComputeNearTransitAsns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3" } }, map, AccessSet, NoDest, Tier1);
+        near.Should().Contain(Lumen);
+        near.Should().NotContain(Cogent);
+    }
+}
+
+public class ComputeExcludedTier1AsnsTests
+{
+    private const int Access = 64500;
+    private const int Regional = 64510;
+    private const int Lumen = 3356;
+    private const int Cogent = 174;
+    private const int Gtt = 3257;
+    private const int Att = 7018;
+
+    private static IReadOnlySet<int> Tier1 => new HashSet<int> { Lumen, Cogent, Gtt, Att };
+    private static IReadOnlySet<int> AccessSet => new HashSet<int> { Access };
+
+    private static Dictionary<string, int> Map(params (string Ip, int Asn)[] e)
+        => e.ToDictionary(x => x.Ip, x => x.Asn, StringComparer.OrdinalIgnoreCase);
+
+    [Fact]
+    public void Tier1_above_non_tier1_is_kept()
+    {
+        // access(non-T1) -> Lumen(T1): grounded, not excluded.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Lumen));
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2" } }, map, Tier1, AccessSet);
+        excluded.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Tier1_directly_above_another_tier1_is_excluded()
+    {
+        // access -> Cogent(T1) -> Lumen(T1): Lumen is core peering, excluded. Cogent
+        // sits above access (non-T1) so it stays.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Cogent), ("192.0.2.3", Lumen));
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3" } }, map, Tier1, AccessSet);
+        excluded.Should().BeEquivalentTo(new[] { Lumen });
+    }
+
+    [Fact]
+    public void Kept_when_grounded_on_any_trace()
+    {
+        // One trace shows Lumen above Cogent; another shows Lumen directly above access.
+        // A single grounded sighting keeps it.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Cogent), ("192.0.2.3", Lumen),
+                      ("198.51.100.1", Access), ("198.51.100.2", Lumen));
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[]
+            {
+                new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3" },
+                new[] { "198.51.100.1", "198.51.100.2" }
+            }, map, Tier1, AccessSet);
+        excluded.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Excluded_only_when_tier1_downstream_on_every_trace()
+    {
+        // Lumen sits above a tier-1 (Cogent, then GTT) on both traces -> excluded.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Cogent), ("192.0.2.3", Lumen),
+                      ("198.51.100.1", Access), ("198.51.100.2", Gtt), ("198.51.100.3", Lumen));
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[]
+            {
+                new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3" },
+                new[] { "198.51.100.1", "198.51.100.2", "198.51.100.3" }
+            }, map, Tier1, AccessSet);
+        excluded.Should().BeEquivalentTo(new[] { Lumen });
+    }
+
+    [Fact]
+    public void Tier1_as_first_resolved_hop_is_grounded()
+    {
+        // Unresolved gateway hop then Lumen: downstream is us, so Lumen is grounded.
+        var map = Map(("192.0.2.2", Lumen)); // first hop has no ASN
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[] { new[] { "10.0.0.1", "192.0.2.2" } }, map, Tier1, AccessSet);
+        excluded.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Consecutive_same_asn_hops_are_collapsed()
+    {
+        // access -> Lumen -> Lumen -> Cogent: Cogent's true downstream is Lumen(T1),
+        // so Cogent is excluded; Lumen is grounded by access and kept.
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Lumen),
+                      ("192.0.2.3", Lumen), ("192.0.2.4", Cogent));
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4" } }, map, Tier1, AccessSet);
+        excluded.Should().BeEquivalentTo(new[] { Cogent });
+    }
+
+    [Fact]
+    public void Non_tier1_asns_are_never_excluded()
+    {
+        var map = Map(("192.0.2.1", Access), ("192.0.2.2", Regional));
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2" } }, map, Tier1, AccessSet);
+        excluded.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void No_traces_yields_nothing()
+    {
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            Array.Empty<IReadOnlyList<string>>(), new Dictionary<string, int>(), Tier1, AccessSet);
+        excluded.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void First_tier1_above_a_tier1_access_isp_is_kept()
+    {
+        // AT&T fiber customer: access ASN is itself tier-1 (AS7018), and Lumen sits
+        // directly above it. Lumen is AT&T's upstream/peer - the thing to monitor - not
+        // core peering, so the access ASN grounds it even though it's a tier-1.
+        var access = new HashSet<int> { Att };
+        var map = Map(("192.0.2.1", Att), ("192.0.2.2", Lumen));
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2" } }, map, Tier1, access);
+        excluded.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Second_tier1_above_a_tier1_access_isp_is_excluded()
+    {
+        // access=AT&T(T1) -> Lumen(T1) -> Cogent(T1): Lumen is grounded by the access
+        // ISP and kept; Cogent sits above a non-access tier-1 (Lumen) and is excluded.
+        var access = new HashSet<int> { Att };
+        var map = Map(("192.0.2.1", Att), ("192.0.2.2", Lumen), ("192.0.2.3", Cogent));
+        var excluded = UpstreamTracerService.ComputeExcludedTier1Asns(
+            new[] { new[] { "192.0.2.1", "192.0.2.2", "192.0.2.3" } }, map, Tier1, access);
+        excluded.Should().BeEquivalentTo(new[] { Cogent });
+    }
+
+    [Fact]
+    public void Tier1Asns_constant_includes_major_carriers_and_live_siblings()
+    {
+        // Core tier-1s, plus the corrected AS1239 (now Cogent) and active AT&T/Lumen
+        // sibling ASNs that show up in US traces.
+        WellKnownAsns.Tier1.Should().Contain(
+            new[] { 3356, 174, 7018, 2914, 1299, 6461, 1239, 7132, 3561 });
+    }
+
+    [Fact]
+    public void Tier1Asns_excludes_hurricane_electric()
+    {
+        // AS6939 is not settlement-free on IPv4, so it carries no reliable core-peering
+        // signal and stays out of the adjacency set.
+        WellKnownAsns.Tier1.Should().NotContain(6939);
+    }
+
+    [Fact]
+    public void NonTransitInfrastructure_includes_woodynet_pch()
+    {
+        // WoodyNet / PCH (AS42, AS715) runs IXP route servers and anycast DNS, not
+        // commercial transit, so both stay in the non-transit exclusion set.
+        WellKnownAsns.NonTransitInfrastructure.Should().Contain(new[] { 42, 715 });
+    }
+}
+
+public class DetermineAccessAsnTests
+{
+    // Real ASNs because the logic keys on destination sets built from real endpoints;
+    // all hop IPs are RFC 5737 documentation addresses.
+    private const int Bell = 577;
+    private const int Cloudflare = 13335;
+    private const int Google = 15169;
+
+    private static IReadOnlySet<int> Dest => new HashSet<int> { Cloudflare, Google };
+    private static IReadOnlySet<int> NoDest => new HashSet<int>();
+
+    private static Dictionary<string, int> Map(params (string Ip, int Asn)[] e)
+        => e.ToDictionary(x => x.Ip, x => x.Asn, StringComparer.OrdinalIgnoreCase);
+
+    // The #984 shape: Bell's first mile is RFC1918 + unannounced public space (absent
+    // from the ASN map), so on the Cloudflare trace the first attributable hop is
+    // Cloudflare's own edge. Bell only appears on the Google trace, one hop deeper.
+    private static readonly IReadOnlyList<string>[] BellTraces =
+    {
+        new[] { "10.0.0.2", "203.0.113.10", "203.0.113.11", "198.51.100.7", "198.51.100.8" }, // -> 1.1.1.1: CF edge at depth 4
+        new[] { "10.0.0.2", "203.0.113.10", "203.0.113.12", "192.0.2.60", "198.51.100.9" },   // -> 8.8.8.8: Bell at depth 4
+    };
+
+    private static readonly Dictionary<string, int> BellMap = Map(
+        ("198.51.100.7", Cloudflare), ("198.51.100.8", Cloudflare),
+        ("192.0.2.60", Bell), ("198.51.100.9", Google));
+
+    [Fact]
+    public void Destination_edge_is_not_crowned_access_isp()
+    {
+        // Even with no WAN IP signal (CGNAT), voting skips destination ASNs: the
+        // Cloudflare trace contributes no vote, the Google trace votes Bell.
+        UpstreamTracerService.DetermineAccessAsn(BellTraces, BellMap, wanIpAsn: null, Dest)
+            .Should().Be(Bell);
+    }
+
+    [Fact]
+    public void Wan_ip_asn_wins_when_corroborated_by_a_hop()
+    {
+        UpstreamTracerService.DetermineAccessAsn(BellTraces, BellMap, wanIpAsn: Bell, Dest)
+            .Should().Be(Bell);
+    }
+
+    [Fact]
+    public void Wan_ip_asn_kept_when_no_hop_is_attributable_at_all()
+    {
+        // Fully silent/unannounced first mile and no announced ISP hop responded:
+        // keep the WAN allocation's ASN for labeling and curated fallbacks.
+        var traces = new[] { new[] { "10.0.0.2", "203.0.113.10" } };
+        UpstreamTracerService.DetermineAccessAsn(traces, new Dictionary<string, int>(), Bell, Dest)
+            .Should().Be(Bell);
+    }
+
+    [Fact]
+    public void Uncorroborated_wan_asn_defers_to_the_voted_winner()
+    {
+        // WAN allocation resolves to a sibling ASN that never appears on any hop;
+        // the ASN actually fronting the traces wins.
+        UpstreamTracerService.DetermineAccessAsn(BellTraces, BellMap, wanIpAsn: 64499, Dest)
+            .Should().Be(Bell);
+    }
+
+    [Fact]
+    public void Wan_asn_that_is_also_a_destination_can_win()
+    {
+        // An access ISP that is one of our probed orgs is legitimate when the WAN
+        // IP itself resolves to it - the destination skip only guards voting.
+        var traces = new IReadOnlyList<string>[] { new[] { "198.51.100.9" } };
+        var map = Map(("198.51.100.9", Google));
+        UpstreamTracerService.DetermineAccessAsn(traces, map, wanIpAsn: Google, Dest)
+            .Should().Be(Google);
+    }
+
+    [Fact]
+    public void Majority_vote_beats_a_single_shallower_sighting()
+    {
+        var traces = new IReadOnlyList<string>[]
+        {
+            new[] { "192.0.2.1" },                            // odd ASN out at depth 1
+            new[] { "203.0.113.1", "203.0.113.2", "192.0.2.10" },
+            new[] { "203.0.113.1", "203.0.113.3", "192.0.2.11" },
+            new[] { "203.0.113.1", "203.0.113.4", "192.0.2.12" },
+        };
+        var map = Map(("192.0.2.1", 64501),
+            ("192.0.2.10", 64502), ("192.0.2.11", 64502), ("192.0.2.12", 64502));
+        UpstreamTracerService.DetermineAccessAsn(traces, map, null, NoDest)
+            .Should().Be(64502);
+    }
+
+    [Fact]
+    public void Vote_tie_breaks_toward_the_shallowest_hop()
+    {
+        var traces = new IReadOnlyList<string>[]
+        {
+            new[] { "192.0.2.1" },                  // ASN 64510 at depth 1
+            new[] { "203.0.113.1", "192.0.2.2" },   // ASN 64505 at depth 2
+        };
+        var map = Map(("192.0.2.1", 64510), ("192.0.2.2", 64505));
+        UpstreamTracerService.DetermineAccessAsn(traces, map, null, NoDest)
+            .Should().Be(64510);
+    }
+
+    [Fact]
+    public void Simple_announced_first_hop_still_wins()
+    {
+        var traces = new IReadOnlyList<string>[] { new[] { "192.0.2.1", "198.51.100.7" } };
+        var map = Map(("192.0.2.1", 64500), ("198.51.100.7", Cloudflare));
+        UpstreamTracerService.DetermineAccessAsn(traces, map, null, Dest)
+            .Should().Be(64500);
+    }
+
+    [Fact]
+    public void No_data_yields_null()
+    {
+        UpstreamTracerService.DetermineAccessAsn(
+                Array.Empty<IReadOnlyList<string>>(), new Dictionary<string, int>(), null, NoDest)
+            .Should().BeNull();
+    }
+}
+
+public class CollectUnannouncedAccessAddressesTests
+{
+    private const int Bell = 577;
+    private const int Cloudflare = 13335;
+
+    private static Dictionary<string, int> Map(params (string Ip, int Asn)[] e)
+        => e.ToDictionary(x => x.Ip, x => x.Asn, StringComparer.OrdinalIgnoreCase);
+
+    [Fact]
+    public void Unannounced_public_hops_before_the_access_border_are_attributed()
+    {
+        // The #984 shape: RFC1918, then unannounced public space, then the announced
+        // access-ASN border. Everything below the border is kept, private included.
+        var traces = new IReadOnlyList<string>[]
+        {
+            new[] { "10.0.0.2", "203.0.113.10", "203.0.113.11", "192.0.2.60" }
+        };
+        var map = Map(("192.0.2.60", Bell));
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell)
+            .Should().Equal("10.0.0.2", "203.0.113.10", "203.0.113.11");
+    }
+
+    [Fact]
+    public void Cgnat_prefix_hops_are_attributed()
+    {
+        var traces = new IReadOnlyList<string>[] { new[] { "100.64.0.5", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell)
+            .Should().Equal("100.64.0.5");
+    }
+
+    [Fact]
+    public void Rfc1918_hops_are_attributed()
+    {
+        // An ISP numbering its access network out of private space leaves no other trace of its
+        // first mile, so every private hop below the ISP's border is a candidate.
+        var traces = new IReadOnlyList<string>[] { new[] { "10.0.0.2", "172.16.0.2", "192.168.1.2", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell)
+            .Should().Equal("10.0.0.2", "172.16.0.2", "192.168.1.2");
+    }
+
+    [Fact]
+    public void Our_own_gateway_is_never_attributed()
+    {
+        var traces = new IReadOnlyList<string>[] { new[] { "192.168.1.1", "192.168.100.1", "10.99.2.5", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+        var gateways = new HashSet<string>(new[] { "192.168.1.1" }, StringComparer.OrdinalIgnoreCase);
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell, gateways)
+            .Should().Equal("192.168.100.1", "10.99.2.5");
+    }
+
+    [Fact]
+    public void A_private_hop_answering_from_our_own_side_is_not_attributed()
+    {
+        // 192.168.100.1 at 0.3 ms is a bridged CPE on our side of the WAN; the CMTS at 11 ms is a
+        // WAN crossing away. Distance separates them where position cannot.
+        var traces = new IReadOnlyList<string>[] { new[] { "192.168.100.1", "10.99.2.5", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+        var rtt = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["192.168.100.1"] = 0.3,
+            ["10.99.2.5"] = 11.087,
+        };
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell, null, rtt)
+            .Should().Equal("10.99.2.5");
+    }
+
+    [Fact]
+    public void A_private_hop_with_no_timing_is_still_attributed()
+    {
+        var traces = new IReadOnlyList<string>[] { new[] { "10.99.2.5", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(
+                traces, map, Bell, null, new Dictionary<string, double>())
+            .Should().Equal("10.99.2.5");
+    }
+
+    [Fact]
+    public void A_close_public_hop_is_still_attributed()
+    {
+        // The distance test is for private space only - carrier space is carrier space.
+        var traces = new IReadOnlyList<string>[] { new[] { "198.51.100.9", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+        var rtt = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase) { ["198.51.100.9"] = 0.4 };
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell, null, rtt)
+            .Should().Equal("198.51.100.9");
+    }
+
+    [Fact]
+    public void The_first_responding_hop_is_attributed_when_the_gateway_is_the_vantage()
+    {
+        // Probing from the gateway itself: there is no gateway hop to skip, and the first responder
+        // is already ISP-side.
+        var traces = new IReadOnlyList<string>[] { new[] { "10.99.2.5", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell)
+            .Should().Equal("10.99.2.5");
+    }
+
+    [Fact]
+    public void A_cgnat_first_hop_past_our_gateway_is_still_attributed()
+    {
+        // The hold-back is for RFC1918 only. On a CGNAT provider the first hop past the gateway is
+        // the carrier's own first-mile device, and it is usually the only one that answers at all.
+        var traces = new IReadOnlyList<string>[] { new[] { "192.168.1.1", "100.64.0.1", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+        var gateways = new HashSet<string>(new[] { "192.168.1.1" }, StringComparer.OrdinalIgnoreCase);
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell, gateways)
+            .Should().Equal("100.64.0.1");
+    }
+
+    [Fact]
+    public void A_public_first_hop_past_our_gateway_is_still_attributed()
+    {
+        var traces = new IReadOnlyList<string>[] { new[] { "192.168.1.1", "198.51.100.9", "192.0.2.60" } };
+        var map = Map(("192.0.2.60", Bell));
+        var gateways = new HashSet<string>(new[] { "192.168.1.1" }, StringComparer.OrdinalIgnoreCase);
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell, gateways)
+            .Should().Equal("198.51.100.9");
+    }
+
+    [Fact]
+    public void Trace_whose_first_attributed_hop_is_not_the_access_asn_contributes_nothing()
+    {
+        // A trace that only ever surfaces the destination's edge can't prove its
+        // unattributed prefix sits below the access border.
+        var traces = new IReadOnlyList<string>[]
+        {
+            new[] { "203.0.113.10", "198.51.100.7" }
+        };
+        var map = Map(("198.51.100.7", Cloudflare));
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell)
+            .Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Dedupes_across_traces_preserving_first_seen_order()
+    {
+        var traces = new IReadOnlyList<string>[]
+        {
+            new[] { "203.0.113.10", "192.0.2.60" },
+            new[] { "203.0.113.10", "203.0.113.12", "192.0.2.61" },
+        };
+        var map = Map(("192.0.2.60", Bell), ("192.0.2.61", Bell));
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell)
+            .Should().Equal("203.0.113.10", "203.0.113.12");
+    }
+
+    [Fact]
+    public void Hops_after_the_access_border_are_not_attributed()
+    {
+        // Only the pre-border prefix counts: unattributed hops BETWEEN access and
+        // transit (e.g. an IXP LAN) must not be pulled into the access cloud.
+        var traces = new IReadOnlyList<string>[]
+        {
+            new[] { "192.0.2.60", "203.0.113.50", "198.51.100.7" }
+        };
+        var map = Map(("192.0.2.60", Bell), ("198.51.100.7", Cloudflare));
+
+        UpstreamTracerService.CollectUnannouncedAccessAddresses(traces, map, Bell)
+            .Should().BeEmpty();
+    }
+}
+
+public class AccessIspFallbackTests
+{
+    [Fact]
+    public void AccessIspFallbackHosts_AS3320_has_the_pingable_telekom_pops()
+    {
+        UpstreamTracerService.AccessIspFallbackHosts.Should().ContainKey(3320);
+        UpstreamTracerService.AccessIspFallbackHosts[3320].Should().BeEquivalentTo(new[]
+        {
+            "ffm.wsqm.telekom-dienste.de",
+            "ham.wsqm.telekom-dienste.de",
+            "mue.wsqm.telekom-dienste.de",
+            "ber.wsqm.telekom-dienste.de",
+        });
+    }
+
+    [Fact]
+    public void AccessIspFallbackHosts_AS3320_omits_non_pingable_dusseldorf()
+    {
+        // dssd-tc.wsqm.telekom-dienste.de does not answer ICMP, so it must stay out of the map.
+        UpstreamTracerService.AccessIspFallbackHosts[3320]
+            .Should().NotContain(h => h.StartsWith("dssd"));
+    }
+
+    [Fact]
+    public void AccessIspFallbackHosts_AS701_has_the_verified_verizon_pops()
+    {
+        // Spelled out rather than pattern-matched: a mistyped host fails silently at runtime
+        // (NXDOMAIN, skipped with a debug log), so the list itself is what needs pinning.
+        UpstreamTracerService.AccessIspFallbackHosts.Should().ContainKey(701);
+        UpstreamTracerService.AccessIspFallbackHosts[701].Should().BeEquivalentTo(new[]
+        {
+            "dllstx97-040205c-inet.vzbi.com",
+            "bstpmall-100207c-inet.vzbi.com",
+            "rvdlilbd-0011403f-inet.vzbi.com",
+            "dnvrco26-091505f-inet.vzbi.com",
+            "sccsnj75-010206e-inet.vzbi.com",
+            "miauflws-040102d-inet.vzbi.com",
+            "sttlwawb-000t08c-inet.vzbi.com",
+            "lsancakv-075715b-inet.vzbi.com",
+        });
+    }
+
+    [Fact]
+    public void AccessIspFallbackHosts_cellco_asns_share_the_AS701_pops()
+    {
+        // The PoPs all live in AS701; Cellco keys to them because its own first mile answers nothing.
+        var pops = UpstreamTracerService.AccessIspFallbackHosts[701];
+        UpstreamTracerService.AccessIspFallbackHosts[6167].Should().BeEquivalentTo(pops);
+        UpstreamTracerService.AccessIspFallbackHosts[22394].Should().BeEquivalentTo(pops);
+    }
+
+    [Fact]
+    public void SelectLowestRtt_picks_the_lowest_rtt_candidate()
+    {
+        var probes = new[]
+        {
+            new UpstreamTracerService.AccessFallbackProbe("ffm.wsqm.telekom-dienste.de", "203.0.113.10", 24.5),
+            new UpstreamTracerService.AccessFallbackProbe("ham.wsqm.telekom-dienste.de", "203.0.113.20", 11.2),
+            new UpstreamTracerService.AccessFallbackProbe("mue.wsqm.telekom-dienste.de", "203.0.113.30", 31.0),
+        };
+
+        var winner = UpstreamTracerService.SelectLowestRtt(probes);
+
+        winner.Should().NotBeNull();
+        winner!.Host.Should().Be("ham.wsqm.telekom-dienste.de");
+        winner.Rtt.Should().Be(11.2);
+    }
+
+    [Fact]
+    public void SelectLowestRtt_returns_the_single_candidate_when_only_one_reachable()
+    {
+        var probes = new[]
+        {
+            new UpstreamTracerService.AccessFallbackProbe("mue.wsqm.telekom-dienste.de", "203.0.113.30", 31.0),
+        };
+
+        UpstreamTracerService.SelectLowestRtt(probes)!.Host.Should().Be("mue.wsqm.telekom-dienste.de");
+    }
+
+    [Fact]
+    public void SelectLowestRtt_returns_null_when_none_reachable()
+    {
+        UpstreamTracerService.SelectLowestRtt(Array.Empty<UpstreamTracerService.AccessFallbackProbe>())
+            .Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(17.3, 27.5, true)]    // IX peering-LAN hop pinged through another carrier: +10 ms
+    [InlineData(17.3, 21.0, false)]   // +3.7 ms, under the 5 ms floor
+    [InlineData(2.5, 8.0, true)]      // metro hop, +5.5 ms clears the floor
+    [InlineData(2.5, 7.0, false)]     // +4.5 ms at metro RTT is still under the floor
+    [InlineData(80.0, 98.0, false)]   // long-haul: +18 ms is under 25%
+    [InlineData(80.0, 102.0, true)]   // long-haul: +22 ms clears 25%
+    [InlineData(17.3, 15.0, false)]   // a faster ping is never off path
+    public void IsOffPath_flags_ping_rtt_well_above_trace_rtt(double traceRtt, double pingRtt, bool expected)
+    {
+        UpstreamTracerService.IsOffPath(traceRtt, pingRtt).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(49.0, 16.0, 27.5, true)]    // slow time-exceeded reply; the later hop at 16 ms caps it
+    [InlineData(18.6, 16.0, 27.9, true)]    // own trace RTT already catches it
+    [InlineData(53.3, 20.0, 53.1, false)]   // own reply not slow vs its ping: no cap, genuine long-return hop
+    [InlineData(49.0, 25.0, 27.5, false)]   // slow reply, but the later hop does not undercut the ping enough
+    [InlineData(49.0, null, 27.5, false)]   // slow reply with no later responding hop
+    public void IsOffPath_caps_a_slow_trace_reply_with_the_later_hop_rtt(double traceRtt, double? laterRtt, double pingRtt, bool expected)
+    {
+        UpstreamTracerService.IsOffPath(traceRtt, laterRtt, pingRtt).Should().Be(expected);
+    }
+
+    [Fact]
+    public void LaterHopRtts_takes_the_lowest_rtt_after_each_hop_and_skips_silent_hops()
+    {
+        var hops = new[]
+        {
+            new TraceHop { HopNumber = 1, Address = "192.0.2.1", RttMinMs = 0.3, Responses = 2 },
+            new TraceHop { HopNumber = 2, Address = "198.51.100.1", RttMinMs = 11.0, Responses = 2 },
+            new TraceHop { HopNumber = 3, Address = null, Responses = 0 },
+            new TraceHop { HopNumber = 4, Address = "203.0.113.224", RttMinMs = 49.0, Responses = 2 },
+            new TraceHop { HopNumber = 5, Address = "203.0.113.9", RttMinMs = 16.0, Responses = 2 },
+        };
+
+        var later = UpstreamTracerService.LaterHopRtts(hops).ToDictionary(x => x.Address, x => x.LaterRttMs);
+
+        later.Should().BeEquivalentTo(new Dictionary<string, double>
+        {
+            ["192.0.2.1"] = 11.0,
+            ["198.51.100.1"] = 16.0,
+            ["203.0.113.224"] = 16.0,
+        });
+    }
+}
+
+public class CarveOutBlockedByTier1AccessTests
+{
+    private const int Lumen = 3356;
+    private const int Att = 7018;
+    private const int Indatel = 30517;
+    private static IReadOnlySet<int> Tier1 => new HashSet<int> { Lumen, Att, 1299 };
+
+    [Fact]
+    public void Regional_carve_out_is_blocked_above_a_tier1_access_isp()
+    {
+        // INDATEL cannot be AT&T's upstream; it is on the path only because we probed it.
+        UpstreamTracerService.CarveOutBlockedByTier1Access(Indatel, accessIsTier1: true, Tier1)
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void Tier1_carve_out_survives_a_tier1_access_isp()
+    {
+        // Lumen above AT&T is a real relationship, so the Lumen probe stays eligible.
+        UpstreamTracerService.CarveOutBlockedByTier1Access(Lumen, accessIsTier1: true, Tier1)
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void Regional_carve_out_survives_a_normal_access_isp()
+    {
+        // The reason the carve-out exists: on an INDATEL member ISP, access -> INDATEL is
+        // genuinely its transit and must still be discovered.
+        UpstreamTracerService.CarveOutBlockedByTier1Access(Indatel, accessIsTier1: false, Tier1)
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void Nothing_is_blocked_when_the_access_isp_is_not_tier1()
+    {
+        UpstreamTracerService.CarveOutBlockedByTier1Access(Lumen, accessIsTier1: false, Tier1)
+            .Should().BeFalse();
+        UpstreamTracerService.CarveOutBlockedByTier1Access(64500, accessIsTier1: false, Tier1)
+            .Should().BeFalse();
+    }
+}
+
+public class ResolveVantageFromLinkTests
+{
+    private static readonly string[] PerWanKeys =
+        { "server", "agent:67:wan1", "agent:67:wan2", "agent:81:wan1" };
+
+    [Fact]
+    public void Agent_only_link_selects_that_agents_first_vantage()
+    {
+        // WanContextsCard and the Latency Targets card can only name an agent: a WAN context
+        // records no vantage id. Exact-match alone dropped these on every multi-WAN site.
+        NetworkOptimizer.Web.Components.Pages.MonitoringTools
+            .ResolveVantageFromLink("agent:67", PerWanKeys)
+            .Should().Be("agent:67:wan1");
+    }
+
+    [Fact]
+    public void Exact_key_wins_over_the_agent_prefix()
+    {
+        NetworkOptimizer.Web.Components.Pages.MonitoringTools
+            .ResolveVantageFromLink("agent:67:wan2", PerWanKeys)
+            .Should().Be("agent:67:wan2");
+    }
+
+    [Fact]
+    public void Server_link_still_resolves()
+    {
+        NetworkOptimizer.Web.Components.Pages.MonitoringTools
+            .ResolveVantageFromLink("server", PerWanKeys)
+            .Should().Be("server");
+    }
+
+    [Fact]
+    public void Agent_with_no_vantages_matches_its_bare_key()
+    {
+        NetworkOptimizer.Web.Components.Pages.MonitoringTools
+            .ResolveVantageFromLink("agent:12", new[] { "server", "agent:12" })
+            .Should().Be("agent:12");
+    }
+
+    [Fact]
+    public void Unknown_or_missing_link_leaves_the_remembered_choice_alone()
+    {
+        NetworkOptimizer.Web.Components.Pages.MonitoringTools
+            .ResolveVantageFromLink("agent:99", PerWanKeys).Should().BeNull();
+        NetworkOptimizer.Web.Components.Pages.MonitoringTools
+            .ResolveVantageFromLink(null, PerWanKeys).Should().BeNull();
+        NetworkOptimizer.Web.Components.Pages.MonitoringTools
+            .ResolveVantageFromLink("", PerWanKeys).Should().BeNull();
+    }
+
+    [Fact]
+    public void Agent_prefix_does_not_bleed_into_a_longer_agent_id()
+    {
+        // agent:6 must not adopt agent:67's vantage.
+        NetworkOptimizer.Web.Components.Pages.MonitoringTools
+            .ResolveVantageFromLink("agent:6", PerWanKeys)
+            .Should().BeNull();
+    }
+}

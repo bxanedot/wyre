@@ -1,0 +1,4763 @@
+// 3D LAN Flow Map (spec 5.7)
+//
+// Three.js scene that paints the LAN topology with rate-proportional
+// bidirectional particle streams. Direction is pre-resolved on the server
+// (spec 5.7.1): every link's DownstreamBps is gateway -> device (blue
+// --speed-download-color), UpstreamBps is device -> gateway (green
+// --speed-upload-color). The JS layer never re-derives direction from the
+// underlying SNMP/UniFi data - it just paints what the server pre-resolves.
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { buildBuildings } from './lan-flow-buildings.js?v=1';
+// KEEP IN SYNC: lan-flow-map-2d.js imports the same module. Both must use the same ?v= or they get separate instances.
+import * as flowData from './lan-flow-data.js?v=16';
+
+const COLORS = {
+    background: 0x202023,
+    fog: 0x202023,
+    gateway: 0xfacc15,
+    switchNode: 0x9aa6b2,
+    ap: 0x3385d6,
+    wiredClient: 0xc9d2e0,
+    wifiClient: 0xe2e8f0,
+    cloud: 0x4d556b,
+    accent: 0x2ba89a,
+    // Virtual hub: dim neutral so it reads as "logical, not a real device"
+    // and visually clusters its member leaves without competing for attention.
+    virtualHub: 0x6b7785,
+
+    // Direction palette (locked, spec 5.7.1)
+    downstream: 0x3385d6,   // var(--speed-download-color)
+    upstream: 0x24bc70,     // var(--speed-upload-color)
+
+    // Pipe backdrop (health shift)
+    pipeCool: 0x1f4068,
+    pipeWarm: 0xe79613,
+    pipeHot: 0xee6368,
+
+    // WiFi band palette - matches the WiFi Optimizer + CLAUDE.md spec. Used as the
+    // base "cool" color for wifi-client + mesh-backhaul links, so the pipe color
+    // identifies the band at a glance and only shifts toward amber/red when the
+    // link approaches capacity.
+    band24: 0xfbbf24, // 2.4 GHz amber
+    band5:  0x3b82f6, // 5 GHz blue
+    band6:  0xa855f7, // 6 GHz purple
+};
+
+function bandBaseColor(band) {
+    if (band === '2.4') return COLORS.band24;
+    if (band === '5')   return COLORS.band5;
+    if (band === '6')   return COLORS.band6;
+    return COLORS.pipeCool;
+}
+
+// Fade-in (ms) applied to a client re-attached to a different AP during roam playback.
+const ROAM_FADE_MS = 350;
+// How long the arrival focus glow shows once its node exists (mount option focusClient), and
+// how long to wait for the node before giving up.
+const FOCUS_MS = 5000;
+const FOCUS_GIVE_UP_MS = 30000;
+
+// Deterministic PRNG (mulberry32) seeded off a node id. Lets a roamed client scatter
+// near its AP using the same distribution as a freshly-added client, while staying
+// stable across scrub crossings (no re-jitter when re-pointed to the same AP).
+function _roamSeed(id) {
+    let h = 1779033703 ^ id.length;
+    for (let i = 0; i < id.length; i += 1) {
+        h = Math.imul(h ^ id.charCodeAt(i), 3432918353);
+        h = (h << 13) | (h >>> 19);
+    }
+    let a = h >>> 0;
+    return function () {
+        a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+const NODE_RADIUS = {
+    gateway: 1.6,
+    switch: 1.2,
+    ap: 1.0,
+    wiredClient: 0.45,
+    wifiClient: 0.45,
+    cloud: 2.4,
+    virtualHub: 0.55,
+};
+
+// NODE_RADIUS was tuned against a single-home property, whose meters->scene
+// factor works out to about REF_WORLD_SCALE. Larger properties squeeze more
+// meters into the same ~30-unit scene, so fixed scene-unit devices end up
+// towering over the shrunken buildings. Devices therefore keep a fixed
+// physical size: their radii shrink with the same meters->scene factor the
+// buildings use, capped at 1.0 (small sites render exactly as before) and
+// floored so devices stay readable on very large campuses. WAN globes float
+// outside the structures, so they only breathe a little around design size.
+const REF_WORLD_SCALE = 2.25;
+const DEVICE_SCALE_MIN = 0.35;
+const CLOUD_SCALE_MIN = 0.75;
+const CLOUD_SCALE_MAX = 1.1;
+// Pipes and particle dots track the property shrink too, but on a tighter
+// clamp: they are thin already and carry the flow readability, so they only
+// come down far enough to not read as oversized against small buildings.
+const LINK_SCALE_MIN = 0.6;
+
+// Camera-distance compensation for device meshes (labels have their own DOM
+// equivalent and are untouched): neutral at the fly-in viewing distance,
+// growing toward a ceiling as you zoom out (visibility at property level)
+// and shrinking toward a floor as you zoom in (no room-filling routers).
+const DEVICE_ZOOM_REF_DIST = 60;
+const DEVICE_ZOOM_MIN = 0.6;
+const DEVICE_ZOOM_MAX = 1.6;
+// Pipes/particles get the same treatment on a tighter band: a decent floor so
+// they never go skinny, and a capped ceiling zoomed out - just fat enough to
+// still see what's flowing without turning into hoses.
+const LINK_ZOOM_MIN = 0.5;
+const LINK_ZOOM_MAX = 1.35;
+// Links ramp against a shorter reference than devices: at the mid-zoom range
+// (buildings-and-the-space-between view) pipes were sagging too thin between
+// their floor and ceiling, so they reach full girth earlier while zooming
+// out. The floor and ceiling clamps themselves are unchanged.
+const LINK_ZOOM_REF_DIST = 45;
+// The zoom-out ceiling is relative to property size: property factor x zoom
+// boost never exceeds this multiple of an object's designed size. Single-home
+// maps (factor 1.0) top out at design size, while large campuses keep their
+// full zoom boost since their objects start shrunken.
+const ZOOM_EFFECTIVE_CEIL = 1.0;
+// Sprite labels are world-sized, so perspective balloons them as the camera
+// closes in (the DOM labels already clamp their screen-space scale). Shrink
+// them proportionally inside the reference distance - apparent size then
+// stays constant once you're closer than REF, with a floor so they never
+// collapse entirely. Beyond REF they behave exactly as today.
+const LABEL_ZOOM_REF_DIST = 60;
+const LABEL_ZOOM_MIN = 0.25;
+// Distant device labels fade out entirely - past these camera distances
+// they'd be illegible smudges, so ramp opacity down and hide.
+const LABEL_FADE_START_DIST = 82;
+const LABEL_FADE_END_DIST = 128;
+// Network device (DOM) labels fade sooner than the client sprites above -
+// they're denser (name + rate badge) and crowd the view faster.
+const NET_LABEL_FADE_START_DIST = 66;
+const NET_LABEL_FADE_END_DIST = 102;
+// Throughput pills fade earlier still - when pulling back, device identity
+// should outlive the rate readouts.
+const LINK_LABEL_FADE_START_DIST = 62;
+const LINK_LABEL_FADE_END_DIST = 97;
+// WAN throughput labels outlast the LAN pills - there are only one or two of
+// them and WAN utilisation stays interesting from farther back.
+const WAN_LINK_LABEL_FADE_START_DIST = 78;
+const WAN_LINK_LABEL_FADE_END_DIST = 121;
+
+const LINK_KIND = {
+    Uplink: 0,
+    WiredClient: 1,
+    WifiClient: 2,
+    Wan: 3,
+    Transit: 4,
+    MeshBackhaul: 5,
+};
+
+const NODE_KIND = {
+    Gateway: 0,
+    Switch: 1,
+    AccessPoint: 2,
+    WiredClient: 3,
+    WifiClient: 4,
+    Cloud: 5,
+    // Synthetic grouping node when several wired clients share one physical
+    // switch port (server with VLAN sub-interfaces, etc.). Server inserts it
+    // and reparents the members so the leaves don't fan out.
+    VirtualHub: 6,
+};
+
+// Threshold below which link rate labels stay hidden. Keeps idle topology clean;
+// only links carrying meaningful traffic get a label. 1 Mbps either direction
+// is the cutoff - low enough to surface most user-noticeable flows, high enough
+// that monitoring's own ping/loss probes don't render labels everywhere.
+const LINK_LABEL_THRESHOLD_BPS = 1_000_000;
+const WAN_LABEL_THRESHOLD_BPS = 500_000;
+
+// Camera-distance cutoff (scene units) above which leaf link labels
+// (WiredClient / WifiClient) stop rendering. Keeps the wide-angle view
+// uncluttered - leaf details only surface when the user zooms in. Trunks and
+// WAN labels are always visible (above the rate threshold).
+const LEAF_LABEL_MAX_DIST = 35;
+
+const PLACEMENT_SOURCE = {
+    Layout: 0,
+    Anchor: 1,
+    Interpolated: 2,
+};
+
+const CLOUD_TIER = {
+    // Per spec 5.7: solid = real router target, PathProxy = dashed "via path",
+    // Unresolved = discovery still pending (no live stats yet).
+    Solid: 0,
+    PathProxy: 1,
+    Unresolved: 2,
+};
+
+// How close to "now" an EXPLICIT seek must land before it counts as live rather than
+// historic. Deliberately far tighter than the scrubber's own minute of slack: a click
+// names an instant, so only one at the live edge should keep playing.
+const ExplicitSeekLiveToleranceMs = 1000;
+
+export class LanFlowMap {
+    constructor(canvasEl, options = {}) {
+        this.canvas = canvasEl;
+        this.stage = canvasEl.parentElement || canvasEl;
+        this.apiBase = options.apiBase ?? '/api/monitoring/lan-flow-map';
+        this.pollIntervalMs = options.pollIntervalMs ?? 1000;
+        this.onError = options.onError ?? ((err) => console.error('[LanFlowMap]', err));
+        this._storagePrefix = options.storagePrefix ?? 'lanFlowMap';
+        // The embedded dashboard Live View panel opts out of the Signal Map
+        // discovery hint to keep its compact chrome clean (it also hides the
+        // scrubber/status). Full Monitoring page leaves it on.
+        this._signalHintEnabled = options.signalHint ?? true;
+        // Deep-link entry point (e.g. from a speed-test result): an absolute epoch-ms
+        // instant to open in historic playback, paused. Applied once at the end of start().
+        this._initialAtMs = Number.isFinite(options.initialAt) ? options.initialAt : null;
+        // A node to glow for a moment on arrival (Client Performance's Live View link, or a
+        // speed-test result's). Held as the MAC, not a node id: the target is a client or a
+        // UniFi device, and which prefix it carries is only known once the snapshot is in.
+        this._focusMac = options.focusClient
+            ? String(options.focusClient).toLowerCase().replaceAll('-', ':') : null;
+        this._focusClientId = null;
+        // The clock starts when the node first exists, not here: the scene builds after the fetch.
+        this._focusUntil = 0;
+        this._focusGiveUp = this._focusMac ? performance.now() + FOCUS_GIVE_UP_MS : 0;
+        this._focusGlowing = null; // the group's original emissive/halo, restored when the glow ends
+
+        this._snapshot = null;
+        this._deviceScale = 1;          // property-size factor for device radii (set in _layoutNodes)
+        this._cloudScale = 1;           // gentler property-size factor for WAN globes
+        this._linkScale = 1;            // gentler property-size factor for pipes + particle dots
+        this._nodesByLink = new Map();
+        this._nodeMeshes = new Map();   // nodeId -> THREE.Group
+        this._linkMeshes = new Map();   // linkId -> { pipe, particlesDown, particlesUp }
+        this._cloudMeshes = new Map();  // cloudId -> THREE.Group
+        this._labelSprites = new Map(); // nodeId -> THREE.Sprite
+        this._speedTestOverlay = null;  // currently-rendered overlay tubes
+
+        // Overlay + filter state. Defaults match spec 5.7.1 ("default 'all on' so a
+        // first-time user sees the full picture, but power users can declutter").
+        // Restore persisted overlay toggles, falling back to defaults.
+        const defaultOverlays = {
+            wifiClients: true,
+            wiredClients: true,
+            clouds: true,
+            speedTests: false,
+            buildings: true,
+        };
+        try {
+            const saved = JSON.parse(localStorage.getItem(this._storagePrefix + 'Overlays'));
+            this._overlays = saved ? { ...defaultOverlays, ...saved } : { ...defaultOverlays };
+        } catch {
+            this._overlays = { ...defaultOverlays };
+        }
+        this._filter = {
+            text: '',
+            bands: { '2.4': true, '5': true, '6': true },
+        };
+        this._mode = 'live';      // 'live' | 'historic'
+        this._historicAt = null;  // Date when in historic mode
+        this._pendingScrubAt = null; // Date of a scrub not yet flushed to _onScrubberChange
+        this._kbScrubTime = null;    // ms epoch of the continuous keyboard-scrub position
+        this._dotnetRef = window.__monitoringRef || null;
+        this._playbackSpeed = 1;  // real-time multiplier
+        this._playbackAccum = 0;  // fractional slider unit accumulator
+        // Timeline window: the slider spans the latest _scrubSpan ms, always
+        // trailing now so the right edge is Live and recent time stays reachable.
+        let savedSpan = null;
+        try { savedSpan = localStorage.getItem(this._storagePrefix + 'ScrubSpan'); } catch { /* localStorage unavailable */ }
+        const savedPreset = flowData.SCRUBBER_PRESETS.find(p => p.key === savedSpan);
+        this._scrubSpanKey = savedPreset ? savedPreset.key : '24h';
+        // A restored 'max' preset (ms: null) seeds at the 90-day retention cap;
+        // _loadHistoryRange narrows it to the actual data start once known.
+        this._scrubSpan = savedPreset ? (savedPreset.ms ?? 90 * 86400000) : 24 * 3600000;
+        this._dataStartMs = null; // earliest stored point; clamps Max and disables too-wide presets
+
+        this._panels = {};        // DOM refs for overlay UI
+        this._floatingLabels = new Map();  // nodeId -> { el, nameEl, rateEl }
+        this._linkLabels = new Map();      // linkId -> { el } - rate pill at link midpoint
+        this._wanPills = new Map();        // wanNodeId -> el
+        this._latestSpeedTestByWan = new Map();  // wanInterface -> SpeedTestOverlayItem
+        this._raycaster = new THREE.Raycaster();
+        this._pointerNdc = new THREE.Vector2();
+        this._pointerScreen = { x: 0, y: 0 };
+        this._hoverTarget = null;
+
+        // Reposition mode state
+        this._repositionMode = false;
+        this._repositionNode = null;   // node being moved
+        this._repositionGroup = null;  // THREE.Group for the node
+        this._repositionOrigPos = null; // original position for cancel
+
+        this._raf = null;
+        this._pollTimer = null;
+        this._lastFrame = performance.now();
+        this._destroyed = false;
+
+        this._initScene();
+        this._initInteractions();
+    }
+
+    // ------------------------------------------------------------------------
+    // Scene setup
+    // ------------------------------------------------------------------------
+
+    _initScene() {
+        const rect = this.canvas.getBoundingClientRect();
+        const width = Math.max(rect.width || this.canvas.clientWidth || 800, 320);
+        const height = Math.max(rect.height || this.canvas.clientHeight || 480, 240);
+
+        this.renderer = new THREE.WebGLRenderer({
+            canvas: this.canvas,
+            antialias: true,
+            alpha: false,
+            powerPreference: 'high-performance',
+        });
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        this.renderer.setSize(width, height, false);
+        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        this.renderer.toneMappingExposure = 1.15;
+
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(COLORS.background);
+        this.scene.fog = new THREE.Fog(COLORS.fog, 70, 260);
+
+        this.camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
+        // Will animate IN from here on first mount via _flyIn().
+        this.camera.position.set(120, 80, 120);
+        this.camera.lookAt(0, 0, 0);
+
+        // Post-processing: bloom for the luminous-particles look. Selective bloom would
+        // require layers + a separate composer pass; for now, full-scene bloom with
+        // conservative parameters keeps device meshes from blowing out while making
+        // the particle streams genuinely glow.
+        this.composer = new EffectComposer(this.renderer);
+        this.composer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        this.composer.setSize(width, height);
+        this.composer.addPass(new RenderPass(this.scene, this.camera));
+        this.bloomPass = new UnrealBloomPass(
+            new THREE.Vector2(width, height),
+            0.45,   // strength (0.85 was too intense, 0.21 was too tame, this is the middle)
+            0.45,   // radius
+            0.45,   // threshold (between original 0.32 and the over-conservative 0.55)
+        );
+        this.composer.addPass(this.bloomPass);
+        this.composer.addPass(new OutputPass());
+
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping = true;
+        this.controls.dampingFactor = 0.08;
+        this.controls.rotateSpeed = 0.65;
+        this.controls.zoomSpeed = 0.75;
+        this.controls.minDistance = 5;
+        this.controls.maxDistance = 220;
+        this.controls.target.set(0, 0, 0);
+
+        // Restore persisted camera target for fly-in destination.
+        try {
+            const saved = JSON.parse(localStorage.getItem(this._storagePrefix + 'Camera'));
+            if (saved) {
+                this._savedCamera = saved;
+            }
+        } catch {}
+
+        // Persist camera on orbit change with 500ms debounce.
+        // Skip saves during the fly-in animation so we don't overwrite
+        // the saved position with intermediate fly-in frames.
+        let camSaveTimer = null;
+        this.controls.addEventListener('change', () => {
+            clearTimeout(camSaveTimer);
+            camSaveTimer = setTimeout(() => {
+                if (this._flyInUntil && performance.now() < this._flyInUntil) return;
+                try {
+                    const p = this.camera.position;
+                    const t = this.controls.target;
+                    localStorage.setItem(this._storagePrefix + 'Camera', JSON.stringify({
+                        cx: p.x, cy: p.y, cz: p.z,
+                        tx: t.x, ty: t.y, tz: t.z,
+                    }));
+                } catch {}
+            }, 500);
+        });
+
+        // Subtle hemispheric lighting so nodes have a sense of depth without flat shading.
+        const hemi = new THREE.HemisphereLight(0xb1d4ff, 0x1a2029, 0.55);
+        const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+        const key = new THREE.DirectionalLight(0xffffff, 0.7);
+        key.position.set(40, 60, 30);
+        this.scene.add(hemi, ambient, key);
+
+
+        // Container groups so toggling layers is cheap.
+        this.buildingGroup = new THREE.Group();
+        this.nodeGroup = new THREE.Group();
+        this.linkGroup = new THREE.Group();
+        this.cloudGroup = new THREE.Group();
+        this.particleGroup = new THREE.Group();
+        this.labelGroup = new THREE.Group();
+        this.scene.add(this.buildingGroup, this.nodeGroup, this.linkGroup, this.cloudGroup, this.particleGroup, this.labelGroup);
+    }
+
+    _initInteractions() {
+        this._resizeObserver = new ResizeObserver(() => this._handleResize());
+        this._resizeObserver.observe(this.canvas.parentElement || this.canvas);
+
+        this.canvas.addEventListener('pointermove', (e) => this._onPointerMove(e));
+        this.canvas.addEventListener('pointerleave', () => this._clearHover());
+        this.canvas.addEventListener('dblclick', (e) => this._onDoubleClick(e));
+        this.canvas.addEventListener('contextmenu', (e) => this._onContextMenu(e));
+        this.canvas.addEventListener('pointerdown', (e) => {
+            if (this._repositionMode) return;
+            this._dismissContextMenu();
+            this._tapStart = e.pointerType === 'mouse' ? null : { id: e.pointerId, x: e.clientX, y: e.clientY };
+        });
+        // Touch never synthesizes dblclick on every browser, so pair the taps here.
+        this.canvas.addEventListener('pointerup', (e) => {
+            const start = this._tapStart;
+            this._tapStart = null;
+            if (this._repositionMode || !start || start.id !== e.pointerId
+                || Math.hypot(e.clientX - start.x, e.clientY - start.y) >= 8) return;
+            const last = this._lastTap, now = performance.now();
+            this._lastTap = { t: now, x: e.clientX, y: e.clientY };
+            if (last && now - last.t < 350 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 24) {
+                this._lastTap = null;
+                this._onDoubleClick(e);
+            }
+        });
+
+        // WASD keyboard navigation: W/S = zoom in/out, A/D = orbit left/right
+        this._keys = {};
+        this._onKeyDown = (e) => {
+            if (e.key === 'Escape') {
+                if (this._repositionMode) {
+                    this._cancelReposition();
+                    return;
+                }
+                if (this.stage?.classList.contains('lan-flow-map-fullscreen')) {
+                    this._toggleFullscreen();
+                    return;
+                }
+            }
+            const scrubberFocused = document.activeElement === this._panels?.scrubberRange;
+            if (!scrubberFocused && !this._shouldAcceptKeys(e)) return;
+            if (e.key === ' ') {
+                e.preventDefault();
+                this._togglePlayPause();
+                return;
+            }
+            if (e.key === 'Shift') this._keys.shift = true;
+            if (['arrowleft','arrowright','w','a','s','d','q','e'].includes(e.key.toLowerCase())) {
+                if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') e.preventDefault();
+                this._keys[e.key.toLowerCase()] = true;
+            }
+        };
+        this._onKeyUp = (e) => {
+            this._keys[e.key.toLowerCase()] = false;
+            if (e.key === 'Shift') this._keys.shift = false;
+            if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                this._arrowScrubStart = null;
+                this._kbScrubTime = null;
+            }
+        };
+        document.addEventListener('keydown', this._onKeyDown);
+        document.addEventListener('keyup', this._onKeyUp);
+    }
+
+    _shouldAcceptKeys(e) {
+        const tag = document.activeElement?.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return false;
+        if (document.activeElement?.isContentEditable) return false;
+        const onScreen = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            return rect.bottom > 0 && rect.top < window.innerHeight;
+        };
+        if (onScreen(this.canvas)) return true;
+        // Scrub/pause keys also work while the companion 2D map is on screen -
+        // it mirrors this map's scrubber, and without this the keyboard goes
+        // dead the moment the 3D canvas scrolls out of view. Camera keys
+        // (WASD/QE) stay 3D-only so the camera can't be flown around unseen.
+        const isScrubKey = e && (e.key === ' ' || e.key === 'Shift'
+            || e.key === 'ArrowLeft' || e.key === 'ArrowRight');
+        return isScrubKey && onScreen(document.querySelector('.lan-flow-map-2d-stage'));
+    }
+
+    _fitCamera() {
+        let cx = 0, cy = 0, cz = 0, n = 0;
+        for (const pos of this._positions.values()) {
+            cx += pos.x; cy += pos.y; cz += pos.z; n++;
+        }
+        if (n > 0) { cx /= n; cy /= n; cz /= n; }
+        const target = new THREE.Vector3(cx, cy, cz);
+        const cam = new THREE.Vector3(cx + 60, cy + 40, cz + 60);
+        this._flyInStartCam = this.camera.position.clone();
+        this._flyInTargetCam = cam;
+        this._flyInTargetLookAt = target;
+        this._flyInUntil = performance.now() + 1300;
+    }
+
+    _toggleFullscreen() {
+        const el = this.stage;
+        const isFs = el.classList.contains('lan-flow-map-fullscreen');
+        if (isFs) {
+            el.classList.remove('lan-flow-map-fullscreen');
+            this._panels.fullscreenBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 8 3 3 8 3"></polyline><polyline points="16 3 21 3 21 8"></polyline>
+                <polyline points="21 16 21 21 16 21"></polyline><polyline points="8 21 3 21 3 16"></polyline></svg>`;
+            this._panels.fullscreenBtn.setAttribute('data-tooltip', 'Fullscreen');
+        } else {
+            el.classList.add('lan-flow-map-fullscreen');
+            this._panels.fullscreenBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="4 10 10 10 10 4"></polyline><polyline points="14 4 14 10 20 10"></polyline>
+                <polyline points="20 14 14 14 14 20"></polyline><polyline points="10 20 10 14 4 14"></polyline></svg>`;
+            this._panels.fullscreenBtn.setAttribute('data-tooltip', 'Exit fullscreen (Esc)');
+        }
+        document.dispatchEvent(new CustomEvent('lanflowmap-fullscreen', {
+            detail: { fullscreen: !isFs }
+        }));
+        requestAnimationFrame(() => requestAnimationFrame(() => this._handleResize()));
+    }
+
+    _handleResize() {
+        const rect = this.canvas.getBoundingClientRect();
+        const width = Math.max(rect.width || this.canvas.clientWidth || 800, 320);
+        const height = Math.max(rect.height || this.canvas.clientHeight || 480, 240);
+        this.renderer.setSize(width, height, false);
+        this.composer?.setSize(width, height);
+        this.bloomPass?.setSize(width, height);
+        this.camera.aspect = width / height;
+        this.camera.updateProjectionMatrix();
+    }
+
+    // ------------------------------------------------------------------------
+    // Public lifecycle
+    // ------------------------------------------------------------------------
+
+    async start() {
+        this._buildOverlayUI();
+        await this._loadSnapshot();
+        await this._loadInitialSpeedTests();
+        this._startAnimation();
+        this._startPolling();
+        this._applyInitialSeek();
+    }
+
+    // Honor a deep-linked timestamp (options.initialAt) by dropping straight into
+    // historic playback, paused, at that instant. Widens the timeline window first
+    // if the target predates the current span so the instant is reachable rather
+    // than clamping to the left edge (an instant older than retention still clamps).
+    _applyInitialSeek() {
+        const ms = this._initialAtMs;
+        if (!Number.isFinite(ms)) return;
+        this._initialAtMs = null; // one-shot
+        const needed = Date.now() - ms;
+        if (needed > this._scrubSpan) {
+            const preset = flowData.SCRUBBER_PRESETS.find(p => (p.ms ?? Infinity) >= needed)
+                || flowData.SCRUBBER_PRESETS[flowData.SCRUBBER_PRESETS.length - 1];
+            this._setScrubSpan(preset.key);
+        }
+        this.seekTo(ms);
+    }
+
+    dispose() {
+        this._destroyed = true;
+        if (this.stage.classList.contains('lan-flow-map-fullscreen'))
+            this.stage.classList.remove('lan-flow-map-fullscreen');
+        if (this._repositionMode) this._exitRepositionMode();
+        this._dismissContextMenu();
+        // The render loop registered via setAnimationLoop checks _destroyed
+        // and tears itself down. Belt-and-suspenders null it here too.
+        this.renderer?.setAnimationLoop(null);
+        if (this._raf) cancelAnimationFrame(this._raf);
+        if (this._pollTimer) clearInterval(this._pollTimer);
+        if (this._historicPlaybackTimer) clearInterval(this._historicPlaybackTimer);
+        clearTimeout(this._scrubberInputDebounce);
+        if (this._snapshotTimer) clearInterval(this._snapshotTimer);
+        if (this._windowTickTimer) clearInterval(this._windowTickTimer);
+        if (this._resizeObserver) this._resizeObserver.disconnect();
+        if (this._onKeyDown) document.removeEventListener('keydown', this._onKeyDown);
+        if (this._onKeyUp) document.removeEventListener('keyup', this._onKeyUp);
+        this.controls?.dispose();
+        this.renderer?.dispose();
+        this._disposeScene();
+        // Tear down overlay UI added to the stage.
+        for (const key of Object.keys(this._panels)) {
+            const el = this._panels[key];
+            if (el && el.remove) el.remove();
+        }
+        this._panels = {};
+    }
+
+    _disposeScene() {
+        const disposeMat = (m) => {
+            if (m.map) m.map.dispose();
+            m.dispose();
+        };
+        const disposeGroup = (g) => {
+            g.traverse((obj) => {
+                if (obj.geometry) obj.geometry.dispose();
+                if (obj.material) {
+                    if (Array.isArray(obj.material)) obj.material.forEach(disposeMat);
+                    else disposeMat(obj.material);
+                }
+            });
+            while (g.children.length) g.remove(g.children[0]);
+        };
+        if (this.buildingGroup) disposeGroup(this.buildingGroup);
+        if (this.nodeGroup) disposeGroup(this.nodeGroup);
+        if (this.linkGroup) disposeGroup(this.linkGroup);
+        if (this.cloudGroup) disposeGroup(this.cloudGroup);
+        if (this.particleGroup) disposeGroup(this.particleGroup);
+        if (this.labelGroup) disposeGroup(this.labelGroup);
+    }
+
+    // ------------------------------------------------------------------------
+    // Data loading
+    // ------------------------------------------------------------------------
+
+    /// External reload: tear down the scene meshes + DOM labels + bookkeeping
+    /// state, then re-fetch the snapshot. Used by the wizard panel after the
+    /// user saves new monitoring targets so the map picks up the change
+    /// without a full page reload.
+    async _reloadSnapshot() {
+        this._disposeScene();
+        this._nodeMeshes.clear();
+        this._linkMeshes.clear();
+        this._cloudMeshes.clear();
+        this._positions.clear();
+        this._currentRates = {};
+        // Mesh refs are recreated below, so any roam re-pointing state is now stale.
+        this._appliedAssoc3D?.clear();
+        this._roamBasePos?.clear();
+        this._roamFade3D?.clear();
+        if (this._labelsLayer) {
+            for (const { el } of this._floatingLabels.values()) el.remove();
+            for (const { el } of this._linkLabels.values()) el.remove();
+            for (const el of this._wanPills.values()) el.remove();
+        }
+        this._floatingLabels.clear();
+        this._linkLabels.clear();
+        this._wanPills.clear();
+        await this._loadSnapshot();
+    }
+
+    async _loadSnapshot() {
+        try {
+            const res = await fetch(`${this.apiBase}/snapshot`, { credentials: 'same-origin' });
+            if (!res.ok) throw new Error(`snapshot HTTP ${res.status}`);
+            const snap = await res.json();
+            this._snapshot = snap;
+            flowData.publishSnapshot(snap);
+            // Seed cloudStats from snapshot clouds so RTT labels show immediately
+            const seedCloudStats = {};
+            for (const c of (snap.clouds || [])) {
+                seedCloudStats[c.id] = { rttAvgMs: c.rttAvgMs, lossPercent: c.lossPercent, success: c.rttAvgMs != null };
+            }
+            flowData.publishLive({ cloudStats: seedCloudStats });
+
+            this._layoutNodes(snap);
+            this._rebuildBuildings(snap);
+            this._buildNodes(snap);
+            // Clouds must build before links - links reference cloud node IDs in their
+            // FromNodeId/ToNodeId and _buildLinks looks positions up via _positions.
+            this._buildClouds(snap);
+            this._buildLinks(snap);
+            this._buildFloatingLabels(snap);
+            this._applyOverlayVisibility();
+            this._applyLiveRates(snap.liveRates || {});
+            this._refreshCloudRttLabels();
+            this._updateSignalMapHint();
+        } catch (err) {
+            this.onError(err);
+        }
+    }
+
+    _rebuildBuildings(snap) {
+        const disposeMat = (m) => { if (m.map) m.map.dispose(); m.dispose(); };
+        const disposeGroup = (g) => {
+            g.traverse((obj) => {
+                if (obj.geometry) obj.geometry.dispose();
+                if (obj.material) {
+                    if (Array.isArray(obj.material)) obj.material.forEach(disposeMat);
+                    else disposeMat(obj.material);
+                }
+            });
+            while (g.children.length) g.remove(g.children[0]);
+        };
+        if (this.buildingGroup) {
+            disposeGroup(this.buildingGroup);
+            this.scene.remove(this.buildingGroup);
+        }
+        this.buildingGroup = buildBuildings(snap);
+        this.buildingGroup.visible = this._overlays.buildings;
+        this.scene.add(this.buildingGroup);
+    }
+
+    async _pollLive() {
+        if (this._destroyed) return;
+        try {
+            const res = await fetch(`${this.apiBase}/live`, { credentials: 'same-origin' });
+            if (!res.ok) return;
+            const update = await res.json();
+            flowData.publishLive(update);
+            // The tick was computed against a snapshot generation the store does not hold: its
+            // patch was withheld, and the rebuilt snapshot is what carries the change - get it.
+            if (flowData.snapshotIsStale()) this._refreshSnapshot();
+            // Live ticks carry no historic clients, so this drops any still on the scene.
+            this._applyHistoricClients(update);
+            this._currentBadges = update.nodeBadges || {};
+            this._currentClientStats = update.clientStats || {};
+            this._applyOnlineState();
+            this._applyClientAssoc3D();
+            this._applyLiveRates(update.linkRates || {});
+        } catch (err) {
+            // Keep ticking; transient network errors are fine.
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Layout
+    // ------------------------------------------------------------------------
+
+    _layoutNodes(snap) {
+        const bounds = snap.bounds || { radius: 1.0, anchorCount: 0 };
+        // Normalize anchor coordinates to a scene-sized sphere (~30 unit radius)
+        // and then spread by ANCHOR_SPREAD_FACTOR so interpolated / unanchored
+        // devices have room to settle between the pinned APs without crowding.
+        const sceneRadius = 30.0;
+        const ANCHOR_SPREAD_FACTOR = 1.875;
+        const boundsR = Number.isFinite(bounds.radius) ? bounds.radius : 1.0;
+        const scale = (sceneRadius / Math.max(boundsR, 1.0)) * ANCHOR_SPREAD_FACTOR;
+
+        // Pin devices to a fixed physical size relative to the buildings (which
+        // are built in meters * this same factor). Unanchored sites have a tiny
+        // default bounds radius, so the ratio clamps to 1.0 and nothing changes.
+        // Kept for nodes added after this pass (a client rebuilt mid-playback): its saved
+        // placement has to be projected with the same scale or it lands somewhere else.
+        this._anchorScale = scale;
+        const sizeRatio = scale / REF_WORLD_SCALE;
+        this._deviceScale = Math.max(DEVICE_SCALE_MIN, Math.min(1.0, sizeRatio));
+        this._cloudScale = Math.max(CLOUD_SCALE_MIN, Math.min(CLOUD_SCALE_MAX, sizeRatio));
+        this._linkScale = Math.max(LINK_SCALE_MIN, Math.min(1.0, sizeRatio));
+
+        const positions = new Map();
+        const anchors = new Map();
+
+        // Mount height offsets within a floor (in meters, pre-scale).
+        // ceiling = near ceiling, wall = mid-height, desktop = near floor.
+        const WALL_H_M = 2.9;
+        const mountOffsetM = { ceiling: WALL_H_M * 0.85, wall: WALL_H_M * 0.5, desktop: WALL_H_M * 0.15 };
+
+        for (const node of snap.nodes) {
+            const p = node.placement;
+            if (p && (p.source === PLACEMENT_SOURCE.Anchor || p.source === PLACEMENT_SOURCE.Interpolated)) {
+                if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) {
+                    console.warn('[LanFlowMap] Non-finite placement for node', node.id, node.name,
+                        '| placement:', { x: p.x, y: p.y, z: p.z, source: p.source });
+                } else if (p.source === PLACEMENT_SOURCE.Anchor) {
+                    const isClient = node.kind === NODE_KIND.WiredClient || node.kind === NODE_KIND.WifiClient;
+                    const isInfra = node.kind === NODE_KIND.Switch || node.kind === NODE_KIND.Gateway;
+                    // Precise saved height (3D reposition) wins over the
+                    // MountType / device-kind estimate. p.z is the floor's base
+                    // elevation in metres; heightM is metres above that.
+                    const mountM = Number.isFinite(p.heightM) ? p.heightM
+                        : node.mountType ? (mountOffsetM[node.mountType] || 0)
+                        : isClient ? WALL_H_M * 0.5
+                        : isInfra ? WALL_H_M * 0.15
+                        : 0;
+                    positions.set(node.id, {
+                        x: -p.x * scale,
+                        y: p.z * scale * 0.8 + mountM * scale * 0.8,
+                        z: p.y * scale,
+                        pinned: true,
+                    });
+                    anchors.set(node.id, true);
+                } else {
+                    positions.set(node.id, {
+                        x: -p.x * scale,
+                        y: p.z * scale * 0.8 - 4,
+                        z: p.y * scale,
+                        pinned: false,
+                    });
+                }
+            }
+        }
+
+        // Initial positions for unpinned nodes: scattered around the origin. Clouds are
+        // not LanNode entries (they live in snap.clouds and get positions in _buildClouds);
+        // we don't see Cloud kind here in practice.
+        for (const node of snap.nodes) {
+            if (positions.has(node.id)) continue;
+            const theta = (Math.random() * 2 - 1) * Math.PI;
+            const r = 12 + Math.random() * 8;
+            positions.set(node.id, {
+                x: Math.cos(theta) * r,
+                y: (Math.random() - 0.5) * 5,
+                z: Math.sin(theta) * r,
+                pinned: false,
+            });
+        }
+
+        // Force-directed relaxation: spring along every link, Coulomb-style repulsion
+        // between all pairs. Anchors stay fixed. Converges in a few hundred iterations
+        // since the graph is small (< ~200 nodes for a typical home/prosumer LAN).
+        const links = (snap.links || []).filter((l) => positions.has(l.fromNodeId) && positions.has(l.toNodeId));
+        const ids = Array.from(positions.keys());
+        const repulsion = 28.0;
+        const springRest = 6.0;
+        const springK = 0.22;
+        const damping = 0.78;
+        // Per-iteration displacement cap. This explicit-Euler integrator has no dt
+        // and is unstable for graphs with few/no pinned anchors: spring + repulsion
+        // forces can compound ~4x per iteration, blowing positions past Double.MAX to
+        // Infinity within ~65 iters, then Infinity - Infinity = NaN poisons every
+        // position (camera centroid becomes NaN -> entire scene blanks, no error
+        // thrown). Anchored APs normally bleed enough energy to stay bounded, so this
+        // only bites users with no Signal-Map AP placements. Clamping each node's step
+        // makes the system bounded for any graph; it never triggers on already-stable
+        // (anchored) layouts since their velocities stay well under the cap.
+        const maxStep = 4.0;
+
+        const velocities = new Map(ids.map((id) => [id, { vx: 0, vy: 0, vz: 0 }]));
+        for (let iter = 0; iter < 350; iter += 1) {
+            // Pairwise repulsion.
+            for (let i = 0; i < ids.length; i += 1) {
+                const a = positions.get(ids[i]);
+                if (a.pinned) continue;
+                let fx = 0, fy = 0, fz = 0;
+                for (let j = 0; j < ids.length; j += 1) {
+                    if (i === j) continue;
+                    const b = positions.get(ids[j]);
+                    const dx = a.x - b.x;
+                    const dy = a.y - b.y;
+                    const dz = a.z - b.z;
+                    const d2 = dx * dx + dy * dy + dz * dz + 0.001;
+                    const d = Math.sqrt(d2);
+                    const f = repulsion / d2;
+                    fx += (dx / d) * f;
+                    fy += (dy / d) * f;
+                    fz += (dz / d) * f;
+                }
+                const v = velocities.get(ids[i]);
+                v.vx = (v.vx + fx) * damping;
+                v.vy = (v.vy + fy) * damping;
+                v.vz = (v.vz + fz) * damping;
+            }
+            // Springs along links.
+            for (const link of links) {
+                const a = positions.get(link.fromNodeId);
+                const b = positions.get(link.toNodeId);
+                const dx = b.x - a.x;
+                const dy = b.y - a.y;
+                const dz = b.z - a.z;
+                const d = Math.sqrt(dx * dx + dy * dy + dz * dz) + 0.001;
+                const f = springK * (d - springRest);
+                const ux = dx / d, uy = dy / d, uz = dz / d;
+                if (!a.pinned) {
+                    const v = velocities.get(link.fromNodeId);
+                    v.vx += ux * f;
+                    v.vy += uy * f;
+                    v.vz += uz * f;
+                }
+                if (!b.pinned) {
+                    const v = velocities.get(link.toNodeId);
+                    v.vx -= ux * f;
+                    v.vy -= uy * f;
+                    v.vz -= uz * f;
+                }
+            }
+            // Integrate. Clamp the step magnitude so an unstable graph (few/no
+            // pinned anchors) can't diverge to Infinity/NaN; see maxStep above.
+            for (const id of ids) {
+                const p = positions.get(id);
+                if (p.pinned) continue;
+                const v = velocities.get(id);
+                const step = Math.sqrt(v.vx * v.vx + v.vy * v.vy + v.vz * v.vz);
+                if (step > maxStep) {
+                    const k = maxStep / step;
+                    v.vx *= k; v.vy *= k; v.vz *= k;
+                }
+                p.x += v.vx;
+                p.y += v.vy;
+                p.z += v.vz;
+            }
+        }
+
+        // Post-layout: put each unplaced client in the room its AP is in, and where no walls are
+        // drawn, push it outward from the AP so leaves don't clump on the infrastructure.
+        const WIFI_SPREAD = 1.4;
+        const CLIENT_MAX_PARENT_DIST = 12;
+        this._buildRoomWalls(snap, scale);
+        const takenByParent = new Map();
+        for (const [id, pos] of positions) {
+            if (!pos.pinned) continue;
+            takenByParent.set(id, pos);
+        }
+        const placedNear = [...takenByParent.values()];
+        for (const node of snap.nodes) {
+            if (node.kind !== NODE_KIND.WifiClient) continue;
+            const p = positions.get(node.id);
+            if (!p || p.pinned) continue;
+            const parentId = node.parentId;
+            if (!parentId) continue;
+            const pp = positions.get(parentId);
+            if (!pp) continue;
+
+            const room = this._placeInRoom(node.id, pp, p, CLIENT_MAX_PARENT_DIST, placedNear);
+            if (room) {
+                p.x = room.x; p.y = room.y; p.z = room.z;
+                placedNear.push(p);
+                continue;
+            }
+            const dx = p.x - pp.x;
+            const dy = p.y - pp.y;
+            const dz = p.z - pp.z;
+            const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (d < 0.1) continue;
+            // Fan out, but not off into the distance: repulsion from every other leaf can push a
+            // client far past its AP, and the 1.4 above then multiplies that. Cap the result at
+            // the spacing a client added mid-playback gets, which is the spacing that reads right.
+            const spread = Math.min(d * WIFI_SPREAD, CLIENT_MAX_PARENT_DIST) / d;
+            p.x = pp.x + dx * spread;
+            p.y = pp.y + dy * spread;
+            p.z = pp.z + dz * spread;
+        }
+
+        // Safety net: should never trigger given the step clamp above, but if any
+        // position is still non-finite from any source, snap it to a small bounded
+        // scatter. One NaN position would otherwise blank the whole scene (NaN
+        // camera centroid) with no error, so we never let a non-finite leak through.
+        let nonFinite = 0;
+        for (const [id, p] of positions) {
+            if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) {
+                nonFinite += 1;
+                const theta = (Math.random() * 2 - 1) * Math.PI;
+                const r = 12 + Math.random() * 8;
+                positions.set(id, { x: Math.cos(theta) * r, y: (Math.random() - 0.5) * 5, z: Math.sin(theta) * r, pinned: false });
+            }
+        }
+        if (nonFinite > 0) {
+            console.warn(`[LanFlowMap] Layout produced ${nonFinite} non-finite position(s); reset to bounded scatter.`);
+        }
+
+        this._positions = positions;
+    }
+
+    // ------------------------------------------------------------------------
+    // Node + link + cloud meshes
+    // ------------------------------------------------------------------------
+
+    _buildNodes(snap) {
+        for (const node of snap.nodes) {
+            if (node.kind === NODE_KIND.Cloud) continue;  // clouds handled separately
+            const pos = this._positions.get(node.id);
+            if (!pos) continue;
+
+            const radius = this._nodeRadius(node.kind);
+            const color = this._nodeColor(node.kind);
+            const group = new THREE.Group();
+
+            // Soft outer halo - sized to the bounding sphere of whatever shape we draw.
+            const halo = new THREE.Mesh(
+                new THREE.SphereGeometry(radius * 1.7, 24, 16),
+                new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.12, depthWrite: false }),
+            );
+            group.add(halo);
+
+            // Distinct shape per kind. Gateway = rounded box (taller); switch = flat
+            // chassis cuboid; AP = thin disc-like cylinder; clients = small icosahedra.
+            // Each one reads at-a-glance and the bloom pass makes them genuinely glow.
+            const baseEmissive = 0.45;
+            const core = this._makeDeviceCore(node.kind, radius, color, baseEmissive);
+            group.add(core);
+
+            group.position.set(pos.x, pos.y, pos.z);
+            if (!node.online) {
+                core.material.opacity = 0.55;
+                core.material.transparent = true;
+                halo.material.opacity = 0.05;
+            }
+            group.userData = { node, core, halo, baseEmissive };
+            this.nodeGroup.add(group);
+            this._nodeMeshes.set(node.id, group);
+
+            // Sprite labels for clients only. Infrastructure devices get DOM
+            // labels (with rate badges); their sprite twin used to hide exactly
+            // behind the DOM pill at the old shared anchor height, but with
+            // labels anchored to the mesh top the two would both show, so
+            // infra skips the sprite entirely.
+            const isClientNode = node.kind === NODE_KIND.WiredClient || node.kind === NODE_KIND.WifiClient;
+            if (node.name && isClientNode) {
+                const sprite = this._makeLabelSprite(node.name);
+                sprite.position.set(0, this._nodeTopHalfHeight(node.kind) + 0.35 * this._deviceScale, 0);
+                group.add(sprite);
+                this._labelSprites.set(node.id, sprite);
+            }
+        }
+    }
+
+    _makeDeviceCore(kind, radius, color, baseEmissive) {
+        const material = (extra = {}) => new THREE.MeshStandardMaterial({
+            color,
+            emissive: color,
+            emissiveIntensity: baseEmissive,
+            roughness: 0.55,
+            metalness: 0.15,
+            ...extra,
+        });
+        let geo;
+        switch (kind) {
+            case NODE_KIND.Gateway:
+                // Stacked rounded chassis: wider than tall to read as a router.
+                geo = new THREE.BoxGeometry(radius * 2.4, radius * 1.3, radius * 1.6);
+                break;
+            case NODE_KIND.Switch:
+                // Low-profile rack-unit cuboid.
+                geo = new THREE.BoxGeometry(radius * 2.6, radius * 0.7, radius * 1.4);
+                break;
+            case NODE_KIND.AccessPoint:
+                // Flat disc evocative of a ceiling AP.
+                geo = new THREE.CylinderGeometry(radius * 1.3, radius * 1.3, radius * 0.45, 28);
+                break;
+            case NODE_KIND.WiredClient:
+                geo = new THREE.IcosahedronGeometry(radius * 0.95, 0);
+                break;
+            case NODE_KIND.WifiClient:
+                geo = new THREE.OctahedronGeometry(radius * 0.95, 0);
+                break;
+            case NODE_KIND.VirtualHub:
+                // Squat torus reads as "junction / fanout", not a device.
+                geo = new THREE.TorusGeometry(radius * 0.85, radius * 0.25, 12, 24);
+                break;
+            default:
+                geo = new THREE.SphereGeometry(radius, 24, 18);
+        }
+        return new THREE.Mesh(geo, material());
+    }
+
+    _buildLinks(snap) {
+        for (const link of snap.links || []) {
+            const a = this._positions.get(link.fromNodeId);
+            const b = this._positions.get(link.toNodeId);
+            if (!a || !b) continue;
+
+            // For WAN/Transit links, shorten the cloud end to the globe surface
+            // so the pipe terminates at the wireframe, not the center.
+            let effA = a, effB = b;
+            const isWan = link.kind === LINK_KIND.Wan || link.kind === LINK_KIND.Transit;
+            if (isWan) {
+                const r = this._cloudRadius();
+                const cloudEnd = this._cloudMeshes.has(link.toNodeId) ? 'b'
+                    : this._cloudMeshes.has(link.fromNodeId) ? 'a' : null;
+                if (cloudEnd) {
+                    const from = cloudEnd === 'b' ? a : b;
+                    const to = cloudEnd === 'b' ? b : a;
+                    const dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z;
+                    const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+                    const surfPt = { x: to.x - (dx / d) * r, y: to.y - (dy / d) * r, z: to.z - (dz / d) * r };
+                    if (cloudEnd === 'b') effB = surfPt; else effA = surfPt;
+                }
+            }
+
+            const pipe = this._makePipeMesh(effA, effB, link);
+            this.linkGroup.add(pipe);
+
+            const down = new ParticleStream({
+                from: effA, to: effB, color: COLORS.downstream, particleCount: 0, sizeScale: this._linkScale,
+            });
+            const up = new ParticleStream({
+                from: effB, to: effA, color: COLORS.upstream, particleCount: 0, sizeScale: this._linkScale,
+            });
+            this.particleGroup.add(down.mesh, up.mesh);
+
+            this._linkMeshes.set(link.id, { pipe, down, up, link });
+            this._nodesByLink.set(link.id, [link.fromNodeId, link.toNodeId]);
+        }
+    }
+
+    _buildClouds(snap) {
+        // Place clouds along the bisector of the widest XZ angular gap between
+        // LAN-fabric vertices as seen from the gateway, so the WAN link is
+        // equidistant from the two nearest fabric nodes on either side. This
+        // avoids crossings over LAN devices regardless of how the force solver
+        // settled the topology. Vertical (Y) is ignored - the gap math is
+        // purely on the horizontal plane.
+        const gatewayNode = (snap.nodes || []).find((n) => n.kind === NODE_KIND.Gateway);
+        const gwPos = gatewayNode ? this._positions.get(gatewayNode.id) : null;
+        let gwX = 0, gwY = 0, gwZ = 0;
+        if (gwPos) { gwX = gwPos.x; gwY = gwPos.y; gwZ = gwPos.z; }
+
+        // Collect bearings of every other fabric vertex (switch + AP) from
+        // the gateway. Exclude clients - they're leaves and don't constrain
+        // the trunk lines visually.
+        const bearings = [];
+        for (const n of snap.nodes || []) {
+            if (n.id === gatewayNode?.id) continue;
+            if (n.kind !== NODE_KIND.Switch && n.kind !== NODE_KIND.AccessPoint) continue;
+            const p = this._positions.get(n.id);
+            if (!p) continue;
+            const dx = p.x - gwX, dz = p.z - gwZ;
+            if (Math.hypot(dx, dz) < 0.5) continue;
+            bearings.push(Math.atan2(dz, dx));
+        }
+
+        let outBearing = 0;
+        if (bearings.length === 0) {
+            // No fabric to dodge - default to +X.
+            outBearing = 0;
+        } else if (bearings.length === 1) {
+            // Single peer - put the cloud diametrically opposite it.
+            outBearing = bearings[0] + Math.PI;
+        } else {
+            bearings.sort((a, b) => a - b);
+            let maxGap = -Infinity;
+            for (let i = 0; i < bearings.length; i++) {
+                const next = i === bearings.length - 1
+                    ? bearings[0] + 2 * Math.PI
+                    : bearings[i + 1];
+                const gap = next - bearings[i];
+                if (gap > maxGap) {
+                    maxGap = gap;
+                    outBearing = (bearings[i] + next) / 2;
+                }
+            }
+        }
+        const dirX = Math.cos(outBearing);
+        const dirZ = Math.sin(outBearing);
+
+        // Access cloud on the outbound axis; all other clouds (transits +
+        // path-ends) fan out around it in an arc. Arc grows with sibling
+        // count up to a near-full 270 deg so 10-12 clouds clearly form a
+        // half-bowl around the access cloud rather than stacking. Stagger
+        // both radius (alternating inner/outer ring) and Y so the labels
+        // don't pile up.
+        const accessRadius = 40;
+        const innerRadius = 80;
+        const outerRadius = 100;
+        const allClouds = snap.clouds || [];
+        const accessClouds = allClouds.filter((c) => c.order === 0);
+        const siblings = allClouds.filter((c) => c.order > 0);
+        const fanRad = Math.min(Math.PI * 1.5, Math.max(Math.PI * 0.5, siblings.length * (Math.PI / 8)));
+        const arcStep = siblings.length > 1 ? fanRad / (siblings.length - 1) : 0;
+        const arcStart = -fanRad / 2;
+
+        const placeCloud = (cloud, x, y, z) => {
+            const pos = { x, y, z, pinned: true };
+            this._positions.set(cloud.id, pos);
+            return pos;
+        };
+
+        const cloudPositions = new Map();
+        if (accessClouds.length === 1) {
+            const cloud = accessClouds[0];
+            const x = gwX + dirX * accessRadius;
+            const y = gwY + 4;
+            const z = gwZ + dirZ * accessRadius;
+            cloudPositions.set(cloud.id, placeCloud(cloud, x, y, z));
+        } else {
+            const accessFan = Math.min(Math.PI * 0.4, accessClouds.length * (Math.PI / 10));
+            const accessArcStep = accessClouds.length > 1 ? accessFan / (accessClouds.length - 1) : 0;
+            const accessArcStart = -accessFan / 2;
+            for (let i = 0; i < accessClouds.length; i++) {
+                const cloud = accessClouds[i];
+                const angle = outBearing + accessArcStart + accessArcStep * i;
+                const x = gwX + Math.cos(angle) * accessRadius;
+                const y = gwY + 4;
+                const z = gwZ + Math.sin(angle) * accessRadius;
+                cloudPositions.set(cloud.id, placeCloud(cloud, x, y, z));
+            }
+        }
+        for (let i = 0; i < siblings.length; i++) {
+            const cloud = siblings[i];
+            const angle = outBearing + arcStart + arcStep * i;
+            const r = (i % 2 === 0) ? innerRadius : outerRadius;
+            const x = gwX + Math.cos(angle) * r;
+            const y = gwY + 4 + (i % 3) * 4;
+            const z = gwZ + Math.sin(angle) * r;
+            cloudPositions.set(cloud.id, placeCloud(cloud, x, y, z));
+        }
+
+        for (const cloud of allClouds) {
+            const pos = cloudPositions.get(cloud.id);
+            if (!pos) continue;
+
+            const group = new THREE.Group();
+            // Tier (DiscoveryMethod) drives the visual posture:
+            //   Solid     - bright, opaque cloud
+            //   PathProxy - dashed/dimmer, "via path" tag overlaid on label
+            //   Unresolved - neutral grey, "discovery pending" tag, no RTT badge
+            const tier = cloud.tier ?? CLOUD_TIER.Solid;
+            const baseOpacity = tier === CLOUD_TIER.Solid ? 0.85
+                              : tier === CLOUD_TIER.PathProxy ? 0.55
+                              : 0.35;
+            const baseColor = tier === CLOUD_TIER.Unresolved ? 0x2a3340 : COLORS.cloud;
+
+            // Wireframe globe - no solid sphere, just the lat/lng grid lines.
+            // LineBasicMaterial.linewidth doesn't work on WebGL, so we use
+            // thin tube geometry for each line to get visible thickness.
+            const r = this._cloudRadius();
+            const gridColor = tier === CLOUD_TIER.Unresolved ? 0x3a4455 : 0x3385d6;
+            const tubeMat = new THREE.MeshBasicMaterial({
+                color: gridColor,
+                transparent: true,
+                opacity: baseOpacity * 0.6,
+            });
+            const tubeRadius = r * 0.02;
+            // Latitude lines
+            for (let lat = -75; lat <= 75; lat += 25) {
+                const phi = (90 - lat) * Math.PI / 180;
+                const pts = [];
+                for (let lng = 0; lng <= 360; lng += 10) {
+                    const theta = lng * Math.PI / 180;
+                    pts.push(new THREE.Vector3(
+                        r * Math.sin(phi) * Math.cos(theta),
+                        r * Math.cos(phi),
+                        r * Math.sin(phi) * Math.sin(theta),
+                    ));
+                }
+                const curve = new THREE.CatmullRomCurve3(pts);
+                group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, pts.length, tubeRadius, 4, false), tubeMat));
+            }
+            // Longitude lines
+            for (let lng = 0; lng < 360; lng += 30) {
+                const theta = lng * Math.PI / 180;
+                const pts = [];
+                for (let lat = -90; lat <= 90; lat += 10) {
+                    const phi = (90 - lat) * Math.PI / 180;
+                    pts.push(new THREE.Vector3(
+                        r * Math.sin(phi) * Math.cos(theta),
+                        r * Math.cos(phi),
+                        r * Math.sin(phi) * Math.sin(theta),
+                    ));
+                }
+                const curve = new THREE.CatmullRomCurve3(pts);
+                group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, pts.length, tubeRadius, 4, false), tubeMat));
+            }
+
+            // Subtle outer glow
+            const glow = new THREE.Mesh(
+                new THREE.SphereGeometry(r * 1.5, 24, 16),
+                new THREE.MeshBasicMaterial({ color: 0x1a3050, transparent: true, opacity: 0.08, depthWrite: false }),
+            );
+            group.add(glow);
+
+            // Label: ASN name (primary), with sub-tags for access-tech / OUI / tier hint.
+            const labelText = cloud.name || (cloud.asn ? `AS${cloud.asn}` : 'Cloud');
+            const subText = this._buildCloudSubLabel(cloud, tier);
+            const label = this._makeLabelSprite(labelText, subText);
+            label.position.set(0, this._cloudRadius() + 1.2, 0);
+            group.add(label);
+
+            group.position.set(pos.x, pos.y, pos.z);
+            group.userData = { cloud };
+            this.cloudGroup.add(group);
+            this._cloudMeshes.set(cloud.id, group);
+        }
+    }
+
+    _makePipeMesh(a, b, link) {
+        const from = new THREE.Vector3(a.x, a.y, a.z);
+        const to = new THREE.Vector3(b.x, b.y, b.z);
+        const dir = to.clone().sub(from);
+        const length = dir.length();
+        if (!Number.isFinite(length) || length < 0.01) {
+            if (!Number.isFinite(length)) {
+                console.warn('[LanFlowMap] NaN pipe length for link', link.id,
+                    '| from:', { x: a.x, y: a.y, z: a.z },
+                    '| to:', { x: b.x, y: b.y, z: b.z },
+                    '| capacityBps:', link.capacityBps);
+            }
+            return new THREE.Group();
+        }
+
+        const baseRadius = this._pipeRadiusForCapacity(link.capacityBps);
+        if (!Number.isFinite(baseRadius)) {
+            console.warn('[LanFlowMap] NaN pipe radius for link', link.id,
+                '| capacityBps:', link.capacityBps, '(type:', typeof link.capacityBps, ')');
+            return new THREE.Group();
+        }
+        const geo = new THREE.CylinderGeometry(baseRadius, baseRadius, length, 14, 1, true);
+        const mat = new THREE.MeshStandardMaterial({
+            color: COLORS.pipeCool,
+            emissive: COLORS.pipeCool,
+            emissiveIntensity: 0.25,
+            roughness: 0.8,
+            metalness: 0.0,
+            transparent: true,
+            opacity: 0.45,
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+
+        // CylinderGeometry is aligned to the Y axis. Orient it along the link vector and
+        // position at the midpoint.
+        const mid = from.clone().add(to).multiplyScalar(0.5);
+        mesh.position.copy(mid);
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+        mesh.userData = { link, baseRadius };
+        return mesh;
+    }
+
+    _pipeRadiusForCapacity(capacityBps) {
+        if (typeof capacityBps !== 'number' || !Number.isFinite(capacityBps) || capacityBps <= 0) return 0.10 * this._linkScale;
+        // Log scale: 100 Mbps -> 0.13, 1 Gbps -> 0.18, 10 Gbps -> 0.24, 25 Gbps -> 0.28.
+        // Only the base thins with the property factor; the capacity term stays
+        // at designed size so speed-driven girth (and the contrast between
+        // speeds) reads the same on shrunken maps as on a single home.
+        const gbps = capacityBps / 1_000_000_000;
+        const t = Math.log10(Math.max(gbps, 0.01)) + 2;  // 1 Mbps -> 0, 10 Gbps -> 3
+        return 0.10 * this._linkScale + Math.min(t, 3.5) * 0.05;
+    }
+
+    _nodeRadius(kind) {
+        const base = (() => {
+            switch (kind) {
+                case NODE_KIND.Gateway: return NODE_RADIUS.gateway;
+                case NODE_KIND.Switch: return NODE_RADIUS.switch;
+                case NODE_KIND.AccessPoint: return NODE_RADIUS.ap;
+                case NODE_KIND.WiredClient: return NODE_RADIUS.wiredClient;
+                case NODE_KIND.WifiClient: return NODE_RADIUS.wifiClient;
+                case NODE_KIND.VirtualHub: return NODE_RADIUS.virtualHub;
+                default: return 0.6;
+            }
+        })();
+        return base * this._deviceScale;
+    }
+
+    _cloudRadius() {
+        return NODE_RADIUS.cloud * this._cloudScale;
+    }
+
+    // Approximate half-height of the rendered core mesh, for anchoring labels
+    // just above the top. Radius alone overshoots badly for the flat shapes
+    // (an AP disc is only 0.45r tall), which left labels floating far above.
+    _nodeTopHalfHeight(kind) {
+        const r = this._nodeRadius(kind);
+        switch (kind) {
+            case NODE_KIND.Gateway: return r * 0.65;       // box height 1.3r
+            case NODE_KIND.Switch: return r * 0.35;        // box height 0.7r
+            case NODE_KIND.AccessPoint: return r * 0.225;  // disc height 0.45r
+            case NODE_KIND.VirtualHub: return r * 0.55;    // squat torus
+            default: return r * 0.95;                      // client polyhedra
+        }
+    }
+
+    _nodeColor(kind) {
+        switch (kind) {
+            case NODE_KIND.Gateway: return COLORS.gateway;
+            case NODE_KIND.Switch: return COLORS.switchNode;
+            case NODE_KIND.AccessPoint: return COLORS.ap;
+            case NODE_KIND.WiredClient: return COLORS.wiredClient;
+            case NODE_KIND.WifiClient: return COLORS.wifiClient;
+            case NODE_KIND.VirtualHub: return COLORS.virtualHub;
+            default: return COLORS.accent;
+        }
+    }
+
+    _makeLabelSprite(text, subText = null) {
+        const dm = window.DemoMask;
+        if (dm?.isEnabled()) {
+            text = dm.maskString?.(text) ?? text;
+            if (subText) subText = dm.maskString?.(subText) ?? subText;
+        }
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const fontSize = 36;
+        const subFontSize = 22;
+        const pad = 16;
+        ctx.font = `${fontSize}px ui-sans-serif, system-ui, sans-serif`;
+        const titleW = Math.ceil(ctx.measureText(text).width);
+        let subW = 0;
+        if (subText) {
+            ctx.font = `${subFontSize}px ui-sans-serif, system-ui, sans-serif`;
+            subW = Math.ceil(ctx.measureText(subText).width);
+        }
+        const w = Math.max(titleW, subW) + pad * 2;
+        const h = subText ? fontSize + subFontSize + pad * 2 + 6 : fontSize + pad * 2;
+        canvas.width = w;
+        canvas.height = h;
+        ctx.fillStyle = 'rgba(6, 8, 12, 0.92)';
+        roundRect(ctx, 0, 0, w, h, 12);
+        ctx.fillStyle = '#f1f5f9';
+        ctx.textBaseline = 'top';
+        ctx.font = `${fontSize}px ui-sans-serif, system-ui, sans-serif`;
+        ctx.fillText(text, pad, pad);
+        if (subText) {
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = `${subFontSize}px ui-sans-serif, system-ui, sans-serif`;
+            ctx.fillText(subText, pad, pad + fontSize + 6);
+        }
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.needsUpdate = true;
+        const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
+        const sprite = new THREE.Sprite(mat);
+        const scaleY = 1.2 * (h / (fontSize + pad * 2));
+        const scaleX = scaleY * (w / h);
+        sprite.scale.set(scaleX, scaleY, 1);
+        sprite.userData.baseScale = { x: scaleX, y: scaleY };
+        return sprite;
+    }
+
+    _buildCloudSubLabel(cloud, tier) {
+        const parts = [];
+        if (cloud.accessTechnology) parts.push(cloud.accessTechnology);
+        if (cloud.l2NeighborOui) {
+            const oui = cloud.l2NeighborOui.length > 20
+                ? cloud.l2NeighborOui.substring(0, 20).trimEnd() + '...'
+                : cloud.l2NeighborOui;
+            parts.push(oui);
+        }
+        if (cloud.isCgnat) parts.push('CGNAT');
+        if (tier === CLOUD_TIER.PathProxy) parts.push('via path');
+        if (tier === CLOUD_TIER.Unresolved) parts.push('discovery pending');
+        if (cloud.rttAvgMs && Number.isFinite(cloud.rttAvgMs)) {
+            parts.push(`${cloud.rttAvgMs.toFixed(1)} ms`);
+        }
+        return parts.length ? parts.join('  ·  ') : null;
+    }
+
+    // ------------------------------------------------------------------------
+    // Live rate -> particle stream + pipe color
+    // ------------------------------------------------------------------------
+
+    _applyLiveRates(rates) {
+        // Merge the incoming rates with whatever we already had. The 2s live tick
+        // payload only includes link types the backend actively refreshes (uplink,
+        // wifi, WAN) - wired client links are seeded only at snapshot rebuild
+        // (every 30s). A wholesale replace was wiping wired client rates 2 seconds
+        // after each snapshot, leaving the leaf pipes idle forever.
+        this._currentRates = { ...(this._currentRates || {}), ...rates };
+        const badges = this._currentBadges || {};
+        const isOffline = (nodeId) => badges[nodeId]?.online === false;
+        for (const [linkId, link] of this._linkMeshes) {
+            const r = this._currentRates[linkId];
+            // An offline endpoint can't be moving traffic. Because the rate map is
+            // merged (not replaced) the last sample would otherwise stay frozen on the
+            // pipe forever, so force its links idle the moment a device goes offline.
+            const endpointOffline = isOffline(link.link?.fromNodeId) || isOffline(link.link?.toNodeId);
+            if (!r || endpointOffline) {
+                link.down.setRate(0);
+                link.up.setRate(0);
+                this._setPipeHealth(link.pipe, 0);
+                continue;
+            }
+            link.down.setRate(r.downstreamBps || 0);
+            link.up.setRate(r.upstreamBps || 0);
+
+            // Health: per-direction utilization against capacity. A link is
+            // full-duplex - each direction carries the full capacity independently
+            // - so a single saturated direction is NOT a saturated link. Reserve
+            // the top (red) color for genuine duplex saturation: the busier
+            // direction drives most of the ramp, but the quieter one must also
+            // load up to reach full. A lone saturated direction tops out in amber.
+            // Without capacity, fall back to a fixed 1 Gbps reference so it reads.
+            const capacity = (link.link.capacityBps && link.link.capacityBps > 0)
+                ? link.link.capacityBps
+                : 1_000_000_000;
+            const downU = Math.min((r.downstreamBps || 0) / capacity, 1.0);
+            const upU = Math.min((r.upstreamBps || 0) / capacity, 1.0);
+            const util = 0.75 * Math.max(downU, upU) + 0.25 * Math.min(downU, upU);
+            this._setPipeHealth(link.pipe, util);
+        }
+        // Refresh the device-rate text on the floating DOM labels.
+        this._refreshDeviceLabelRates();
+        this._refreshLinkLabels();
+        this._refreshCloudRttLabels();
+    }
+
+    _applyOnlineState() {
+        // Online/offline isn't baked into the mesh - it changes between snapshot
+        // rebuilds (live) and across the timeline (historic). Re-skin every node from
+        // the latest badge each tick so a device that was online when the mesh was
+        // built doesn't stay lit after it drops (and vice versa during playback).
+        // Badges only carry online for infrastructure; a node with no badge is left
+        // untouched (clients track association, not device state).
+        const badges = this._currentBadges || {};
+        for (const [id, group] of this._nodeMeshes) {
+            const badge = badges[id];
+            if (!badge) continue;
+            const online = badge.online !== false;
+            const { core, halo, node } = group.userData || {};
+            if (node) node.online = online;
+            if (core?.material) {
+                core.material.transparent = true;
+                core.material.opacity = online ? 1 : 0.55;
+            }
+            if (halo?.material) halo.material.opacity = online ? 0.12 : 0.05;
+        }
+    }
+
+    // Re-attach wifi clients to the AP they were on at the scrubbed instant (roam
+    // playback). Historic ticks carry clientStats[id].apNodeId; live ticks send none,
+    // so every client falls back to its snapshot parent (reset). Only mutates on an
+    // actual association change, so steady live is a no-op. Snapshot polls are paused
+    // during historic, so this never races the live incremental add/remove path.
+    _applyClientAssoc3D() {
+        const stats = this._currentClientStats || {};
+        if (!this._appliedAssoc3D) this._appliedAssoc3D = new Map();
+        if (!this._roamBasePos) this._roamBasePos = new Map();
+        for (const [id, group] of this._nodeMeshes) {
+            const node = group.userData?.node;
+            if (!node || node.kind !== NODE_KIND.WifiClient) continue;
+            const baseline = node.parentId;
+            const desired = stats[id]?.apNodeId || baseline;
+            const cur = this._appliedAssoc3D.get(id) || baseline;
+            if (desired === cur) continue;
+            if (!this._positions.get(desired)) continue; // historic AP not present - leave put
+            this._repointClientLink(id, desired, baseline);
+            if (desired === baseline) this._appliedAssoc3D.delete(id);
+            else this._appliedAssoc3D.set(id, desired);
+        }
+    }
+
+    // Clients that were connected at the scrubbed instant but are not connected now. The
+    // snapshot's client list is UniFi's currently-connected set, so without this a client that
+    // has since disconnected is invisible at every instant even though its telemetry is right
+    // there. Reuses the same incremental add/remove the live snapshot poll uses, so these leaves
+    // are ordinary nodes once placed. Live ticks carry an empty set, which removes them all.
+    _applyHistoricClients(update) {
+        const nodes = update.addedClientNodes || [];
+        const links = update.addedClientLinks || [];
+        if (!this._historicClientIds) this._historicClientIds = new Set();
+        // Before the early return below: an update with nothing added and nothing departed is
+        // the common one, and the present set still has to be applied on it.
+        this._applyPresentClients(update);
+
+        // Clients their access point reports gone. The server snapshot still lists them until the
+        // console notices, so they are removed explicitly rather than by the sweep below. The
+        // snapshot diff will not re-add them: they are in both its previous and current snapshots.
+        const departed = update.removedClientIds || [];
+        for (const id of departed) {
+            if (this._nodeMeshes.has(id)) this._removeNodeIncremental(id);
+            this._historicClientIds.delete(id);
+        }
+
+        if (nodes.length === 0 && departed.length === 0 && this._historicClientIds.size === 0) return;
+
+        const wanted = new Set(nodes.map(n => n.id));
+        // Ids the server snapshot already carries. The overlay stops emitting a client the moment
+        // the console catches up and the snapshot includes it, so without this the handoff removes
+        // a CONNECTED client and it stays gone until the next snapshot poll re-adds it.
+        const inSnapshot = new Set((this._snapshot?.nodes || []).map(n => n.id));
+        for (const id of [...this._historicClientIds]) {
+            if (wanted.has(id)) continue;
+            if (inSnapshot.has(id)) { this._historicClientIds.delete(id); continue; }
+            if (this._nodeMeshes.has(id)) this._removeNodeIncremental(id);
+            this._historicClientIds.delete(id);
+        }
+        for (const node of nodes) {
+            if (this._historicClientIds.has(node.id) || this._nodeMeshes.has(node.id)) continue;
+            this._addNodeIncremental(node, { links });
+            this._historicClientIds.add(node.id);
+        }
+    }
+
+    // The snapshot carries the clients connected NOW, so playback has to be told who was
+    // connected THEN, the same way the 2D map is: a measured client absent from the present
+    // set at this instant comes off the scene, and comes back the moment an instant (or the
+    // return to live) has it again. A client that writes no telemetry at all is unknowable and
+    // stays drawn as it always was.
+    _applyPresentClients(update) {
+        if (!this._absentClientIds) this._absentClientIds = new Set();
+        const present = update.presentClientIds ? new Set(update.presentClientIds) : null;
+        const measured = update.measuredClientIds ? new Set(update.measuredClientIds) : null;
+        const snapshot = this._snapshot;
+        const clients = (snapshot?.nodes || []).filter(n =>
+            n.kind === NODE_KIND.WiredClient || n.kind === NODE_KIND.WifiClient);
+        for (const node of clients) {
+            const absent = !!(present && measured && measured.has(node.id) && !present.has(node.id));
+            if (absent && this._nodeMeshes.has(node.id)) {
+                this._removeNodeIncremental(node.id);
+                this._absentClientIds.add(node.id);
+            } else if (!absent && this._absentClientIds.has(node.id)) {
+                this._addNodeIncremental(node, snapshot);
+                this._absentClientIds.delete(node.id);
+            }
+        }
+    }
+
+    // Historic roam: re-point with baseline restore. On reset (newApId === the live
+    // snapshot parent) the client returns to its exact original spot; otherwise it
+    // scatters near the historic AP.
+    _repointClientLink(clientId, newApId, baselineApId) {
+        const pos = this._positions.get(clientId);
+        if (!pos) return;
+        if (!this._roamBasePos.has(clientId)) {
+            this._roamBasePos.set(clientId, { x: pos.x, y: pos.y, z: pos.z });
+        }
+        if (newApId === baselineApId && this._roamBasePos.has(clientId)) {
+            const b = this._roamBasePos.get(clientId);
+            this._roamBasePos.delete(clientId);
+            this._attachClientToAp(clientId, newApId, b);
+        } else {
+            this._attachClientToAp(clientId, newApId);
+        }
+    }
+
+    // Move a client next to an AP and rebuild its uplink pipe + particle streams from
+    // the new endpoints (geometry is baked, so it must be recreated). Shared by historic
+    // roam playback and live roam (snapshot parent changed). explicitPos restores an
+    // exact spot; otherwise the client scatters to a stable spot near the AP.
+    _attachClientToAp(clientId, apId, explicitPos) {
+        const pos = this._positions.get(clientId);
+        const group = this._nodeMeshes.get(clientId);
+        const apPos = this._positions.get(apId);
+        if (!pos || !group || !apPos) return;
+        if (explicitPos) {
+            pos.x = explicitPos.x; pos.y = explicitPos.y; pos.z = explicitPos.z;
+        } else if (pos.pinned) {
+            // A device someone placed stays where they put it. Roaming changes which AP it talks
+            // to, not where it physically is, so only the link is re-pointed below.
+        } else {
+            // Same scatter as a freshly-attached client (_addNodeIncremental): random
+            // angle, 6-12 units out, slight y jitter - but seeded off the client id so
+            // it's stable across scrub crossings instead of re-rolling each time.
+            const rnd = _roamSeed(clientId);
+            const angle = rnd() * Math.PI * 2;
+            const dist = 6 + rnd() * 6;
+            pos.x = apPos.x + Math.cos(angle) * dist;
+            pos.y = apPos.y - 1.5 + rnd();
+            pos.z = apPos.z + Math.sin(angle) * dist;
+        }
+        group.position.set(pos.x, pos.y, pos.z);
+
+        let linkId = null;
+        for (const [lid, eps] of this._nodesByLink) {
+            if (eps[0] === clientId || eps[1] === clientId) { linkId = lid; break; }
+        }
+        const old = linkId ? this._linkMeshes.get(linkId) : null;
+        if (old) {
+            // Carry the old pipe's visibility onto the rebuilt one - a fresh mesh defaults
+            // to visible, which would resurrect the pipe of a filtered-out client.
+            const wasVisible = old.pipe.visible;
+            this.linkGroup.remove(old.pipe);
+            old.pipe.geometry?.dispose();
+            old.pipe.material?.dispose();
+            this.particleGroup.remove(old.down.mesh, old.up.mesh);
+            old.down.mesh.geometry?.dispose();
+            old.up.mesh.geometry?.dispose();
+            const pipe = this._makePipeMesh(apPos, pos, old.link);
+            pipe.visible = wasVisible;
+            this.linkGroup.add(pipe);
+            const down = new ParticleStream({ from: apPos, to: pos, color: COLORS.downstream, particleCount: 0, sizeScale: this._linkScale });
+            const up = new ParticleStream({ from: pos, to: apPos, color: COLORS.upstream, particleCount: 0, sizeScale: this._linkScale });
+            down.mesh.visible = wasVisible;
+            up.mesh.visible = wasVisible;
+            this.particleGroup.add(down.mesh, up.mesh);
+            this._linkMeshes.set(linkId, { pipe, down, up, link: old.link });
+            this._nodesByLink.set(linkId, [apId, clientId]);
+        }
+
+        if (!this._roamFade3D) this._roamFade3D = new Map();
+        this._roamFade3D.set(clientId, performance.now() + ROAM_FADE_MS);
+    }
+
+    // Live roam: a persisting wifi client whose snapshot parent changed (no add/remove).
+    // The snapshot diff doesn't catch this, so re-attach it to the new AP here. The new
+    // parent becomes the baseline, so any later historic re-point/reset is relative to it.
+    _applyLiveRoam(prev, snap) {
+        const prevById = new Map((prev?.nodes ?? []).map(n => [n.id, n]));
+        for (const node of (snap.nodes ?? [])) {
+            if (node.kind !== NODE_KIND.WifiClient) continue;
+            const pn = prevById.get(node.id);
+            if (!pn || pn.parentId === node.parentId) continue;
+            if (!this._nodeMeshes.has(node.id) || !this._positions.get(node.parentId)) continue;
+            const group = this._nodeMeshes.get(node.id);
+            if (group?.userData) group.userData.node = node; // refresh parentId/band/etc.
+            this._roamBasePos?.delete(node.id);
+            this._appliedAssoc3D?.delete(node.id);
+            this._attachClientToAp(node.id, node.parentId);
+        }
+    }
+
+    _refreshLinkLabels() {
+        if (!this._linkLabels || this._linkLabels.size === 0) return;
+        for (const [linkId, { el, kind, link }] of this._linkLabels) {
+            // The negotiated-speed hover follows the tick for a mesh backhaul, as the node
+            // tooltips do: the scrubbed PHY for the child node wins over the snapshot
+            // capacities. The app's tooltip sweep rebinds when the attribute changes.
+            if (kind === LINK_KIND.MeshBackhaul && link) {
+                const mcs = this._currentClientStats?.[link.toNodeId];
+                const capDown = mcs?.phyRxKbps > 0 ? mcs.phyRxKbps * 1000 : link.capacityDownBps;
+                const capUp = mcs?.phyTxKbps > 0 ? mcs.phyTxKbps * 1000 : link.capacityUpBps;
+                const capLabel = link.isMloMesh ? 'Link speed (MLO)' : 'Link speed';
+                let tip = null;
+                if (capDown > 0 && capUp > 0) tip = `${capLabel}: ↓ ${formatCapacity(capDown)} / ↑ ${formatCapacity(capUp)}`;
+                else if (capDown > 0 || capUp > 0) tip = `${capLabel}: ${formatCapacity(capDown > 0 ? capDown : capUp)}`;
+                if (tip) el.setAttribute('data-tooltip', tip);
+            }
+            const r = this._currentRates?.[linkId];
+            const down = r?.downstreamBps || 0;
+            const up = r?.upstreamBps || 0;
+            const isWan = kind === LINK_KIND.Wan || kind === LINK_KIND.Transit;
+            const thresh = isWan ? WAN_LABEL_THRESHOLD_BPS : LINK_LABEL_THRESHOLD_BPS;
+            if (down < thresh && up < thresh) {
+                el.classList.remove('is-visible');
+                el._hasData = false;
+                continue;
+            }
+            el.innerHTML = `<span class="down">↓ ${formatBps(down)}</span><span class="up">↑ ${formatBps(up)}</span>`;
+            // Don't add is-visible here — _updateFloatingLabels will add it
+            // after positioning, so the label never flashes at a stale position.
+            el._hasData = true;
+        }
+    }
+
+    _setPipeHealth(pipe, utilization) {
+        if (!pipe.material) return;
+        const u = Math.max(0, Math.min(1, utilization));
+        // 0 ..  0.7  : cool blue
+        // 0.7 .. 0.9 : warm amber
+        // 0.9 ..  1  : red
+        let color;
+        if (u < 0.7) {
+            color = lerpColor(COLORS.pipeCool, COLORS.pipeCool, 0);
+        } else if (u < 0.9) {
+            color = lerpColor(COLORS.pipeCool, COLORS.pipeWarm, (u - 0.7) / 0.2);
+        } else {
+            color = lerpColor(COLORS.pipeWarm, COLORS.pipeHot, (u - 0.9) / 0.1);
+        }
+        pipe.material.color.setHex(color);
+        pipe.material.emissive.setHex(color);
+        pipe.material.emissiveIntensity = 0.25 + u * 0.55;
+        pipe.material.opacity = 0.45 + u * 0.35;
+    }
+
+    // ------------------------------------------------------------------------
+    // Animation + polling
+    // ------------------------------------------------------------------------
+
+    _startAnimation() {
+        // Schedule a one-shot camera fly-in. If the user has a saved camera
+        // position, fly to that instead of the default overview.
+        this._flyInUntil = performance.now() + 1300;
+        const sc = this._savedCamera;
+        if (sc) {
+            this._flyInTargetCam = new THREE.Vector3(sc.cx, sc.cy, sc.cz);
+            this._flyInTargetLookAt = new THREE.Vector3(sc.tx, sc.ty, sc.tz);
+        } else {
+            // Compute centroid of all positioned nodes so we aim at the actual
+            // topology, not hardcoded origin (which can be empty space when
+            // anchored APs shift the layout away from 0,0,0).
+            let cx = 0, cy = 0, cz = 0, n = 0;
+            for (const pos of this._positions.values()) {
+                cx += pos.x; cy += pos.y; cz += pos.z; n++;
+            }
+            if (n > 0) { cx /= n; cy /= n; cz /= n; }
+            this._flyInTargetCam = new THREE.Vector3(cx + 60, cy + 40, cz + 60);
+            this._flyInTargetLookAt = new THREE.Vector3(cx, cy, cz);
+            this.controls.target.set(cx, cy, cz);
+        }
+        this._flyInStartCam = this.camera.position.clone();
+        this._flyInStartLookAt = new THREE.Vector3(0, 0, 0);
+
+        // Cap render rate at 120 fps. setAnimationLoop is the modern Three.js
+        // entry point (also required for WebXR). We accumulate elapsed time
+        // and only do the render+update work once per frameInterval, so on
+        // 240+ Hz monitors we run at 120 instead of burning GPU for an
+        // essentially-static scene. 120 over the more usual 60 because the
+        // particle streams look noticeably smoother at the higher cap.
+        const TARGET_FPS = 120;
+        const FRAME_MS = 1000 / TARGET_FPS;
+        let lastTickMs = 0;
+        let accumulator = 0;
+
+        this.renderer.setAnimationLoop((now) => {
+            if (this._destroyed) {
+                this.renderer.setAnimationLoop(null);
+                return;
+            }
+            // Clamp delta so a backgrounded tab (which throttles RAF to ~1 Hz)
+            // doesn't dump multiple seconds of accumulated dt into the particle
+            // physics when the tab regains focus.
+            const rawDelta = lastTickMs ? Math.min(now - lastTickMs, 100) : 0;
+            lastTickMs = now;
+            accumulator += rawDelta;
+            if (accumulator < FRAME_MS) return;
+            // dt = time since the last ACCEPTED render, not since the last RAF
+            // callback. Otherwise on a 240 Hz monitor with a 120 fps cap, we'd
+            // advance particles by ~4 ms of physics while ~8 ms of wall-clock
+            // actually elapsed, making them look like they're moving at half
+            // speed. Read accumulator before modulo'ing it down.
+            const dt = Math.min(accumulator / 1000, 0.1);
+            // Use modulo (not reset) to preserve leftover time and avoid drift
+            // that would settle the effective cap below the target.
+            accumulator = accumulator % FRAME_MS;
+
+            // Camera fly-in (easeOutCubic) on first ~1.3 s.
+            if (now < this._flyInUntil) {
+                const t = 1 - (this._flyInUntil - now) / 1300;
+                const eased = 1 - Math.pow(1 - t, 3);
+                this.camera.position.lerpVectors(this._flyInStartCam, this._flyInTargetCam, eased);
+                if (this._flyInTargetLookAt) {
+                    this.controls.target.lerpVectors(this._flyInStartLookAt ?? new THREE.Vector3(0, 0, 0), this._flyInTargetLookAt, eased);
+                }
+                this.camera.lookAt(this.controls.target);
+            } else if (this._repositionMode && this._repositionGroup) {
+                // In reposition mode WASD nudges the device on the XZ plane.
+                // Step is proportional to camera-to-device distance so nudges
+                // track what you see: fine control zoomed in for room-level
+                // placement, faster traversal zoomed out - and consistent
+                // across property sizes (a fixed scene-unit step covered many
+                // real meters per tick on large, heavily-normalized maps).
+                if (this._keys) {
+                    // Dulled by the property factor too: on large maps the same
+                    // scene distance spans far more real-world meters.
+                    const camDist = this.camera.position.distanceTo(this._repositionGroup.position);
+                    const step = Math.max(0.01, camDist * 0.00375 * this._deviceScale);
+                    const cam = this.camera;
+                    const forward = new THREE.Vector3();
+                    cam.getWorldDirection(forward);
+                    forward.y = 0;
+                    forward.normalize();
+                    const right = new THREE.Vector3();
+                    right.crossVectors(forward, cam.up).normalize();
+
+                    const g = this._repositionGroup;
+                    if (this._keys['w']) { g.position.x += forward.x * step; g.position.z += forward.z * step; }
+                    if (this._keys['s']) { g.position.x -= forward.x * step; g.position.z -= forward.z * step; }
+                    if (this._keys['d']) { g.position.x += right.x * step; g.position.z += right.z * step; }
+                    if (this._keys['a']) { g.position.x -= right.x * step; g.position.z -= right.z * step; }
+                    if (this._keys['e']) { g.position.y += step; this._repositionPlane.constant = -g.position.y; }
+                    if (this._keys['q']) { g.position.y -= step; this._repositionPlane.constant = -g.position.y; }
+                    if (this._keys['w'] || this._keys['a'] || this._keys['s'] || this._keys['d'] || this._keys['q'] || this._keys['e']) {
+                        this._updateAdjacentLinks();
+                    }
+                }
+            } else {
+                // WASD: W/S zoom, A/D orbit around target
+                if (this._keys) {
+                    const cam = this.camera;
+                    const target = this.controls.target;
+                    const offset = cam.position.clone().sub(target);
+                    const dist = offset.length();
+                    const zoomStep = dist * 0.015;
+                    const panDist = dist * 0.008;
+
+                    if (this._keys['w'] && dist > this.controls.minDistance + zoomStep) {
+                        offset.multiplyScalar(1 - zoomStep / dist);
+                        cam.position.copy(target).add(offset);
+                    }
+                    if (this._keys['s'] && dist < this.controls.maxDistance - zoomStep) {
+                        offset.multiplyScalar(1 + zoomStep / dist);
+                        cam.position.copy(target).add(offset);
+                    }
+                    if (this._keys['a'] || this._keys['d']) {
+                        const right = new THREE.Vector3();
+                        cam.getWorldDirection(right);
+                        right.cross(cam.up).normalize();
+                        const panOffset = right.multiplyScalar(this._keys['a'] ? -panDist : panDist);
+                        cam.position.add(panOffset);
+                        target.add(panOffset);
+                    }
+                }
+                this.controls?.update();
+            }
+
+            // Left/right arrow: scrub timeline. Throttled to 5 ticks/sec.
+            // Accelerates after holding: 4 → 12 → 35 slider-units of time per
+            // tick over 2 seconds. Shift multiplies by 9x on top of acceleration.
+            // Steps a continuous timestamp, not the integer slider value: the
+            // slider window trails now, so requantizing through slider units
+            // would make each step land on a slightly different instant than
+            // the label showed, and the seconds would wander.
+            if (this._keys?.['arrowleft'] || this._keys?.['arrowright']) {
+                if (this._historicPlaybackTimer) this._stopHistoricPlayback();
+                const now = performance.now();
+                if (!this._arrowScrubStart) this._arrowScrubStart = now;
+                if (!this._lastArrowScrub || now - this._lastArrowScrub >= 200) {
+                    this._lastArrowScrub = now;
+                    const range = this._panels.scrubberRange;
+                    if (range) {
+                        const held = now - this._arrowScrubStart;
+                        let units = held > 2000 ? 35 : held > 1000 ? 12 : 4;
+                        if (this._keys.shift) units *= 9;
+                        const stepMs = units * (this._scrubSpan / 10000);
+                        const { start, end } = this._scrubWindowBounds();
+                        const base = this._kbScrubTime
+                            ?? this._pendingScrubAt?.getTime()
+                            ?? this._historicAt?.getTime()
+                            ?? this._scrubberValueToTime(Number(range.value)).getTime();
+                        const t = Math.max(start, Math.min(end,
+                            base + (this._keys['arrowright'] ? stepMs : -stepMs)));
+                        this._kbScrubTime = t;
+                        const at = new Date(t);
+                        const val = this._timeToScrubberValue(t);
+                        range.value = val;
+                        this._onScrubberInput(val, at);
+                        if (this._mode === 'live' && !this._isLiveValue(val, at)) {
+                            this._enterHistoricScrub();
+                        }
+                        this._queueScrubChange(val, at);
+                    }
+                }
+            } else {
+                this._arrowScrubStart = null;
+                this._kbScrubTime = null;
+            }
+
+            // Freeze particle motion while paused (Live or Historic) so the
+            // dots visibly stop with the polling; otherwise they keep flowing
+            // off whatever the last rate snapshot was.
+            if (!this._paused) {
+                for (const link of this._linkMeshes.values()) {
+                    link.down.advance(dt);
+                    link.up.advance(dt);
+                }
+            }
+            // Subtle node breathing: every infrastructure node's emissive intensity
+            // oscillates around its base value on a ~3 s cycle. Idle, traffic-less
+            // scenes still feel alive.
+            this._pulseNodes(now);
+
+            // Camera-distance size compensation for devices, pipes, particles.
+            this._applyZoomScaling();
+
+            // Render through the composer so bloom + tone mapping apply.
+            this.composer.render();
+            // After the render we have up-to-date matrixWorld for every node group;
+            // project them to screen space for the floating DOM labels and WAN pills.
+            this._updateFloatingLabels();
+        });
+    }
+
+    _pulseNodes(nowMs) {
+        const phase = (nowMs % 3000) / 3000;       // 0..1
+        const factor = 0.85 + 0.15 * Math.sin(phase * Math.PI * 2);
+        for (const group of this._nodeMeshes.values()) {
+            const core = group.userData?.core;
+            const base = group.userData?.baseEmissive;
+            if (!core || base == null) continue;
+            core.material.emissiveIntensity = base * factor;
+        }
+        this._pulseFocus(nowMs);
+        // Ramp opacity back up on clients that just roamed to a new AP so they fade in
+        // rather than pop. _applyOnlineState re-asserts the correct opacity afterwards.
+        if (this._roamFade3D && this._roamFade3D.size) {
+            for (const [id, until] of this._roamFade3D) {
+                const core = this._nodeMeshes.get(id)?.userData?.core;
+                if (!core) { this._roamFade3D.delete(id); continue; }
+                const t = 1 - Math.max(0, (until - nowMs) / ROAM_FADE_MS);
+                core.material.transparent = true;
+                core.material.opacity = Math.max(0.15, t);
+                if (t >= 1) this._roamFade3D.delete(id);
+            }
+        }
+    }
+
+    // Glide the camera to a node along its current viewing direction, reusing the mount
+    // fly-in's lerp (start/target/until). The orbit target ends on the node, so the viewer
+    // is left orbiting what they came to see.
+    _flyToGroup(group) {
+        const p = group.position;
+        const dir = this.camera.position.clone().sub(p);
+        if (dir.lengthSq() < 1) dir.set(1, 0.7, 1);
+        dir.normalize();
+        const dist = 30 * (this._deviceScale || 1);
+        this._flyInStartCam = this.camera.position.clone();
+        this._flyInStartLookAt = this.controls.target.clone();
+        this._flyInTargetCam = p.clone().add(dir.multiplyScalar(dist)).add(new THREE.Vector3(0, dist * 0.25, 0));
+        this._flyInTargetLookAt = p.clone();
+        this._flyInUntil = performance.now() + 1300;
+    }
+
+    // Arrival focus: the focused client's core and halo take the download blue and breathe
+    // bright for FOCUS_MS, then go back to exactly what they were. The bloom pass turns the
+    // raised emissive into the glow.
+    _pulseFocus(nowMs) {
+        if (!this._focusMac) return;
+        // Meshes first, as the lookup always was: a client that pops back in mid-playback gets a
+        // mesh with no snapshot entry, and a speed-test link lands in playback.
+        this._focusClientId ||= ['cli-' + this._focusMac, 'dev-' + this._focusMac]
+            .find(id => this._nodeMeshes.has(id) || (this._snapshot?.nodes ?? []).some(n => n.id === id)) ?? null;
+        if (!this._focusClientId) {
+            if (nowMs >= this._focusGiveUp) this._focusMac = null;
+            return;
+        }
+        let group = this._nodeMeshes.get(this._focusClientId);
+        // A VirtualHub member can be missing or hidden while the hub stands in for it on
+        // screen; glow the hub, or the arrival focus breathes on nothing.
+        if (!group || !group.visible) {
+            const node = (this._snapshot?.nodes ?? []).find(n => n.id === this._focusClientId);
+            const parent = node?.parentId ? this._nodeMeshes.get(node.parentId) : null;
+            if (parent?.userData?.node?.kind === NODE_KIND.VirtualHub) group = parent;
+        }
+        const { core, halo, baseEmissive } = group?.userData ?? {};
+        if (!this._focusUntil) {
+            if (core) {
+                this._focusUntil = nowMs + FOCUS_MS;
+                // Fly the camera to the focused node, riding the mount fly-in's own animation
+                // slot - re-aiming it also settles "the initial zoom-in wins": whichever fly
+                // starts later owns the remaining 1.3s.
+                this._flyToGroup(group);
+            }
+            else if (nowMs >= this._focusGiveUp) { this._focusMac = null; this._focusClientId = null; }
+            if (!this._focusUntil) return;
+        }
+        // A rebuilt scene hands the client a new mesh: put the old one back and glow the new.
+        const stale = this._focusGlowing && this._focusGlowing.core !== core;
+        if (nowMs >= this._focusUntil || !core || stale) {
+            if (this._focusGlowing) {
+                const g = this._focusGlowing;
+                g.core.material.emissive.setHex(g.emissive);
+                g.core.material.emissiveIntensity = g.baseEmissive;
+                if (g.halo) { g.halo.material.color.setHex(g.haloColor); g.halo.material.opacity = g.haloOpacity; }
+                this._focusGlowing = null;
+            }
+            if (nowMs >= this._focusUntil) { this._focusMac = null; this._focusClientId = null; }
+            if (!stale || nowMs >= this._focusUntil) return;
+        }
+        if (!this._focusGlowing) {
+            this._focusGlowing = {
+                core, halo, baseEmissive,
+                emissive: core.material.emissive.getHex(),
+                haloColor: halo?.material.color.getHex(),
+                haloOpacity: halo?.material.opacity,
+            };
+            core.material.emissive.setHex(COLORS.downstream);
+            halo?.material.color.setHex(COLORS.downstream);
+        }
+        const t = (nowMs % 1500) / 1500;
+        core.material.emissiveIntensity = baseEmissive * (2.5 + 1.5 * Math.sin(t * Math.PI * 2));
+        if (halo) halo.material.opacity = 0.35 + 0.25 * Math.sin(t * Math.PI * 2);
+    }
+
+    // Scale device cores/halos with camera distance: up toward a ceiling when
+    // zoomed out so devices stay visible at property level, down toward a floor
+    // when zoomed in so they don't fill a room. Only the core and halo scale -
+    // sprite labels are siblings in the same group and keep today's behavior.
+    // Pipes fatten/thin on a tighter clamp (X/Z only - Y is the pipe length),
+    // and particle streams follow via a shader zoom uniform.
+    _applyZoomScaling() {
+        const camPos = this.camera.position;
+        const devMax = Math.max(1.0, Math.min(DEVICE_ZOOM_MAX, ZOOM_EFFECTIVE_CEIL / this._deviceScale));
+        const linkMax = Math.max(1.0, Math.min(LINK_ZOOM_MAX, ZOOM_EFFECTIVE_CEIL / this._linkScale));
+        // Zoom-in floor is relative like the ceiling: large properties thin
+        // their pipes further up close; single-home keeps the designed floor.
+        const linkMin = LINK_ZOOM_MIN * this._linkScale;
+        for (const group of this._nodeMeshes.values()) {
+            const { core, halo } = group.userData ?? {};
+            if (!core) continue;
+            const dist = camPos.distanceTo(group.position);
+            const z = Math.max(DEVICE_ZOOM_MIN, Math.min(devMax, dist / DEVICE_ZOOM_REF_DIST));
+            core.scale.setScalar(z);
+            if (halo) halo.scale.setScalar(z);
+        }
+        for (const { pipe, down, up } of this._linkMeshes.values()) {
+            if (!pipe) continue;
+            const dist = camPos.distanceTo(pipe.position);
+            const z = Math.max(linkMin, Math.min(linkMax, dist / LINK_ZOOM_REF_DIST));
+            pipe.scale.x = z;
+            pipe.scale.z = z;
+            down?.setZoom(z);
+            up?.setZoom(z);
+        }
+        // Sprite labels: reference distance stretches with property size so the
+        // apparent size (and the point where they lock at max) stays
+        // proportional to the shrunken devices instead of locking too early.
+        // The Y offset tracks the rendered top of the core mesh each frame.
+        const labelRef = LABEL_ZOOM_REF_DIST / this._deviceScale;
+        this._devZoomMax = devMax;
+        for (const [nodeId, sprite] of this._labelSprites) {
+            const base = sprite.userData?.baseScale;
+            const group = this._nodeMeshes.get(nodeId);
+            if (!base || !group) continue;
+            const dist = camPos.distanceTo(group.position);
+            const f = Math.max(LABEL_ZOOM_MIN, Math.min(1.0, dist / labelRef));
+            sprite.scale.set(base.x * f, base.y * f, 1);
+            const kind = group.userData?.node?.kind;
+            const z = Math.max(DEVICE_ZOOM_MIN, Math.min(devMax, dist / DEVICE_ZOOM_REF_DIST));
+            sprite.position.y = this._nodeTopHalfHeight(kind) * z + 0.35 * this._deviceScale;
+            const fade = 1 - Math.min(1, Math.max(0,
+                (dist - LABEL_FADE_START_DIST) / (LABEL_FADE_END_DIST - LABEL_FADE_START_DIST)));
+            sprite.material.opacity = fade;
+            sprite.visible = fade > 0.01;
+        }
+    }
+
+    _startPolling() {
+        if (this._pollTimer) clearInterval(this._pollTimer);
+        this._pollTimer = setInterval(() => {
+            if (this._mode === 'live' && !this._paused) this._pollLive();
+        }, this.pollIntervalMs);
+        // Periodic light snapshot refresh to pick up data changes (mesh PHY rates, online
+        // status, ISP speeds) without re-running force layout or resetting the camera.
+        // The endpoint serves a cached snapshot and only rebuilds on its own slow interval, so
+        // asking often costs a serialize, not a rebuild. Polling at the rebuild interval was
+        // the mistake: two unaligned 30s timers stacked, and a reconnecting client could wait a
+        // minute to appear.
+        if (this._snapshotTimer) clearInterval(this._snapshotTimer);
+        this._snapshotTimer = setInterval(() => this._refreshSnapshot(), 5000);
+    }
+
+    // One snapshot refresh pass. Runs on the 5s timer, and immediately when a live tick reports
+    // a snapshot generation the data store does not hold - a server rebuild that dropped or
+    // gained clients, which must reach the scene now rather than at the next timer beat.
+    async _refreshSnapshot() {
+        if (this._snapshotFetchInFlight) return;
+        if (this._mode === 'live' && !this._paused && !this._destroyed) {
+            this._snapshotFetchInFlight = true;
+            try {
+                const res = await fetch(`${this.apiBase}/snapshot`, { credentials: 'same-origin' });
+                if (!res.ok) return;
+                const snap = await res.json();
+                const prev = this._snapshot;
+                this._snapshot = snap;
+                flowData.publishSnapshot(snap);
+
+                // Diff: infrastructure change = full rebuild; client churn = incremental
+                const infraKinds = new Set([NODE_KIND.Gateway, NODE_KIND.Switch, NODE_KIND.AccessPoint, NODE_KIND.VirtualHub]);
+                const prevInfraIds = new Set((prev?.nodes ?? []).filter(n => infraKinds.has(n.kind)).map(n => n.id));
+                const newInfraIds = new Set((snap.nodes ?? []).filter(n => infraKinds.has(n.kind)).map(n => n.id));
+                const infraChanged = prevInfraIds.size !== newInfraIds.size
+                    || [...prevInfraIds].some(id => !newInfraIds.has(id));
+
+                if (infraChanged) {
+                    // Rebuilt from the snapshot, which carries no historic-only clients.
+                    this._historicClientIds = new Set();
+                    await this._reloadSnapshot();
+                } else {
+                    // Incremental client add/remove
+                    const prevNodeIds = new Set((prev?.nodes ?? []).map(n => n.id));
+                    const newNodeIds = new Set((snap.nodes ?? []).map(n => n.id));
+                    const added = (snap.nodes ?? []).filter(n => !prevNodeIds.has(n.id));
+                    const removed = [...prevNodeIds].filter(id => !newNodeIds.has(id));
+                    for (const id of removed) this._removeNodeIncremental(id);
+                    for (const node of added) this._addNodeIncremental(node, snap);
+                    // Seamless roam keeps the client's node id, so add/remove misses
+                    // it - re-attach any persisting client whose parent AP changed.
+                    this._applyLiveRoam(prev, snap);
+                    // Don't apply snapshot liveRates - they're stale vs the 1s
+                    // live poll and would clobber fresh rates momentarily.
+                    this._refreshCloudRttLabels();
+                }
+                // Anchor count can flip (e.g. user just placed APs on the
+                // Signal Map) without infra membership changing, so refresh
+                // the discovery hint on every snapshot poll.
+                this._updateSignalMapHint();
+            } catch { /* transient */ }
+            finally { this._snapshotFetchInFlight = false; }
+        }
+    }
+
+
+    // ---- Room-aware client placement -------------------------------------------------
+    //
+    // An unplaced client belongs in the room its AP is in, not on a ring around it. Rooms are
+    // not stored as polygons, so the room is measured instead: cast rays from the AP across the
+    // floor's wall segments and take how far each one travels. That handles L-shapes and alcoves
+    // without solving the planar graph, and a floor with no walls drawn simply yields nothing and
+    // the caller falls back to the ring.
+    _buildRoomWalls(snap, scale) {
+        this._wallSegs = [];
+        for (const b of snap.buildings || []) {
+            for (const f of b.floors || []) {
+                const segs = [];
+                for (const w of f.walls || []) {
+                    const pts = (w.points || []).map(pt => ({ x: -pt.x * scale, z: pt.y * scale }));
+                    for (let i = 1; i < pts.length; i++) segs.push([pts[i - 1], pts[i]]);
+                }
+                if (segs.length) this._wallSegs.push({ z: f.z ?? 0, segs });
+            }
+        }
+    }
+
+    // Distance from a point to the first wall along a direction, or null if it reaches nothing.
+    _rayToWall(segs, ox, oz, dx, dz) {
+        let best = null;
+        for (const [a, b] of segs) {
+            const sx = b.x - a.x, sz = b.z - a.z;
+            const denom = dx * sz - dz * sx;
+            if (Math.abs(denom) < 1e-9) continue;
+            const t = ((a.x - ox) * sz - (a.z - oz) * sx) / denom;
+            const u = ((a.x - ox) * dz - (a.z - oz) * dx) / denom;
+            if (t > 0.01 && u >= 0 && u <= 1 && (best === null || t < best)) best = t;
+        }
+        return best;
+    }
+
+    // A spot for a client inside its parent's room: an angle of its own, a radius bounded by how
+    // far the room actually goes, and a nudge off anything already placed there.
+    _placeInRoom(nodeId, parentPos, current, preferred, taken) {
+        const scale = this._anchorScale ?? 1;
+        // The floor this AP sits above: its base elevation is what client heights are measured
+        // from, since an AP is usually on the ceiling and hanging clients under it would leave
+        // every device floating at head-height of the storey above.
+        // Tolerance in metres, not scene units: a ceiling-mounted AP hangs a little under the
+        // floor above, and on a large site the whole scene shrinks until a fixed unit slack would
+        // read that AP as belonging upstairs. Mount type otherwise does not matter here - wall,
+        // desk and ceiling APs on one storey all resolve to the same room.
+        const slack = 0.35 * scale * 0.8;
+        let floor = null;
+        for (const f of this._wallSegs || []) {
+            const baseY = (f.z ?? 0) * scale * 0.8;
+            if (baseY - slack > parentPos.y) continue;
+            if (floor === null || baseY > floor.baseY) floor = { baseY, segs: f.segs };
+        }
+        const wallsForFloor = floor ? floor.segs : [];
+
+        // Stable angle per client, so a rebuild puts it back where it was.
+        const rnd = _roamSeed(nodeId);
+        let radius = preferred;
+        if (wallsForFloor.length > 0) {
+            const hits = [];
+            for (let i = 0; i < 24; i++) {
+                const a = (i / 24) * Math.PI * 2;
+                const d = this._rayToWall(wallsForFloor, parentPos.x, parentPos.z, Math.cos(a), Math.sin(a));
+                if (d !== null) hits.push(d);
+            }
+            if (hits.length >= 8) {
+                // Median, not the per-ray distance: a doorway lets one ray shoot into the next
+                // room, and sizing off that would post clients through the wall.
+                hits.sort((x, y) => x - y);
+                const median = hits[Math.floor(hits.length / 2)];
+                // Fraction of the way to the wall the first ring sits at. Devices belong near the
+                // AP they are talking to, so this is deliberately well inside the room; the
+                // overflow rings step outward from here when it fills.
+                radius = Math.max(2.0, Math.min(preferred, median * 0.4));
+            }
+        }
+
+        // Start from where the relaxation already put this client - it has spread the leaves
+        // apart sensibly - and let the room only pull it in. Ignoring that and re-scattering
+        // everything from scratch is what threw devices across the property.
+        let baseAngle = rnd() * Math.PI * 2;
+        let baseDist = radius * (0.55 + rnd() * 0.45);
+        if (current) {
+            const dx = current.x - parentPos.x, dz = current.z - parentPos.z;
+            const d = Math.sqrt(dx * dx + dz * dz);
+            if (d > 0.1) {
+                baseAngle = Math.atan2(dz, dx);
+                // Keep the direction the relaxation chose, but not its distance when that is
+                // wider than the room allows.
+                baseDist = Math.min(d, radius);
+            }
+        }
+
+        // Fill the room first, then step outward gently. A room that runs out of space pushes the
+        // overflow past its walls rather than stacking devices on each other, but a step of a few
+        // percent per ring keeps that a nudge instead of a launch.
+        // Best of a handful rather than first acceptable: taking the first spot that merely
+        // clears everything leaves the gap between two nearby devices unused, because both push
+        // their own clients away from it. Scoring by how empty a spot is fills that space.
+        let last = null;
+        let best = null;
+        let bestScore = -1;
+        for (let ring = 0; ring < 6; ring++) {
+            const ringRadius = baseDist * (1 + ring * 0.12);
+            for (let attempt = 0; attempt < 12; attempt++) {
+                const angle = baseAngle + (attempt === 0 && ring === 0 ? 0 : (rnd() - 0.5) * Math.PI);
+                const r = ringRadius * (0.9 + rnd() * 0.2);
+                // Staggered through the room's height rather than strung at one level: each
+                // client takes the next of five bands between floor and ceiling with jitter
+                // inside it, so a busy room reads with depth. No floor to measure from means no
+                // room either, so those sit below the AP as before.
+                const band = (this._roomBand = ((this._roomBand ?? -1) + 1) % 5);
+                const wallH = 2.9 * scale * 0.8;
+                const y = floor
+                    ? floor.baseY + wallH * (0.1 + band * 0.19 + rnd() * 0.13)
+                    : parentPos.y - 1.5 + rnd() * 2;
+                const cand = {
+                    x: parentPos.x + Math.cos(angle) * r,
+                    y,
+                    z: parentPos.z + Math.sin(angle) * r,
+                    pinned: false,
+                };
+                last = cand;
+                // How far this spot sits from the nearest thing already placed, height included
+                // so a different shelf is not treated as the same spot.
+                let nearest = Infinity;
+                for (const t of taken) {
+                    const dx = t.x - cand.x, dz = t.z - cand.z, dy = (t.y - cand.y) * 0.6;
+                    const d2 = dx * dx + dz * dz + dy * dy;
+                    if (d2 < nearest) nearest = d2;
+                }
+                if (nearest > bestScore) { bestScore = nearest; best = cand; }
+                // Roomy enough that looking further would only be churn.
+                if (nearest > 36) return cand;
+            }
+            // A ring with a genuinely clear spot ends the search; otherwise widen.
+            if (bestScore > 9) return best;
+        }
+        return best ?? last;
+    }
+
+    // Incremental client add: create mesh near parent, create link pipe + particles.
+    _addNodeIncremental(node, snap) {
+        if (node.kind === NODE_KIND.Cloud) return;
+        // Adding a node that already has a mesh overwrites its map entry and orphans the old mesh
+        // and pipe in the scene forever, while the live sweep then removes the tracked copy. The
+        // overlay path checks this; the snapshot diff path did not.
+        if (this._nodeMeshes.has(node.id)) return;
+        // Position near parent: find the link to this node
+        const link = (snap.links ?? []).find(l => l.toNodeId === node.id || l.fromNodeId === node.id);
+        if (!link) return;
+        const parentId = link.fromNodeId === node.id ? link.toNodeId : link.fromNodeId;
+        const parentPos = this._positions.get(parentId);
+        if (!parentPos) return;
+        // A device the user has placed goes where they put it, even when it is being added back
+        // mid-playback rather than laid out with everything else. Same projection as _layoutNodes,
+        // so it lands on the same spot it holds in live.
+        const p = node.placement;
+        const scale = this._anchorScale;
+        let pos;
+        if (p && p.source === PLACEMENT_SOURCE.Anchor && Number.isFinite(scale)
+            && Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z)) {
+            const mountM = Number.isFinite(p.heightM) ? p.heightM : 2.9 * 0.5;
+            pos = {
+                x: -p.x * scale,
+                y: p.z * scale * 0.8 + mountM * scale * 0.8,
+                z: p.y * scale,
+                pinned: true,
+            };
+        } else {
+            // Same room placement the layout pass uses, so a client that pops back in mid-playback
+            // lands where it would have on a fresh load rather than on a ring of its own.
+            const taken = [...this._positions.values()];
+            pos = this._placeInRoom(node.id, parentPos, null, 12, taken) || {
+                x: parentPos.x + Math.cos(Math.random() * Math.PI * 2) * 8,
+                y: parentPos.y - 1.5 + Math.random(),
+                z: parentPos.z + Math.sin(Math.random() * Math.PI * 2) * 8,
+                pinned: false,
+            };
+        }
+        this._positions.set(node.id, pos);
+
+        // Build node mesh (same as _buildNodes for a single node)
+        const radius = this._nodeRadius(node.kind);
+        const color = this._nodeColor(node.kind);
+        const group = new THREE.Group();
+        const halo = new THREE.Mesh(
+            new THREE.SphereGeometry(radius * 1.7, 24, 16),
+            new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.12, depthWrite: false }),
+        );
+        group.add(halo);
+        const baseEmissive = 0.45;
+        const core = this._makeDeviceCore(node.kind, radius, color, baseEmissive);
+        group.add(core);
+        group.position.set(pos.x, pos.y, pos.z);
+        if (!node.online) {
+            core.material.opacity = 0.55;
+            core.material.transparent = true;
+            halo.material.opacity = 0.05;
+        }
+        group.userData = { node, core, halo, baseEmissive };
+        this.nodeGroup.add(group);
+        this._nodeMeshes.set(node.id, group);
+        if (node.name) {
+            const sprite = this._makeLabelSprite(node.name);
+            sprite.position.set(0, this._nodeTopHalfHeight(node.kind) + 0.35 * this._deviceScale, 0);
+            group.add(sprite);
+            this._labelSprites.set(node.id, sprite);
+        }
+
+        // Build link pipe + particles
+        const a = this._positions.get(link.fromNodeId);
+        const b = this._positions.get(link.toNodeId);
+        let pipe = null, down = null, up = null;
+        if (a && b) {
+            pipe = this._makePipeMesh(a, b, link);
+            this.linkGroup.add(pipe);
+            down = new ParticleStream({ from: a, to: b, color: COLORS.downstream, particleCount: 0, sizeScale: this._linkScale });
+            up = new ParticleStream({ from: b, to: a, color: COLORS.upstream, particleCount: 0, sizeScale: this._linkScale });
+            this.particleGroup.add(down.mesh, up.mesh);
+            this._linkMeshes.set(link.id, { pipe, down, up, link });
+            this._nodesByLink.set(link.id, [link.fromNodeId, link.toNodeId]);
+        }
+
+        // Respect the active band/overlay filter: a client that connects while filtered
+        // out shouldn't pop into view (node or pipe).
+        const isClient = node.kind === NODE_KIND.WifiClient || node.kind === NODE_KIND.WiredClient;
+        if (isClient && !this._isClientVisible(node)) {
+            group.visible = false;
+            if (pipe) pipe.visible = false;
+            if (down) down.mesh.visible = false;
+            if (up) up.mesh.visible = false;
+        }
+    }
+
+    // Incremental client remove: dispose mesh, link, particles.
+    _removeNodeIncremental(nodeId) {
+        // Remove node mesh
+        const group = this._nodeMeshes.get(nodeId);
+        if (group) {
+            this.nodeGroup.remove(group);
+            group.traverse(obj => {
+                if (obj.geometry) obj.geometry.dispose();
+                if (obj.material) {
+                    if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+                    else obj.material.dispose();
+                }
+            });
+            this._nodeMeshes.delete(nodeId);
+        }
+        this._labelSprites.delete(nodeId);
+        this._positions.delete(nodeId);
+
+        // Remove any links connected to this node
+        for (const [linkId, endpoints] of this._nodesByLink) {
+            if (endpoints[0] === nodeId || endpoints[1] === nodeId) {
+                const linkObj = this._linkMeshes.get(linkId);
+                if (linkObj) {
+                    this.linkGroup.remove(linkObj.pipe);
+                    linkObj.pipe.traverse(obj => {
+                        if (obj.geometry) obj.geometry.dispose();
+                        if (obj.material) obj.material.dispose();
+                    });
+                    this.particleGroup.remove(linkObj.down.mesh, linkObj.up.mesh);
+                    linkObj.down.mesh.geometry?.dispose();
+                    linkObj.up.mesh.geometry?.dispose();
+                    this._linkMeshes.delete(linkId);
+                }
+                this._nodesByLink.delete(linkId);
+            }
+        }
+
+        // Remove floating label if present
+        const label = this._floatingLabels.get(nodeId);
+        if (label) { label.el.remove(); this._floatingLabels.delete(nodeId); }
+    }
+
+    // Play/Pause: in Live mode, pause freezes rates by skipping the poll. In
+    // Historic mode, play advances the scrubber forward over time so the user
+    // can watch the recent window roll back into Live.
+    _togglePlayPause() {
+        this._paused = !this._paused;
+        this._syncPlayPauseIcon();
+        flowData.publishPlayState(this._paused, this._mode);
+        this._notifyPlayState();
+        // In live mode flip the time label between Live and Live (Paused)
+        // so frozen rates aren't mistaken for live data. Historic mode keeps
+        // its timestamp; the mode badge stays Live/Historic either way.
+        if (this._mode === 'live') {
+            const label = this._paused ? 'Live (Paused)' : 'Live';
+            if (this._panels.scrubberRight) this._panels.scrubberRight.textContent = label;
+            flowData.publishScrubber(
+                Number(this._panels.scrubberRange?.value ?? 10000), label, this._playbackSpeed);
+        }
+        if (this._paused) {
+            this._stopHistoricPlayback();
+            return;
+        }
+        if (this._mode === 'historic') this._startHistoricPlayback();
+        else this._pollLive();
+    }
+
+    _startHistoricPlayback() {
+        if (this._historicPlaybackTimer) return;
+        // Track playback as a continuous timestamp, not integer slider units.
+        const TICK_MS = 1000;
+        const DATA_REFRESH_TICKS = 1;
+        // A scrub queued but not yet flushed through the debounced change handler
+        // is the user's freshest intent - resume from that exact instant and drop
+        // the pending flush (the first playback tick loads data anyway, and a
+        // late flush would snap playback back to the pre-play position).
+        clearTimeout(this._scrubberInputDebounce);
+        const pending = this._pendingScrubAt;
+        this._pendingScrubAt = null;
+        // Otherwise seed from the ABSOLUTE parked instant - never the slider-derived
+        // fromValue. The timeline window trails now, so a fixed slider value maps to a
+        // later time as the page sits; seeding from it added the whole sit-duration to
+        // the resume point (park at T, sit 2 min, play started at T+2 min). historicAt
+        // is an absolute Date kept current on every commit path (deep-link, drag,
+        // keyboard scrub), so it never drifts; pending covers an in-flight scrub not yet
+        // committed; fromValue is only a last-resort fallback if neither is set.
+        const fromValue = this._scrubberValueToTime(
+            Number(this._panels.scrubberRange?.value ?? 500));
+        this._playbackTime = pending ?? this._historicAt ?? fromValue;
+        // Publish the seed position immediately instead of waiting for the first
+        // 1s tick: consumers re-baseline their playhead on a confirmed seek, and
+        // an adopted pending scrub gets its data loaded now rather than a tick late.
+        this._historicAt = this._playbackTime;
+        this._notifyStatCards(this._playbackTime);
+        this._loadHistoric(this._playbackTime);
+        let tickCount = 0;
+        this._historicPlaybackTimer = setInterval(() => {
+            if (this._paused) return;
+            const range = this._panels.scrubberRange;
+            if (!range) return;
+            // Advance the continuous timestamp
+            this._playbackTime = new Date(
+                this._playbackTime.getTime() + TICK_MS * this._playbackSpeed);
+            // Derive slider position from the timestamp (inverse of _scrubberValueToTime)
+            const clamped = this._timeToScrubberValue(this._playbackTime.getTime());
+            range.value = clamped;
+            // Live detection is time-based - on a wide window the last slider
+            // step spans many minutes and value-based detection would snap
+            // playback to Live long before it actually caught up to now.
+            const atLive = this._playbackTime.getTime() >= Date.now() - 2000;
+            // Update the time label from the continuous timestamp, not the
+            // integer slider position (which only moves every ~86s at 1x).
+            const rightLabel = atLive ? 'Live' : _fmtDateTime(this._playbackTime);
+            if (this._panels.scrubberRight) {
+                this._panels.scrubberRight.textContent = rightLabel;
+            }
+            flowData.publishScrubber(clamped, rightLabel, this._playbackSpeed);
+            tickCount++;
+            // Refresh map and stat cards periodically
+            if (tickCount % DATA_REFRESH_TICKS === 0 || atLive) {
+                if (atLive) {
+                    if (this._historicPlaybackTimer) {
+                        clearInterval(this._historicPlaybackTimer);
+                        this._historicPlaybackTimer = null;
+                    }
+                    range.value = 10000;
+                    this._onScrubberChange(10000);
+                } else {
+                    this._historicAt = this._playbackTime;
+                    this._notifyStatCards(this._playbackTime);
+                    this._loadHistoric(this._playbackTime);
+                }
+            }
+        }, TICK_MS);
+    }
+
+    _stopHistoricPlayback() {
+        if (this._historicPlaybackTimer) {
+            clearInterval(this._historicPlaybackTimer);
+            this._historicPlaybackTimer = null;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Overlay UI (controls, filter, legend, scrubber, mode indicator)
+    // ------------------------------------------------------------------------
+
+    _buildOverlayUI() {
+        if (!this.stage) return;
+
+        const isMobile = window.matchMedia('(max-width: 768px)').matches;
+
+        // Filter panel (top-left)
+        const filter = this._makePanel('lan-flow-map-filter');
+        const filterTitle = document.createElement('div');
+        filterTitle.className = 'lan-flow-map-panel-title';
+        filterTitle.textContent = isMobile ? 'Filter' : 'Filter clients';
+        if (isMobile) filterTitle.classList.add('lan-flow-map-panel-title-toggle');
+        filter.appendChild(filterTitle);
+        const filterBody = document.createElement('div');
+        filterBody.className = 'lan-flow-map-panel-body';
+        filterBody.innerHTML = `
+            <input class="lan-flow-map-search" type="search" placeholder="Search by name or MAC" />
+            <div class="lan-flow-map-chips" data-chip-group="band">
+                <span class="lan-flow-map-chip is-on" data-band="2.4">2.4 GHz</span>
+                <span class="lan-flow-map-chip is-on" data-band="5">5 GHz</span>
+                <span class="lan-flow-map-chip is-on" data-band="6">6 GHz</span>
+            </div>
+        `;
+        if (isMobile) filterBody.classList.add('is-collapsed');
+        filter.appendChild(filterBody);
+        if (isMobile) {
+            filterTitle.addEventListener('click', () => this._toggleMobilePanel('filter'));
+        }
+        const search = filterBody.querySelector('.lan-flow-map-search');
+        search.addEventListener('input', (e) => {
+            this._filter.text = (e.target.value || '').toLowerCase().trim();
+            this._applyFilter();
+        });
+        const bandChips = Array.from(filterBody.querySelectorAll('.lan-flow-map-chip'));
+        bandChips.forEach((chip) => {
+            chip.addEventListener('click', () => {
+                const b = chip.dataset.band;
+                const allOn = bandChips.every((c) => this._filter.bands[c.dataset.band]);
+                if (allOn) {
+                    for (const c of bandChips) {
+                        const cb = c.dataset.band;
+                        this._filter.bands[cb] = (cb === b);
+                        c.classList.toggle('is-on', this._filter.bands[cb]);
+                    }
+                } else {
+                    const onlyThisOn = this._filter.bands[b]
+                        && bandChips.every((c) => c.dataset.band === b || !this._filter.bands[c.dataset.band]);
+                    if (onlyThisOn) {
+                        for (const c of bandChips) {
+                            this._filter.bands[c.dataset.band] = true;
+                            c.classList.add('is-on');
+                        }
+                    } else {
+                        this._filter.bands[b] = !this._filter.bands[b];
+                        chip.classList.toggle('is-on', this._filter.bands[b]);
+                    }
+                }
+                this._applyFilter();
+            });
+        });
+        this._panels.filter = filter;
+        this._panels.filterBody = filterBody;
+
+        // Controls panel (top-right) - overlay toggles
+        const controls = this._makePanel('lan-flow-map-controls');
+        const controlsTitle = document.createElement('div');
+        controlsTitle.className = 'lan-flow-map-panel-title';
+        controlsTitle.textContent = 'Overlays';
+        if (isMobile) controlsTitle.classList.add('lan-flow-map-panel-title-toggle');
+        controls.appendChild(controlsTitle);
+        const controlsBody = document.createElement('div');
+        controlsBody.className = 'lan-flow-map-panel-body';
+        if (isMobile) controlsBody.classList.add('is-collapsed');
+        controls.appendChild(controlsBody);
+        if (isMobile) {
+            controlsTitle.addEventListener('click', () => this._toggleMobilePanel('controls'));
+        }
+        const overlayDefs = [
+            ['wifiClients', 'Wi-Fi clients'],
+            ['wiredClients', 'Wired clients'],
+            ['clouds', 'WAN globes'],
+            ['buildings', 'Buildings'],
+            // TODO: Speed test path overlay needs rework - see research/monitoring/3d-map-overlays-TODO.md
+        ];
+        for (const [key, label] of overlayDefs) {
+            const row = document.createElement('div');
+            row.className = `lan-flow-map-toggle ${this._overlays[key] ? 'is-on' : ''}`;
+            row.innerHTML = `<span>${label}</span><span class="lan-flow-map-toggle-pill"></span>`;
+            row.addEventListener('click', () => {
+                this._overlays[key] = !this._overlays[key];
+                row.classList.toggle('is-on', this._overlays[key]);
+                this._applyOverlayVisibility();
+                if (key === 'speedTests') this._renderSpeedTestOverlay();
+                try { localStorage.setItem(this._storagePrefix + 'Overlays', JSON.stringify(this._overlays)); } catch {}
+            });
+            controlsBody.appendChild(row);
+        }
+        this._panels.controls = controls;
+        this._panels.controlsBody = controlsBody;
+
+        // Fullscreen toggle
+        const fsBtn = document.createElement('button');
+        fsBtn.className = 'lan-flow-map-fullscreen-btn';
+        fsBtn.setAttribute('data-tooltip', 'Fullscreen');
+        fsBtn.setAttribute('data-tooltip-hover-only', '');
+        fsBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 8 3 3 8 3"></polyline>
+            <polyline points="16 3 21 3 21 8"></polyline>
+            <polyline points="21 16 21 21 16 21"></polyline>
+            <polyline points="8 21 3 21 3 16"></polyline>
+        </svg>`;
+        fsBtn.addEventListener('click', () => this._toggleFullscreen());
+        this.stage.appendChild(fsBtn);
+        this._panels.fullscreenBtn = fsBtn;
+
+        // Fit / reset camera button
+        const fitBtn = document.createElement('button');
+        fitBtn.className = 'lan-flow-map-fit-btn';
+        fitBtn.setAttribute('data-tooltip', 'Fit all');
+        fitBtn.setAttribute('data-tooltip-hover-only', '');
+        fitBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="4 14 4 20 10 20"></polyline><polyline points="20 10 20 4 14 4"></polyline>
+            <line x1="14" y1="10" x2="20" y2="4"></line><line x1="4" y1="20" x2="10" y2="14"></line></svg>`;
+        fitBtn.addEventListener('click', () => this._fitCamera());
+        this.stage.appendChild(fitBtn);
+
+        // Legend (bottom-right)
+        const legend = this._makePanel('lan-flow-map-legend');
+        legend.innerHTML = `
+            <span class="lan-flow-map-legend-dot down"></span> Download
+            <span class="lan-flow-map-legend-dot up"></span> Upload
+        `;
+        this._panels.legend = legend;
+
+        // Controls help (starts collapsed, title click toggles - same pattern
+        // as the Filter/Overlays panels on mobile). OrbitControls handles the
+        // actual input bindings; this just documents them so users can find
+        // their way around without trial and error.
+        const help = this._makePanel('lan-flow-map-help');
+        const helpTitle = document.createElement('div');
+        helpTitle.className = 'lan-flow-map-panel-title lan-flow-map-panel-title-toggle';
+        helpTitle.textContent = 'Controls';
+        help.appendChild(helpTitle);
+        const helpBody = document.createElement('div');
+        helpBody.className = 'lan-flow-map-panel-body is-collapsed';
+        helpBody.innerHTML = `
+            <div class="lan-flow-map-help-row"><span>Rotate</span><span class="kbd">Left-drag</span></div>
+            <div class="lan-flow-map-help-row"><span>Pan</span><span class="kbd">Right-drag</span> or <span class="kbd">A</span> <span class="kbd">D</span></div>
+            <div class="lan-flow-map-help-row"><span>Zoom</span><span class="kbd">Scroll</span> or <span class="kbd">W</span> <span class="kbd">S</span></div>
+            <div class="lan-flow-map-help-row"><span>Hover detail</span><span class="kbd">Mouse over</span></div>
+            <div class="lan-flow-map-help-row"><span>Open client</span><span class="kbd">Double-click</span></div>
+            <div class="lan-flow-map-help-row"><span>Move device</span><span class="kbd">Right-click</span></div>
+            <div class="lan-flow-map-help-row"><span>Pause / Play</span><span class="kbd">Space</span></div>
+            <div class="lan-flow-map-help-row"><span>Scrub timeline</span><span class="kbd">←</span> <span class="kbd">→</span></div>
+            <div class="lan-flow-map-help-row"><span>Fast scrub</span><span class="kbd">Shift</span> + <span class="kbd">←</span> <span class="kbd">→</span></div>
+            <div class="lan-flow-map-help-row"><span>Fullscreen</span><span class="kbd">Esc</span> to exit</div>
+        `;
+        help.appendChild(helpBody);
+        helpTitle.addEventListener('click', () => helpBody.classList.toggle('is-collapsed'));
+        this._panels.help = help;
+
+        // Status / mode indicator (bottom-left)
+        const status = this._makePanel('lan-flow-map-status');
+        const modeBadge = document.createElement('span');
+        modeBadge.className = 'lan-flow-map-mode';
+        modeBadge.textContent = 'Live';
+        modeBadge.setAttribute('data-tooltip-hover-only', '');
+        modeBadge.addEventListener('click', () => {
+            if (this._mode === 'live') return;
+            this._returnToLive();
+        });
+        status.appendChild(modeBadge);
+        this._panels.status = status;
+        this._panels.modeBadge = modeBadge;
+
+        // Timeline scrubber (bottom center). The right-side label swaps between
+        // "Live" and a long locale datetime as you scrub; without a min-width on
+        // that span the row reflows and the slider thumb jumps the moment you
+        // approach the right edge, making it almost impossible to land on Live.
+        const scrubber = document.createElement('div');
+        scrubber.className = 'lan-flow-map-scrubber';
+        scrubber.dataset.tour = 'live-view-timeline';
+        scrubber.innerHTML = `
+            <div class="lan-flow-map-scrubber-row">
+                <button class="lan-flow-map-scrubber-playpause" data-role="playpause" type="button" aria-label="Pause">⏸</button>
+                <div class="lan-flow-map-speed-control" data-role="speed">
+                    <button class="lan-flow-map-speed-step" data-dir="-1" type="button" aria-label="Slower">-</button>
+                    <span class="lan-flow-map-speed-label" data-role="speed-label">1x</span>
+                    <button class="lan-flow-map-speed-step" data-dir="1" type="button" aria-label="Faster">+</button>
+                </div>
+                <select class="lan-flow-map-scrubber-window" data-role="window" aria-label="Timeline range"></select>
+                <span data-role="left">-24h</span>
+                <span class="lan-flow-map-scrubber-track">
+                    <input class="lan-flow-map-scrubber-range" type="range" min="0" max="10000" value="10000" />
+                    <span class="lan-flow-map-scrubber-ticks" data-role="ticks"></span>
+                </span>
+                <span data-role="right">Live</span>
+            </div>
+        `;
+        const windowSel = scrubber.querySelector('[data-role="window"]');
+        for (const p of flowData.SCRUBBER_PRESETS) {
+            const opt = document.createElement('option');
+            opt.value = p.key;
+            opt.textContent = p.label;
+            windowSel.appendChild(opt);
+        }
+        windowSel.value = this._scrubSpanKey;
+        windowSel.addEventListener('change', () => this._setScrubSpan(windowSel.value));
+        // Arrow left/right (with Shift for fast scrub) and Space float up to
+        // timeline scrubbing and play/pause; without this the focused dropdown
+        // consumes them natively and the global key handler ignores keys while
+        // a select has focus. Enter/Up/Down stay native so the dropdown remains
+        // keyboard-operable.
+        windowSel.addEventListener('keydown', (e) => {
+            if (e.key === 'Shift') { this._keys.shift = true; return; }
+            if (e.key === ' ') {
+                e.preventDefault();
+                this._togglePlayPause();
+                return;
+            }
+            if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+            e.preventDefault();
+            this._keys[e.key.toLowerCase()] = true;
+        });
+        const range = scrubber.querySelector('.lan-flow-map-scrubber-range');
+        this._scrubberInputDebounce = null;
+        this._scrubberLastFire = 0;
+        // Both listeners resolve the slider value to a timestamp AT EVENT TIME and
+        // carry it through the debounce. The window trails now, so re-deriving the
+        // time when the debounced handler fires (up to 500ms later) would load a
+        // different instant than the label showed.
+        const onScrub = (e) => {
+            const val = Number(e.target.value);
+            const at = this._scrubberValueToTime(val);
+            this._onScrubberInput(val, at);
+            if (this._mode === 'live' && !this._isLiveValue(val, at)) {
+                this._enterHistoricScrub();
+            }
+            this._queueScrubChange(val, at);
+        };
+        range.addEventListener('input', onScrub);
+        range.addEventListener('change', onScrub);
+        range.addEventListener('keydown', (e) => e.preventDefault());
+        // User grabbing the thumb implicitly cancels any active historic playback.
+        range.addEventListener('pointerdown', () => this._stopHistoricPlayback());
+        const playPause = scrubber.querySelector('[data-role="playpause"]');
+        playPause.addEventListener('click', () => this._togglePlayPause());
+        const SPEED_STEPS = [0.5, 1, 2, 5, 10, 30, 60, 120, 360, 720, 1440];
+        this._speedSteps = SPEED_STEPS;
+        this._speedIndex = 1; // starts at 1x
+        for (const btn of scrubber.querySelectorAll('.lan-flow-map-speed-step')) {
+            btn.addEventListener('click', () => {
+                const dir = Number(btn.dataset.dir);
+                let newIdx = Math.max(0, Math.min(SPEED_STEPS.length - 1, this._speedIndex + dir));
+                if (this._mode === 'live' && dir > 0) {
+                    const liveIdx = SPEED_STEPS.indexOf(1);
+                    if (newIdx > liveIdx) newIdx = liveIdx;
+                }
+                if (newIdx === this._speedIndex) return;
+                this._speedIndex = newIdx;
+                this._playbackSpeed = SPEED_STEPS[newIdx];
+                this._syncSpeedLabel();
+                // Publish right away so the 2D mirror's speed label updates
+                // immediately - otherwise it waits for the next playback tick
+                // (1s), or indefinitely while paused.
+                flowData.publishScrubber(
+                    Number(this._panels.scrubberRange?.value ?? 10000),
+                    this._panels.scrubberRight?.textContent ?? 'Live',
+                    this._playbackSpeed);
+                if (this._mode === 'live' && this._playbackSpeed < 1) {
+                    const nearNow = this._timeToScrubberValue(Date.now() - 5000);
+                    const clamped = Math.min(nearNow, 9997);
+                    if (this._panels.scrubberRange) this._panels.scrubberRange.value = clamped;
+                    this._onScrubberInput(clamped);
+                    this._speedTransition = true;
+                    this._onScrubberChange(clamped);
+                    this._speedTransition = false;
+                    this._startHistoricPlayback();
+                }
+                if (this._mode === 'historic' && this._historicPlaybackTimer) {
+                    this._stopHistoricPlayback();
+                    this._startHistoricPlayback();
+                }
+            });
+        }
+        if (isMobile) {
+            this.stage.parentElement.insertBefore(scrubber, this.stage.nextSibling);
+        } else {
+            this.stage.appendChild(scrubber);
+        }
+        this._panels.scrubber = scrubber;
+        this._panels.scrubberRange = range;
+        this._panels.scrubberLeft = scrubber.querySelector('[data-role="left"]');
+        this._panels.scrubberRight = scrubber.querySelector('[data-role="right"]');
+        this._panels.scrubberPlayPause = playPause;
+        this._panels.scrubberWindow = windowSel;
+        this._panels.scrubberTicks = scrubber.querySelector('[data-role="ticks"]');
+        this._paused = false;
+        this._syncSpeedLabel();
+        this._publishWindow();
+        this._loadHistoryRange();
+        // Trailing multi-day windows slide with now, so the midnight ticks drift;
+        // a slow refresh keeps them honest on long-open pages.
+        this._windowTickTimer = setInterval(() => {
+            if (this._scrubSpan >= 48 * 3600000) this._publishWindow();
+        }, 60000);
+
+        this._buildSignalMapHint();
+    }
+
+    // One-time discovery nudge. A user with no AP placements on the Signal Map gets
+    // no spatial anchoring here (devices fall back to the abstract force layout and
+    // buildings have nothing to anchor to), so they may not realize the map can show
+    // their real floor plan and device positions. Surface a small, dismissible pill
+    // pointing to Wi-Fi Optimizer > Signal Map. Shown only when there are zero anchors
+    // and the user hasn't dismissed it - invisible for anyone who has placed their APs.
+    _buildSignalMapHint() {
+        if (!this._signalHintEnabled) return;
+        const hint = document.createElement('div');
+        hint.className = 'lan-flow-map-signal-hint';
+        hint.style.display = 'none';
+
+        const text = document.createElement('span');
+        text.className = 'lan-flow-map-signal-hint-text';
+        text.textContent = 'Add your floor plan and AP spots in the Signal Map to see them here.';
+
+        const link = document.createElement('a');
+        link.className = 'lan-flow-map-signal-hint-link';
+        link.href = '/wifi-optimizer?tab=floorplan';
+        link.textContent = 'Open Signal Map ↗';
+
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'lan-flow-map-signal-hint-close';
+        close.setAttribute('aria-label', 'Dismiss');
+        close.textContent = '×';
+        close.addEventListener('click', () => {
+            hint.style.display = 'none';
+            try { localStorage.setItem(this._storagePrefix + 'SignalHintDismissed', '1'); } catch { /* localStorage unavailable */ }
+        });
+
+        hint.append(text, link, close);
+        this.stage.appendChild(hint);
+        this._panels.signalHint = hint;
+    }
+
+    _updateSignalMapHint() {
+        const hint = this._panels?.signalHint;
+        if (!hint) return;
+        let dismissed = false;
+        try { dismissed = localStorage.getItem(this._storagePrefix + 'SignalHintDismissed') === '1'; } catch { /* localStorage unavailable */ }
+        const anchorCount = this._snapshot?.bounds?.anchorCount ?? 0;
+        hint.style.display = (!dismissed && anchorCount === 0) ? 'flex' : 'none';
+    }
+
+    _makePanel(extraClass) {
+        const el = document.createElement('div');
+        el.className = `lan-flow-map-panel ${extraClass}`;
+        this.stage.appendChild(el);
+        return el;
+    }
+
+    _toggleMobilePanel(panelKey) {
+        const panels = { filter: this._panels.filterBody, controls: this._panels.controlsBody };
+        const target = panels[panelKey];
+        if (!target) return;
+        const wasCollapsed = target.classList.contains('is-collapsed');
+        for (const [key, body] of Object.entries(panels)) {
+            if (!body) continue;
+            body.classList.add('is-collapsed');
+        }
+        if (wasCollapsed) {
+            target.classList.remove('is-collapsed');
+        }
+    }
+
+    _applyFilter() {
+        for (const node of (this._snapshot?.nodes || [])) {
+            if (node.kind !== NODE_KIND.WiredClient && node.kind !== NODE_KIND.WifiClient) continue;
+            const group = this._nodeMeshes.get(node.id);
+            if (!group) continue;
+            const visible = this._isClientVisible(node);
+            group.visible = visible;
+            // Hide the matching link too.
+            const linkId = 'cli-link-' + node.mac;
+            const link = this._linkMeshes.get(linkId);
+            if (link) {
+                link.pipe.visible = visible;
+                link.down.mesh.visible = visible;
+                link.up.mesh.visible = visible;
+            }
+        }
+    }
+
+    _isClientVisible(node) {
+        // Overlay master toggle wins first.
+        if (node.kind === NODE_KIND.WifiClient && !this._overlays.wifiClients) return false;
+        if (node.kind === NODE_KIND.WiredClient && !this._overlays.wiredClients) return false;
+        // Text search.
+        if (this._filter.text) {
+            const hay = `${node.name || ''} ${node.mac || ''} ${node.ssid || ''}`.toLowerCase();
+            if (!hay.includes(this._filter.text)) return false;
+        }
+        // Band filter (WiFi only). Follows the scrubbed instant like the tooltip and the node
+        // skin do, so filtering to 5 GHz keeps a client that was on 5 GHz then - the snapshot's
+        // band is "now". Live ticks carry no client stats, so this reads the snapshot value.
+        if (node.kind === NODE_KIND.WifiClient) {
+            const band = this._currentClientStats?.[node.id]?.band ?? node.band;
+            if (band && this._filter.bands[band] === false) return false;
+        }
+        return true;
+    }
+
+    _applyOverlayVisibility() {
+        if (this.cloudGroup) this.cloudGroup.visible = this._overlays.clouds;
+        if (this.buildingGroup) this.buildingGroup.visible = this._overlays.buildings;
+        this._applyFilter();
+    }
+
+    // ------------------------------------------------------------------------
+    // Speed test overlay (spec 5.7.2)
+    // ------------------------------------------------------------------------
+
+    async _loadInitialSpeedTests() {
+        try {
+            const res = await fetch(`${this.apiBase}/speed-tests`, { credentials: 'same-origin' });
+            if (!res.ok) return;
+            this._speedTests = await res.json();
+        } catch {
+            this._speedTests = [];
+        }
+
+        // Build the per-WAN lookup. Tests whose WanNetworkGroup is set get keyed to
+        // that interface. WAN tests without a group default to the primary WAN per
+        // user direction; we use a "*wan*" wildcard key the pill lookup falls back to.
+        this._latestSpeedTestByWan.clear();
+        for (const t of (this._speedTests || [])) {
+            if (t.testType !== 'wan') continue;
+            const key = t.wanNetworkGroup
+                ? t.wanNetworkGroup.toLowerCase()
+                : '*wan*';
+            const existing = this._latestSpeedTestByWan.get(key);
+            if (!existing || new Date(t.testTime) > new Date(existing.testTime)) {
+                this._latestSpeedTestByWan.set(key, t);
+            }
+        }
+        this._refreshWanPills();
+
+        if (this._overlays.speedTests) this._renderSpeedTestOverlay();
+    }
+
+    _renderSpeedTestOverlay() {
+        if (this._speedTestOverlay) {
+            this.particleGroup.remove(this._speedTestOverlay);
+            this._speedTestOverlay.traverse((o) => {
+                if (o.geometry) o.geometry.dispose();
+                if (o.material) o.material.dispose();
+            });
+            this._speedTestOverlay = null;
+        }
+        if (!this._overlays.speedTests) return;
+        const tests = this._speedTests || [];
+        if (tests.length === 0) return;
+
+        // Render only the most recent test of each type (WAN + LAN) to avoid clutter.
+        const wan = tests.find((t) => t.testType === 'wan');
+        const lan = tests.find((t) => t.testType === 'lan');
+        const recent = [wan, lan].filter(Boolean);
+
+        const group = new THREE.Group();
+        for (const test of recent) {
+            this._addSpeedTestOverlayRibbon(group, test);
+        }
+        this.particleGroup.add(group);
+        this._speedTestOverlay = group;
+    }
+
+    _addSpeedTestOverlayRibbon(parent, test) {
+        // Walk the hops in order, drawing a paired blue + green ribbon along the device-MAC
+        // chain. The server pre-resolved FromDeviceBps / ToDeviceBps direction per spec 5.7.2,
+        // so the JS layer just paints what it's given.
+        const hops = (test.hops || []).filter((h) => h.deviceMac);
+        if (hops.length < 2) return;
+        const positions = [];
+        for (const hop of hops) {
+            const pos = this._positions.get('dev-' + hop.deviceMac);
+            if (pos) positions.push(pos);
+        }
+        if (positions.length < 2) return;
+
+        const curve = new THREE.CatmullRomCurve3(positions.map((p) => new THREE.Vector3(p.x, p.y + 1.2, p.z)));
+        const downGeo = new THREE.TubeGeometry(curve, 64, 0.20, 8, false);
+        const upGeo = new THREE.TubeGeometry(
+            new THREE.CatmullRomCurve3(positions.map((p) => new THREE.Vector3(p.x, p.y + 2.0, p.z))),
+            64, 0.20, 8, false,
+        );
+        const downMat = new THREE.MeshBasicMaterial({
+            color: COLORS.downstream, transparent: true, opacity: 0.55,
+            blending: THREE.AdditiveBlending, depthWrite: false,
+        });
+        const upMat = new THREE.MeshBasicMaterial({
+            color: COLORS.upstream, transparent: true, opacity: 0.55,
+            blending: THREE.AdditiveBlending, depthWrite: false,
+        });
+        parent.add(new THREE.Mesh(downGeo, downMat));
+        parent.add(new THREE.Mesh(upGeo, upMat));
+    }
+
+    // ------------------------------------------------------------------------
+    // Timeline scrubber
+    // ------------------------------------------------------------------------
+
+    // Flip Live -> Historic on the first scrub interaction: land paused with the
+    // Historic badge up, and kill any running playback.
+    _enterHistoricScrub() {
+        this._mode = 'historic';
+        this._paused = true;
+        // Mirror the transition into the shared store immediately. The debounced
+        // _onScrubberChange republishes 0-500ms later, but consumers mounting in
+        // that window must not read a stale 'live' state.
+        flowData.publishPlayState(this._paused, this._mode);
+        this._syncPlayPauseIcon();
+        this._stopHistoricPlayback();
+        if (this._panels.modeBadge) {
+            this._panels.modeBadge.textContent = 'Historic';
+            this._panels.modeBadge.classList.add('is-historic');
+            this._panels.modeBadge.style.cursor = 'pointer';
+            this._panels.modeBadge.setAttribute('data-tooltip', 'Click to return to live');
+        }
+        this._syncSpeedLabel();
+    }
+
+    // Debounced data-load dispatch for scrub interactions (leading fire, then
+    // trailing at 500ms). The exact instant rides along so the eventual
+    // _onScrubberChange loads what the label showed; _pendingScrubAt keeps the
+    // not-yet-flushed instant visible to _startHistoricPlayback, so stepping and
+    // immediately hitting play resumes from the stepped position instead of a
+    // requantized slider value.
+    _queueScrubChange(val, at, explicit = false) {
+        this._pendingScrubAt = at;
+        const now = Date.now();
+        const sinceLastFire = now - this._scrubberLastFire;
+        clearTimeout(this._scrubberInputDebounce);
+        const fire = () => {
+            this._scrubberLastFire = Date.now();
+            this._pendingScrubAt = null;
+            this._onScrubberChange(val, at, explicit);
+        };
+        if (sinceLastFire >= 500) fire();
+        else this._scrubberInputDebounce = setTimeout(fire, 500 - sinceLastFire);
+    }
+
+    // External seek to an absolute instant (ms epoch) - e.g. a click on the WAN
+    // chart timeline. Mirrors a manual scrub: stops any playback, parks the
+    // timeline at the instant (or snaps to Live at the right edge) and loads it
+    // through the same debounced pipeline as slider/keyboard scrubbing.
+    seekTo(ms) {
+        const range = this._panels.scrubberRange;
+        if (!range || !Number.isFinite(ms)) return;
+        this._stopHistoricPlayback();
+        const { start, end } = this._scrubWindowBounds();
+        const t = Math.max(start, Math.min(end, ms));
+        const at = new Date(t);
+        const val = this._timeToScrubberValue(t);
+        range.value = val;
+        this._onScrubberInput(val, at);
+        // Explicit: only a click at the live edge itself means live. t is already clamped to the
+        // window end, so a click at or past "now" lands within the tight tolerance and stays live.
+        if (this._mode === 'live' && !this._isLiveValue(val, at, ExplicitSeekLiveToleranceMs))
+            this._enterHistoricScrub();
+        this._queueScrubChange(val, at, true);
+    }
+
+    _onScrubberInput(value, at = null) {
+        // Visual-only update while dragging - cheap label refresh.
+        at = at ?? this._scrubberValueToTime(value);
+        const rightLabel = this._isLiveValue(value, at) ? 'Live' : _fmtDateTime(at);
+        if (this._panels.scrubberRight) {
+            this._panels.scrubberRight.textContent = rightLabel;
+        }
+        flowData.publishScrubber(value, rightLabel, this._playbackSpeed);
+    }
+
+    async _onScrubberChange(value, at = null, explicit = false) {
+        if (this._isLiveValue(value, at, explicit ? ExplicitSeekLiveToleranceMs : 60000)) {
+            // Snap back to live.
+            this._stopHistoricPlayback();
+            this._mode = 'live';
+            this._historicAt = null;
+            // Reset the rate BEFORE the publish inside _onScrubberInput, which carries
+            // _playbackSpeed to the 2D mirror. Resetting after it leaves the mirror showing
+            // the playback rate while the map is back on live data.
+            this._speedIndex = this._speedSteps.indexOf(1);
+            this._playbackSpeed = 1;
+            this._onScrubberInput(10000);
+            if (this._panels.modeBadge) {
+                this._panels.modeBadge.textContent = 'Live';
+                this._panels.modeBadge.classList.remove('is-historic');
+                this._panels.modeBadge.style.cursor = '';
+                this._panels.modeBadge.removeAttribute('data-tooltip');
+                if (this._panels.modeBadge._tippy) this._panels.modeBadge._tippy.destroy();
+            }
+            // Returning to live: resume polling at the 1x rate set above.
+            this._paused = false;
+            this._syncPlayPauseIcon();
+            this._syncSpeedLabel();
+            flowData.publishPlayState(false, 'live');
+            this._notifyStatCards(null);
+            await this._pollLive();
+            return;
+        }
+        at = at ?? this._scrubberValueToTime(value);
+        this._mode = 'historic';
+        this._historicAt = at;
+        // Redirect any running playback to the new position - otherwise its
+        // next tick snaps the thumb back to wherever it was playing.
+        if (this._historicPlaybackTimer) this._playbackTime = at;
+        if (this._panels.modeBadge) {
+            this._panels.modeBadge.textContent = 'Historic';
+            this._panels.modeBadge.classList.add('is-historic');
+            this._panels.modeBadge.style.cursor = 'pointer';
+            this._panels.modeBadge.setAttribute('data-tooltip', 'Click to return to live');
+        }
+        this._syncSpeedLabel();
+        // Scrubbing back into historic by the user lands paused so they can
+        // inspect the point they picked. The playback timer also calls this
+        // method on every tick (to load the historic snapshot for the new
+        // slider position); skip the auto-pause in that case or playback
+        // would stop after one tick.
+        if (this._mode !== 'historic') return;
+        if (!this._historicPlaybackTimer && !this._speedTransition && !this._paused) {
+            this._paused = true;
+            this._syncPlayPauseIcon();
+        }
+        flowData.publishPlayState(this._paused, this._mode);
+        this._notifyStatCards(at);
+        await this._loadHistoric(at);
+    }
+
+    _notifyPlayState() {
+        if (!this._dotnetRef) return;
+        this._dotnetRef.invokeMethodAsync('OnMapPlayStateChanged', this._paused, this._mode)
+            .catch(() => {});
+    }
+
+    _notifyStatCards(at) {
+        if (!this._dotnetRef) {
+            console.warn('[LanFlowMap] _notifyStatCards: dotnetRef is null');
+            return;
+        }
+        const iso = at ? at.toISOString() : null;
+        this._dotnetRef.invokeMethodAsync('OnMapTimeChanged', iso)
+            .catch(err => console.warn('[LanFlowMap] OnMapTimeChanged failed:', err));
+    }
+
+    _syncPlayPauseIcon() {
+        const btn = this._panels.scrubberPlayPause;
+        if (!btn) return;
+        btn.textContent = this._paused ? '▶' : '⏸';
+        btn.setAttribute('aria-label', this._paused ? 'Play' : 'Pause');
+    }
+
+    _syncSpeedLabel() {
+        const label = this._panels.scrubber?.querySelector('[data-role="speed-label"]');
+        if (label) label.textContent = `${this._playbackSpeed}x`;
+    }
+
+    // Current timeline window bounds. The window slides with now so Live is
+    // always the right edge.
+    _scrubWindowBounds() {
+        const end = Date.now();
+        return { start: end - this._scrubSpan, end };
+    }
+
+    _scrubberValueToTime(value) {
+        // Range 0..10000 maps linearly across the current window.
+        const { start, end } = this._scrubWindowBounds();
+        return new Date(start + (value / 10000) * (end - start));
+    }
+
+    _timeToScrubberValue(ms) {
+        const { start, end } = this._scrubWindowBounds();
+        const span = end - start;
+        if (span <= 0) return 10000;
+        return Math.max(0, Math.min(10000, Math.round((ms - start) / span * 10000)));
+    }
+
+    // The window trails now, so the right edge of the slider is Live. Near-edge
+    // values only count as Live when they are also near now in TIME - on a wide
+    // window the last couple of slider steps span many minutes, and a position
+    // parked "10 minutes ago" must not read (or snap) as Live. Callers that
+    // already resolved the value to an instant pass it so the check agrees with
+    // the time they are actually working with.
+    /// A minute of slack so releasing the scrubber near the right edge means "live" without
+    /// having to land on it exactly. An EXPLICIT seek passes a tight tolerance instead: clicking
+    /// a spot on the WAN Live chart names an instant, and treating anything inside the last
+    /// minute as "you meant live" is what made the most recent minute unseekable - the playhead
+    /// appeared and the chart carried on playing.
+    _isLiveValue(value, at = null, toleranceMs = 60000) {
+        if (value < 9998) return false;
+        return Date.now() - (at ?? this._scrubberValueToTime(value)).getTime() < toleranceMs;
+    }
+
+    // Widest selectable span: capped by the primary bucket's 90-day retention and,
+    // once known, by the earliest stored data point.
+    _maxScrubSpan(now = Date.now()) {
+        const cap = 90 * 86400000;
+        if (this._dataStartMs == null) return cap;
+        return Math.max(3600000, Math.min(cap, now - this._dataStartMs));
+    }
+
+    // Switch the timeline window preset. The window always spans the latest N back
+    // from now. At Live nothing else moves. Parked or playing at a historic instant,
+    // the instant stays under the thumb when it still falls inside the new window;
+    // an instant older than the new window clamps to the left edge (the oldest
+    // reachable point) and seeks there.
+    _setScrubSpan(key) {
+        const preset = flowData.SCRUBBER_PRESETS.find(p => p.key === key);
+        if (!preset) return;
+        const now = Date.now();
+        const span = Math.min(preset.ms ?? this._maxScrubSpan(now), this._maxScrubSpan(now));
+        const range = this._panels.scrubberRange;
+        const value = Number(range?.value ?? 10000);
+        this._scrubSpanKey = key;
+        try { localStorage.setItem(this._storagePrefix + 'ScrubSpan', key); } catch { /* localStorage unavailable */ }
+        if (this._mode === 'live' || this._isLiveValue(value)) {
+            this._scrubSpan = span;
+        } else {
+            // Resolve the current instant against the OLD window before resizing.
+            const at = (this._historicAt ?? this._scrubberValueToTime(value)).getTime();
+            this._scrubSpan = span;
+            const clampedAt = Math.max(at, now - span);
+            const atDate = new Date(clampedAt);
+            this._historicAt = atDate;
+            if (range) range.value = this._timeToScrubberValue(clampedAt);
+            // Label from the true instant, not the requantized slider value -
+            // near the live edge of a wide window the rounded value would read
+            // back as Live (or minutes off) while the data stays historic.
+            const rightLabel = _fmtDateTime(atDate);
+            if (this._panels.scrubberRight) this._panels.scrubberRight.textContent = rightLabel;
+            flowData.publishScrubber(Number(range?.value ?? 0), rightLabel, this._playbackSpeed);
+            if (clampedAt !== at) {
+                // The old position fell off the narrower window: seek to the
+                // new left edge, keeping any running playback going from there.
+                if (this._historicPlaybackTimer) this._playbackTime = atDate;
+                this._notifyStatCards(atDate);
+                this._loadHistoric(atDate);
+            }
+        }
+        if (this._panels.scrubberWindow) this._panels.scrubberWindow.value = key;
+        this._publishWindow();
+    }
+
+    // One-time fetch of the earliest stored data point so Max spans to real data
+    // instead of a mostly-empty 90-day track on young installs.
+    async _loadHistoryRange() {
+        try {
+            const res = await fetch(`${this.apiBase}/history/range`, { credentials: 'same-origin' });
+            if (!res.ok) return;
+            const data = await res.json();
+            if (!data?.earliest) return;
+            this._dataStartMs = new Date(data.earliest).getTime();
+            const avail = this._maxScrubSpan();
+            const current = flowData.SCRUBBER_PRESETS.find(p => p.key === this._scrubSpanKey);
+            // A preset wider than the stored history is a mostly-empty track;
+            // fall back to Max, which spans exactly the data that exists.
+            if (current?.ms != null && current.ms > avail) this._setScrubSpan('max');
+            else if (this._scrubSpanKey === 'max') this._setScrubSpan('max'); // recompute span from data start
+            else this._publishWindow();
+        } catch { /* keep the 90d fallback */ }
+    }
+
+    _disabledPresetKeys() {
+        const avail = this._maxScrubSpan();
+        return flowData.SCRUBBER_PRESETS
+            .filter(p => p.ms != null && p.ms > avail)
+            .map(p => p.key);
+    }
+
+    _returnToLive() {
+        const range = this._panels.scrubberRange;
+        if (range) range.value = 10000;
+        this._onScrubberChange(10000);
+    }
+
+    _windowLeftLabel() {
+        const p = flowData.SCRUBBER_PRESETS.find(x => x.key === this._scrubSpanKey);
+        if (p?.ms != null) return `-${p.label}`;
+        return `-${_fmtSpan(this._scrubSpan)}`;
+    }
+
+    // Refresh the 3D scrubber's window-dependent UI (left label, preset select,
+    // disabled options, midnight ticks) and publish to the shared store so the
+    // 2D mirror renders identically.
+    _publishWindow() {
+        const sel = this._panels.scrubberWindow;
+        const disabled = this._disabledPresetKeys();
+        if (sel) {
+            sel.value = this._scrubSpanKey;
+            for (const opt of sel.options) opt.disabled = disabled.includes(opt.value);
+        }
+        if (this._panels.scrubberLeft) this._panels.scrubberLeft.textContent = this._windowLeftLabel();
+        const { start, end } = this._scrubWindowBounds();
+        flowData.renderScrubberTicks(this._panels.scrubberTicks, start, end);
+        flowData.publishScrubberWindow({
+            startMs: start,
+            endMs: end,
+            presetKey: this._scrubSpanKey,
+            leftLabel: this._windowLeftLabel(),
+            disabledKeys: disabled,
+        });
+    }
+
+    async _loadHistoric(at) {
+        const gen = this._historicGen = (this._historicGen || 0) + 1;
+        try {
+            const url = `${this.apiBase}/history?at=${encodeURIComponent(at.toISOString())}`;
+            const res = await fetch(url, { credentials: 'same-origin' });
+            if (!res.ok || gen !== this._historicGen) return;
+            const update = await res.json();
+            if (gen !== this._historicGen) return;
+            flowData.publishLive(update);
+            // Add the clients that were connected at this instant but are not now, before
+            // skinning and rates so they are treated like any other leaf.
+            this._applyHistoricClients(update);
+            // Set badges before applying rates: _applyOnlineState re-skins the nodes and
+            // _applyLiveRates reads the badges to force offline endpoints' pipes idle.
+            this._currentBadges = update.nodeBadges || {};
+            this._currentClientStats = update.clientStats || {};
+            this._applyOnlineState();
+            this._applyClientAssoc3D();
+            this._applyLiveRates(update.linkRates || {});
+        } catch (err) {
+            // Keep ticking; transient errors are fine.
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Floating DOM labels (per-device rates) + WAN speed test pill + hover tooltip
+    // ------------------------------------------------------------------------
+
+    _ensureLabelsLayer() {
+        if (this._labelsLayer) return;
+        const layer = document.createElement('div');
+        layer.className = 'lan-flow-map-labels';
+        this.stage.appendChild(layer);
+        this._labelsLayer = layer;
+
+        const tip = document.createElement('div');
+        tip.className = 'lan-flow-map-tooltip';
+        this.stage.appendChild(tip);
+        this._tooltipEl = tip;
+    }
+
+    _buildFloatingLabels(snap) {
+        this._ensureLabelsLayer();
+        // Clear previous labels.
+        for (const { el } of this._floatingLabels.values()) el.remove();
+        this._floatingLabels.clear();
+        for (const { el } of this._linkLabels.values()) el.remove();
+        this._linkLabels.clear();
+        for (const el of this._wanPills.values()) el.remove();
+        this._wanPills.clear();
+
+        // Per-link rate pills - one per link, only shown when traffic on either
+        // direction is above the threshold (LINK_LABEL_THRESHOLD_BPS). Lets the
+        // map convey "how busy" at the link level without cluttering idle links.
+        for (const link of snap.links || []) {
+            const el = document.createElement('div');
+            el.className = 'lan-flow-map-link-label';
+            // Park offscreen until the first projection update positions it so
+            // a stray is-visible flash doesn't render the label at canvas
+            // top-left (CSS default 0,0).
+            el.style.left = '-9999px';
+            el.style.top = '-9999px';
+            // Hover tooltip with the link's negotiated capacity - both
+            // directions when asymmetric (WiFi PHY, ISP-provisioned WAN).
+            // Long delay so it doesn't fire while just moving around the map.
+            // Directional capacities always win over the symmetric PHY figure -
+            // a symmetric ISP plan must still show the plan, not the port speed.
+            const capDown = link.capacityDownBps, capUp = link.capacityUpBps;
+            const capLabel = link.isMloMesh ? 'Link speed (MLO)' : 'Link speed';
+            let capTip = null;
+            if (capDown > 0 && capUp > 0) {
+                capTip = `${capLabel}: ↓ ${formatCapacity(capDown)} / ↑ ${formatCapacity(capUp)}`;
+            } else if (capDown > 0 || capUp > 0) {
+                capTip = `${capLabel}: ${formatCapacity(capDown > 0 ? capDown : capUp)}`;
+            } else if (Number.isFinite(link.capacityBps) && link.capacityBps > 0) {
+                capTip = `${capLabel}: ${formatCapacity(link.capacityBps)}`;
+            }
+            if (capTip) {
+                el.setAttribute('data-tooltip', capTip);
+                el.setAttribute('data-tooltip-hover-only', '');
+                el.setAttribute('data-tooltip-delay', '500');
+            }
+            // Pills accept pointer events for the tooltip, which would swallow
+            // the scroll wheel - forward it to the canvas so zoom keeps working.
+            el.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                this.canvas.dispatchEvent(new WheelEvent('wheel', e));
+            }, { passive: false });
+            this._labelsLayer.appendChild(el);
+            this._linkLabels.set(link.id, { el, kind: link.kind, link });
+        }
+
+        // Device labels: infrastructure devices (gateway, switch, AP) get DOM labels.
+        // Clients stay as sprites for proper 3D depth sorting.
+        for (const node of snap.nodes) {
+            if (node.kind === NODE_KIND.WiredClient || node.kind === NODE_KIND.WifiClient) continue;
+            if (node.kind === NODE_KIND.Cloud) continue;
+            const el = document.createElement('div');
+            el.className = 'lan-flow-map-label';
+            // Same offscreen park as link labels and WAN pills.
+            el.style.left = '-9999px';
+            el.style.top = '-9999px';
+            const nameEl = document.createElement('div');
+            nameEl.className = 'lan-flow-map-label-name';
+            nameEl.textContent = node.name || (node.mac || '');
+            const rateEl = document.createElement('div');
+            rateEl.className = 'lan-flow-map-label-rates';
+            rateEl.innerHTML = `<span class="down">↓ -</span> &nbsp; <span class="up">↑ -</span>`;
+            el.appendChild(nameEl);
+            el.appendChild(rateEl);
+            this._labelsLayer.appendChild(el);
+            this._floatingLabels.set(node.id, { el, nameEl, rateEl, crowdScale: 1 });
+        }
+
+        // Local-density label shrink: infra devices clustered together (rack
+        // areas) get proportionally smaller labels so they don't pile up.
+        // Computed once per layout in world space - stable across camera moves,
+        // unlike per-frame screen-space overlap testing which jitters.
+        const CROWD_RADIUS = 8;
+        const labelIds = Array.from(this._floatingLabels.keys());
+        for (const id of labelIds) {
+            const p = this._positions.get(id);
+            if (!p) continue;
+            let neighbors = 0;
+            for (const otherId of labelIds) {
+                if (otherId === id) continue;
+                const q = this._positions.get(otherId);
+                if (!q) continue;
+                const dx = p.x - q.x, dy = p.y - q.y, dz = p.z - q.z;
+                if (dx * dx + dy * dy + dz * dz < CROWD_RADIUS * CROWD_RADIUS) neighbors += 1;
+            }
+            this._floatingLabels.get(id).crowdScale = Math.max(0.6, 1 - 0.12 * neighbors);
+        }
+
+        // WAN speed test pills: one per access-ISP cloud, anchored to the cloud mesh.
+        // Key by wanInterface so the JS lookup can fall back to the primary WAN when
+        // a test has no WanNetworkGroup set.
+        for (const cloud of (snap.clouds || [])) {
+            if (cloud.kind !== 0 /* AccessIsp */) continue;
+            if (!cloud.wanInterface) continue;
+            const pill = document.createElement('div');
+            pill.className = 'lan-flow-map-wan-pill';
+            // Park offscreen until the first projection update places it. Without
+            // this the pill briefly shows at top-left (CSS default 0,0) the moment
+            // _refreshWanPills adds is-visible but before _updateFloatingLabels
+            // has projected the access cloud's screen coords.
+            pill.style.left = '-9999px';
+            pill.style.top = '-9999px';
+            this._labelsLayer.appendChild(pill);
+            this._wanPills.set(cloud.wanInterface, pill);
+        }
+
+        // Cloud RTT labels: live-updating DOM element below each access cloud.
+        this._cloudRttLabels = this._cloudRttLabels || new Map();
+        for (const el of this._cloudRttLabels.values()) el.remove();
+        this._cloudRttLabels.clear();
+        for (const cloud of (snap.clouds || [])) {
+            if (cloud.kind !== 0 /* AccessIsp */) continue;
+            const lbl = document.createElement('div');
+            lbl.className = 'lan-flow-map-cloud-rtt';
+            lbl.style.left = '-9999px';
+            lbl.style.top = '-9999px';
+            this._labelsLayer.appendChild(lbl);
+            this._cloudRttLabels.set(cloud.id, lbl);
+        }
+
+        // Hide the existing 3D sprite labels for devices we now show via DOM (keeps
+        // the scene from double-labeling them).
+        for (const [id, sprite] of this._labelSprites) {
+            const node = snap.nodes.find((n) => n.id === id);
+            if (!node) continue;
+            if (node.kind !== NODE_KIND.WiredClient && node.kind !== NODE_KIND.WifiClient
+                && node.kind !== NODE_KIND.Cloud) {
+                sprite.visible = false;
+            }
+        }
+    }
+
+    _updateFloatingLabels() {
+        if (!this._labelsLayer) return;
+        const rect = this.canvas.getBoundingClientRect();
+        const halfW = rect.width / 2;
+        const halfH = rect.height / 2;
+        const tmp = new THREE.Vector3();
+        const camPos = this.camera.position;
+        // Reference distance: roughly the fly-in camera target distance (~60u).
+        // At this distance labels render at 100%. Farther = smaller, closer = larger.
+        const REF_DIST = 36;
+        const MIN_SCALE = 0.24;
+        const MAX_SCALE = 1.2;
+        // On large properties the shrink floor scales down with the devices,
+        // so labels keep receding when zoomed out instead of flooring early
+        // and dominating the shrunken scene. The max cap comes down too (by
+        // sqrt, gentler) so mid-zoom building-overview views don't crowd with
+        // full-size labels over shrunken devices. Single-home is unchanged.
+        const minScale = MIN_SCALE * this._deviceScale;
+        const maxScale = MAX_SCALE * Math.sqrt(this._deviceScale);
+
+        for (const [nodeId, { el, crowdScale }] of this._floatingLabels) {
+            const group = this._nodeMeshes.get(nodeId);
+            if (!group) { el.classList.remove('is-visible'); continue; }
+            if (!group.visible) { el.classList.remove('is-visible'); continue; }
+            tmp.setFromMatrixPosition(group.matrixWorld);
+            const dist = tmp.distanceTo(camPos);
+            // Anchor just above the rendered top of the core mesh (tracks the
+            // per-frame zoom scale) instead of a fixed offset above center.
+            const zDev = Math.max(DEVICE_ZOOM_MIN, Math.min(this._devZoomMax ?? 1, dist / DEVICE_ZOOM_REF_DIST));
+            tmp.y += this._nodeTopHalfHeight(group.userData?.node?.kind) * zDev + 0.35 * this._deviceScale;
+            tmp.project(this.camera);
+            if (tmp.z > 1) { el.classList.remove('is-visible'); continue; }
+            const fade = 1 - Math.min(1, Math.max(0,
+                (dist - NET_LABEL_FADE_START_DIST) / (NET_LABEL_FADE_END_DIST - NET_LABEL_FADE_START_DIST)));
+            if (fade <= 0.01) { el.classList.remove('is-visible'); continue; }
+            el.style.opacity = fade.toFixed(3);
+            const x = (tmp.x * halfW) + halfW;
+            const y = -(tmp.y * halfH) + halfH;
+            // Crowd shrink only matters where labels can actually collide -
+            // zoomed out. Up close the cluster spreads across the screen, so
+            // blend the factor out below 25 units and fully in past 60.
+            const crowdT = Math.min(1, Math.max(0, (dist - 25) / 35));
+            const crowdF = 1 - (1 - (crowdScale ?? 1)) * crowdT;
+            const scale = Math.max(minScale, Math.min(maxScale, REF_DIST / Math.max(dist, 1))) * crowdF;
+            el.style.transform = `translate(-50%, -100%) scale(${scale.toFixed(3)})`;
+            el.style.transformOrigin = 'center bottom';
+            el.style.left = `${x}px`;
+            el.style.top = `${y}px`;
+            el.classList.add('is-visible');
+        }
+
+        for (const [wanIface, pill] of this._wanPills) {
+            const group = this._cloudMeshes.get(`cloud-access-${wanIface}`);
+            if (!group) { pill.classList.remove('is-visible'); continue; }
+            tmp.setFromMatrixPosition(group.matrixWorld);
+            tmp.y -= this._cloudRadius() + 0.5;
+            const dist = tmp.distanceTo(camPos);
+            tmp.project(this.camera);
+            if (tmp.z > 1) { pill.classList.remove('is-visible'); continue; }
+            const x = (tmp.x * halfW) + halfW;
+            const y = -(tmp.y * halfH) + halfH;
+            const scale = Math.max(MIN_SCALE, Math.min(1.0, REF_DIST / Math.max(dist, 1)));
+            pill.style.transform = `translate(-50%, 0%) scale(${scale.toFixed(3)})`;
+            pill.style.transformOrigin = 'center top';
+            pill.style.left = `${x}px`;
+            pill.style.top = `${y}px`;
+        }
+
+        // Cloud RTT labels - positioned right below the WAN speed test pill.
+        // Only show if the label has content (set by _refreshCloudRttLabels).
+        if (this._cloudRttLabels) {
+            for (const [cloudId, lbl] of this._cloudRttLabels) {
+                if (!lbl.textContent) { lbl.classList.remove('is-visible'); continue; }
+                const group = this._cloudMeshes.get(cloudId);
+                if (!group) { lbl.classList.remove('is-visible'); continue; }
+                tmp.setFromMatrixPosition(group.matrixWorld);
+                tmp.y -= this._cloudRadius() + 0.5;
+                const dist = tmp.distanceTo(camPos);
+                tmp.project(this.camera);
+                if (tmp.z > 1) { lbl.classList.remove('is-visible'); continue; }
+                const x = (tmp.x * halfW) + halfW;
+                const y = -(tmp.y * halfH) + halfH;
+                const scale = Math.max(MIN_SCALE, Math.min(1.0, REF_DIST / Math.max(dist, 1)));
+                const wanIface = cloudId.replace('cloud-access-', '');
+                const pill = this._wanPills.get(wanIface);
+                const pillOffset = pill?.classList.contains('is-visible') ? (pill.offsetHeight * scale + 6) : 0;
+                lbl.style.transform = `translate(-50%, 0%) scale(${scale.toFixed(3)})`;
+                lbl.style.transformOrigin = 'center top';
+                lbl.style.left = `${x}px`;
+                lbl.style.top = `${y + pillOffset}px`;
+                lbl.classList.add('is-visible');
+            }
+        }
+
+        // Link rate pills: positioned at the link midpoint. Visibility + text is
+        // driven by _refreshLinkLabels (set is-visible class only when above
+        // threshold). Per-frame we project the position + scale, and apply a
+        // camera-distance gate: leaf links (wired / wifi client) hide their
+        // label when zoomed out, unless a filter has reduced the parent
+        // switch's visible-leaf count to <= 25% - in that sparsely-filtered
+        // case we always show, since clutter is no longer a concern.
+        // Pre-compute visible-leaf ratio per parent so the inner loop is O(1).
+        const leafByParent = new Map();
+        for (const [, { link }] of this._linkMeshes) {
+            const k = link.kind;
+            if (k !== LINK_KIND.WiredClient && k !== LINK_KIND.WifiClient) continue;
+            const parentId = link.fromNodeId;
+            let counts = leafByParent.get(parentId);
+            if (!counts) { counts = { total: 0, visible: 0 }; leafByParent.set(parentId, counts); }
+            counts.total++;
+            const leafGroup = this._nodeMeshes.get(link.toNodeId);
+            if (leafGroup && leafGroup.visible) counts.visible++;
+        }
+
+        const midA = new THREE.Vector3();
+        const midB = new THREE.Vector3();
+        for (const [linkId, { el }] of this._linkLabels) {
+            const link = this._linkMeshes.get(linkId);
+            if (!link || !el._hasData) { el.classList.remove('is-visible'); continue; }
+            // Respect the band/overlay filter: _applyFilter hides a filtered client
+            // link's pipe, so its throughput label must hide too (device labels already
+            // gate on group.visible; link labels need the same check).
+            if (!link.pipe.visible) { el.classList.remove('is-visible'); continue; }
+            const fromPos = this._positions.get(link.link.fromNodeId);
+            const toPos = this._positions.get(link.link.toNodeId);
+            if (!fromPos || !toPos) continue;
+            midA.set(fromPos.x, fromPos.y, fromPos.z);
+            midB.set(toPos.x, toPos.y, toPos.z);
+            tmp.copy(midA).add(midB).multiplyScalar(0.5);
+            const dist = tmp.distanceTo(camPos);
+            const kind = link.link.kind;
+            const isLeaf = kind === LINK_KIND.WiredClient || kind === LINK_KIND.WifiClient;
+            if (isLeaf && dist > LEAF_LABEL_MAX_DIST) {
+                const counts = leafByParent.get(link.link.fromNodeId);
+                const sparselyFiltered = counts && counts.total > 0
+                    && counts.visible > 0
+                    && (counts.visible / counts.total) <= 0.25;
+                if (!sparselyFiltered) {
+                    el.classList.remove('is-visible');
+                    continue;
+                }
+            }
+            tmp.project(this.camera);
+            if (tmp.z > 1) { el.classList.remove('is-visible'); continue; }
+            const fadeStart = kind === LINK_KIND.Wan ? WAN_LINK_LABEL_FADE_START_DIST : LINK_LABEL_FADE_START_DIST;
+            const fadeEnd = kind === LINK_KIND.Wan ? WAN_LINK_LABEL_FADE_END_DIST : LINK_LABEL_FADE_END_DIST;
+            const fade = 1 - Math.min(1, Math.max(0, (dist - fadeStart) / (fadeEnd - fadeStart)));
+            if (fade <= 0.01) { el.classList.remove('is-visible'); continue; }
+            el.style.opacity = fade.toFixed(3);
+            const x = (tmp.x * halfW) + halfW;
+            const y = -(tmp.y * halfH) + halfH;
+            const scale = Math.max(minScale, Math.min(maxScale, REF_DIST / Math.max(dist, 1)));
+            el.style.transform = `translate(-50%, -50%) scale(${scale.toFixed(3)})`;
+            el.style.left = `${x}px`;
+            el.style.top = `${y}px`;
+            el.classList.add('is-visible');
+        }
+    }
+
+    // Resolve a VirtualHub's own throughput. The hub groups several wired clients
+    // that share one physical switch port (a server's VLAN sub-interfaces, etc.);
+    // the parent switch -> hub link carries the real, direction-correct port rate
+    // while the hub -> member leaf links carry per-client rates. The hub's boundary
+    // throughput IS its upstream port link, so prefer it and only fall back to
+    // summing the members when that port link has no rate (e.g. an SNMP-free parent
+    // port). On every WiredClient link downstreamBps is the toward-leaf (download)
+    // value and upstreamBps the toward-gateway (upload) value, so both the port link
+    // and the member links map down=downstream / up=upstream with no end-based flip.
+    _virtualHubRates(nodeId) {
+        let upDown = 0, upUp = 0, upHas = false;
+        let sumDown = 0, sumUp = 0, sumHas = false;
+        for (const [linkId, lm] of this._linkMeshes) {
+            const lk = lm.link;
+            const r = this._currentRates?.[linkId];
+            if (!r) continue;
+            const dn = r.downstreamBps || 0, up = r.upstreamBps || 0;
+            if (lk.toNodeId === nodeId) { upDown += dn; upUp += up; upHas = true; }
+            else if (lk.fromNodeId === nodeId) { sumDown += dn; sumUp += up; sumHas = true; }
+        }
+        if (upHas) return { down: upDown, up: upUp, any: (upDown > 0 || upUp > 0) };
+        if (sumHas) return { down: sumDown, up: sumUp, any: (sumDown > 0 || sumUp > 0) };
+        return { down: 0, up: 0, any: false };
+    }
+
+    _refreshDeviceLabelRates() {
+        // Floating labels render only on infrastructure (gateway / switch / AP).
+        // Aggregate across adjacent links using internet-centric direction:
+        //   blue down arrow  = download-direction sum (data flowing toward leaves)
+        //   green up arrow   = upload-direction sum (data flowing toward internet)
+        // For WAN/uplink/wifi links the backend's UpstreamBps holds the
+        // download-direction value (display-layer swap). WiredClient links are
+        // the exception: backend's DownstreamBps already holds the
+        // download-direction value (SNMP port TX = toward leaf), so no swap.
+        for (const [nodeId, { rateEl }] of this._floatingLabels) {
+            let downBps = 0;
+            let upBps = 0;
+            let anyData = false;
+            const node = this._nodeMeshes.get(nodeId)?.userData?.node;
+            // Prefer the per-device aggregate badge if the server published one.
+            // For switches the server emits fabric ingress/egress (sum across
+            // every port_table entry) so multi-trunk switches don't under-
+            // count egress. Other fabric devices use the trunk-port rate.
+            // Either way it's better than summing adjacent links, which
+            // double-counts any flow that traverses the device.
+            const badge = this._currentBadges?.[nodeId];
+            const hasFabric = badge && (badge.fabricIngressBps != null || badge.fabricEgressBps != null);
+            const hasAggregate = badge && (badge.aggregateInBps != null || badge.aggregateOutBps != null);
+            if (node?.kind === NODE_KIND.VirtualHub) {
+                // A VirtualHub's own throughput is the rate on its single upstream
+                // port link (parent switch -> hub), which carries direction-correct
+                // port stats. Summing the member leaf links here would double-count
+                // and read the members with the wrong orientation, so use the port
+                // link and only fall back to the members when it has no rate.
+                const hr = this._virtualHubRates(nodeId);
+                downBps = hr.down;
+                upBps = hr.up;
+                anyData = hr.any;
+            } else if (hasFabric) {
+                downBps = badge.fabricIngressBps || 0;
+                upBps = badge.fabricEgressBps || 0;
+                anyData = (downBps > 0 || upBps > 0);
+            } else if (hasAggregate) {
+                // For APs the aggregate badge comes from the parent switch's
+                // port_table TX/RX, which UniFi reports from the connected
+                // device's perspective (port TX = bytes the AP sent up,
+                // RX = bytes the AP received). The tooltip's "Ingress"
+                // (= aggregateInBps) reads naturally as "client data
+                // arriving at the AP" under that convention. The floating
+                // label is gateway-relative though - blue down arrow is
+                // always data flowing FROM the gateway - so for APs the
+                // mapping has to swap.
+                if (node?.kind === NODE_KIND.AccessPoint) {
+                    downBps = badge.aggregateOutBps || 0;
+                    upBps = badge.aggregateInBps || 0;
+                } else {
+                    downBps = badge.aggregateInBps || 0;
+                    upBps = badge.aggregateOutBps || 0;
+                }
+                anyData = (downBps > 0 || upBps > 0);
+            } else {
+                for (const [linkId, link] of this._linkMeshes) {
+                    if (link.link.fromNodeId !== nodeId && link.link.toNodeId !== nodeId) continue;
+                    const r = this._currentRates?.[linkId];
+                    if (!r) continue;
+                    anyData = true;
+                    // Backend emits DownstreamBps = downloads, UpstreamBps =
+                    // uploads on every link kind, so no leaf/non-leaf swap.
+                    downBps += r.downstreamBps || 0;
+                    upBps += r.upstreamBps || 0;
+                }
+            }
+            if (!anyData) {
+                rateEl.innerHTML = `<span class="down">↓ -</span> &nbsp; <span class="up">↑ -</span>`;
+                continue;
+            }
+            rateEl.innerHTML =
+                `<span class="down">↓ ${formatBps(downBps)}</span> &nbsp; ` +
+                `<span class="up">↑ ${formatBps(upBps)}</span>`;
+        }
+    }
+
+    _refreshWanPills() {
+        const primary = this._snapshot?.primaryWanInterface;
+        for (const [wanIface, pill] of this._wanPills) {
+            // First look for a test bound to this specific WAN. If none, and this is
+            // the primary WAN, fall back to any ungrouped WAN test ("*wan*" wildcard).
+            let test = this._latestSpeedTestByWan.get(wanIface);
+            if (!test && wanIface === primary) {
+                test = this._latestSpeedTestByWan.get('*wan*');
+            }
+            if (!test) { pill.classList.remove('is-visible'); continue; }
+            const dl = test.downloadMbps ?? 0;
+            const ul = test.uploadMbps ?? 0;
+            const ageMs = Date.now() - new Date(test.testTime).getTime();
+            const ageLabel = formatAge(ageMs);
+            pill.textContent = `Last test: ${dl.toFixed(0)} / ${ul.toFixed(0)} Mbps  ·  ${ageLabel}`;
+            pill.classList.add('is-visible');
+        }
+    }
+
+    _refreshCloudRttLabels() {
+        if (!this._cloudRttLabels || this._cloudRttLabels.size === 0) return;
+        const cs = flowData.getCloudStats();
+        for (const [cloudId, lbl] of this._cloudRttLabels) {
+            const stats = cs?.[cloudId];
+            if (!stats || stats.rttAvgMs == null) {
+                lbl.classList.remove('is-visible');
+                continue;
+            }
+            const parts = [`${stats.rttAvgMs.toFixed(2)} ms`];
+            if (stats.lossPercent != null && stats.lossPercent > 0) {
+                parts.push(`${stats.lossPercent.toFixed(1)}% loss`);
+            }
+            lbl.textContent = parts.join('  ·  ');
+        }
+    }
+
+    _onPointerMove(e) {
+        const rect = this.canvas.getBoundingClientRect();
+        this._pointerScreen.x = e.clientX - rect.left;
+        this._pointerScreen.y = e.clientY - rect.top;
+        this._pointerNdc.x = (this._pointerScreen.x / rect.width) * 2 - 1;
+        this._pointerNdc.y = -(this._pointerScreen.y / rect.height) * 2 + 1;
+        if (this._repositionMode) return;
+        this._raycaster.setFromCamera(this._pointerNdc, this.camera);
+        // Raycast against device node spheres - cheap, ~tens of meshes.
+        const candidates = [];
+        for (const group of this._nodeMeshes.values()) {
+            if (!group.visible) continue;
+            for (const child of group.children) {
+                if (child.isMesh) candidates.push(child);
+            }
+        }
+        const hits = this._raycaster.intersectObjects(candidates, false);
+        if (hits.length === 0) { this._clearHover(); return; }
+        const hit = hits[0].object;
+        // Walk up to find the group with userData.node.
+        let g = hit;
+        while (g && !(g.userData && g.userData.node)) g = g.parent;
+        if (!g) { this._clearHover(); return; }
+        this._showHover(g.userData.node);
+    }
+
+    _onDoubleClick(e) {
+        if (this._repositionMode) return;
+        const rect = this.canvas.getBoundingClientRect();
+        const ndc = new THREE.Vector2(
+            ((e.clientX - rect.left) / rect.width) * 2 - 1,
+            -((e.clientY - rect.top) / rect.height) * 2 + 1
+        );
+        this._raycaster.setFromCamera(ndc, this.camera);
+        const candidates = [];
+        for (const group of this._nodeMeshes.values()) {
+            if (!group.visible) continue;
+            for (const child of group.children) {
+                if (child.isMesh) candidates.push(child);
+            }
+        }
+        const hits = this._raycaster.intersectObjects(candidates, false);
+        if (hits.length === 0) return;
+        let g = hits[0].object;
+        while (g && !(g.userData?.node)) g = g.parent;
+        if (!g) return;
+        const node = g.userData.node;
+        // Switches and gateways scroll to the port stats table and isolate that device.
+        if (node.kind === NODE_KIND.Switch || node.kind === NODE_KIND.Gateway) {
+            if (node.mac && window.__portStatsTable) {
+                // The table is under the map, so fullscreen would hide the jump.
+                if (this.stage?.classList.contains('lan-flow-map-fullscreen')) this._toggleFullscreen();
+                window.__portStatsTable.selectDevice(node.mac);
+                document.getElementById('port-stats-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+            return;
+        }
+        // A shared-port hub carries the IP of its busiest interface, so it opens like a client.
+        if (node.kind !== NODE_KIND.WifiClient && node.kind !== NODE_KIND.WiredClient && node.kind !== NODE_KIND.VirtualHub) return;
+        const ip = node.ip;
+        if (!ip) return;
+        // Wi-Fi clients land on the Signal tab; wired clients have no signal data,
+        // so they go to the default tab.
+        const tab = node.kind === NODE_KIND.WifiClient ? '&tab=signal' : '';
+        const url = `/client-dashboard?ip=${encodeURIComponent(ip)}${tab}`;
+        window.location.href = window.noSiteContext ? window.noSiteContext.stampUrl(url) : url;
+    }
+
+    _showHover(node) {
+        if (!this._tooltipEl) return;
+        const rows = [];
+        // During playback prefer the client's wireless stats at the scrubbed instant
+        // over the snapshot-frozen values (band/signal/PHY rate below).
+        const cs = this._currentClientStats?.[node.id];
+        const band = cs?.band ?? node.band;
+        const signalDbm = cs?.signalDbm ?? node.signalDbm;
+        if (node.ip) rows.push(['IP', node.ip]);
+        if (node.mac) rows.push(['MAC', node.mac]);
+        if (node.model) rows.push(['Model', node.model]);
+        if (band) rows.push(['Band', `${band} GHz`]);
+        if (node.ssid) rows.push(['SSID', node.ssid]);
+        if (node.network) rows.push(['Network', node.network]);
+        if (signalDbm) rows.push(['Signal', `${signalDbm} dBm`]);
+        if (node.switchPortName) rows.push(['Switch port', node.switchPortName]);
+        // Device health from NodeLiveBadge (infrastructure nodes only)
+        const badge = this._currentBadges?.[node.id];
+        if (badge?.cpuPercent != null) rows.push(['CPU', `${badge.cpuPercent.toFixed(0)}%`]);
+        if (badge?.memoryUsedPercent != null) rows.push(['Memory', `${badge.memoryUsedPercent.toFixed(0)}%`]);
+        if (badge?.temperatureC != null) rows.push(['Temp', `${badge.temperatureC.toFixed(0)} °C`]);
+        if (badge?.uptimeSeconds != null) {
+            const d = Math.floor(badge.uptimeSeconds / 86400);
+            const h = Math.floor((badge.uptimeSeconds % 86400) / 3600);
+            rows.push(['Uptime', d > 0 ? `${d}d ${h}h` : `${h}h`]);
+        }
+        // Aggregate rate across adjacent links. For fabric devices (gateway /
+        // switch / AP) we show ingress (data flowing INTO the device across
+        // every port) and egress (data flowing OUT). For client nodes the
+        // single leaf link makes ingress == download-to-client and egress ==
+        // upload-from-client, so we keep the friendlier Download / Upload
+        // wording for them.
+        //
+        // Fabric devices (gateway/switch/AP): use the per-device badge so the
+        // tooltip numbers match the floating label exactly. The badge is the
+        // boundary throughput from the trunk/uplink port (or gateway WAN
+        // port), single-counted. Summing every adjacent link instead
+        // double-counts any flow that traverses the device.
+        // Client devices: the leaf link is the only adjacent rate, no
+        // double-count risk - sum the single link with direction resolved.
+        const isFabric = node.kind === NODE_KIND.Gateway
+            || node.kind === NODE_KIND.Switch
+            || node.kind === NODE_KIND.AccessPoint;
+        let ingressBps = 0, egressBps = 0, anyData = false;
+        if (node.kind === NODE_KIND.VirtualHub) {
+            // Hub throughput is its upstream port link, direction-correct; only fall
+            // back to the members when that link has no rate. down = download-to-hub
+            // (ingress), up = upload-from-hub (egress), so no end-based flip.
+            const hr = this._virtualHubRates(node.id);
+            ingressBps = hr.down;
+            egressBps = hr.up;
+            anyData = hr.any;
+        } else if (isFabric) {
+            const badge = this._currentBadges?.[node.id];
+            if (badge && (badge.fabricIngressBps != null || badge.fabricEgressBps != null)) {
+                ingressBps = badge.fabricIngressBps || 0;
+                egressBps = badge.fabricEgressBps || 0;
+                anyData = (ingressBps > 0 || egressBps > 0);
+            } else if (badge && (badge.aggregateInBps != null || badge.aggregateOutBps != null)) {
+                ingressBps = badge.aggregateInBps || 0;
+                egressBps = badge.aggregateOutBps || 0;
+                anyData = (ingressBps > 0 || egressBps > 0);
+            }
+        } else {
+            for (const [, link] of this._linkMeshes) {
+                if (link.link.fromNodeId !== node.id && link.link.toNodeId !== node.id) continue;
+                const r = this._currentRates?.[link.link.id];
+                if (!r) continue;
+                anyData = true;
+                // Backend emits DownstreamBps = downloads (parent -> child)
+                // and UpstreamBps = uploads (child -> parent) uniformly.
+                const dl = r.downstreamBps || 0;
+                const ul = r.upstreamBps || 0;
+                if (link.link.toNodeId === node.id) {
+                    // This node sits at the "leaf" end of the link, so the
+                    // downstream flow arrives at us (ingress) and the upstream
+                    // flow leaves us (egress).
+                    ingressBps += dl;
+                    egressBps += ul;
+                } else {
+                    // This node is the "parent" end of the link, so uploads
+                    // arrive from the leaf (ingress) and downloads leave us
+                    // toward the leaf (egress).
+                    ingressBps += ul;
+                    egressBps += dl;
+                }
+            }
+        }
+        // A device on a wireless mesh uplink (a mesh AP, or a UDB - UniFi Device Bridge -
+        // which classifies as a Switch) reports its PHY rate and boundary throughput from that
+        // backhaul, whose Tx/Rx polarity is the reverse of a Wi-Fi client's. Detect it by
+        // the device's OWN uplink link being a MeshBackhaul (toNodeId === node.id) - this
+        // is device-kind agnostic and ignores downlinks to child mesh devices.
+        let isMeshUplink = false;
+        for (const [, lm] of this._linkMeshes) {
+            const lk = lm.link;
+            if (lk.toNodeId === node.id && lk.kind === LINK_KIND.MeshBackhaul) { isMeshUplink = true; break; }
+        }
+
+        // Negotiated link speed (wired port or wireless PHY rate), shown directly
+        // above the live throughput so the capable rate sits over the actual rate.
+        if (node.wiredLinkSpeedMbps) {
+            rows.push(['Link speed', formatLinkSpeed(node.wiredLinkSpeedMbps)]);
+        } else if (node.phyTxKbps || node.phyRxKbps || cs?.phyTxKbps || cs?.phyRxKbps) {
+            // Device perspective: download (↓) is the AP's TX to a Wi-Fi client, upload
+            // (↑) is the AP's RX. A mesh uplink's Tx/Rx is the reverse, so swap. Prefer
+            // the scrubbed-instant PHY rate during playback.
+            const pTx = cs?.phyTxKbps ?? node.phyTxKbps;
+            const pRx = cs?.phyRxKbps ?? node.phyRxKbps;
+            const downKbps = isMeshUplink ? pRx : pTx;
+            const upKbps = isMeshUplink ? pTx : pRx;
+            const dl = downKbps ? `↓${formatLinkSpeed(Math.round(downKbps / 1000))}` : '';
+            const ul = upKbps ? `↑${formatLinkSpeed(Math.round(upKbps / 1000))}` : '';
+            rows.push([node.isMloMesh ? 'Link speed (MLO)' : 'Link speed', `${dl}${dl && ul ? '  ' : ''}${ul}`]);
+        }
+        if (anyData) {
+            if (node.kind === NODE_KIND.AccessPoint) {
+                // AP boundary throughput is its uplink, flipped to read as the
+                // to-gateway (fabric) direction. Wired-backhaul APs get the 'Wired'
+                // qualifier; mesh-uplink APs don't (their uplink is wireless).
+                rows.push([isMeshUplink ? 'Ingress' : 'Wired ingress', formatBps(egressBps)]);
+                rows.push([isMeshUplink ? 'Egress' : 'Wired egress', formatBps(ingressBps)]);
+            } else if (isFabric) {
+                rows.push(['Ingress', formatBps(ingressBps)]);
+                rows.push(['Egress', formatBps(egressBps)]);
+            } else {
+                rows.push(['Download', formatBps(ingressBps)]);
+                rows.push(['Upload', formatBps(egressBps)]);
+            }
+        }
+        const html = `<div class="lan-flow-map-tooltip-title">${escapeHtml(node.name || node.mac || '')}</div>` +
+            rows.map(([k, v]) => `<div class="lan-flow-map-tooltip-row"><span>${k}</span><span class="v">${escapeHtml(String(v))}</span></div>`).join('');
+        this._tooltipEl.innerHTML = html;
+        this._tooltipEl.style.left = `${this._pointerScreen.x + 14}px`;
+        this._tooltipEl.style.top = `${this._pointerScreen.y + 14}px`;
+        this._tooltipEl.classList.add('is-visible');
+        this._hoverTarget = node;
+    }
+
+    _clearHover() {
+        if (this._tooltipEl) this._tooltipEl.classList.remove('is-visible');
+        this._hoverTarget = null;
+    }
+
+    // ------------------------------------------------------------------------
+    // Right-click context menu + device reposition
+    // ------------------------------------------------------------------------
+
+    _onContextMenu(e) {
+        e.preventDefault();
+        if (this._repositionMode) return;
+
+        const rect = this.canvas.getBoundingClientRect();
+        const ndc = new THREE.Vector2(
+            ((e.clientX - rect.left) / rect.width) * 2 - 1,
+            -((e.clientY - rect.top) / rect.height) * 2 + 1
+        );
+        this._raycaster.setFromCamera(ndc, this.camera);
+        const candidates = [];
+        for (const group of this._nodeMeshes.values()) {
+            if (!group.visible) continue;
+            for (const child of group.children) {
+                if (child.isMesh) candidates.push(child);
+            }
+        }
+        for (const group of this._cloudMeshes.values()) {
+            if (!group.visible) continue;
+            for (const child of group.children) {
+                if (child.isMesh) candidates.push(child);
+            }
+        }
+        const hits = this._raycaster.intersectObjects(candidates, false);
+        if (hits.length === 0) return;
+        let g = hits[0].object;
+        while (g && !(g.userData?.node || g.userData?.cloud)) g = g.parent;
+        if (!g) return;
+
+        if (g.userData?.cloud) {
+            const cloud = g.userData.cloud;
+            // Every access-ISP globe, not just the primary's: upstream discovery runs per WAN now,
+            // and the menu carries the WAN so it opens on that globe's own discovery.
+            if (cloud.kind === 0) {
+                this._showCloudContextMenu(e.clientX, e.clientY, cloud);
+            }
+            return;
+        }
+
+        const node = g.userData.node;
+        if (node.kind === NODE_KIND.Cloud || node.kind === NODE_KIND.VirtualHub) return;
+        this._showContextMenu(e.clientX, e.clientY, node, g);
+    }
+
+    _showContextMenu(clientX, clientY, node, group) {
+        this._dismissContextMenu();
+        const menu = document.createElement('div');
+        menu.className = 'lan-flow-map-context-menu';
+        const item = document.createElement('div');
+        item.className = 'lan-flow-map-context-menu-item';
+        item.textContent = 'Reposition Device';
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this._dismissContextMenu();
+            this._enterReposition(node, group);
+        });
+        menu.appendChild(item);
+
+        const stageRect = this.stage.getBoundingClientRect();
+        menu.style.left = `${clientX - stageRect.left}px`;
+        menu.style.top = `${clientY - stageRect.top}px`;
+        this.stage.appendChild(menu);
+        this._contextMenuEl = menu;
+    }
+
+    _showCloudContextMenu(clientX, clientY, cloud) {
+        this._dismissContextMenu();
+        const menu = document.createElement('div');
+        menu.className = 'lan-flow-map-context-menu';
+        const item = document.createElement('div');
+        item.className = 'lan-flow-map-context-menu-item';
+        item.textContent = 'Run Upstream Discovery';
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this._dismissContextMenu();
+            if (this._dotnetRef) {
+                // The globe knows which WAN it is, so the panel opens on that WAN's discovery
+                // rather than on the primary's - which on a secondary globe is the wrong panel.
+                this._dotnetRef.invokeMethodAsync('NavigateToUpstreamDiscoveryForWan', cloud.wanInterface || null);
+            }
+        });
+        menu.appendChild(item);
+
+        const stageRect = this.stage.getBoundingClientRect();
+        menu.style.left = `${clientX - stageRect.left}px`;
+        menu.style.top = `${clientY - stageRect.top}px`;
+        this.stage.appendChild(menu);
+        this._contextMenuEl = menu;
+    }
+
+    _dismissContextMenu() {
+        if (this._contextMenuEl) {
+            this._contextMenuEl.remove();
+            this._contextMenuEl = null;
+        }
+    }
+
+    _enterReposition(node, group) {
+        this._repositionMode = true;
+        this._repositionNode = node;
+        this._repositionGroup = group;
+        this._repositionOrigPos = group.position.clone();
+        this._clearHover();
+
+        this.controls.enabled = false;
+        this.canvas.style.cursor = 'move';
+
+        // Show the reposition HUD banner
+        const hud = document.createElement('div');
+        hud.className = 'lan-flow-map-reposition-hud';
+        hud.innerHTML = `
+            <span class="lan-flow-map-reposition-title">Moving: ${escapeHtml(node.name || node.mac || 'Device')}</span>
+            <span class="lan-flow-map-reposition-keys">
+                <span class="kbd">W</span><span class="kbd">A</span><span class="kbd">S</span><span class="kbd">D</span> move
+                &nbsp;&middot;&nbsp; <span class="kbd">Q</span><span class="kbd">E</span> / <span class="kbd">Scroll</span> height
+                &nbsp;&middot;&nbsp; Drag to move
+                &nbsp;&middot;&nbsp; <span class="kbd">Click</span> place
+                &nbsp;&middot;&nbsp; <span class="kbd">Esc</span> cancel
+            </span>
+        `;
+        this.stage.appendChild(hud);
+        this._repositionHud = hud;
+
+        // Set up mouse-drag on the XZ plane at the device's Y height.
+        // Confirm on pointerup only if the pointer barely moved (click, not drag).
+        this._repositionDragging = false;
+        this._repositionDragMoved = false;
+        this._repositionDownPt = null;
+        this._repositionPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -group.position.y);
+        this._repositionMoveHandler = (e) => this._onRepositionPointerMove(e);
+        this._repositionDownHandler = (e) => {
+            if (e.button === 0) {
+                this._repositionDragging = true;
+                this._repositionDragMoved = false;
+                this._repositionDownPt = { x: e.clientX, y: e.clientY };
+                e.preventDefault();
+            }
+        };
+        this._repositionUpHandler = (e) => {
+            if (e.button === 0 && this._repositionMode) {
+                this._repositionDragging = false;
+                if (!this._repositionDragMoved) {
+                    this._confirmReposition();
+                }
+            }
+        };
+        this._repositionWheelHandler = (e) => {
+            if (!this._repositionMode) return;
+            e.preventDefault();
+            const step = e.deltaY > 0 ? -0.5 : 0.5;
+            this._repositionGroup.position.y += step;
+            this._repositionPlane.constant = -this._repositionGroup.position.y;
+            this._updateAdjacentLinks();
+        };
+        this.canvas.addEventListener('pointermove', this._repositionMoveHandler);
+        this.canvas.addEventListener('pointerdown', this._repositionDownHandler, true);
+        this.canvas.addEventListener('pointerup', this._repositionUpHandler);
+        this.canvas.addEventListener('wheel', this._repositionWheelHandler, { passive: false });
+    }
+
+    _onRepositionPointerMove(e) {
+        if (!this._repositionMode || !this._repositionDragging) return;
+
+        // Track whether the pointer actually moved (drag vs click)
+        if (this._repositionDownPt) {
+            const dx = e.clientX - this._repositionDownPt.x;
+            const dy = e.clientY - this._repositionDownPt.y;
+            if (dx * dx + dy * dy > 9) this._repositionDragMoved = true;
+        }
+        if (!this._repositionDragMoved) return;
+
+        const rect = this.canvas.getBoundingClientRect();
+        const ndc = new THREE.Vector2(
+            ((e.clientX - rect.left) / rect.width) * 2 - 1,
+            -((e.clientY - rect.top) / rect.height) * 2 + 1
+        );
+        this._raycaster.setFromCamera(ndc, this.camera);
+        const intersection = new THREE.Vector3();
+        if (this._raycaster.ray.intersectPlane(this._repositionPlane, intersection)) {
+            this._repositionGroup.position.x = intersection.x;
+            this._repositionGroup.position.z = intersection.z;
+            this._updateAdjacentLinks();
+        }
+    }
+
+    _updateAdjacentLinks() {
+        if (!this._repositionNode) return;
+        const nodeId = this._repositionNode.id;
+        const pos = this._repositionGroup.position;
+
+        // If moving a gateway, drag all connected clouds along (they're positioned
+        // relative to the gateway and have no independent geo coords).
+        if (this._repositionNode.kind === NODE_KIND.Gateway) {
+            if (!this._repositionCloudOffsets) {
+                this._repositionCloudOffsets = new Map();
+                for (const [cloudId, group] of this._cloudMeshes) {
+                    this._repositionCloudOffsets.set(cloudId, {
+                        dx: group.position.x - this._repositionOrigPos.x,
+                        dy: group.position.y - this._repositionOrigPos.y,
+                        dz: group.position.z - this._repositionOrigPos.z,
+                    });
+                }
+            }
+            for (const [cloudId, offset] of this._repositionCloudOffsets) {
+                const group = this._cloudMeshes.get(cloudId);
+                if (!group) continue;
+                group.position.set(pos.x + offset.dx, pos.y + offset.dy, pos.z + offset.dz);
+                this._positions.set(cloudId, {
+                    x: group.position.x, y: group.position.y, z: group.position.z, pinned: true,
+                });
+            }
+        }
+
+        for (const [linkId, linkObj] of this._linkMeshes) {
+            if (linkObj.link.fromNodeId !== nodeId && linkObj.link.toNodeId !== nodeId) continue;
+            const otherNodeId = linkObj.link.fromNodeId === nodeId ? linkObj.link.toNodeId : linkObj.link.fromNodeId;
+            const otherGroup = this._nodeMeshes.get(otherNodeId) || this._cloudMeshes.get(otherNodeId);
+            if (!otherGroup) continue;
+
+            const a = linkObj.link.fromNodeId === nodeId ? pos : otherGroup.position;
+            const b = linkObj.link.toNodeId === nodeId ? pos : otherGroup.position;
+
+            // Update pipe mesh
+            this._updatePipePosition(linkObj.pipe, a, b);
+            // Update particle stream endpoints
+            if (linkObj.link.fromNodeId === nodeId) {
+                linkObj.down.updateEndpoints(pos, otherGroup.position);
+                linkObj.up.updateEndpoints(otherGroup.position, pos);
+            } else {
+                linkObj.down.updateEndpoints(otherGroup.position, pos);
+                linkObj.up.updateEndpoints(pos, otherGroup.position);
+            }
+        }
+    }
+
+    _updatePipePosition(pipe, a, b) {
+        if (!pipe.isMesh) return;
+        const from = new THREE.Vector3(a.x, a.y, a.z);
+        const to = new THREE.Vector3(b.x, b.y, b.z);
+        const dir = to.clone().sub(from);
+        const length = dir.length();
+        if (!Number.isFinite(length) || length < 0.01) return;
+
+        const mid = from.clone().add(to).multiplyScalar(0.5);
+        pipe.position.copy(mid);
+        pipe.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+        const origHeight = pipe.geometry.parameters?.height || 1;
+        pipe.scale.y = length / origHeight;
+    }
+
+    async _confirmReposition() {
+        if (!this._repositionMode) return;
+        const group = this._repositionGroup;
+        const node = this._repositionNode;
+        const pos = { x: group.position.x, y: group.position.y, z: group.position.z };
+
+        this._exitRepositionMode();
+
+        // Update the internal positions map
+        this._positions.set(node.id, {
+            x: pos.x, y: pos.y, z: pos.z, pinned: true,
+        });
+
+        // Reverse-project 3D scene coords back to geo
+        const bounds = this._snapshot?.bounds;
+        if (bounds?.centerLat == null || bounds?.lngScale == null) {
+            console.warn('[LanFlowMap] No projection params - cannot save placement');
+            return;
+        }
+        const sceneRadius = 30.0;
+        const ANCHOR_SPREAD_FACTOR = 1.875;
+        const boundsR = Number.isFinite(bounds.radius) ? bounds.radius : 1.0;
+        const scale = (sceneRadius / Math.max(boundsR, 1.0)) * ANCHOR_SPREAD_FACTOR;
+        const EARTH_RADIUS = 6_371_000.0;
+
+        // Undo JS transform: posX = -(local.x * scale), posZ = local.y * scale
+        // (posY = local.z * scale * 0.8 but we don't save floor from 3D)
+        const localX = -(pos.x / scale);
+        const localY = pos.z / scale; // JS z maps to projection y
+
+        // Undo equirectangular projection
+        const dLng = localX / (bounds.lngScale * EARTH_RADIUS);
+        const dLat = localY / EARTH_RADIUS;
+        const lat = bounds.centerLat + dLat * 180 / Math.PI;
+        const lng = bounds.centerLng + dLng * 180 / Math.PI;
+
+        // Reverse Y exactly: rendered y = (floor * 2.9 + heightM) * scale * 0.8.
+        // Floor = the story the device is physically in (carries through to the
+        // Signal Map); heightM = metres above that floor's base, so the next
+        // load reproduces this position bit-for-bit.
+        const totalM = pos.y / (scale * 0.8);
+        const floor = Math.floor(totalM / 2.9);
+        const heightM = totalM - floor * 2.9;
+
+        try {
+            await fetch(`${this.apiBase}/device-placement`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ mac: node.mac, latitude: lat, longitude: lng, floor, heightM }),
+            });
+        } catch (err) {
+            console.error('[LanFlowMap] Failed to save placement:', err);
+        }
+    }
+
+    _cancelReposition() {
+        if (!this._repositionMode) return;
+        this._repositionGroup.position.copy(this._repositionOrigPos);
+        // Restore cloud positions if we moved a gateway
+        if (this._repositionCloudOffsets) {
+            for (const [cloudId, offset] of this._repositionCloudOffsets) {
+                const group = this._cloudMeshes.get(cloudId);
+                if (!group) continue;
+                group.position.set(
+                    this._repositionOrigPos.x + offset.dx,
+                    this._repositionOrigPos.y + offset.dy,
+                    this._repositionOrigPos.z + offset.dz,
+                );
+            }
+        }
+        this._updateAdjacentLinks();
+        this._exitRepositionMode();
+    }
+
+    _exitRepositionMode() {
+        this._repositionMode = false;
+        this._repositionNode = null;
+        this._repositionGroup = null;
+        this._repositionOrigPos = null;
+        this._repositionDragging = false;
+        this._repositionDragMoved = false;
+        this._repositionDownPt = null;
+        this._repositionCloudOffsets = null;
+
+        this.controls.enabled = true;
+        this.canvas.style.cursor = '';
+
+        if (this._repositionHud) { this._repositionHud.remove(); this._repositionHud = null; }
+        this.canvas.removeEventListener('pointermove', this._repositionMoveHandler);
+        this.canvas.removeEventListener('pointerdown', this._repositionDownHandler, true);
+        this.canvas.removeEventListener('pointerup', this._repositionUpHandler);
+        this.canvas.removeEventListener('wheel', this._repositionWheelHandler);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ParticleStream - GPU-friendly one-direction particle flow along a link.
+// Density and velocity both scale with rate (spec 5.7.1 hybrid dot semantics).
+// ----------------------------------------------------------------------------
+
+// Shared circular-dot texture so PointsMaterial renders round dots instead
+// of the default square gl_Point quads. Generated lazily on first use,
+// then memoized so every stream instance shares the same texture handle.
+let _dotTexture = null;
+function _getDotTexture() {
+    if (_dotTexture) return _dotTexture;
+    const size = 64;
+    const canvas = document.createElement('canvas');
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    // Radial gradient: bright center -> soft edge -> transparent at the rim.
+    // Soft edge keeps the dot reading as round even at small on-screen sizes.
+    const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    grad.addColorStop(0.0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.35, 'rgba(255,255,255,0.85)');
+    grad.addColorStop(0.7, 'rgba(255,255,255,0.25)');
+    grad.addColorStop(1.0, 'rgba(255,255,255,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    _dotTexture = new THREE.CanvasTexture(canvas);
+    _dotTexture.needsUpdate = true;
+    return _dotTexture;
+}
+
+class ParticleStream {
+    constructor({ from, to, color, particleCount = 0, sizeScale = 1 }) {
+        const fromV = new THREE.Vector3(from.x, from.y, from.z);
+        const toV = new THREE.Vector3(to.x, to.y, to.z);
+        this._from = fromV;
+        this._to = toV;
+        this._direction = toV.clone().sub(fromV);
+        this._length = this._direction.length();
+        if (Number.isFinite(this._length) && this._length > 0.001) {
+            this._direction.normalize();
+        } else {
+            this._length = 0;
+            this._direction.set(0, 1, 0);
+        }
+
+        const MAX = 200;
+        this._max = MAX;
+        // Inactive particles are parked outside the camera's far plane (1000 units)
+        // so they don't render. Without this, all 80 vertices start at (0, 0, 0) -
+        // with additive blending + bloom across every stream, that piles into a
+        // bright artifact right at world origin.
+        const PARK = 1e6;
+        this._park = PARK;
+        const positions = new Float32Array(MAX * 3);
+        for (let i = 0; i < MAX; i += 1) {
+            positions[i * 3 + 0] = PARK;
+            positions[i * 3 + 1] = PARK;
+            positions[i * 3 + 2] = PARK;
+        }
+        const t = new Float32Array(MAX);
+        for (let i = 0; i < MAX; i += 1) {
+            t[i] = -1;  // inactive
+        }
+        // Per-particle size attribute. Each dot keeps the size it was
+        // emitted at, so a burst of heavy traffic doesn't retroactively
+        // bloat dots that were already in flight when the link was idle.
+        const sizes = new Float32Array(MAX);
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+        // Custom shader that mimics PointsMaterial(sizeAttenuation=true) but
+        // reads gl_PointSize from a per-vertex attribute. Three.js's
+        // PointsMaterial has no per-vertex size hook, so we re-implement the
+        // size-attenuation formula here. The scale factor mirrors what the
+        // stock shader uses: canvas drawing-buffer height in pixels, with a
+        // perspective falloff of (scale / -mvPosition.z).
+        const material = new THREE.ShaderMaterial({
+            uniforms: {
+                color: { value: new THREE.Color(color) },
+                map: { value: _getDotTexture() },
+                scale: { value: 600.0 },
+                zoom: { value: 1.0 },
+            },
+            vertexShader: `
+                attribute float size;
+                uniform float scale;
+                uniform float zoom;
+                void main() {
+                    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+                    gl_PointSize = size * zoom * (scale / max(-mv.z, 1.0));
+                    gl_Position = projectionMatrix * mv;
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 color;
+                uniform sampler2D map;
+                void main() {
+                    vec4 tex = texture2D(map, gl_PointCoord);
+                    if (tex.a < 0.01) discard;
+                    gl_FragColor = vec4(color, tex.a * 0.92);
+                }
+            `,
+            transparent: true,
+            depthWrite: false,
+            depthTest: false, // additive dots should always blend on top - the pipe's
+                              // transparent geometry was occluding them from the side
+                              // opposite the link's near surface.
+            blending: THREE.AdditiveBlending,
+        });
+        this._material = material;
+        this._sizes = sizes;
+        this.mesh = new THREE.Points(geometry, material);
+        // Disable frustum culling: parking inactive particles outside the camera
+        // far plane (above) means the auto-computed bounding sphere centers at the
+        // park position, and Three.js culls the entire mesh as "off-screen" even
+        // when active particles are inside the view. Skipping the cull is essentially
+        // free for 80-vertex Points meshes.
+        this.mesh.frustumCulled = false;
+        this._t = t;
+        this._positions = positions;
+
+        this._rateBps = 0;
+        this._spawnAccumulator = 0;
+        this._density = 0;     // 0..1 (fraction of MAX)
+        this._velocity = 0.4;  // units/sec along the link
+        // Size that NEW particles will be born at - written into the size
+        // attribute when the particle spawns. Existing in-flight particles
+        // keep whatever size they were emitted with.
+        this._sizeScale = sizeScale;
+        this._currentSize = 0.05 * sizeScale;
+    }
+
+    // Camera-distance compensation, applied uniformly to all in-flight dots
+    // (unlike per-particle spawn sizes, zooming should resize existing dots).
+    setZoom(z) {
+        this._material.uniforms.zoom.value = z;
+    }
+
+    setRate(bps) {
+        this._rateBps = Math.max(bps, 0);
+        // Unfloored log intensity: full range 1bps -> 100Gbps (log10 0..11)
+        // mapped to 0..1. No threshold below which the stream goes dark, so
+        // even tiny housekeeping traffic shows a wisp of flow.
+        const intensity = Math.max(0, Math.min(1,
+            Math.log10(Math.max(this._rateBps, 1)) / 11));
+        this._density = intensity;
+        // Particle size on a squared curve so the low end collapses to
+        // pinprick wisps and heavy traffic blooms to chunky dots:
+        //   100bps  -> ~0.05  (tiny)
+        //   100kbps -> ~0.28  (small)
+        //   10Mbps  -> ~0.56  (mid)
+        //   1Gbps   -> ~0.92  (chunky)
+        //   100Gbps -> 1.35   (max)
+        // Stored for use at spawn time only - particles already in flight
+        // keep their birth size so a sudden rate change doesn't visually
+        // resize dots that have already left the sender.
+        this._currentSize = (0.0375 + (intensity * intensity) * 1.3125) * this._sizeScale;
+        // Velocity: 2.5 idle -> 6.5 saturated. Still communicates throughput
+        // without slamming between crawl and jet on per-poll rate fluctuations.
+        this._velocity = 2.5 + intensity * 4.0;
+    }
+
+    updateEndpoints(from, to) {
+        this._from.set(from.x, from.y, from.z);
+        this._to.set(to.x, to.y, to.z);
+        this._direction.copy(this._to).sub(this._from);
+        this._length = this._direction.length();
+        this._direction.normalize();
+    }
+
+    advance(dt) {
+        // Model dot emission like the sender pushing bytes onto the wire:
+        // a constant per-second emission rate proportional to bitrate,
+        // independent of link length. Link length only changes how long
+        // each dot lives in flight, so a longer link naturally accumulates
+        // more dots at steady state - but the dots arrive at the receiver
+        // at the same rate (matching the bitrate) and are spaced the same
+        // absolute distance apart whether the link is short or long.
+        //
+        // Emission rate scales non-linearly with the log-mapped density so
+        // visible spacing differs noticeably across rate decades:
+        //   density 0.25 (~Kbps)  -> ~0.75 dots/sec, big gaps
+        //   density 0.5  (~Mbps)  -> ~3 dots/sec, breezy stream
+        //   density 0.75 (~Gbps)  -> ~6.75 dots/sec, busy stream
+        //   density 1.0  (saturat)-> ~12 dots/sec, thick stream
+        // Each emission interval is jittered ±40% so the stream looks like
+        // organic packet traffic rather than a metronome of dots.
+        const EMIT_PER_SEC_MAX = 12;
+        this._spawnAccumulator += this._density * this._density * EMIT_PER_SEC_MAX * dt;
+        let sizesDirty = false;
+        while (this._spawnAccumulator >= 1) {
+            this._spawnAccumulator -= (0.6 + Math.random() * 0.8);
+            for (let i = 0; i < this._max; i += 1) {
+                if (this._t[i] < 0) {
+                    // Spawn at the sender end of the link and freeze the
+                    // size at the rate observed AT THIS INSTANT.
+                    this._t[i] = 0;
+                    this._sizes[i] = this._currentSize;
+                    sizesDirty = true;
+                    break;
+                }
+            }
+        }
+
+        // Advance existing particles.
+        const v = this._velocity / Math.max(this._length, 0.001);  // normalised /sec
+        for (let i = 0; i < this._max; i += 1) {
+            if (this._t[i] < 0) continue;
+            this._t[i] += v * dt;
+            if (this._t[i] >= 1) {
+                this._t[i] = -1;
+                // Park outside the camera frustum so the inactive slot doesn't
+                // contribute a vertex at world origin (which would pile up bright
+                // additive-blended dots under bloom).
+                this._positions[i * 3 + 0] = this._park;
+                this._positions[i * 3 + 1] = this._park;
+                this._positions[i * 3 + 2] = this._park;
+                // Zero the slot's size so a stale uniform doesn't bleed a
+                // dot at the park location if anything ever renders it.
+                this._sizes[i] = 0;
+                sizesDirty = true;
+                continue;
+            }
+            const lerpX = this._from.x + (this._to.x - this._from.x) * this._t[i];
+            const lerpY = this._from.y + (this._to.y - this._from.y) * this._t[i];
+            const lerpZ = this._from.z + (this._to.z - this._from.z) * this._t[i];
+            this._positions[i * 3 + 0] = lerpX;
+            this._positions[i * 3 + 1] = lerpY;
+            this._positions[i * 3 + 2] = lerpZ;
+        }
+        this.mesh.geometry.attributes.position.needsUpdate = true;
+        if (sizesDirty) this.mesh.geometry.attributes.size.needsUpdate = true;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Small utilities
+// ----------------------------------------------------------------------------
+
+function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fill();
+}
+
+
+function formatLinkSpeed(mbps) {
+    if (!Number.isFinite(mbps) || mbps <= 0) return '';
+    if (mbps >= 1000) {
+        const gbps = mbps / 1000;
+        // Common negotiated rates render cleanly: 1, 2.5, 5, 10 Gbps
+        return `${gbps % 1 === 0 ? gbps.toFixed(0) : gbps.toFixed(1)} Gbps`;
+    }
+    return `${mbps} Mbps`;
+}
+
+function formatBps(bps) {
+    if (!Number.isFinite(bps) || bps <= 0) return '0 bps';
+    const units = ['bps', 'Kbps', 'Mbps', 'Gbps', 'Tbps'];
+    let i = 0;
+    let v = bps;
+    while (v >= 1000 && i < units.length - 1) { v /= 1000; i += 1; }
+    return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+}
+
+// Capacity variant: whole numbers drop the trailing .0 ("1 Gbps" not
+// "1.0 Gbps"), real decimals keep it ("2.5 Gbps").
+function formatCapacity(bps) {
+    return formatBps(bps).replace('.0 ', ' ');
+}
+
+function formatAge(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return 'just now';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+}
+
+const _p = (n) => String(n).padStart(2, '0');
+// Compact duration for the trailing Max window's left label, e.g. -12d or -18h.
+function _fmtSpan(ms) {
+    const days = ms / 86400000;
+    if (days >= 2) return `${Math.round(days)}d`;
+    return `${Math.round(ms / 3600000)}h`;
+}
+
+function _fmtDateTime(d) {
+    return `${_p(d.getMonth()+1)}/${_p(d.getDate())}/${String(d.getFullYear()).slice(2)} ${_p(d.getHours())}:${_p(d.getMinutes())}:${_p(d.getSeconds())}`;
+}
+
+function escapeHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function lerpColor(a, b, t) {
+    const ar = (a >> 16) & 0xff;
+    const ag = (a >> 8) & 0xff;
+    const ab = a & 0xff;
+    const br = (b >> 16) & 0xff;
+    const bg = (b >> 8) & 0xff;
+    const bb = b & 0xff;
+    const r = Math.round(ar + (br - ar) * t);
+    const g = Math.round(ag + (bg - ag) * t);
+    const bl = Math.round(ab + (bb - ab) * t);
+    return (r << 16) | (g << 8) | bl;
+}
+
+function makeRadialBackgroundTexture(width, height) {
+    // Render at actual screen resolution to avoid upscale banding, and add
+    // subtle noise dithering to break up the 8-bit color quantization in
+    // very dark gradients.
+    const w = Math.max(width, 512);
+    const h = Math.max(height, 256);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const grd = ctx.createRadialGradient(w / 2, h / 2, w * 0.05, w / 2, h / 2, w * 0.65);
+    grd.addColorStop(0, '#0a0b0e');
+    grd.addColorStop(0.55, '#060708');
+    grd.addColorStop(1, '#030304');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, w, h);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.needsUpdate = true;
+    return tex;
+}
+
+// Entry point used by Blazor JS interop.
+let _instance = null;
+
+export async function mount(canvasId, options = {}) {
+    if (_instance) {
+        _instance.dispose();
+        _instance = null;
+    }
+    const el = document.getElementById(canvasId);
+    if (!el) throw new Error(`Canvas #${canvasId} not found`);
+    // The map is the playback authority and mounts before the other Live View
+    // consumers (2D map, WAN chart, port table). Clear playback state a prior
+    // session left in the shared store so every mount starts from Live; a
+    // deep-linked initialAt then re-enters historic through the normal seek path.
+    flowData.resetPlayback();
+    _instance = new LanFlowMap(el, options);
+    await _instance.start();
+    return _instance;
+}
+
+export function unmount() {
+    if (_instance) {
+        _instance.dispose();
+        _instance = null;
+    }
+}
+
+// Re-fetch the snapshot and rebuild the scene from scratch. Used by the
+// upstream tracer wizard after committing new monitoring targets so the
+// map picks up the freshly committed clouds without needing a page reload.
+export async function reload() {
+    if (!_instance) return;
+    await _instance._reloadSnapshot();
+}
+
+export function getInstance() { return _instance; }

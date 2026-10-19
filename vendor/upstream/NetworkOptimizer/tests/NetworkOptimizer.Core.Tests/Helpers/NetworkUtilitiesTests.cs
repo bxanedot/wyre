@@ -1,0 +1,860 @@
+using System.Net;
+using FluentAssertions;
+using NetworkOptimizer.Core.Helpers;
+using Xunit;
+
+namespace NetworkOptimizer.Core.Tests.Helpers;
+
+public class NetworkUtilitiesTests
+{
+    #region IsIpInSubnet(string, string?) Tests
+
+    [Theory]
+    [InlineData("192.168.1.100", "192.168.1.0/24", true)]
+    [InlineData("192.168.1.1", "192.168.1.0/24", true)]
+    [InlineData("192.168.1.254", "192.168.1.0/24", true)]
+    [InlineData("192.168.2.100", "192.168.1.0/24", false)]
+    [InlineData("10.0.0.50", "10.0.0.0/8", true)]
+    [InlineData("10.255.255.255", "10.0.0.0/8", true)]
+    [InlineData("11.0.0.1", "10.0.0.0/8", false)]
+    [InlineData("172.16.5.10", "172.16.0.0/12", true)]
+    [InlineData("172.31.255.255", "172.16.0.0/12", true)]
+    [InlineData("172.32.0.1", "172.16.0.0/12", false)]
+    public void IsIpInSubnet_String_ValidCases(string ip, string subnet, bool expected)
+    {
+        NetworkUtilities.IsIpInSubnet(ip, subnet).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("192.168.1.100", null)]
+    [InlineData("192.168.1.100", "")]
+    public void IsIpInSubnet_String_NullOrEmptySubnet_ReturnsFalse(string ip, string? subnet)
+    {
+        NetworkUtilities.IsIpInSubnet(ip, subnet).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("invalid", "192.168.1.0/24")]
+    [InlineData("", "192.168.1.0/24")]
+    public void IsIpInSubnet_String_InvalidIp_ReturnsFalse(string ip, string subnet)
+    {
+        NetworkUtilities.IsIpInSubnet(ip, subnet).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("192.168.1.100", "192.168.1.0")]
+    [InlineData("192.168.1.100", "192.168.1.0/")]
+    [InlineData("192.168.1.100", "192.168.1.0/abc")]
+    [InlineData("192.168.1.100", "/24")]
+    [InlineData("192.168.1.100", "invalid/24")]
+    public void IsIpInSubnet_String_InvalidSubnetFormat_ReturnsFalse(string ip, string subnet)
+    {
+        NetworkUtilities.IsIpInSubnet(ip, subnet).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsIpInSubnet_String_SlashZero_MatchesAll()
+    {
+        // /0 means all IPs match
+        NetworkUtilities.IsIpInSubnet("1.2.3.4", "0.0.0.0/0").Should().BeTrue();
+        NetworkUtilities.IsIpInSubnet("255.255.255.255", "0.0.0.0/0").Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsIpInSubnet_String_Slash32_ExactMatch()
+    {
+        // /32 means exact IP match only
+        NetworkUtilities.IsIpInSubnet("192.168.1.1", "192.168.1.1/32").Should().BeTrue();
+        NetworkUtilities.IsIpInSubnet("192.168.1.2", "192.168.1.1/32").Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("192.168.1.50", "192.168.1.0/25", true)]    // 0-127 in first half
+    [InlineData("192.168.1.127", "192.168.1.0/25", true)]   // Last IP in first half
+    [InlineData("192.168.1.128", "192.168.1.0/25", false)]  // First IP in second half - NOT in first half
+    [InlineData("192.168.1.128", "192.168.1.128/25", true)] // 128-255 in second half
+    [InlineData("192.168.1.127", "192.168.1.128/25", false)]
+    public void IsIpInSubnet_String_NonStandardPrefixLengths(string ip, string subnet, bool expected)
+    {
+        NetworkUtilities.IsIpInSubnet(ip, subnet).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region IsIpInSubnet(IPAddress, string) Tests
+
+    [Theory]
+    [InlineData("192.168.1.100", "192.168.1.0/24", true)]
+    [InlineData("192.168.2.100", "192.168.1.0/24", false)]
+    public void IsIpInSubnet_IPAddress_ValidCases(string ipStr, string subnet, bool expected)
+    {
+        var ip = IPAddress.Parse(ipStr);
+        NetworkUtilities.IsIpInSubnet(ip, subnet).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region IsIpInSubnet - IPv6 Tests
+
+    [Theory]
+    [InlineData("2001:db8::1", "2001:db8::/32", true)]
+    [InlineData("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", "2001:db8::/32", true)]
+    [InlineData("2001:db9::1", "2001:db8::/32", false)]
+    [InlineData("2001:db8:abcd:1234::1", "2001:db8:abcd:1234::/64", true)]
+    [InlineData("2001:db8:abcd:1234:ffff:ffff:ffff:ffff", "2001:db8:abcd:1234::/64", true)]
+    [InlineData("2001:db8:abcd:1235::1", "2001:db8:abcd:1234::/64", false)]
+    public void IsIpInSubnet_IPv6_ValidCases(string ip, string subnet, bool expected)
+    {
+        NetworkUtilities.IsIpInSubnet(ip, subnet).Should().Be(expected);
+    }
+
+    [Fact]
+    public void IsIpInSubnet_IPv6_Slash128_ExactMatch()
+    {
+        // /128 means exact IPv6 address match only
+        NetworkUtilities.IsIpInSubnet("2001:db8::1", "2001:db8::1/128").Should().BeTrue();
+        NetworkUtilities.IsIpInSubnet("2001:db8::2", "2001:db8::1/128").Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsIpInSubnet_IPv6_SlashZero_MatchesAll()
+    {
+        // /0 means all IPv6 addresses match
+        NetworkUtilities.IsIpInSubnet("2001:db8::1", "::/0").Should().BeTrue();
+        NetworkUtilities.IsIpInSubnet("fe80::1", "::/0").Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsIpInSubnet_MixedAddressFamilies_ReturnsFalse()
+    {
+        // IPv4 address against IPv6 subnet
+        NetworkUtilities.IsIpInSubnet("192.168.1.1", "2001:db8::/32").Should().BeFalse();
+
+        // IPv6 address against IPv4 subnet
+        NetworkUtilities.IsIpInSubnet("2001:db8::1", "192.168.1.0/24").Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsIpInSubnet_IPv6_LinkLocal()
+    {
+        // Link-local addresses (fe80::/10)
+        NetworkUtilities.IsIpInSubnet("fe80::1", "fe80::/10").Should().BeTrue();
+        NetworkUtilities.IsIpInSubnet("fe80::abcd:1234:5678:9abc", "fe80::/10").Should().BeTrue();
+        NetworkUtilities.IsIpInSubnet("2001:db8::1", "fe80::/10").Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("2001:db8::1", "2001:db8::/48", true)]
+    [InlineData("2001:db8:0:ffff::1", "2001:db8::/48", true)]
+    [InlineData("2001:db8:1::1", "2001:db8::/48", false)]
+    public void IsIpInSubnet_IPv6_Slash48(string ip, string subnet, bool expected)
+    {
+        NetworkUtilities.IsIpInSubnet(ip, subnet).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region IsIpInAnySubnet Tests
+
+    [Fact]
+    public void IsIpInAnySubnet_IpInFirstSubnet_ReturnsTrue()
+    {
+        var subnets = new[] { "192.168.1.0/24", "10.0.0.0/8", "172.16.0.0/12" };
+        NetworkUtilities.IsIpInAnySubnet("192.168.1.50", subnets).Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsIpInAnySubnet_IpInLastSubnet_ReturnsTrue()
+    {
+        var subnets = new[] { "192.168.1.0/24", "10.0.0.0/8", "172.16.0.0/12" };
+        NetworkUtilities.IsIpInAnySubnet("172.20.5.10", subnets).Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsIpInAnySubnet_IpNotInAnySubnet_ReturnsFalse()
+    {
+        var subnets = new[] { "192.168.1.0/24", "10.0.0.0/8", "172.16.0.0/12" };
+        NetworkUtilities.IsIpInAnySubnet("8.8.8.8", subnets).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsIpInAnySubnet_EmptySubnetList_ReturnsFalse()
+    {
+        NetworkUtilities.IsIpInAnySubnet("192.168.1.50", Array.Empty<string>()).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsIpInAnySubnet_InvalidIp_ReturnsFalse()
+    {
+        var subnets = new[] { "192.168.1.0/24" };
+        NetworkUtilities.IsIpInAnySubnet("invalid", subnets).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsIpInAnySubnet_SubnetListWithNullAndEmpty_SkipsThem()
+    {
+        var subnets = new[] { null, "", "192.168.1.0/24" };
+        NetworkUtilities.IsIpInAnySubnet("192.168.1.50", subnets!).Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsIpInAnySubnet_ExternalDnsNotInInternalSubnets()
+    {
+        // This is the actual use case - checking if DNS server is internal
+        var internalSubnets = new[]
+        {
+            "192.168.1.0/24",  // Home
+            "192.168.10.0/24", // IoT
+            "192.168.20.0/24", // Security
+            "10.0.0.0/24"      // Management
+        };
+
+        // Cloudflare DNS - should NOT be in any internal subnet
+        NetworkUtilities.IsIpInAnySubnet("1.1.1.1", internalSubnets).Should().BeFalse();
+
+        // Google DNS - should NOT be in any internal subnet
+        NetworkUtilities.IsIpInAnySubnet("8.8.8.8", internalSubnets).Should().BeFalse();
+
+        // Internal Pi-hole - SHOULD be in internal subnet
+        NetworkUtilities.IsIpInAnySubnet("192.168.1.5", internalSubnets).Should().BeTrue();
+    }
+
+    #endregion
+
+    #region IsPrivateIpAddress Tests
+
+    [Theory]
+    [InlineData("10.0.0.1", true)]        // RFC1918 Class A
+    [InlineData("10.255.255.255", true)]  // RFC1918 Class A edge
+    [InlineData("172.16.0.1", true)]      // RFC1918 Class B start
+    [InlineData("172.31.255.255", true)]  // RFC1918 Class B end
+    [InlineData("192.168.0.1", true)]     // RFC1918 Class C
+    [InlineData("192.168.255.255", true)] // RFC1918 Class C edge
+    [InlineData("127.0.0.1", true)]       // Loopback
+    [InlineData("169.254.1.1", true)]     // Link-local
+    [InlineData("100.64.0.1", true)]      // CGNAT start
+    [InlineData("100.127.255.255", true)] // CGNAT end
+    public void IsPrivateIpAddress_PrivateIps_ReturnsTrue(string ip, bool expected)
+    {
+        NetworkUtilities.IsPrivateIpAddress(ip).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("fd12:3456:789a::1", true)]   // IPv6 ULA (fd00::/8)
+    [InlineData("fd00::1", true)]              // IPv6 ULA minimum
+    [InlineData("fdff:ffff:ffff::1", true)]    // IPv6 ULA maximum
+    [InlineData("fc00::1", true)]              // IPv6 ULA (fc00::/8, reserved but valid)
+    [InlineData("fe80::1", true)]              // IPv6 link-local
+    [InlineData("::1", true)]                  // IPv6 loopback
+    public void IsPrivateIpAddress_PrivateIpv6_ReturnsTrue(string ip, bool expected)
+    {
+        NetworkUtilities.IsPrivateIpAddress(ip).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("2001:db8::1")]    // IPv6 documentation range
+    [InlineData("2607:f8b0::1")]   // IPv6 Google
+    public void IsPrivateIpAddress_PublicIpv6_ReturnsFalse(string ip)
+    {
+        NetworkUtilities.IsPrivateIpAddress(ip).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("1.1.1.1")]       // Cloudflare
+    [InlineData("8.8.8.8")]       // Google
+    [InlineData("9.9.9.9")]       // Quad9
+    [InlineData("172.15.0.1")]    // Just before RFC1918 Class B
+    [InlineData("172.32.0.1")]    // Just after RFC1918 Class B
+    [InlineData("100.63.255.255")] // Just before CGNAT
+    [InlineData("100.128.0.0")]   // Just after CGNAT
+    [InlineData("11.0.0.1")]      // Just after Class A private
+    public void IsPrivateIpAddress_PublicIps_ReturnsFalse(string ip)
+    {
+        NetworkUtilities.IsPrivateIpAddress(ip).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("invalid")]
+    [InlineData("")]
+    [InlineData("256.256.256.256")]
+    public void IsPrivateIpAddress_InvalidIp_ReturnsFalse(string ip)
+    {
+        NetworkUtilities.IsPrivateIpAddress(ip).Should().BeFalse();
+    }
+
+    #endregion
+
+    #region IsPublicIpAddress Tests
+
+    [Theory]
+    [InlineData("1.1.1.1", true)]         // Cloudflare
+    [InlineData("8.8.8.8", true)]         // Google
+    [InlineData("192.168.1.1", false)]    // Private
+    [InlineData("10.0.0.1", false)]       // Private
+    [InlineData("127.0.0.1", false)]      // Loopback
+    [InlineData("100.64.0.1", false)]     // CGNAT
+    [InlineData("169.254.1.1", false)]    // Link-local
+    [InlineData("::ffff:8.8.8.8", true)]  // IPv4-mapped public
+    [InlineData("::ffff:192.168.1.1", false)] // IPv4-mapped private
+    [InlineData("2001:4860:4860::8888", true)] // IPv6 global unicast
+    [InlineData("2606:4700:4700::1111", true)]
+    [InlineData("3fff::1", true)]         // Top of 2000::/3
+    [InlineData("fd00::1", false)]        // ULA
+    [InlineData("fe80::1", false)]        // Link-local
+    [InlineData("::1", false)]            // Loopback
+    [InlineData("::", false)]             // Unspecified
+    [InlineData("ff02::1", false)]        // Multicast
+    [InlineData("4000::1", false)]        // Outside 2000::/3
+    public void IsPublicIpAddress_ValidCases(string ip, bool expected)
+    {
+        NetworkUtilities.IsPublicIpAddress(ip).Should().Be(expected);
+    }
+
+    [Fact]
+    public void IsPublicIpAddress_InvalidIp_ReturnsFalse()
+    {
+        NetworkUtilities.IsPublicIpAddress("invalid").Should().BeFalse();
+    }
+
+    #endregion
+
+    #region UrlHost Tests
+
+    [Theory]
+    [InlineData("192.0.2.1", "192.0.2.1")]
+    [InlineData("2001:db8::53", "[2001:db8::53]")]
+    [InlineData("[2001:db8::53]", "[2001:db8::53]")]  // Already bracketed
+    [InlineData("pihole.example.com", "pihole.example.com")]
+    public void UrlHost_ReturnsExpected(string host, string expected)
+    {
+        NetworkUtilities.UrlHost(host).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region IpAddressesAreEqual Tests
+
+    [Theory]
+    [InlineData("192.0.2.1", "192.0.2.1", true)]
+    [InlineData("192.0.2.1", "192.0.2.2", false)]
+    [InlineData("2001:db8::53", "2001:0db8:0000:0000:0000:0000:0000:0053", true)]  // Compressed vs expanded
+    [InlineData("2001:DB8::53", "2001:db8::53", true)]                              // Hex case
+    [InlineData("fd00::1", "fd00::2", false)]
+    [InlineData("192.0.2.1", "::ffff:192.0.2.1", false)]  // Different families stay distinct
+    [InlineData("invalid", "invalid", false)]
+    [InlineData(null, "192.0.2.1", false)]
+    [InlineData("", "", false)]
+    public void IpAddressesAreEqual_ReturnsExpected(string? ip1, string? ip2, bool expected)
+    {
+        NetworkUtilities.IpAddressesAreEqual(ip1, ip2).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region CidrCoversSubnet Tests
+
+    [Theory]
+    [InlineData("192.168.1.0/24", "192.168.1.0/24", true)]   // Exact match
+    [InlineData("192.168.0.0/16", "192.168.1.0/24", true)]   // Larger covers smaller
+    [InlineData("10.0.0.0/8", "10.1.2.0/24", true)]          // Class A covers /24
+    [InlineData("192.168.1.0/24", "192.168.0.0/16", false)]  // Smaller doesn't cover larger
+    [InlineData("192.168.1.0/24", "192.168.2.0/24", false)]  // Different network
+    [InlineData("0.0.0.0/0", "192.168.1.0/24", true)]        // /0 covers everything
+    public void CidrCoversSubnet_IPv4_ValidCases(string outer, string inner, bool expected)
+    {
+        NetworkUtilities.CidrCoversSubnet(outer, inner).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("2001:db8::/32", "2001:db8:abcd::/48", true)]   // IPv6 larger covers smaller
+    [InlineData("2001:db8:abcd::/48", "2001:db8:abcd:1234::/64", true)]
+    [InlineData("2001:db8:abcd:1234::/64", "2001:db8:abcd::/48", false)]
+    [InlineData("::/0", "2001:db8::/32", true)]  // /0 covers everything
+    public void CidrCoversSubnet_IPv6_ValidCases(string outer, string inner, bool expected)
+    {
+        NetworkUtilities.CidrCoversSubnet(outer, inner).Should().Be(expected);
+    }
+
+    [Fact]
+    public void CidrCoversSubnet_MixedFamilies_ReturnsFalse()
+    {
+        NetworkUtilities.CidrCoversSubnet("192.168.0.0/16", "2001:db8::/32").Should().BeFalse();
+        NetworkUtilities.CidrCoversSubnet("2001:db8::/32", "192.168.1.0/24").Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("invalid", "192.168.1.0/24")]
+    [InlineData("192.168.1.0/24", "invalid")]
+    [InlineData("", "192.168.1.0/24")]
+    [InlineData("192.168.1.0", "192.168.1.0/24")]  // Missing prefix
+    public void CidrCoversSubnet_InvalidInput_ReturnsFalse(string outer, string inner)
+    {
+        NetworkUtilities.CidrCoversSubnet(outer, inner).Should().BeFalse();
+    }
+
+    #endregion
+
+    #region ExpandIpRange Tests
+
+    [Fact]
+    public void ExpandIpRange_SingleIp_ReturnsSingleIp()
+    {
+        var result = NetworkUtilities.ExpandIpRange("192.168.1.1");
+        result.Should().ContainSingle().Which.Should().Be("192.168.1.1");
+    }
+
+    [Fact]
+    public void ExpandIpRange_NullOrEmpty_ReturnsEmptyList()
+    {
+        NetworkUtilities.ExpandIpRange(null).Should().BeEmpty();
+        NetworkUtilities.ExpandIpRange("").Should().BeEmpty();
+    }
+
+    [Fact]
+    public void ExpandIpRange_ValidRange_ReturnsAllIps()
+    {
+        var result = NetworkUtilities.ExpandIpRange("192.168.1.10-192.168.1.12");
+        result.Should().HaveCount(3);
+        result.Should().Contain("192.168.1.10");
+        result.Should().Contain("192.168.1.11");
+        result.Should().Contain("192.168.1.12");
+    }
+
+    [Fact]
+    public void ExpandIpRange_TwoIpRange_ReturnsBothIps()
+    {
+        var result = NetworkUtilities.ExpandIpRange("172.16.1.253-172.16.1.254");
+        result.Should().HaveCount(2);
+        result.Should().BeEquivalentTo(new[] { "172.16.1.253", "172.16.1.254" });
+    }
+
+    [Fact]
+    public void ExpandIpRange_CrossSubnetRange_ReturnsSingleValue()
+    {
+        // Cross-subnet ranges are not expanded
+        var result = NetworkUtilities.ExpandIpRange("192.168.1.1-192.168.2.1");
+        result.Should().ContainSingle().Which.Should().Be("192.168.1.1-192.168.2.1");
+    }
+
+    [Fact]
+    public void ExpandIpRange_ReversedRange_ReturnsSingleValue()
+    {
+        // Reversed ranges (start > end) are not expanded
+        var result = NetworkUtilities.ExpandIpRange("192.168.1.10-192.168.1.5");
+        result.Should().ContainSingle().Which.Should().Be("192.168.1.10-192.168.1.5");
+    }
+
+    [Fact]
+    public void ExpandIpRange_InvalidIp_ReturnsSingleValue()
+    {
+        var result = NetworkUtilities.ExpandIpRange("not-an-ip");
+        result.Should().ContainSingle().Which.Should().Be("not-an-ip");
+    }
+
+    #endregion
+
+    #region ParseCidr Tests
+
+    [Fact]
+    public void ParseCidr_ValidIPv4_ReturnsNetworkAndPrefix()
+    {
+        var (network, prefix) = NetworkUtilities.ParseCidr("192.168.1.0/24");
+        network.Should().NotBeNull();
+        network!.ToString().Should().Be("192.168.1.0");
+        prefix.Should().Be(24);
+    }
+
+    [Fact]
+    public void ParseCidr_ValidIPv6_ReturnsNetworkAndPrefix()
+    {
+        var (network, prefix) = NetworkUtilities.ParseCidr("2001:db8::/32");
+        network.Should().NotBeNull();
+        network!.ToString().Should().Be("2001:db8::");
+        prefix.Should().Be(32);
+    }
+
+    [Theory]
+    [InlineData("192.168.1.0")]      // Missing prefix
+    [InlineData("192.168.1.0/")]     // Empty prefix
+    [InlineData("/24")]              // Missing network
+    [InlineData("invalid/24")]       // Invalid IP
+    [InlineData("192.168.1.0/abc")]  // Non-numeric prefix
+    public void ParseCidr_InvalidInput_ReturnsNull(string cidr)
+    {
+        var (network, _) = NetworkUtilities.ParseCidr(cidr);
+        network.Should().BeNull();
+    }
+
+    #endregion
+
+    #region ExtractHostFromUrl Tests
+
+    [Theory]
+    [InlineData(null, "")]
+    [InlineData("", "")]
+    [InlineData("   ", "")]
+    public void ExtractHostFromUrl_NullOrWhitespace_ReturnsEmptyish(string? input, string expected)
+    {
+        NetworkUtilities.ExtractHostFromUrl(input).Should().Be(input ?? expected);
+    }
+
+    [Theory]
+    [InlineData("192.168.100.1", "192.168.100.1")]
+    [InlineData("  192.168.100.1  ", "192.168.100.1")]
+    [InlineData("modem.local", "modem.local")]
+    [InlineData("192.168.100.1:8080", "192.168.100.1:8080")]
+    public void ExtractHostFromUrl_BareHostOrHostPort_PassesThrough(string input, string expected)
+    {
+        NetworkUtilities.ExtractHostFromUrl(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("http://192.168.100.1", "192.168.100.1")]
+    [InlineData("http://192.168.100.1/", "192.168.100.1")]
+    [InlineData("https://192.168.100.1/status.html", "192.168.100.1")]
+    [InlineData("HTTP://192.168.100.1/cgi-bin/status?page=1", "192.168.100.1")]
+    [InlineData("https://192.168.100.1:8443/login", "192.168.100.1")]
+    [InlineData("http://modem.local/#/dashboard", "modem.local")]
+    [InlineData("192.168.100.1/status.html", "192.168.100.1")]
+    public void ExtractHostFromUrl_UrlShapedInput_ReturnsBareHost(string input, string expected)
+    {
+        NetworkUtilities.ExtractHostFromUrl(input).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region NormalizeControllerUrl Tests
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void NormalizeControllerUrl_NullOrWhitespace_ReturnsAsIs(string? url)
+    {
+        NetworkUtilities.NormalizeControllerUrl(url!).Should().Be(url);
+    }
+
+    [Theory]
+    [InlineData("unifi.example.com", "https://unifi.example.com")]
+    [InlineData("192.168.1.1", "https://192.168.1.1")]
+    [InlineData("my-controller.local", "https://my-controller.local")]
+    public void NormalizeControllerUrl_BareHostname_PrependsHttps(string input, string expected)
+    {
+        NetworkUtilities.NormalizeControllerUrl(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("https://unifi.example.com", "https://unifi.example.com")]
+    [InlineData("http://unifi.example.com", "http://unifi.example.com")]
+    [InlineData("HTTPS://unifi.example.com", "https://unifi.example.com")]
+    [InlineData("HTTP://unifi.example.com", "http://unifi.example.com")]
+    public void NormalizeControllerUrl_WithScheme_PreservesScheme(string input, string expected)
+    {
+        NetworkUtilities.NormalizeControllerUrl(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("https://unifi.example.com/", "https://unifi.example.com")]
+    [InlineData("https://unifi.example.com///", "https://unifi.example.com")]
+    [InlineData("unifi.example.com/", "https://unifi.example.com")]
+    public void NormalizeControllerUrl_TrailingSlash_Removed(string input, string expected)
+    {
+        NetworkUtilities.NormalizeControllerUrl(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("https://unifi.example.com/network/default/dashboard", "https://unifi.example.com")]
+    [InlineData("https://unifi.example.com/network/default/dashboard/", "https://unifi.example.com")]
+    [InlineData("unifi.example.com/network/default", "https://unifi.example.com")]
+    [InlineData("http://192.168.1.1/api/s/default", "http://192.168.1.1")]
+    public void NormalizeControllerUrl_WithPath_StripsPath(string input, string expected)
+    {
+        NetworkUtilities.NormalizeControllerUrl(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("https://unifi.example.com:8443", "https://unifi.example.com:8443")]
+    [InlineData("https://unifi.example.com:8443/network/default", "https://unifi.example.com:8443")]
+    [InlineData("http://192.168.1.1:8080/api", "http://192.168.1.1:8080")]
+    [InlineData("unifi.example.com:8443", "https://unifi.example.com:8443")]
+    [InlineData("unifi.example.com:8443/path", "https://unifi.example.com:8443")]
+    public void NormalizeControllerUrl_NonDefaultPort_PortPreserved(string input, string expected)
+    {
+        NetworkUtilities.NormalizeControllerUrl(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("https://unifi.example.com:443", "https://unifi.example.com")]
+    [InlineData("http://unifi.example.com:80", "http://unifi.example.com")]
+    public void NormalizeControllerUrl_DefaultPort_PortOmitted(string input, string expected)
+    {
+        NetworkUtilities.NormalizeControllerUrl(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("  unifi.example.com  ", "https://unifi.example.com")]
+    [InlineData("  https://unifi.example.com  ", "https://unifi.example.com")]
+    [InlineData("\thttps://unifi.example.com\n", "https://unifi.example.com")]
+    public void NormalizeControllerUrl_Whitespace_Trimmed(string input, string expected)
+    {
+        NetworkUtilities.NormalizeControllerUrl(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("https://unifi.example.com?query=1", "https://unifi.example.com")]
+    [InlineData("https://unifi.example.com/path?query=1#fragment", "https://unifi.example.com")]
+    public void NormalizeControllerUrl_QueryAndFragment_Stripped(string input, string expected)
+    {
+        NetworkUtilities.NormalizeControllerUrl(input).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region PreferredWanCounterInterface Tests
+
+    [Theory]
+    // Plain ethernet: physical and uplink are the same port
+    [InlineData("eth4", "eth4", "eth4")]
+    // VLAN-tagged: sub-interface double-counts (verified ~2x on a UCG-Fiber), physical wins
+    [InlineData("eth6", "eth6.100", "eth6")]
+    // PPPoE: tunnel carries the payload, physical over-counts (overhead + sibling VLANs)
+    [InlineData("eth4", "ppp0", "ppp0")]
+    // Cellular WAN via LAN GRE tunnel (UniFi 5G Max): both fields report the tunnel
+    [InlineData("gre1", "gre1", "gre1")]
+    // Hypothetical GRE uplink with a physical LAN port reported: tunnel wins
+    [InlineData("eth3", "gre1", "gre1")]
+    // Missing one side: use whichever is known
+    [InlineData(null, "ppp0", "ppp0")]
+    [InlineData("eth4", null, "eth4")]
+    [InlineData("eth4", "", "eth4")]
+    [InlineData(null, null, null)]
+    public void PreferredWanCounterInterface_PicksCounterBearingInterface(
+        string? physical, string? uplink, string? expected)
+    {
+        NetworkUtilities.PreferredWanCounterInterface(physical, uplink).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region IsRfc1918 Tests
+
+    [Theory]
+    [InlineData("10.0.0.1", true)]
+    [InlineData("10.255.255.255", true)]
+    [InlineData("172.16.0.1", true)]
+    [InlineData("172.31.255.254", true)]
+    [InlineData("192.168.0.1", true)]
+    [InlineData("192.168.255.254", true)]
+    // IPv4-mapped IPv6 forms unwrap before evaluation
+    [InlineData("::ffff:192.168.1.10", true)]
+    [InlineData("::ffff:203.0.113.5", false)]
+    // Adjacent and lookalike ranges are NOT RFC1918
+    [InlineData("9.255.255.255", false)]
+    [InlineData("11.0.0.1", false)]
+    [InlineData("172.15.255.255", false)]
+    [InlineData("172.32.0.1", false)]
+    [InlineData("192.167.1.1", false)]
+    [InlineData("192.169.1.1", false)]
+    // Private-adjacent classes IsPrivateIpAddress accepts but strict RFC1918 must not
+    [InlineData("127.0.0.1", false)]
+    [InlineData("169.254.10.10", false)]
+    [InlineData("100.64.0.1", false)]
+    [InlineData("224.0.0.1", false)]
+    [InlineData("0.0.0.0", false)]
+    // Public and IPv6
+    [InlineData("203.0.113.5", false)]
+    [InlineData("8.8.8.8", false)]
+    [InlineData("2001:db8::1", false)]
+    [InlineData("fd00::1", false)]
+    public void IsRfc1918_ClassifiesStrictly(string ip, bool expected)
+    {
+        NetworkUtilities.IsRfc1918(IPAddress.Parse(ip)).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region IsIPv6UniqueLocal Tests
+
+    [Theory]
+    [InlineData("fc00::1", true)]
+    [InlineData("fd00::1", true)]
+    [InlineData("fdab:cdef::42", true)]
+    [InlineData("fbff::1", false)]
+    [InlineData("fe00::1", false)]
+    [InlineData("fe80::1", false)]
+    [InlineData("2001:db8::1", false)]
+    [InlineData("::1", false)]
+    [InlineData("192.168.1.1", false)]
+    public void IsIPv6UniqueLocal_ClassifiesFc00Slash7(string ip, bool expected)
+    {
+        NetworkUtilities.IsIPv6UniqueLocal(IPAddress.Parse(ip)).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region NormalizeToIPv4String Tests
+
+    [Theory]
+    [InlineData("::ffff:10.20.30.40", "10.20.30.40")]
+    [InlineData("::ffff:192.168.1.100", "192.168.1.100")]
+    [InlineData("::ffff:100.64.0.1", "100.64.0.1")]
+    [InlineData("::ffff:8.8.8.8", "8.8.8.8")]
+    public void NormalizeToIPv4String_UnwrapsMappedAddresses(string input, string expected)
+    {
+        NetworkUtilities.NormalizeToIPv4String(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("10.20.30.40")]          // plain IPv4 - unchanged
+    [InlineData("192.168.1.1")]
+    [InlineData("2001:db8:abcd::1")]    // real IPv6 (RFC 3849 doc range) - must NOT be altered
+    [InlineData("fd00::1")]             // real IPv6 ULA
+    [InlineData("fe80::1")]             // real IPv6 link-local
+    [InlineData("2001:db8::ffff:1")]    // real IPv6 that merely contains 'ffff'
+    [InlineData("::1")]                 // IPv6 loopback
+    [InlineData("unknown")]             // sentinel string
+    [InlineData("not-an-ip")]           // unparseable
+    [InlineData("")]                    // empty
+    public void NormalizeToIPv4String_LeavesNonMappedUnchanged(string input)
+    {
+        NetworkUtilities.NormalizeToIPv4String(input).Should().Be(input);
+    }
+
+    [Fact]
+    public void NormalizeToIPv4String_NullReturnsNull()
+    {
+        NetworkUtilities.NormalizeToIPv4String(null).Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData("::ffff:10.20.30.40", true)]     // mapped RFC1918 must classify as private
+    [InlineData("::ffff:192.168.1.5", true)]
+    [InlineData("::ffff:100.64.0.1", true)]     // mapped CGNAT
+    [InlineData("::ffff:8.8.8.8", false)]       // mapped public stays public
+    public void IsPrivateIpAddress_UnwrapsMappedIPv4(string ip, bool expected)
+    {
+        NetworkUtilities.IsPrivateIpAddress(ip).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("ppp0", true)]
+    [InlineData("ppp3", true)]
+    [InlineData("PPP0", true)]              // case-insensitive
+    [InlineData("pppoe0", true)]            // the form some stacks use
+    [InlineData("eth6", false)]
+    [InlineData("eth6.100", false)]         // VLAN-tagged WAN, not a PPPoE session
+    [InlineData("gre1", false)]             // LAN-tunneled cellular WAN
+    [InlineData("ppp", false)]              // no unit number - not an interface
+    [InlineData("pppoe", false)]
+    [InlineData("ppp0.1", false)]           // anchored: no trailing junk
+    [InlineData("xppp0", false)]            // anchored: no leading junk
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsPppoeInterface_MatchesOnlyPppSessionInterfaces(string? ifName, bool expected)
+    {
+        NetworkUtilities.IsPppoeInterface(ifName).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region ComposeAuthority Tests
+
+    [Theory]
+    [InlineData("host.example.com", null, "host.example.com")]
+    [InlineData("host.example.com", "", "host.example.com")]
+    [InlineData("host.example.com", "  ", "host.example.com")]
+    public void ComposeAuthority_NoPort_ReturnsBareHost(string host, string? port, string expected)
+    {
+        NetworkUtilities.ComposeAuthority(host, port, defaultPort: 443).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("host.example.com", "443", 443, "host.example.com")]
+    [InlineData("host.example.com", "80", 80, "host.example.com")]
+    public void ComposeAuthority_DefaultPort_StaysImplicit(string host, string port, int defaultPort, string expected)
+    {
+        NetworkUtilities.ComposeAuthority(host, port, defaultPort).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("host.example.com", "13444", "host.example.com:13444")]
+    [InlineData("host.example.com", "8443", "host.example.com:8443")]
+    [InlineData(" host.example.com ", " 13444 ", "host.example.com:13444")]
+    public void ComposeAuthority_NonStandardPort_Appended(string host, string port, string expected)
+    {
+        NetworkUtilities.ComposeAuthority(host, port, defaultPort: 443).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("host.example.com:8443", "8443", "host.example.com:8443")]
+    [InlineData("host.example.com:8443", "9999", "host.example.com:8443")]
+    [InlineData("host.example.com:8443", null, "host.example.com:8443")]
+    public void ComposeAuthority_EmbeddedPortWins(string host, string? port, string expected)
+    {
+        NetworkUtilities.ComposeAuthority(host, port, defaultPort: 443).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("[2001:db8::1]", "13444", "[2001:db8::1]:13444")]
+    [InlineData("[2001:db8::1]:8443", "13444", "[2001:db8::1]:8443")]
+    [InlineData("[2001:db8::1]", "443", "[2001:db8::1]")]
+    public void ComposeAuthority_BracketedIPv6_InnerColonsNotPortSeparators(string host, string port, string expected)
+    {
+        NetworkUtilities.ComposeAuthority(host, port, defaultPort: 443).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void ComposeAuthority_NullOrEmptyHost_ReturnsNull(string? host)
+    {
+        NetworkUtilities.ComposeAuthority(host, "13444", defaultPort: 443).Should().BeNull();
+    }
+
+    #endregion
+
+    #region AuthorityHost Tests
+
+    [Theory]
+    [InlineData("host.example.com", "host.example.com")]
+    [InlineData("host.example.com:13444", "host.example.com")]
+    [InlineData(" host.example.com:13444 ", "host.example.com")]
+    [InlineData("[2001:db8::1]", "[2001:db8::1]")]
+    [InlineData("[2001:db8::1]:13444", "[2001:db8::1]")]
+    public void AuthorityHost_DropsPort(string authority, string expected)
+    {
+        NetworkUtilities.AuthorityHost(authority).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void AuthorityHost_NullOrEmpty_ReturnsNull(string? authority)
+    {
+        NetworkUtilities.AuthorityHost(authority).Should().BeNull();
+    }
+
+    #endregion
+
+    #region IpSortKey Tests
+
+    [Fact]
+    public void IpSortKey_OrdersIpv4Numerically()
+    {
+        var sorted = new[] { "10.0.0.10", "10.0.0.9", "10.0.0.100", "192.0.2.1" }
+            .OrderBy(NetworkUtilities.IpSortKey, StringComparer.Ordinal).ToList();
+        sorted.Should().Equal("10.0.0.9", "10.0.0.10", "10.0.0.100", "192.0.2.1");
+    }
+
+    [Fact]
+    public void IpSortKey_Ipv4BeforeIpv6BeforeUnparseable()
+    {
+        var sorted = new[] { "not-an-ip", "2001:db8::1", "198.51.100.7", null }
+            .OrderBy(NetworkUtilities.IpSortKey, StringComparer.Ordinal).ToList();
+        sorted.Should().Equal("198.51.100.7", "2001:db8::1", null, "not-an-ip");
+    }
+
+    #endregion
+}

@@ -1,0 +1,287 @@
+using System.Text.Json;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Models.Identity;
+using NetworkOptimizer.Web.Services.Gates;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// Dashboard card identifiers for the main content grid.
+/// </summary>
+public static class DashboardCards
+{
+    public const string StatsRow = "stats-row";
+    public const string ActiveAlerts = "active-alerts";
+    public const string SecurityPosture = "security-posture";
+    public const string SqmStatus = "sqm-status";
+    public const string ThreatTrends = "threat-trends";
+    public const string CellularStats = "cellular-stats";
+    public const string CmStats = "cm-stats";
+    public const string OntStats = "ont-stats";
+    public const string StarlinkStats = "starlink-stats";
+    public const string SpeedTests = "speed-tests";
+    public const string WiFiOptimizer = "wifi-optimizer";
+    public const string RecentAlerts = "recent-alerts";
+    public const string DeviceStatus = "device-status";
+    public const string LiveView = "live-view";
+
+    /// <summary>All valid card IDs</summary>
+    public static readonly string[] All =
+    [
+        StatsRow, ActiveAlerts, SecurityPosture, SqmStatus, ThreatTrends, CellularStats, CmStats, OntStats,
+        StarlinkStats, SpeedTests, WiFiOptimizer, RecentAlerts, DeviceStatus, LiveView
+    ];
+
+    /// <summary>Default full-width cards</summary>
+    public static readonly HashSet<string> DefaultFullWidth = new()
+    {
+        StatsRow, ActiveAlerts, DeviceStatus, LiveView
+    };
+
+    /// <summary>Display names for cards</summary>
+    public static string GetDisplayName(string cardId) => cardId switch
+    {
+        StatsRow => "Quick Stats",
+        ActiveAlerts => "Active Alerts",
+        SecurityPosture => "Security Posture",
+        SqmStatus => "Adaptive SQM",
+        ThreatTrends => "Threat Trends",
+        CellularStats => "Cellular Stats",
+        CmStats => "Cable Modem Stats",
+        OntStats => "ONT Stats",
+        StarlinkStats => "Starlink Stats",
+        SpeedTests => "Speed Tests",
+        WiFiOptimizer => "Wi-Fi Optimizer",
+        RecentAlerts => "Recent Security Findings",
+        DeviceStatus => "Device Status",
+        LiveView => "Live View",
+        _ => cardId
+    };
+}
+
+/// <summary>
+/// Stat item identifiers for the stats row.
+/// </summary>
+public static class DashboardStatItems
+{
+    public const string TotalDevices = "total-devices";
+    public const string SecurityScore = "security-score";
+    public const string SqmStatus = "sqm-status";
+    public const string ActiveAlerts = "active-alerts";
+    public const string ThreatEvents = "threat-events";
+    public const string WiFiHealth = "wifi-health";
+
+    /// <summary>All valid stat item IDs</summary>
+    public static readonly string[] All =
+    [
+        TotalDevices, SecurityScore, SqmStatus, ActiveAlerts, ThreatEvents, WiFiHealth
+    ];
+
+    /// <summary>Display names for stat items</summary>
+    public static string GetDisplayName(string statId) => statId switch
+    {
+        TotalDevices => "Total Devices",
+        SecurityScore => "Security Score",
+        SqmStatus => "Adaptive SQM",
+        ActiveAlerts => "Security Findings",
+        ThreatEvents => "Threat Events",
+        WiFiHealth => "Wi-Fi Health",
+        _ => statId
+    };
+}
+
+/// <summary>
+/// User-customizable dashboard layout configuration.
+/// </summary>
+public class DashboardLayout
+{
+    /// <summary>Ordered list of card configurations</summary>
+    public List<DashboardCardConfig> Cards { get; set; } = new();
+
+    /// <summary>Ordered list of visible stat item IDs within the stats row</summary>
+    public List<string> StatItems { get; set; } = new();
+
+    /// <summary>Stat items the user explicitly removed (so merge doesn't re-add them)</summary>
+    public List<string> RemovedStatItems { get; set; } = new();
+}
+
+/// <summary>
+/// Configuration for a single dashboard card.
+/// </summary>
+public class DashboardCardConfig
+{
+    public string Id { get; set; } = string.Empty;
+    public bool Visible { get; set; } = true;
+    public bool FullWidth { get; set; }
+
+    /// <summary>Map rendering mode for the Live View card ("2d" or "3d")</summary>
+    public string? MapMode { get; set; }
+
+    /// <summary>Card IDs stacked below this card in the same grid cell</summary>
+    public List<string> StackedCards { get; set; } = new();
+}
+
+/// <summary>
+/// Manages dashboard layout preferences (card order, visibility, stat items).
+/// </summary>
+/// <summary>
+/// Saving the dashboard layout (design doc 06, gate 9).
+///
+/// GetLayoutAsync stays ungated - everyone renders the dashboard from it. The save is Site Admin
+/// because the layout is ONE setting shared by everybody on the site, so arranging it rearranges
+/// what every other person sees. Per-user layouts are a follow-up; until then this is the honest
+/// role for it, and it matches the gate already on the Edit Layout button.
+/// </summary>
+[MutatingService(SiteScoped = true)]
+public interface IDashboardLayoutAdminService
+{
+    [RequireRole(Roles.Admin)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "dashboard_layout")]
+    Task SaveLayoutAsync(DashboardLayout layout);
+}
+
+public class DashboardLayoutService : IDashboardLayoutAdminService
+{
+    private readonly ISystemSettingsService _settings;
+
+    /// <summary>
+    /// Saving goes through the gated admin path, not the plain settings service. The layout is ONE
+    /// setting shared by the whole site, so rearranging it rearranges the dashboard for everybody -
+    /// a Viewer could quietly reorganise what their colleagues see. Reads stay on the plain service,
+    /// which is what every render and background tick needs.
+    /// </summary>
+    private readonly ISystemSettingsAdmin _settingsAdmin;
+    private readonly ILogger<DashboardLayoutService> _logger;
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = false
+    };
+
+    public DashboardLayoutService(
+        ISystemSettingsService settings,
+        ISystemSettingsAdmin settingsAdmin,
+        ILogger<DashboardLayoutService> logger)
+    {
+        _settings = settings;
+        _settingsAdmin = settingsAdmin;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Load the user's dashboard layout, or return the default.
+    /// </summary>
+    public async Task<DashboardLayout> GetLayoutAsync()
+    {
+        try
+        {
+            var json = await _settings.GetAsync(SystemSettingKeys.DashboardLayout);
+            if (!string.IsNullOrEmpty(json))
+            {
+                var layout = JsonSerializer.Deserialize<DashboardLayout>(json, JsonOptions);
+                if (layout != null)
+                {
+                    // Merge in any new cards/stats that were added since the layout was saved
+                    MergeDefaults(layout);
+                    return layout;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load dashboard layout, using defaults");
+        }
+
+        return GetDefaultLayout();
+    }
+
+    /// <summary>
+    /// Save the user's dashboard layout.
+    /// </summary>
+    public async Task SaveLayoutAsync(DashboardLayout layout)
+    {
+        var json = JsonSerializer.Serialize(layout, JsonOptions);
+        await _settingsAdmin.SetAsync(SystemSettingKeys.DashboardLayout, json);
+        _logger.LogDebug("Saved dashboard layout");
+    }
+
+    /// <summary>
+    /// Reset to default layout.
+    /// </summary>
+    public async Task ResetLayoutAsync()
+    {
+        await _settings.SetAsync(SystemSettingKeys.DashboardLayout, null);
+        _logger.LogDebug("Reset dashboard layout to defaults");
+    }
+
+    /// <summary>
+    /// Returns the default dashboard layout matching the original hardcoded order.
+    /// </summary>
+    public static DashboardLayout GetDefaultLayout()
+    {
+        var cards = DashboardCards.All.Select(id => new DashboardCardConfig
+        {
+            Id = id,
+            Visible = id != DashboardCards.LiveView,
+            FullWidth = DashboardCards.DefaultFullWidth.Contains(id)
+        }).ToList();
+
+        // Default stack: SQM hosts Threat Trends
+        var sqmCard = cards.Find(c => c.Id == DashboardCards.SqmStatus);
+        if (sqmCard != null)
+            sqmCard.StackedCards.Add(DashboardCards.ThreatTrends);
+
+        return new DashboardLayout
+        {
+            Cards = cards,
+            StatItems = DashboardStatItems.All.ToList()
+        };
+    }
+
+    /// <summary>
+    /// Ensure any newly added cards/stats appear in existing saved layouts. A new card goes in at its
+    /// default position: right after the nearest card that precedes it in <see cref="DashboardCards.All"/>,
+    /// or first when none does, so it is not buried under every card the site already has.
+    /// </summary>
+    internal static void MergeDefaults(DashboardLayout layout)
+    {
+        var existingCardIds = new HashSet<string>(layout.Cards.Select(c => c.Id));
+        for (var i = 0; i < DashboardCards.All.Length; i++)
+        {
+            var cardId = DashboardCards.All[i];
+            if (existingCardIds.Contains(cardId))
+                continue;
+
+            var isLiveView = cardId == DashboardCards.LiveView;
+            var card = new DashboardCardConfig
+            {
+                Id = cardId,
+                Visible = !isLiveView,
+                FullWidth = isLiveView || DashboardCards.DefaultFullWidth.Contains(cardId)
+            };
+
+            var insertAt = 0;
+            for (var p = i - 1; p >= 0; p--)
+            {
+                var predecessor = layout.Cards.FindIndex(c => c.Id == DashboardCards.All[p]);
+                if (predecessor < 0) continue;
+                insertAt = predecessor + 1;
+                break;
+            }
+
+            layout.Cards.Insert(insertAt, card);
+            existingCardIds.Add(cardId);
+        }
+
+        var existingStatIds = new HashSet<string>(layout.StatItems);
+        var removedStatIds = new HashSet<string>(layout.RemovedStatItems);
+        foreach (var statId in DashboardStatItems.All)
+        {
+            if (!existingStatIds.Contains(statId) && !removedStatIds.Contains(statId))
+            {
+                layout.StatItems.Add(statId);
+            }
+        }
+    }
+}

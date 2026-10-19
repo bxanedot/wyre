@@ -1,0 +1,489 @@
+using Microsoft.EntityFrameworkCore;
+using NetworkOptimizer.Core.Helpers;
+using NetworkOptimizer.Monitoring.Models;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Services;
+
+namespace NetworkOptimizer.Web.Services.Monitoring.IspHealth;
+
+/// <summary>
+/// Resolves the ONE physical-link source that belongs to the WAN being scored, by matching the
+/// configured access technology to a monitored device (ONT/SFP, cable modem, or cellular modem),
+/// then assembles its window-aggregated metrics (time-series) enriched with the live poll snapshot
+/// (PON link state, active OFDMA channel, 5G capability) into a <see cref="PhysicalLinkInput"/>.
+///
+/// Matching is conservative: a single in-medium candidate is used automatically; multiple
+/// candidates require the user's persisted pick (<see cref="MonitoringSettings.PhysicalLinkSourceKey"/>)
+/// and otherwise surface as an ambiguity the panel resolves with a dropdown. One instance
+/// exists per site, created alongside its site's <see cref="IspHealthService"/> by
+/// <see cref="IspHealthRegistry"/> (the monitor services and the InfluxDB client it uses
+/// are that site's instances).
+/// </summary>
+public class PhysicalLinkResolver
+{
+    private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
+    private readonly SiteDbContextFactory _siteDbFactory;
+    private readonly MonitoringInfluxClient _influx;
+    private readonly ICableModemService _cmMonitor;
+    private readonly IOntMonitorService _ontMonitor;
+    private readonly ICellularModemService _cellularMonitor;
+    private readonly IStarlinkMonitorService _starlinkMonitor;
+    private readonly ILogger<PhysicalLinkResolver> _logger;
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
+
+    public PhysicalLinkResolver(
+        IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+        SiteDbContextFactory siteDbFactory,
+        MonitoringInfluxRegistry influxRegistry,
+        ModemMonitorRegistry modemMonitors,
+        ILogger<PhysicalLinkResolver> logger,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
+    {
+        _dbFactory = dbFactory;
+        _siteDbFactory = siteDbFactory;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
+        _influx = influxRegistry.GetFor(_siteSlug);
+        var monitors = modemMonitors.GetFor(_siteSlug);
+        _cmMonitor = monitors.CableModem;
+        _ontMonitor = monitors.Ont;
+        _cellularMonitor = monitors.Cellular;
+        _starlinkMonitor = monitors.Starlink;
+        _logger = logger;
+    }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct)
+    {
+        if (!_isDefault)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
+    }
+
+    /// <summary>One matched/selectable physical source.</summary>
+    private sealed record Cand(string Key, string Label, PhysicalMedium Medium, int? ConfigId, string? Mac, string? Port);
+
+    public async Task<PhysicalLinkResolution> ResolveAsync(
+        AccessTechnology tech, DateTime windowStart, DateTime windowEnd, TimeSpan aggregate, CancellationToken ct)
+    {
+        MonitoringSettings? settings;
+        List<Cand> candidates;
+        await using (var db = await CreateSiteDbAsync(ct))
+        {
+            settings = await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
+            candidates = await EnumerateCandidatesAsync(db, tech, ct);
+        }
+
+        var selectedKey = settings?.PhysicalLinkSourceKey;
+        var candidateModels = candidates.Select(c => new PhysicalLinkCandidate(c.Key, c.Label)).ToList();
+
+        if (candidates.Count == 0)
+            return new PhysicalLinkResolution(null, candidateModels, selectedKey, false);
+
+        Cand chosen;
+        if (candidates.Count == 1)
+        {
+            chosen = candidates[0];
+        }
+        else
+        {
+            var match = candidates.FirstOrDefault(c => c.Key == selectedKey);
+            if (match is null)
+            {
+                _logger.LogDebug("ISP Health physical link: {Count} candidates, none selected - ambiguous", candidates.Count);
+                return new PhysicalLinkResolution(null, candidateModels, null, true);
+            }
+            chosen = match;
+        }
+
+        var input = await AssembleAsync(chosen, tech == AccessTechnology.XgsPon, windowStart, windowEnd, aggregate, ct);
+        return new PhysicalLinkResolution(input, candidateModels, chosen.Key, false);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Candidate enumeration (access technology -> medium family)
+    // ---------------------------------------------------------------------------
+
+    private async Task<List<Cand>> EnumerateCandidatesAsync(NetworkOptimizerDbContext db, AccessTechnology tech, CancellationToken ct)
+    {
+        switch (tech)
+        {
+            case AccessTechnology.Gpon:
+            case AccessTechnology.XgsPon:
+                return await PonCandidatesAsync(db, ct);
+
+            case AccessTechnology.DirectEthernet:
+                return await SfpCandidatesAsync(db, SfpCategory.ActiveEthernet, PhysicalMedium.ActiveEthernet, ct);
+
+            case AccessTechnology.Docsis:
+                return await CableModemCandidatesAsync(db, ct);
+
+            case AccessTechnology.Cellular:
+                return await CellularCandidatesAsync(db, ct);
+
+            case AccessTechnology.Satellite:
+                return await StarlinkCandidatesAsync(db, ct);
+
+            case AccessTechnology.PppoE:
+                // Carve-out: PPPoE often rides PON. If exactly one PON source is monitored,
+                // it is safe to assume it is the user's WAN; otherwise stay out of it.
+                // Kept for WANs still stored as PppoE - it is no longer selectable in Upstream
+                // Discovery, since picking the medium it rides resolves the physical link
+                // outright instead of guessing at it. The guess stays available regardless of
+                // the stored value: ISP Health can tell a PPPoE session on its own, because the
+                // WAN's uplink interface is named ppp* (uplink_ifname "ppp0") and its network
+                // config carries wan_type "pppoe". Worth wiring up here when PPPoE gets scoring
+                // behavior of its own - the encapsulation is then a fact we detect, layered on
+                // the medium the user picked, rather than a choice competing with it.
+                var pon = await PonCandidatesAsync(db, ct);
+                return pon.Count == 1 ? pon : new List<Cand>();
+
+            default:
+                return new List<Cand>();
+        }
+    }
+
+    private async Task<List<Cand>> PonCandidatesAsync(NetworkOptimizerDbContext db, CancellationToken ct)
+    {
+        var sfps = await SfpCandidatesAsync(db, SfpCategory.Pon, PhysicalMedium.Pon, ct);
+        // Attached configs represent the SFP module's PON layer (handled by the SFP
+        // candidate above), not a standalone ONT hop - exclude them here.
+        var onts = (await db.OntConfigurations.AsNoTracking().Where(o => o.Enabled && o.AttachedSfpId == null).ToListAsync(ct))
+            .Where(o => IsFresh(o.LastPolled, o.PollingIntervalSeconds))
+            .Select(o => new Cand($"ont:{o.Id}", o.Name, PhysicalMedium.Pon, o.Id, null, null));
+        return sfps.Concat(onts).ToList();
+    }
+
+    private async Task<List<Cand>> SfpCandidatesAsync(NetworkOptimizerDbContext db, SfpCategory category, PhysicalMedium medium, CancellationToken ct)
+    {
+        return (await db.MonitoredSfps.AsNoTracking().Where(s => s.Category == category).ToListAsync(ct))
+            .Select(s => new Cand(
+                $"sfp:{s.DeviceMac}/{s.PortName}",
+                SfpDisplayLabel(s),
+                medium, null, s.DeviceMac, s.PortName))
+            .ToList();
+    }
+
+    /// <summary>Friendly label for an SFP source: the user's name if set, otherwise the cleaned
+    /// transceiver vendor plus its port (e.g. "Ubiquiti SFP on Port 7"), falling back to just the
+    /// port when no vendor is reported.</summary>
+    private static string SfpDisplayLabel(MonitoredSfp s)
+    {
+        if (!string.IsNullOrWhiteSpace(s.FriendlyName))
+            return s.FriendlyName!;
+        var vendor = NetworkFormatHelpers.CleanOrgName(s.SfpVendor);
+        return string.IsNullOrEmpty(vendor)
+            ? $"SFP on Port {s.PortName}"
+            : $"{vendor} SFP on Port {s.PortName}";
+    }
+
+    private async Task<List<Cand>> CableModemCandidatesAsync(NetworkOptimizerDbContext db, CancellationToken ct)
+    {
+        return (await db.CmConfigurations.AsNoTracking().Where(c => c.Enabled).ToListAsync(ct))
+            .Where(c => IsFresh(c.LastPolled, c.PollingIntervalSeconds))
+            .Select(c => new Cand($"cm:{c.Id}", c.Name, PhysicalMedium.Docsis, c.Id, null, null))
+            .ToList();
+    }
+
+    private async Task<List<Cand>> CellularCandidatesAsync(NetworkOptimizerDbContext db, CancellationToken ct)
+    {
+        return (await db.ModemConfigurations.AsNoTracking().Where(m => m.Enabled).ToListAsync(ct))
+            .Where(m => IsFresh(m.LastPolled, m.PollingIntervalSeconds))
+            .Select(m => new Cand($"modem:{m.Id}", m.Name, PhysicalMedium.Cellular, m.Id, null, null))
+            .ToList();
+    }
+
+    private async Task<List<Cand>> StarlinkCandidatesAsync(NetworkOptimizerDbContext db, CancellationToken ct)
+    {
+        return (await db.StarlinkConfigurations.AsNoTracking().Where(s => s.Enabled).ToListAsync(ct))
+            .Where(s => IsFresh(s.LastPolled, s.PollingIntervalSeconds))
+            .Select(s => new Cand($"starlink:{s.Id}", s.Name, PhysicalMedium.Satellite, s.Id, null, null))
+            .ToList();
+    }
+
+    /// <summary>A configured device counts as a candidate only if it polled recently (3x its interval, min 15 min).</summary>
+    private static bool IsFresh(DateTime? lastPolled, int intervalSeconds) =>
+        lastPolled.HasValue && DateTime.UtcNow - lastPolled.Value <= TimeSpan.FromSeconds(Math.Max(900, intervalSeconds * 3));
+
+    // ---------------------------------------------------------------------------
+    // Assembly (time-series window aggregate + live snapshot enrichment)
+    // ---------------------------------------------------------------------------
+
+    private async Task<PhysicalLinkInput?> AssembleAsync(
+        Cand c, bool isXgsPon, DateTime windowStart, DateTime windowEnd, TimeSpan aggregate, CancellationToken ct)
+    {
+        return c.Medium switch
+        {
+            PhysicalMedium.Pon when c.ConfigId is int ontId => await AssembleOntAsync(c, ontId, isXgsPon, windowStart, windowEnd, aggregate, ct),
+            PhysicalMedium.Pon => await AssembleSfpAsync(c, PhysicalMedium.Pon, isXgsPon, windowStart, windowEnd, aggregate, ct),
+            PhysicalMedium.ActiveEthernet => await AssembleSfpAsync(c, PhysicalMedium.ActiveEthernet, false, windowStart, windowEnd, aggregate, ct),
+            PhysicalMedium.Docsis when c.ConfigId is int cmId => await AssembleCableModemAsync(c, cmId, windowStart, windowEnd, aggregate, ct),
+            PhysicalMedium.Cellular when c.ConfigId is int modemId => await AssembleCellularAsync(c, modemId, windowStart, windowEnd, aggregate, ct),
+            PhysicalMedium.Satellite when c.ConfigId is int starlinkId => await AssembleStarlinkAsync(c, starlinkId, windowStart, windowEnd, aggregate, ct),
+            _ => null
+        };
+    }
+
+    /// <summary>How far back to pull SFP DDM history to fit the temperature-vs-RX coupling slope. A
+    /// mostly pinned optic needs a wide window to catch the occasional temperature excursion that
+    /// gives the fit leverage. The scoring window (<=48h) is a subset of this, so one raw query serves
+    /// both - the 7-day pull is ~150 KB and returns in tens of milliseconds.</summary>
+    private static readonly TimeSpan CouplingFitHistory = TimeSpan.FromDays(7);
+
+    private async Task<PhysicalLinkInput?> AssembleSfpAsync(
+        Cand c, PhysicalMedium medium, bool isXgsPon, DateTime windowStart, DateTime windowEnd, TimeSpan aggregate, CancellationToken ct)
+    {
+        // SFP DDM only: TimeSpan.Zero => RAW (un-aggregated) so glitchy stick reads and temperature
+        // excursions stay isolated - mean aggregation would smear them into buckets that defeat both
+        // artifact rejection and the coupling fit. Pull the wider fit history in one query and score
+        // on the in-window subset.
+        var fitStart = windowEnd - CouplingFitHistory;
+        var dict = await _influx.QuerySfpByModulesAsync(new[] { (c.Mac!, c.Port!) }, fitStart, windowEnd, TimeSpan.Zero, ct);
+        var allPts = dict.Values.FirstOrDefault() ?? new();
+        var coupling = OpticalSampleStats.FitCouplingSlope(allPts.Select(p => (p.Time, p.RxPowerDbm, p.TemperatureC)).ToList());
+
+        var pts = allPts.Where(p => p.Time >= windowStart).ToList();
+        var stats = OpticalSampleStats.Compute(pts.Select(p => (p.Time, p.RxPowerDbm, p.TemperatureC)).ToList(), coupling);
+        // TX over the whole window: median for the displayed level, highest clean sample for the
+        // transmit-power-high rule (the spike). A lone DDM glitch rides the temperature-jump read that
+        // ComputeTx already discards, so it skews neither.
+        var tx = OpticalSampleStats.ComputeTx(pts.Select(p => (p.Time, p.TxPowerDbm, p.TemperatureC)).ToList());
+        _logger.LogDebug("ISP Health physical: SFP {Key} - {N} window samples ({All} over {Days}d fit), {Rej} DDM artifacts rejected, coupling={Slope} dB/C, rxMed={Med} worst={Worst}, txMed={TxMed} spike={TxSpike}",
+            c.Key, pts.Count, allPts.Count, CouplingFitHistory.TotalDays, stats.RejectedArtifacts,
+            coupling?.ToString("0.000") ?? "n/a", stats.MedianDbm, stats.WorstDbm, tx.MedianDbm, tx.SpikeDbm);
+
+        return new PhysicalLinkInput
+        {
+            Medium = medium,
+            SourceName = c.Label,
+            RxPowerMedianDbm = stats.MedianDbm,
+            RxPowerWorstDbm = stats.WorstDbm,
+            RxPowerBaselineDbm = stats.BaselineDbm,
+            TxPowerDbm = tx.MedianDbm,
+            TxPowerSpikeDbm = tx.SpikeDbm,
+            IsXgsPon = isXgsPon,
+            WindowDays = (windowEnd - windowStart).TotalDays
+        };
+    }
+
+    private async Task<PhysicalLinkInput?> AssembleOntAsync(
+        Cand c, int ontId, bool isXgsPon, DateTime windowStart, DateTime windowEnd, TimeSpan aggregate, CancellationToken ct)
+    {
+        // External ONT: vendor firmware, not a DDM stick - no read-artifact problem, so temperature is
+        // NOT passed for rejection (null temps => OpticalSampleStats keeps every sample). RAW points
+        // (TimeSpan.Zero) so the FEC/BIP per-poll deltas are real polls, comparable to the alert threshold.
+        var dict = await _influx.QueryOntAsync(windowStart, windowEnd, ontId.ToString(), TimeSpan.Zero, ct: ct);
+        var pts = (dict.Values.FirstOrDefault() ?? new()).OrderBy(p => p.Time).ToList();
+        var stats = OpticalSampleStats.Compute(pts.Select(p => (p.Time, p.RxPowerDbm, (double?)null)).ToList());
+        var ontTx = OpticalSampleStats.ComputeTx(pts.Select(p => (p.Time, p.TxPowerDbm, (double?)null)).ToList());
+        var live = await _ontMonitor.GetCachedStatsAsync(ontId);
+        var fecTotal = TotalIncrements(pts.Select(p => p.FecErrors).ToList());
+        var bipTotal = TotalIncrements(pts.Select(p => p.BipErrors).ToList());
+        var operational = ResolveOperationalFromHistory(pts);
+        _logger.LogDebug("ISP Health physical: ONT {Key} - {N} samples, rxMed={Med} worst={Worst}, op={Op}, fecTotal={Fec} bipTotal={Bip}",
+            c.Key, pts.Count, stats.MedianDbm, stats.WorstDbm, operational, fecTotal, bipTotal);
+
+        return new PhysicalLinkInput
+        {
+            Medium = PhysicalMedium.Pon,
+            SourceName = c.Label,
+            RxPowerMedianDbm = stats.MedianDbm,
+            RxPowerWorstDbm = stats.WorstDbm,
+            RxPowerBaselineDbm = stats.BaselineDbm,
+            // TX over the whole window, not one poll: median for the displayed level, highest sample for
+            // the transmit-power-high rule. Fall back to the live poll only when the window has no TX
+            // history yet (a freshly-added ONT). No temperature is passed, so nothing is rejected -
+            // external ONT firmware doesn't have the DDM read-glitch problem.
+            TxPowerDbm = ontTx.MedianDbm ?? live?.TxPowerDbm,
+            TxPowerSpikeDbm = ontTx.SpikeDbm ?? live?.TxPowerDbm,
+            PonOperational = operational,
+            IsXgsPon = isXgsPon,
+            FecErrorsTotal = fecTotal,
+            BipErrorsTotal = bipTotal,
+            WindowDays = (windowEnd - windowStart).TotalDays
+        };
+    }
+
+    /// <summary>Total positive increments of a cumulative error counter over the window, reset-guarded
+    /// (negative steps from a counter reset count as zero). Null when there aren't two readings.</summary>
+    private static long? TotalIncrements(IReadOnlyList<long?> counters) => CounterIncrements.Total(counters);
+
+    /// <summary>
+    /// Grades the PON O5 (Operation) state from the persisted series rather than a single live poll:
+    /// true if every reported state was Operation, false if the link broke out of O5 at least once
+    /// during the window. A poll that omits PON Link Status (a DDM stick that never reports it, or the
+    /// gateway's stats page momentarily dropping the row) parses to Unknown and is ignored - missing
+    /// status is absence of data, not a link-down. Returns null when the source reported no O-state at
+    /// all, so the factor never false-alarms on ONTs that don't expose it. Matches OntAlertEvaluator,
+    /// which likewise treats Unknown as "not down".
+    /// </summary>
+    internal static bool? ResolveOperationalFromHistory(IReadOnlyList<MonitoringInfluxClient.OntPoint> pts)
+    {
+        var known = pts
+            .Select(p => PonLinkStateExtensions.ParsePonLinkState(p.PonLinkStatus))
+            .Where(s => s != PonLinkState.Unknown)
+            .ToList();
+        if (known.Count == 0) return null;
+        return known.All(s => s == PonLinkState.Operation);
+    }
+
+    private async Task<PhysicalLinkInput?> AssembleCableModemAsync(
+        Cand c, int cmId, DateTime windowStart, DateTime windowEnd, TimeSpan aggregate, CancellationToken ct)
+    {
+        var dict = await _influx.QueryCableModemAsync(windowStart, windowEnd, cmId.ToString(), aggregate, ct);
+        var pts = (dict.Values.FirstOrDefault() ?? new()).OrderBy(p => p.Time).ToList();
+        var live = await _cmMonitor.GetCachedStatsAsync(cmId);
+
+        var lockedDs = pts.LastOrDefault(p => p.LockedDsChannels.HasValue)?.LockedDsChannels;
+        var peakDs = pts.Where(p => p.LockedDsChannels.HasValue).Select(p => p.LockedDsChannels!.Value)
+            .DefaultIfEmpty().Max();
+
+        return new PhysicalLinkInput
+        {
+            Medium = PhysicalMedium.Docsis,
+            SourceName = c.Label,
+            DsSnrDb = Median(pts.Where(p => p.DsSnrAvgDb.HasValue).Select(p => p.DsSnrAvgDb!.Value).ToList()),
+            DsPowerDbmv = Median(pts.Where(p => p.DsPowerAvgDbmv.HasValue).Select(p => p.DsPowerAvgDbmv!.Value).ToList()),
+            UsPowerDbmv = Median(pts.Where(p => p.UsPowerAvgDbmv.HasValue).Select(p => p.UsPowerAvgDbmv!.Value).ToList()),
+            CorrectablesDelta = pts.Where(p => p.CorrDelta.HasValue).Sum(p => p.CorrDelta!.Value),
+            UncorrectablesDelta = pts.Where(p => p.UncorrDelta.HasValue).Sum(p => p.UncorrDelta!.Value),
+            LockedDsChannels = lockedDs,
+            PeakDsChannels = peakDs > 0 ? peakDs : null,
+            OfdmaActive = live != null
+                ? live.UpstreamChannels.Any(ch => (ch.ChannelType ?? "").Contains("OFDMA", StringComparison.OrdinalIgnoreCase))
+                : null,
+            ModemModel = string.IsNullOrWhiteSpace(live?.DeviceModel) ? null : live!.DeviceModel,
+            WindowDays = (windowEnd - windowStart).TotalDays
+        };
+    }
+
+    private async Task<PhysicalLinkInput?> AssembleCellularAsync(
+        Cand c, int modemId, DateTime windowStart, DateTime windowEnd, TimeSpan aggregate, CancellationToken ct)
+    {
+        // Cellular is keyed by modem_id + network_mode, so a mode change splits into several series.
+        var dict = await _influx.QueryCellularAsync(windowStart, windowEnd, modemId.ToString(), aggregate, ct);
+        var pts = dict.Values.SelectMany(v => v).OrderBy(p => p.Time).ToList();
+        var live = await _cellularMonitor.GetCachedStatsAsync(modemId);
+
+        var qualities = pts.Where(p => p.SignalQuality.HasValue).Select(p => (double)p.SignalQuality!.Value).ToList();
+        var quality = Median(qualities);
+        if (quality is null && live != null) quality = live.SignalQuality;
+
+        var (had5g, latestMode, downgraded) = ResolveCellularMode(pts, aggregate, live);
+
+        return new PhysicalLinkInput
+        {
+            Medium = PhysicalMedium.Cellular,
+            SourceName = c.Label,
+            SignalQuality = quality is double q ? (int)Math.Round(q) : null,
+            NetworkMode = latestMode,
+            NetworkModeDowngraded = downgraded,
+            Is5gCapable = had5g,
+            WindowDays = (windowEnd - windowStart).TotalDays
+        };
+    }
+
+    private async Task<PhysicalLinkInput?> AssembleStarlinkAsync(
+        Cand c, int starlinkId, DateTime windowStart, DateTime windowEnd, TimeSpan aggregate, CancellationToken ct)
+    {
+        var dict = await _influx.QueryStarlinkAsync(windowStart, windowEnd, starlinkId.ToString(), aggregate, ct);
+        var pts = (dict.Values.FirstOrDefault() ?? new()).OrderBy(p => p.Time).ToList();
+        var live = await _starlinkMonitor.GetCachedStatsAsync(starlinkId);
+
+        // outage_seconds/count are per-poll deltas summed per aggregate bucket, so summing
+        // buckets recovers the window total. Drop-rate avg is per-poll means; the median of
+        // those is robust to a lone weather burst, while the max keeps the worst second.
+        var outageSeconds = pts.Any(p => p.OutageSecondsDelta.HasValue)
+            ? pts.Where(p => p.OutageSecondsDelta.HasValue).Sum(p => p.OutageSecondsDelta!.Value)
+            : (double?)null;
+        var outageCount = pts.Any(p => p.OutageCountDelta.HasValue)
+            ? pts.Where(p => p.OutageCountDelta.HasValue).Sum(p => p.OutageCountDelta!.Value)
+            : (long?)null;
+
+        var obstruction = Median(pts.Where(p => p.FractionObstructed.HasValue).Select(p => p.FractionObstructed!.Value).ToList())
+                          ?? live?.FractionObstructed;
+        var dropAvg = Median(pts.Where(p => p.PingDropRateAvg.HasValue).Select(p => p.PingDropRateAvg!.Value).ToList())
+                      ?? live?.PingDropRateAvg;
+        var dropMax = pts.Where(p => p.PingDropRateMax.HasValue).Select(p => p.PingDropRateMax!.Value)
+            .DefaultIfEmpty().Max();
+
+        _logger.LogDebug("ISP Health physical: Starlink {Key} - {N} samples, obstructed={Obs}, dropAvg={Drop}, outage={OutS}s/{OutN}",
+            c.Key, pts.Count, obstruction, dropAvg, outageSeconds, outageCount);
+
+        return new PhysicalLinkInput
+        {
+            Medium = PhysicalMedium.Satellite,
+            SourceName = c.Label,
+            ObstructionFraction = obstruction,
+            CurrentlyObstructed = live?.CurrentlyObstructed,
+            DishDropRateAvg = dropAvg,
+            DishDropRateMax = dropMax > 0 ? dropMax : null,
+            // LowSpeedPolicyLimit is the plan itself being a reduced-speed tier, as the Starlink
+            // panel already reads it. Plain PolicyLimit is ordinary shaping on nearly every plan
+            // and says nothing, so it is deliberately not treated as one.
+            ReducedSpeedTier = live is null
+                ? null
+                : live.DownlinkRestrictedReason == "LowSpeedPolicyLimit"
+                    || live.UplinkRestrictedReason == "LowSpeedPolicyLimit",
+            OutageSecondsTotal = outageSeconds,
+            OutageCountTotal = outageCount,
+            SnrPersistentlyLow = live?.IsSnrPersistentlyLow,
+            DishAlerts = live?.ActiveAlerts,
+            EthSpeedMbps = live?.EthSpeedMbps,
+            WindowDays = (windowEnd - windowStart).TotalDays
+        };
+    }
+
+    /// <summary>
+    /// Resolve which network mode a cellular link was on at the end of the window, and whether
+    /// it lost 5G during it.
+    /// </summary>
+    /// <param name="pts">All points across every mode series, ordered by time.</param>
+    /// <param name="aggregate">Bucket width the points were aggregated to.</param>
+    /// <param name="live">Cached live stats, used when the window holds no points.</param>
+    internal static (bool had5g, string? mode, bool downgraded) ResolveCellularMode(
+        IReadOnlyList<MonitoringInfluxClient.CellularPoint> pts, TimeSpan aggregate, CellularModemStats? live)
+    {
+        // NSA writes a point per mode for the same poll, so the newest point is the LTE half even
+        // on a healthy 5G link. A downgrade is the 5G series going dark while LTE keeps reporting;
+        // one empty bucket is a missed sample, not a downgrade.
+        var lastPoint = pts.LastOrDefault(p => !string.IsNullOrEmpty(p.NetworkMode));
+        var last5g = pts.LastOrDefault(p => IsFiveG(p.NetworkMode));
+        var concurrent = aggregate > TimeSpan.Zero ? aggregate * 2 : TimeSpan.FromMinutes(10);
+
+        var had5g = last5g != null || live?.Nr5g != null;
+        var on5g = last5g != null && lastPoint != null && lastPoint.Time - last5g.Time <= concurrent;
+
+        var mode = on5g
+            ? last5g!.NetworkMode
+            : lastPoint?.NetworkMode ?? (live != null ? live.NetworkModeLabel : null);
+
+        return (had5g, mode, had5g && !on5g && IsLte(mode));
+    }
+
+    private static bool IsFiveG(string? mode) =>
+        !string.IsNullOrEmpty(mode) && (mode.Contains("5G", StringComparison.OrdinalIgnoreCase) || mode.Contains("Nr5g", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsLte(string? mode) =>
+        !string.IsNullOrEmpty(mode) && mode.Contains("LTE", StringComparison.OrdinalIgnoreCase) && !IsFiveG(mode);
+
+    // ---------------------------------------------------------------------------
+    // Aggregation helpers
+    // ---------------------------------------------------------------------------
+
+    private static double? Median(List<double> values)
+    {
+        if (values.Count == 0) return null;
+        var sorted = values.OrderBy(v => v).ToList();
+        var mid = sorted.Count / 2;
+        return sorted.Count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0;
+    }
+}
+
+/// <summary>Outcome of physical-link resolution for one report.</summary>
+public sealed record PhysicalLinkResolution(
+    PhysicalLinkInput? Input,
+    List<PhysicalLinkCandidate> Candidates,
+    string? SelectedKey,
+    bool Ambiguous);

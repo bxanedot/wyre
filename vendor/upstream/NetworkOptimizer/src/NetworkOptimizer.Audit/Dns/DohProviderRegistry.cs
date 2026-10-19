@@ -1,0 +1,410 @@
+using System.Net;
+using System.Text.RegularExpressions;
+
+namespace NetworkOptimizer.Audit.Dns;
+
+/// <summary>
+/// Registry of known DNS-over-HTTPS providers
+/// </summary>
+public static class DohProviderRegistry
+{
+    /// <summary>
+    /// DNS resolver function for reverse DNS lookups. Can be replaced in tests to avoid real network calls.
+    /// Default implementation uses System.Net.Dns.GetHostEntryAsync.
+    /// </summary>
+    public static Func<IPAddress, Task<string?>> DnsResolver { get; set; } = DefaultDnsResolver;
+
+    private static async Task<string?> DefaultDnsResolver(IPAddress ipAddress)
+    {
+        var hostEntry = await System.Net.Dns.GetHostEntryAsync(ipAddress);
+        return hostEntry.HostName;
+    }
+
+    /// <summary>
+    /// Reset the DNS resolver to the default implementation (for test cleanup).
+    /// </summary>
+    public static void ResetDnsResolver() => DnsResolver = DefaultDnsResolver;
+
+    /// <summary>
+    /// Known DoH providers with their configuration details
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, DohProviderInfo> Providers = new Dictionary<string, DohProviderInfo>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["NextDNS"] = new DohProviderInfo
+        {
+            Name = "NextDNS",
+            StampPrefix = "nextdns",
+            Hostnames = new[] { "nextdns.io" }, // PTR returns dns1.nextdns.io, dns2.nextdns.io
+            DnsIps = new[] { "45.90." }, // NextDNS anycast range - prefix match
+            Ipv6Prefixes = new[] { "2a07:a8c0:", "2a07:a8c1:" }, // NextDNS IPv6 anycast prefixes
+            SupportsFiltering = true,
+            HasCustomConfig = true,
+            Description = "NextDNS - Privacy-focused DNS with filtering"
+        },
+        ["AdGuard"] = new DohProviderInfo
+        {
+            Name = "AdGuard",
+            StampPrefix = "adguard",
+            Hostnames = new[] { "dns.adguard.com", "dns-family.adguard.com", "dns-unfiltered.adguard.com" },
+            DnsIps = new[] { "94.140.14.14", "94.140.15.15", "94.140.14.15", "94.140.15.16" },
+            // Default, Family protection, and Non-filtering, per adguard-dns.io/kb/general/dns-providers
+            Ipv6Addresses = new[] { "2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff", "2a10:50c0::bad1:ff", "2a10:50c0::bad2:ff", "2a10:50c0::1:ff", "2a10:50c0::2:ff" },
+            SupportsFiltering = true,
+            HasCustomConfig = true,
+            Description = "AdGuard DNS with ad blocking"
+        },
+        ["Cloudflare"] = new DohProviderInfo
+        {
+            Name = "Cloudflare",
+            StampPrefix = "cloudflare",
+            Hostnames = new[] { "cloudflare-dns.com", "1dot1dot1dot1.cloudflare-dns.com", "one.one.one.one", "dns.cloudflare.com", "mozilla.cloudflare-dns.com", "family.cloudflare-dns.com", "security.cloudflare-dns.com" },
+            DnsIps = new[] { "1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3" },
+            Ipv6Addresses = new[] { "2606:4700:4700::1111", "2606:4700:4700::1001", "2606:4700:4700::1112", "2606:4700:4700::1002", "2606:4700:4700::1113", "2606:4700:4700::1003" },
+            SupportsFiltering = false,
+            HasCustomConfig = false,
+            Description = "Cloudflare 1.1.1.1 DNS"
+        },
+        ["Google"] = new DohProviderInfo
+        {
+            Name = "Google",
+            StampPrefix = "google",
+            Hostnames = new[] { "dns.google", "dns.google.com", "8888.google", "dns64.dns.google" },
+            DnsIps = new[] { "8.8.8.8", "8.8.4.4" },
+            Ipv6Addresses = new[] { "2001:4860:4860::8888", "2001:4860:4860::8844" },
+            SupportsFiltering = false,
+            HasCustomConfig = false,
+            Description = "Google Public DNS"
+        },
+        ["Quad9"] = new DohProviderInfo
+        {
+            Name = "Quad9",
+            StampPrefix = "quad9",
+            Hostnames = new[] { "dns.quad9.net", "dns9.quad9.net", "dns10.quad9.net", "dns11.quad9.net" },
+            DnsIps = new[] { "9.9.9.9", "149.112.112.112", "9.9.9.10", "149.112.112.10" },
+            Ipv6Addresses = new[] { "2620:fe::fe", "2620:fe::9", "2620:fe::11", "2620:fe::fe:11", "2620:fe::10", "2620:fe::fe:10" },
+            SupportsFiltering = true,
+            HasCustomConfig = false,
+            Description = "Quad9 Security-focused DNS"
+        },
+        ["OpenDNS"] = new DohProviderInfo
+        {
+            Name = "OpenDNS",
+            StampPrefix = "opendns",
+            Hostnames = new[] { "doh.opendns.com", "doh.familyshield.opendns.com", "doh.sandbox.opendns.com" },
+            DnsIps = new[] { "208.67.222.222", "208.67.220.220", "208.67.222.123", "208.67.220.123" },
+            Ipv6Addresses = new[] { "2620:119:35::35", "2620:119:53::53" },
+            SupportsFiltering = true,
+            HasCustomConfig = false,
+            Description = "Cisco OpenDNS"
+        },
+        ["CleanBrowsing"] = new DohProviderInfo
+        {
+            Name = "CleanBrowsing",
+            StampPrefix = "cleanbrowsing",
+            Hostnames = new[] { "doh.cleanbrowsing.org" },
+            DnsIps = new[] { "185.228.168.168", "185.228.169.168", "185.228.168.10", "185.228.169.11" },
+            // Family, Adult, and Security filters, per cleanbrowsing.org/filters
+            Ipv6Addresses = new[] { "2a0d:2a00:1::", "2a0d:2a00:2::", "2a0d:2a00:1::1", "2a0d:2a00:2::1", "2a0d:2a00:1::2", "2a0d:2a00:2::2" },
+            SupportsFiltering = true,
+            HasCustomConfig = false,
+            Description = "CleanBrowsing Family-safe DNS"
+        },
+        ["LibreDNS"] = new DohProviderInfo
+        {
+            Name = "LibreDNS",
+            StampPrefix = "libredns",
+            Hostnames = new[] { "doh.libredns.gr" },
+            DnsIps = new[] { "116.202.176.26" },
+            Ipv6Addresses = new[] { "2a01:4f8:1c0c:8274::1" }, // Per libredns.gr
+            SupportsFiltering = false,
+            HasCustomConfig = false,
+            Description = "LibreDNS - Privacy-focused"
+        },
+        ["ControlD"] = new DohProviderInfo
+        {
+            Name = "ControlD",
+            StampPrefix = "controld",
+            Hostnames = new[] { "controld.com", "dns.controld.com" },
+            DnsIps = new[] { "76.76." }, // Prefix match fallback for ControlD anycast
+            // ControlD's resolvers sit across 2606:1a40::/32 (::11, ::22, f000::11 in the ctrld client source)
+            Ipv6Prefixes = new[] { "2606:1a40:" },
+            SupportsFiltering = true,
+            HasCustomConfig = true,
+            Description = "ControlD - Privacy-focused DNS with filtering"
+        }
+    };
+
+    /// <summary>
+    /// Identify a provider from a hostname
+    /// </summary>
+    public static DohProviderInfo? IdentifyProvider(string hostname)
+    {
+        if (string.IsNullOrEmpty(hostname))
+            return null;
+
+        var hostLower = hostname.ToLowerInvariant();
+
+        foreach (var provider in Providers.Values)
+        {
+            if (provider.Hostnames.Any(h => hostLower.Contains(h.ToLowerInvariant())))
+            {
+                return provider;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Identify a provider from a server name (e.g., "NextDNS-fcdba9")
+    /// </summary>
+    public static DohProviderInfo? IdentifyProviderFromName(string serverName)
+    {
+        if (string.IsNullOrEmpty(serverName))
+            return null;
+
+        var nameLower = serverName.ToLowerInvariant();
+
+        foreach (var kvp in Providers)
+        {
+            if (nameLower.StartsWith(kvp.Key.ToLowerInvariant()))
+            {
+                return kvp.Value;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Identify a provider from a DNS IP address (static lookup only)
+    /// </summary>
+    public static DohProviderInfo? IdentifyProviderFromIp(string ip)
+    {
+        if (string.IsNullOrEmpty(ip))
+            return null;
+
+        foreach (var provider in Providers.Values)
+        {
+            if (provider.MatchesIp(ip))
+            {
+                return provider;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Match a list of domain names against known DoH providers.
+    /// </summary>
+    public static (int MatchedCount, HashSet<string> MatchedProviders) MatchKnownDohDomains(IEnumerable<string> domains)
+    {
+        var matchedProviders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        int matchedCount = 0;
+
+        foreach (var domain in domains)
+        {
+            if (string.IsNullOrEmpty(domain))
+                continue;
+
+            var provider = IdentifyProvider(domain);
+            if (provider != null)
+            {
+                matchedCount++;
+                matchedProviders.Add(provider.Name);
+            }
+        }
+
+        return (matchedCount, matchedProviders);
+    }
+
+    /// <summary>
+    /// Match a list of IP addresses against known DoH providers. Returns the total number
+    /// of IPs that match a known provider and the set of distinct provider names matched.
+    /// Used to detect IP-based DoH-blocking firewall rules where the destination is a list
+    /// of provider IPs (typically referenced via an IP group) rather than a hostname or
+    /// DPI app reference.
+    /// </summary>
+    public static (int MatchedCount, HashSet<string> MatchedProviders) MatchKnownDohIps(IEnumerable<string> ips)
+    {
+        var matchedProviders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        int matchedCount = 0;
+
+        foreach (var ip in ips)
+        {
+            if (string.IsNullOrEmpty(ip))
+                continue;
+
+            var provider = IdentifyProviderFromIp(ip);
+            if (provider != null)
+            {
+                matchedCount++;
+                matchedProviders.Add(provider.Name);
+            }
+        }
+
+        return (matchedCount, matchedProviders);
+    }
+
+    /// <summary>
+    /// Identify a provider from a DNS IP address using PTR lookup (authoritative) with static IP fallback.
+    /// PTR lookup is tried first and takes priority when successful.
+    /// Static IP matching (e.g., "45.90." prefix for NextDNS) is only used as fallback when PTR fails.
+    /// </summary>
+    public static async Task<(DohProviderInfo? Provider, string? ReverseDns)> IdentifyProviderFromIpWithPtrAsync(string ip)
+    {
+        if (string.IsNullOrEmpty(ip))
+            return (null, null);
+
+        // Try PTR lookup first - this is the authoritative method
+        string? reverseDns = null;
+        try
+        {
+            reverseDns = await ReverseDnsLookupAsync(ip);
+        }
+        catch
+        {
+            // PTR lookup failed - will fall back to static IP match
+        }
+
+        // If PTR succeeded, try to identify provider from the hostname (authoritative)
+        if (!string.IsNullOrEmpty(reverseDns))
+        {
+            var ptrProvider = IdentifyProvider(reverseDns);
+            if (ptrProvider != null)
+            {
+                return (ptrProvider, reverseDns);
+            }
+        }
+
+        // Fallback to static IP matching only when PTR didn't identify a provider
+        var staticProvider = IdentifyProviderFromIp(ip);
+        return (staticProvider, reverseDns);
+    }
+
+    /// <summary>
+    /// Perform a reverse DNS (PTR) lookup on an IP address.
+    /// Uses the mockable DnsResolver delegate.
+    /// </summary>
+    public static async Task<string?> ReverseDnsLookupAsync(string ip)
+    {
+        if (string.IsNullOrEmpty(ip) || !IPAddress.TryParse(ip, out var ipAddress))
+            return null;
+
+        try
+        {
+            return await DnsResolver(ipAddress);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    #region NextDNS Profile ID Helpers
+
+    /// <summary>
+    /// Extract NextDNS profile ID from a URL path (e.g., "/43b56f" -> "43b56f")
+    /// </summary>
+    public static string? ExtractNextDnsProfileId(string? path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return null;
+
+        var profileId = path.TrimStart('/');
+        return string.IsNullOrEmpty(profileId) ? null : profileId;
+    }
+
+    /// <summary>
+    /// Extract NextDNS profile ID from an IPv6 address.
+    /// NextDNS IPv6 format: 2a07:a8c0::43:b56f where 43:b56f = profile ID "43b56f"
+    /// </summary>
+    public static string? ExtractProfileIdFromNextDnsIpv6(string? ip)
+    {
+        if (string.IsNullOrEmpty(ip))
+            return null;
+
+        // Match NextDNS IPv6 pattern: 2a07:a8c0::XX:XXXX or 2a07:a8c1::XX:XXXX
+        var match = Regex.Match(ip, @"^2a07:a8c[01]::([0-9a-f]+):([0-9a-f]+)$", RegexOptions.IgnoreCase);
+        if (match.Success)
+            return (match.Groups[1].Value + match.Groups[2].Value).ToLowerInvariant();
+
+        return null;
+    }
+
+    /// <summary>
+    /// Check if a NextDNS IPv6 address matches an expected profile ID.
+    /// If expectedProfileId is null, only prefix matching is performed.
+    /// </summary>
+    public static bool NextDnsIpv6MatchesProfile(string ip, string? expectedProfileId)
+    {
+        if (string.IsNullOrEmpty(ip))
+            return false;
+
+        // First check if it's a NextDNS IPv6 address
+        var ipLower = ip.ToLowerInvariant();
+        if (!ipLower.StartsWith("2a07:a8c0:") && !ipLower.StartsWith("2a07:a8c1:"))
+            return false;
+
+        // If no expected profile, prefix match is sufficient
+        if (string.IsNullOrEmpty(expectedProfileId))
+            return true;
+
+        // Extract and compare profile ID
+        var actualProfileId = ExtractProfileIdFromNextDnsIpv6(ip);
+        return string.Equals(actualProfileId, expectedProfileId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    #endregion
+}
+
+/// <summary>
+/// Information about a DoH provider
+/// </summary>
+public class DohProviderInfo
+{
+    public required string Name { get; init; }
+    public required string StampPrefix { get; init; }
+    public required string[] Hostnames { get; init; }
+    public required string[] DnsIps { get; init; }
+    public string[]? Ipv6Prefixes { get; init; }
+
+    /// <summary>
+    /// Published IPv6 resolver addresses, matched by value so any written form of the address matches.
+    /// </summary>
+    public string[]? Ipv6Addresses { get; init; }
+    public required bool SupportsFiltering { get; init; }
+    public required bool HasCustomConfig { get; init; }
+    public required string Description { get; init; }
+
+    /// <summary>
+    /// Check if a given IP matches this provider's expected DNS IPs (IPv4 or IPv6)
+    /// </summary>
+    public bool MatchesIp(string ip)
+    {
+        if (string.IsNullOrEmpty(ip)) return false;
+
+        // IPv4 matching (existing logic)
+        if (DnsIps.Any(expected =>
+            expected.EndsWith('.')
+                ? ip.StartsWith(expected) // Prefix match (e.g., "45.90.")
+                : ip == expected))        // Exact match
+            return true;
+
+        // IPv6 exact matching (by value: "2620:fe::fe" equals "2620:00fe:0:0:0:0:0:fe")
+        if (Ipv6Addresses != null && ip.Contains(':') && IPAddress.TryParse(ip, out var parsed) &&
+            Ipv6Addresses.Any(expected => IPAddress.Parse(expected).Equals(parsed)))
+            return true;
+
+        // IPv6 prefix matching
+        if (Ipv6Prefixes != null)
+        {
+            var ipLower = ip.ToLowerInvariant();
+            if (Ipv6Prefixes.Any(prefix => ipLower.StartsWith(prefix.ToLowerInvariant())))
+                return true;
+        }
+
+        return false;
+    }
+}

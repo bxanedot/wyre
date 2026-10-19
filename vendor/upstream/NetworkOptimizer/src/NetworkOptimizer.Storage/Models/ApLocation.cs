@@ -1,0 +1,41 @@
+using System.ComponentModel.DataAnnotations;
+
+namespace NetworkOptimizer.Storage.Models;
+
+/// <summary>
+/// User-placed AP geographic location for coverage map visualization.
+/// Links an AP MAC address to a latitude/longitude position on the map.
+/// </summary>
+public class ApLocation
+{
+    [Key]
+    public int Id { get; set; }
+
+    /// <summary>AP MAC address (unique identifier linking to UniFi device)</summary>
+    [Required]
+    [MaxLength(17)]
+    public string ApMac { get; set; } = "";
+
+    /// <summary>Latitude coordinate</summary>
+    public double Latitude { get; set; }
+
+    /// <summary>Longitude coordinate</summary>
+    public double Longitude { get; set; }
+
+    /// <summary>Floor number for multi-story buildings (future use)</summary>
+    public int? Floor { get; set; }
+
+    /// <summary>AP orientation in degrees (0-359, 0 = North, clockwise)</summary>
+    public int OrientationDeg { get; set; }
+
+    /// <summary>Mount type: "ceiling", "wall", or "desktop". Null = auto-detect from model.</summary>
+    [MaxLength(20)]
+    public string? MountType { get; set; }
+
+    /// <summary>Precise height in metres above the assigned floor's base elevation, set by
+    /// 3D map repositioning. Null = derive height from MountType / device kind (legacy).</summary>
+    public double? HeightM { get; set; }
+
+    /// <summary>When this location was last updated</summary>
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+}

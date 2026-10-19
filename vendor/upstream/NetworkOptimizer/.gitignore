@@ -1,0 +1,68 @@
+# Build outputs
+bin/
+obj/
+out/
+publish/
+
+# Go build artifacts
+src/uwnspeedtest/uwnspeedtest*
+src/cfspeedtest/cfspeedtest*
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# .NET
+*.dll
+*.pdb
+*.cache
+
+# Docker data
+docker/data/
+docker/logs/
+
+# Per-host compose overrides (local customizations not checked in)
+docker/docker-compose.override.yml
+
+# Secrets
+*.env
+!*.env.example
+docker/.env
+ssh-keys/
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# Temp files
+*.tmp
+*.log
+
+# Internal development notes
+CLAUDE.md
+.claude/
+tmpclaude-*
+plans/
+
+# Local research work / scratch
+research/
+code-review/
+
+# Local development scripts
+scripts/local-dev/
+
+# Archived code
+archive/
+
+# Coverage reports
+coverage/
+TestResults/
+
+# Backup
+backup/
+
+# Layout lab: a local harness for judging 2D map packing, never shipped
+src/NetworkOptimizer.Web/wwwroot/dev/

@@ -1,0 +1,334 @@
+@using NetworkOptimizer.Web.Services
+@using AuditSeverity = NetworkOptimizer.Audit.Models.AuditSeverity
+@inject UniFiConnectionService ConnectionService
+@inject AuditService AuditService
+@inject IAuditScanService AuditScan
+
+<div class="alerts-list">
+    @if (isLoading)
+    {
+        <div class="loading-state">
+            <span class="spinner"></span>
+            <span>Loading alerts...</span>
+        </div>
+    }
+    else if (ConnectionService.IsInitialized && !ConnectionService.IsConnected)
+    {
+        <div class="no-alerts">
+            <div class="no-alerts-icon">!</div>
+            <p>Connect to a UniFi Console to view alerts.</p>
+            <a href="/settings?tab=connection#console-connection" class="btn btn-sm btn-primary">Go to Settings</a>
+        </div>
+    }
+    else if (!ConnectionService.IsInitialized)
+    {
+        <div class="loading-state">
+            <span class="spinner"></span>
+            <span>Connecting...</span>
+        </div>
+    }
+    else if (!alerts.Any())
+    {
+        <div class="no-alerts">
+            <div class="no-alerts-icon">✓</div>
+            <p>No active alerts. Your network is running smoothly!</p>
+        </div>
+    }
+    else
+    {
+        var shouldCollapse = alerts.Count > 3;
+        @if (!shouldCollapse)
+        {
+            @foreach (var alert in GetDisplayAlerts())
+            {
+                <div class="alert-item alert-item-@alert.Severity.ToLower()">
+                    <div class="alert-icon">
+                        @((MarkupString)GetAlertIcon(alert.Severity))
+                    </div>
+                    <div class="alert-content">
+                        <div class="alert-header">
+                            <h4 class="alert-title">@alert.Title</h4>
+                            <span class="alert-time">@alert.Time</span>
+                        </div>
+                        <p class="alert-message">@alert.Message</p>
+                    </div>
+                    <div class="alert-actions" @onclick:stopPropagation>
+                        <button class="btn btn-sm btn-ghost" @onclick="() => DismissAlert(alert.Id)" data-tooltip="Hide this issue - still scored">
+                            Acknowledge
+                        </button>
+                    </div>
+                </div>
+            }
+        }
+        else
+        {
+            @foreach (var group in GetGroupedAlerts())
+            {
+                var groupCount = group.Count();
+                var firstAlert = group.First();
+                var groupKey = group.Key;
+                var isExpanded = _expandedGroups.Contains(groupKey);
+                var severityClass = firstAlert.Severity.ToLower() == "critical" ? "critical" : "recommended";
+
+                <div class="issue-type-group issue-@severityClass">
+                    <div class="issue-type-header @(isExpanded ? "expanded" : "")"
+                         @onclick="() => ToggleGroup(groupKey)" @onclick:stopPropagation>
+                        <div class="issue-type-icon">
+                            @((MarkupString)GetAlertIcon(firstAlert.Severity))
+                        </div>
+                        <div class="issue-type-body">
+                            <div class="issue-title">@firstAlert.Title</div>
+                        </div>
+                        <span class="group-count-badge alert-badge-@firstAlert.Severity.ToLower()">@groupCount</span>
+                        <span class="issue-type-chevron">@(isExpanded ? "\u25B2" : "\u25BC")</span>
+                    </div>
+                    <div class="expand-wrapper @(isExpanded ? "expanded" : "")">
+                        <div class="expand-content">
+                            <div class="issue-type-items-list">
+                                @foreach (var alert in group)
+                                {
+                                    <div class="issue-type-item alert-group-item">
+                                        <div class="alert-content">
+                                            <p class="alert-message">@alert.Message</p>
+                                        </div>
+                                        <div class="alert-actions" @onclick:stopPropagation>
+                                            <button class="btn btn-sm btn-ghost" @onclick="() => DismissAlert(alert.Id)" data-tooltip="Hide this issue - still scored">
+                                                Acknowledge
+                                            </button>
+                                        </div>
+                                    </div>
+                                }
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+        }
+    }
+</div>
+
+@code {
+    [Parameter]
+    public int? MaxItems { get; set; }
+
+    [Parameter]
+    public EventCallback OnAlertDismissed { get; set; }
+
+    private List<AlertInfo> alerts = new();
+    private bool isLoading = true;
+    private HashSet<string> _expandedGroups = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Wait for connection with longer timeout on cold start
+        if (await ConnectionService.WaitForConnectionAsync(TimeSpan.FromSeconds(10)))
+        {
+            // Only delay if no audit data exists yet (cold start)
+            if (!AuditService.LastAuditTime.HasValue)
+            {
+                await Task.Delay(200);
+            }
+            await LoadAlerts();
+        }
+    }
+
+    private async Task LoadAlerts()
+    {
+        isLoading = true;
+        try
+        {
+            alerts.Clear();
+
+            if (!ConnectionService.IsConnected)
+            {
+                return;
+            }
+
+            // Use active (non-dismissed) issues - only actionable ones (Critical/Recommended)
+            // TODO: Once we have clients with many alerts, move filtering and Take() to backend/query side
+            var activeIssues = await AuditService.GetActiveIssuesAsync();
+            var actionableIssues = activeIssues
+                .Where(i => i.Severity == AuditSeverity.Critical || i.Severity == AuditSeverity.Recommended)
+                .OrderBy(i => i.Severity == AuditSeverity.Critical ? 0 : 1) // Critical first
+                .ThenBy(i => i.Category) // Then by category for grouping
+                .ToList();
+
+            if (actionableIssues.Any())
+            {
+                var id = 1;
+                var timeAgo = AuditService.LastAuditTime.HasValue
+                    ? FormatTimeAgo(AuditService.LastAuditTime.Value)
+                    : "Recently";
+
+                foreach (var issue in actionableIssues.Take(10))
+                {
+                    alerts.Add(new AlertInfo
+                    {
+                        Id = id++,
+                        Severity = issue.Severity.ToString(),
+                        Title = issue.Title,
+                        Message = issue.Description,
+                        Source = issue.Category,
+                        Time = timeAgo,
+                        ActionUrl = "/audit",
+                        IssueKey = AuditService.GetIssueKey(issue)
+                    });
+                }
+            }
+        }
+        finally
+        {
+            isLoading = false;
+        }
+    }
+
+    private string FormatTimeAgo(DateTime time) =>
+        TimeFormatHelper.FormatRelativeTimeShort(time);
+
+    private IEnumerable<AlertInfo> GetDisplayAlerts()
+    {
+        var displayAlerts = alerts.AsEnumerable();
+        if (MaxItems.HasValue)
+            displayAlerts = displayAlerts.Take(MaxItems.Value);
+        return displayAlerts;
+    }
+
+    private IEnumerable<IGrouping<string, AlertInfo>> GetGroupedAlerts()
+    {
+        var displayAlerts = alerts.AsEnumerable();
+        if (MaxItems.HasValue)
+        {
+            displayAlerts = displayAlerts.Take(MaxItems.Value);
+        }
+        return displayAlerts.GroupBy(a => a.Title);
+    }
+
+    private void ToggleGroup(string key)
+    {
+        if (!_expandedGroups.Remove(key))
+            _expandedGroups.Add(key);
+    }
+
+    private string GetAlertIcon(string severity)
+    {
+        return severity.ToLower() switch
+        {
+            // Shield with X - critical/danger
+            "critical" => """<svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M12 2L3 7v6c0 5.25 3.85 10.15 9 11 5.15-.85 9-5.75 9-11V7l-9-5zm-1 14h2v2h-2v-2zm0-8h2v6h-2V8z" opacity="0.2"/><path d="M12 2L3 7v6c0 5.25 3.85 10.15 9 11 5.15-.85 9-5.75 9-11V7l-9-5zm0 2.18l7 3.89v5.43c0 4.14-3.01 8.05-7 8.88-3.99-.83-7-4.74-7-8.88V8.07l7-3.89zM11 8h2v6h-2V8zm0 8h2v2h-2v-2z"/></svg>""",
+            // Triangle with exclamation - recommended (was warning)
+            "recommended" => """<svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M1 21h22L12 2 1 21z" opacity="0.2"/><path d="M12 5.99L19.53 19H4.47L12 5.99M12 2L1 21h22L12 2zm1 14h-2v2h2v-2zm0-6h-2v4h2v-4z"/></svg>""",
+            // Circle with i - info
+            "info" or "informational" => """<svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><circle cx="12" cy="12" r="10" opacity="0.2"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-11h2v6h-2v-6zm0-4h2v2h-2V7z"/></svg>""",
+            _ => """<svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><circle cx="12" cy="12" r="10" opacity="0.2"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>"""
+        };
+    }
+
+    private async Task DismissAlert(int alertId)
+    {
+        var alert = alerts.FirstOrDefault(a => a.Id == alertId);
+        if (alert != null)
+        {
+            // Find the original issue and dismiss it in the service
+            var activeIssues = await AuditService.GetActiveIssuesAsync();
+            var issue = activeIssues.FirstOrDefault(i => AuditService.GetIssueKey(i) == alert.IssueKey);
+            if (issue != null)
+            {
+                await AuditScan.DismissIssueAsync(issue);
+            }
+            alerts.Remove(alert);
+
+            // Notify parent to refresh counts
+            await OnAlertDismissed.InvokeAsync();
+        }
+        StateHasChanged();
+    }
+
+    public class AlertInfo
+    {
+        public int Id { get; set; }
+        public string Severity { get; set; } = "";
+        public string Title { get; set; } = "";
+        public string Message { get; set; } = "";
+        public string Source { get; set; } = "";
+        public string Time { get; set; } = "";
+        public string? ActionUrl { get; set; }
+        public string IssueKey { get; set; } = "";
+    }
+}
+
+<style>
+    .alert-group-badge {
+        font-size: 0.65rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+        background: var(--bg-primary);
+    }
+
+    .alert-badge-critical {
+        color: var(--danger-color);
+        background: rgba(239, 68, 68, 0.15);
+    }
+
+    .alert-badge-recommended {
+        color: var(--warning-color);
+        background: rgba(251, 191, 36, 0.15);
+    }
+
+    .alert-group-item {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding: 0.5rem 0;
+        border-bottom: 1px solid var(--bg-tertiary);
+    }
+
+    .alert-group-item:last-child {
+        border-bottom: none;
+    }
+
+    .alert-group-item .alert-content {
+        flex: 1;
+        min-width: 0;
+    }
+
+    .alert-group-item .alert-message {
+        margin: 0;
+        font-size: 0.85rem;
+    }
+
+    .alert-group-item .alert-actions {
+        flex-shrink: 0;
+    }
+
+    .alert-message {
+        margin: 0;
+    }
+
+    .issue-type-header {
+        align-items: center;
+    }
+
+    .issue-title {
+        margin-bottom: 0;
+    }
+
+    .issue-type-chevron {
+        margin-left: -1rem;
+    }
+
+    @@media (max-width: 768px) {
+        .alerts-list .group-count-badge {
+            position: absolute;
+            right: 2rem;
+            top: 50%;
+            transform: translateY(-50%);
+        }
+
+        .issue-type-chevron {
+            margin-left: 0;
+        }
+    }
+</style>

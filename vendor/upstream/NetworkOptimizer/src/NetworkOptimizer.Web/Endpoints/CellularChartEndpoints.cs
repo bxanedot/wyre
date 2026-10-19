@@ -1,0 +1,106 @@
+using NetworkOptimizer.Storage.Services;
+using NetworkOptimizer.Web.Services;
+using NetworkOptimizer.Web.Services.Authorization;
+
+namespace NetworkOptimizer.Web.Endpoints;
+
+/// <summary>
+/// REST endpoint for cellular modem signal time-series data.
+/// Returns per-band series (e.g. separate LTE and NR5G lines for NSA modems).
+/// Mirrors the SFP chart endpoint pattern.
+/// </summary>
+public static class CellularChartEndpoints
+{
+    public static void Map(WebApplication app)
+    {
+        // Gate 2 (design doc 06): the whole group carries authorization metadata, which is what
+        // architecture test A1 checks. The policy short-circuits when the install has
+        // authentication disabled (GlobalRoleHandler).
+        var group = app.MapGroup("").RequireAuthorization(Policies.RequireViewer);
+
+        group.MapGet("/api/monitoring/cellular-chart", async (
+            MonitoringInfluxClient influx,
+            ICellularModemService modemService,
+            int? rangeHours,
+            DateTime? from,
+            DateTime? to,
+            string? modemId,
+            CancellationToken ct) =>
+        {
+            DateTime queryFrom, queryTo;
+            if (from.HasValue && to.HasValue)
+            {
+                queryFrom = from.Value.ToUniversalTime();
+                queryTo = to.Value.ToUniversalTime();
+            }
+            else
+            {
+                var hours = rangeHours ?? 1;
+                queryTo = DateTime.UtcNow;
+                queryFrom = hours == 0 ? queryTo.AddMinutes(-15) : queryTo.AddHours(-hours);
+            }
+
+            var data = await influx.QueryCellularAsync(queryFrom, queryTo, modemId, ct: ct);
+
+            var modems = await modemService.GetModemsAsync();
+            var nameMap = modems.ToDictionary(m => m.Id.ToString(), m => m.Name);
+
+            // Keys are "modemId" or "modemId:mode" (e.g. "3:LTE", "3:5G NSA").
+            // Only surface modems that still have a config. Deleting a modem config
+            // leaves its historical series in InfluxDB; without this filter those
+            // orphaned modem_ids show up as phantom "Modem {id}" entries on the chart.
+            var result = data
+                .Where(kvp => nameMap.ContainsKey(kvp.Key.Split(':', 2)[0]))
+                .Select(kvp =>
+            {
+                var parts = kvp.Key.Split(':', 2);
+                var rawModemId = parts[0];
+                var mode = parts.Length > 1 ? parts[1] : null;
+                var modemName = nameMap[rawModemId];
+
+                var label = !string.IsNullOrEmpty(mode)
+                    ? $"{modemName} ({mode})"
+                    : modemName;
+
+                // Current state, sent once per modem rather than on every point: these fields
+                // change rarely and the detail table only ever shows the latest.
+                var pts = kvp.Value;
+                string? Latest(Func<MonitoringInfluxClient.CellularPoint, string?> pick) =>
+                    pts.Select(pick).LastOrDefault(v => !string.IsNullOrWhiteSpace(v));
+
+                return new
+                {
+                    id = kvp.Key,
+                    modemId = rawModemId,
+                    label,
+                    mode,
+                    current = new
+                    {
+                        carrier = Latest(p => p.Carrier),
+                        band = Latest(p => p.Band),
+                        bandwidthMhz = pts.Select(p => p.BandwidthMhz).LastOrDefault(v => v != null),
+                        cellId = pts.Select(p => p.CellId).LastOrDefault(v => v != null),
+                        roaming = pts.Select(p => p.IsRoaming).LastOrDefault(v => v != null),
+                        moduleVendor = Latest(p => p.ModuleVendor),
+                        moduleModel = Latest(p => p.ModuleModel),
+                        softwareVersion = Latest(p => p.SoftwareVersion),
+                        hostVersion = Latest(p => p.HostVersion),
+                    },
+                    data = kvp.Value.Select(p => new
+                    {
+                        time = p.Time.ToString("o"),
+                        rsrp = p.Rsrp,
+                        rsrq = p.Rsrq,
+                        snr = p.Snr,
+                        rssi = p.Rssi,
+                        quality = p.SignalQuality,
+                        band = p.Band,
+                        carrier = p.Carrier,
+                    })
+                };
+            });
+
+            return Results.Ok(new { modems = result });
+        });
+    }
+}

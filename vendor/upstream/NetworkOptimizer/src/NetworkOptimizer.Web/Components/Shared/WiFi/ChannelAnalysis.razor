@@ -1,0 +1,1688 @@
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.WiFi
+@using NetworkOptimizer.WiFi.Helpers
+@using NetworkOptimizer.WiFi.Models
+@using NetworkOptimizer.WiFi.Services
+@using NetworkOptimizer.Storage.Models
+@inject WiFiOptimizerService WiFiService
+@inject UniFiConnectionService ConnectionService
+@inject ISystemSettingsService SettingsService
+@inject IWiFiRadioKeepService RadioKeep
+@inject IChannelPlanApplyService ChannelApply
+@implements IDisposable
+
+<div class="channel-analysis-container wifi-sections" data-tour="wifi-channels">
+    <div class="channel-header">
+        <h3>@(_showRecommendations ? "Channel Analysis - Recommended" : "Channel Analysis - Current")</h3>
+        <div class="header-actions">
+            @if (!_showRecommendations && _accessPoints.Any(ap => ap.IsOnline && ap.Radios.Any(r => r.Channel.HasValue)))
+            {
+                <button class="btn btn-recommend" @onclick="RunRecommendation" disabled="@_loadingRecommendations">
+                    @if (_loadingRecommendations)
+                    {
+                        <span class="spinner-sm"></span> <span>Analyzing...</span>
+                    }
+                    else
+                    {
+                        <span>Recommend Best Channels</span>
+                    }
+                </button>
+            }
+            @if (_showRecommendations && PlanComputedAtUtc is { } computedAt)
+            {
+                <span class="channel-plan-age">Last computed: @TimeFormatHelper.FormatRelativeTimeShort(computedAt)</span>
+            }
+            <button class="btn btn-sm btn-secondary" @onclick="RefreshData" disabled="@(_loading || _applying)">
+                @if (_loading)
+                {
+                    <span class="spinner-sm"></span>
+                }
+                else
+                {
+                    <span>@(_showRecommendations ? "Recompute" : "Refresh")</span>
+                }
+            </button>
+        </div>
+    </div>
+
+    @if (_loading)
+    {
+        <div class="channel-loading">
+            <span class="spinner"></span>
+            <span>Loading channel data...</span>
+        </div>
+    }
+    else if (_accessPoints.Count == 0)
+    {
+        <div class="channel-empty">
+            <p>No access points found. Connect to UniFi to analyze channel usage.</p>
+        </div>
+    }
+    else
+    {
+        <!-- Summary Stats -->
+        <div class="channel-stats-row">
+            <div class="channel-stat-card @(_channelIssues.Count > 0 ? "stat-warning" : "")">
+                <div class="channel-stat-value">@_channelIssues.Count</div>
+                <div class="channel-stat-label">Channel Issues</div>
+            </div>
+            <div class="channel-stat-card">
+                <div class="channel-stat-value">@_channelsInUse.Count</div>
+                <div class="channel-stat-label">Channels In Use</div>
+            </div>
+            <div class="channel-stat-card @GetUtilizationStatClass(_avgUtilization)">
+                <div class="channel-stat-value">@_avgUtilization%</div>
+                <div class="channel-stat-label">Avg Utilization</div>
+            </div>
+            <div class="channel-stat-card @GetInterferenceStatClass(_avgInterference)">
+                <div class="channel-stat-value">@_avgInterference%</div>
+                <div class="channel-stat-label">Avg Interference</div>
+            </div>
+        </div>
+
+        <!-- Band Tabs -->
+        <div class="band-tabs">
+            @foreach (var band in _bands)
+            {
+                var bandData = GetBandData(band);
+                var hasRecForBand = _showRecommendations && _channelPlans.ContainsKey(band);
+                <button class="band-tab @GetBandClass(band) @(_selectedBand == band ? "active" : "") @(bandData.HasIssues ? "has-issues" : "")"
+                        @onclick="() => { _selectedBand = band; _selectedChannel = null; _bandManuallySelected = true; }">
+                    @band.ToDisplayString()
+                    @if (_showRecommendations && hasRecForBand)
+                    {
+                        var bandPlan = _channelPlans[band];
+                        @if (bandPlan.ImprovementPercent > 0)
+                        {
+                            <span class="issue-indicator" style="background: var(--success-color);">@FormatPercent(bandPlan.ImprovementPercent)%</span>
+                        }
+                    }
+                    else if (bandData.HasIssues)
+                    {
+                        <span class="issue-indicator">!</span>
+                    }
+                    else if (bandData.HasMesh)
+                    {
+                        <span class="mesh-indicator" data-tooltip="Mesh APs sharing channel">M</span>
+                    }
+                </button>
+            }
+        </div>
+
+        @if (_showRecommendations)
+        {
+            <div class="recommendation-view" data-tour="channel-recommendation">
+                <div class="section-header">
+                    <h4>Recommended Channel Plan - @_selectedBand.ToDisplayString()</h4>
+                    <button class="btn btn-sm btn-ghost" disabled="@_applying" @onclick="() => { _showRecommendations = false; _channelPlans = new(); }"><span class="btn-label-full">Show Current Channels</span><span class="btn-label-compact">Show Current</span></button>
+                </div>
+
+                @* Auto-hide once every scannable radio has a measurement (no gaps): the rec is then
+                   grounded in measured airtime/noise, not flying on the unreliable neighbor scan. *@
+                @if (!_channelDisclaimerDismissed && _scanGaps.Count > 0)
+                {
+                    <div class="channel-disclaimer">
+                        <div class="disclaimer-content">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="disclaimer-icon">
+                                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                            </svg>
+                            <span>
+                                These recommendations rely on neighbor scan data from UniFi, which may not always report accurate channels.
+                                Check <a href="/wifi-optimizer?tab=spectrum" class="disclaimer-link">RF Environment</a> first to verify that neighboring networks show unique, realistic channels
+                                before acting on these recommendations.
+                            </span>
+                        </div>
+                        <button class="disclaimer-dismiss-btn" @onclick="DismissChannelDisclaimerAsync">Got it</button>
+                    </div>
+                }
+
+                @if (_scanGaps.Count > 0)
+                {
+                    <div class="alert-info scan-gap-banner">
+                        <div class="scan-gap-text">
+                            <strong>@_scanGaps.Count @(_scanGaps.Count == 1 ? "radio needs" : "radios need") a scan.</strong>
+                            Their channel congestion is estimated from nearby networks, not measured. @ScanDisruptionNote(_scanGaps)
+                        </div>
+                        <SiteOperatorOnly>
+                            <ChildContent><button class="btn btn-primary btn-sm" @onclick="RunGapScans" disabled="@(_scanningGaps || _scanningStale)"
+                                data-tooltip="Runs a quick RF scan to measure the real airtime and noise floor on these channels, so the recommendations reflect what's actually on the air instead of a guess.">
+                            @if (_scanningGaps)
+                            {
+                                <span class="spinner spinner-sm"></span>
+                                <span>@ScanProgressLabel()</span>
+                            }
+                            else
+                            {
+                                <span>Run quick scan</span>
+                            }
+                        </button></ChildContent>
+                            @* Shown exactly where the button would have been: the banner says a scan is
+                               needed, so without this a Viewer is told about work with no way to ask for it. *@
+                            <NotAuthorized><span class="scan-gap-ask">Ask a Site Operator or Admin to run it.</span></NotAuthorized>
+                        </SiteOperatorOnly>
+                    </div>
+                    @if (_scanError is not null)
+                    {
+                        <div class="alert-danger scan-error-banner">@_scanError</div>
+                    }
+                }
+
+                @* Present-but-stale-AND-material: a re-scan could actually change a recommendation
+                   (a stale, uncorroborated spectrum reading is holding or deciding a channel). Kept
+                   separate from the missing-data gap banner above so that flow is unchanged. *@
+                @if (_staleScanTargets.Count > 0)
+                {
+                    <div class="alert-info scan-gap-banner">
+                        <div class="scan-gap-text">
+                            <strong>@_staleScanTargets.Count @(_staleScanTargets.Count == 1 ? "radio has" : "radios have") stale scan data.</strong>
+                            Their recommendation is based on an old reading that may no longer reflect what's on the air. @ScanDisruptionNote(_staleScanTargets)
+                        </div>
+                        <SiteOperatorOnly>
+                            <ChildContent><button class="btn btn-primary btn-sm" @onclick="RunStaleScans" disabled="@(_scanningGaps || _scanningStale)"
+                                data-tooltip="Re-measures the real airtime and noise floor on these channels. The current recommendation is resting on an older scan that nearby networks no longer corroborate, so a fresh one may change the advice.">
+                            @if (_scanningStale)
+                            {
+                                <span class="spinner spinner-sm"></span>
+                                <span>@ScanProgressLabel()</span>
+                            }
+                            else
+                            {
+                                <span>Re-scan</span>
+                            }
+                        </button></ChildContent>
+                            @* Shown exactly where the button would have been: the banner says a scan is
+                               needed, so without this a Viewer is told about work with no way to ask for it. *@
+                            <NotAuthorized><span class="scan-gap-ask">Ask a Site Operator or Admin to run it.</span></NotAuthorized>
+                        </SiteOperatorOnly>
+                    </div>
+                    @if (_staleScanError is not null)
+                    {
+                        <div class="alert-danger scan-error-banner">@_staleScanError</div>
+                    }
+                }
+
+                @if (_channelPlan is { } plan)
+                {
+                    <!-- Network Score Summary -->
+                    <div class="channel-stats-row">
+                        <div class="channel-stat-card">
+                            <div class="channel-stat-value">@FormatScore(plan.CurrentNetworkScore)</div>
+                            <div class="channel-stat-label">Current Score</div>
+                        </div>
+                        <div class="channel-stat-card @(plan.ImprovementPercent > 0 ? "stat-improvement" : "")">
+                            <div class="channel-stat-value">@FormatScore(plan.RecommendedNetworkScore)</div>
+                            <div class="channel-stat-label">Recommended Score</div>
+                        </div>
+                        @if (plan.ImprovementPercent > 0)
+                        {
+                            <div class="channel-stat-card stat-improvement">
+                                <div class="channel-stat-value">@FormatPercent(plan.ImprovementPercent)%</div>
+                                <div class="channel-stat-label">Less Interference</div>
+                            </div>
+                        }
+                        else if (!plan.Recommendations.Any(r => r.IsChanged))
+                        {
+                            @* A soaking radio is held where it is, so "Optimal" would claim what is not measured yet. *@
+                            @if (plan.Recommendations.Any(r => r.IsSoaking))
+                            {
+                                <div class="channel-stat-card">
+                                    <div class="channel-stat-value">Soaking</div>
+                                    <div class="channel-stat-label">Judging recent moves</div>
+                                </div>
+                            }
+                            else
+                            {
+                                <div class="channel-stat-card">
+                                    <div class="channel-stat-value score-excellent">Optimal</div>
+                                    <div class="channel-stat-label">No changes needed</div>
+                                </div>
+                            }
+                        }
+                    </div>
+
+                    <!-- DFS Preference Toggle (5 GHz only) -->
+                    @if (_selectedBand == RadioBand.Band5GHz)
+                    {
+                        <div class="time-range-selector dfs-toggle">
+                            <button class="time-btn @(_dfsPreference == DfsPreference.IncludeWithPenalty ? "active" : "")"
+                                    @onclick="() => ChangeDfsPreference(DfsPreference.IncludeWithPenalty)">
+                                Include DFS
+                            </button>
+                            <button class="time-btn @(_dfsPreference == DfsPreference.Exclude ? "active" : "")"
+                                    @onclick="() => ChangeDfsPreference(DfsPreference.Exclude)">
+                                Avoid DFS
+                            </button>
+                            <button class="time-btn @(_dfsPreference == DfsPreference.Prefer ? "active" : "")"
+                                    @onclick="() => ChangeDfsPreference(DfsPreference.Prefer)">
+                                Prefer DFS
+                            </button>
+                        </div>
+                        @if (plan.DfsAvoidanceNotPossible && _dfsPreference == DfsPreference.Exclude)
+                        {
+                            <div class="alert-info" style="margin-top: 0.5rem; padding: 0.5rem 0.75rem; font-size: 0.8rem;">
+                                DFS channels can't be avoided at 160 MHz - all bonding groups include DFS frequencies. Results shown are the same as Include DFS.
+                            </div>
+                        }
+                    }
+
+                    <!-- Per-AP Recommendation Table -->
+                    <div class="aps-band-table rec-table">
+                        <div class="rec-header">
+                            <div class="rec-col rec-name-col">Access Point</div>
+                            <div class="rec-col rec-score-col">Score</div>
+                            <div class="rec-col rec-channels-col">Current → Recommended</div>
+                            <div class="rec-col rec-score-col">Score</div>
+                        </div>
+                        @foreach (var rec in plan.Recommendations)
+                        {
+                            <div class="rec-row @(rec.IsChanged ? "ap-recommendation-changed" : "")">
+                                <div class="rec-col rec-name-col">
+                                    <span class="ap-name">
+                                        <DeviceIcon Model="@GetApModel(rec.ApMac)" Size="md" />
+                                        @rec.ApName
+                                        @if (rec.IsMeshConstrained)
+                                        {
+                                            <span class="mesh-link-badge" data-tooltip="Mesh uplink - shares channel with parent">Mesh</span>
+                                        }
+                                        @if (rec.IsSoaking)
+                                        {
+                                            <span class="soak-badge" data-tooltip="@GetSoakTooltip(rec)">Soaking</span>
+                                        }
+                                        @if (rec.IsKept)
+                                        {
+                                            <span class="mesh-link-badge" data-tooltip="Pinned - Channel Recommendation leaves this radio where it is">Pinned</span>
+                                        }
+                                        @if (rec.IsUnplaced)
+                                        {
+                                            <span class="tooltip-icon tooltip-icon-sm" data-tooltip="Not placed on floor plan - using estimated interference">?</span>
+                                        }
+                                    </span>
+                                    @* A mesh child follows its parent, so the pin sits on the parent. *@
+                                    @if (!rec.IsMeshConstrained)
+                                    {
+                                        <SiteAdminOnly>
+                                            <button class="rec-pin-btn @(rec.IsKept ? "pinned" : "")" disabled="@(_keepBusy || _applying)"
+                                                    data-tooltip="@(rec.IsKept ? "Unpin Channel - let Channel Recommendation move this radio again" : "Pin Channel - Channel Recommendation will leave this radio where it is")"
+                                                    aria-label="@(rec.IsKept ? "Unpin Channel" : "Pin Channel")"
+                                                    @onclick="() => ToggleKeepAsync(rec)">
+                                                <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z"/></svg>
+                                            </button>
+                                        </SiteAdminOnly>
+                                    }
+                                </div>
+                                <div class="rec-col rec-score-col">
+                                    <span class="@GetScoreClass(rec.CurrentScore)">@FormatScore(rec.CurrentScore)</span>
+                                </div>
+                                <div class="rec-col rec-channels-col">
+                                    @if (rec.IsChanged)
+                                    {
+                                        <span>Ch @rec.CurrentChannel / @(rec.CurrentWidth) MHz</span>
+                                        @if (rec.IsCurrentDfsChannel)
+                                        {
+                                            <span class="dfs-badge">DFS</span>
+                                        }
+                                        <span class="channel-change-arrow"><svg width="20" height="14" viewBox="0 0 20 14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 1L19 7L12 13M19 7H1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                                        <span class="rec-changed">Ch @rec.RecommendedChannel / @(rec.RecommendedWidth) MHz</span>
+                                        @if (rec.IsRecommendedDfsChannel)
+                                        {
+                                            <span class="dfs-badge">DFS</span>
+                                        }
+                                    }
+                                    else
+                                    {
+                                        <span>Ch @rec.CurrentChannel / @(rec.CurrentWidth) MHz</span>
+                                        @if (rec.IsCurrentDfsChannel)
+                                        {
+                                            <span class="dfs-badge">DFS</span>
+                                        }
+                                        <span class="rec-no-change">(No change)</span>
+                                    }
+                                    @if (!string.IsNullOrEmpty(rec.WidthReason))
+                                    {
+                                        <div class="rec-move-note"><span>@rec.WidthReason</span></div>
+                                    }
+                                    @* A move the AP Agent saw within the last day. *@
+                                    @if (rec.MovedAt.HasValue)
+                                    {
+                                        <div class="rec-move-note">
+                                            @if (rec.MoveInterferenceBefore.HasValue && rec.MoveInterferenceAfter.HasValue)
+                                            {
+                                                <span>Measured since the move: interference @rec.MoveInterferenceBefore.Value.ToString("F0")% before, @rec.MoveInterferenceAfter.Value.ToString("F0")% after.</span>
+                                            }
+                                            else if (rec.MoveVerdictDueAt.HasValue)
+                                            {
+                                                <span>Measuring the new channel; the first hour's result lands at @rec.MoveVerdictDueAt.Value.ToLocalTime().ToString("t").</span>
+                                            }
+                                        </div>
+                                    }
+                                </div>
+                                <div class="rec-col rec-score-col">
+                                    <span class="@GetScoreClass(rec.RecommendedScore)">@FormatScore(rec.RecommendedScore)</span>
+                                </div>
+                            </div>
+                        }
+                    </div>
+
+                    <SiteAdminOnly>
+                        @{
+                            var (applyItems, _) = ChannelPlanApply.FromPlan(plan);
+                            var run = _applyRun is { } r && r.Band == _selectedBand ? r : null;
+                        }
+                        @if (run != null)
+                        {
+                            <div class="recommendation-notice channel-apply-panel">
+                                <div class="channel-apply-title">@(run.Running ? "Applying channel changes" : "Channel changes")</div>
+                                @RenderApplyList(run)
+                                <div class="action-buttons channel-apply-actions">
+                                    <button class="btn btn-contrast" @onclick="CloseApply" disabled="@run.Running">
+                                        @if (run.Running)
+                                        {
+                                            <span class="spinner-sm"></span> <span>Applying wave @(run.CurrentWave + 1) of @run.WaveCount</span>
+                                        }
+                                        else
+                                        {
+                                            <span>Done</span>
+                                        }
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                        else if (applyItems.Count > 0)
+                        {
+                            <div class="action-buttons channel-apply-actions">
+                                <button class="btn btn-primary" data-tour="apply-channels" @onclick="() => ApplyChannelsAsync(plan)" disabled="@(_keepBusy || _loading || _applying)">Apply Recommended Channels</button>
+                            </div>
+                        }
+                        @if (_applyError != null)
+                        {
+                            <div class="alert-danger">@_applyError</div>
+                        }
+                    </SiteAdminOnly>
+
+                    <!-- Notices -->
+                    @if (!plan.HasBuildingData)
+                    {
+                        <div class="alert-warning recommendation-notice">
+                            No floor plan or building data found. Build out your property in Signal Map for propagation-modeled recommendations
+                            that account for wall materials, antenna patterns, and AP placement.
+                        </div>
+                    }
+                    @if (plan.KeptRadioCount > 0)
+                    {
+                        <div class="recommendation-notice">@plan.KeptRadioCount radio(s) pinned.</div>
+                    }
+                    else if (plan.UnplacedApCount > 0)
+                    {
+                        <div class="recommendation-notice">
+                            @plan.UnplacedApCount AP@(plan.UnplacedApCount > 1 ? "s" : "") not placed on floor plan - using estimated interference.
+                            Place them on a floor plan for more accurate recommendations.
+                        </div>
+                    }
+                    @if (!plan.HasScanData)
+                    {
+                        <div class="recommendation-notice">
+                            No RF scan data available. Recommendations are based on internal AP interference only.
+                            External neighbor networks are not factored in.
+                        </div>
+                    }
+                    else if (!plan.HasNeighborNetworks && plan.HasMeasuredChannelData)
+                    {
+                        <div class="recommendation-notice">
+                            No neighbor networks detected on this band, but measured channel occupancy and noise floor
+                            from RF scans are factored in - so these recommendations reflect real on-air conditions, not
+                            just internal AP interference.
+                        </div>
+                    }
+                    else if (!plan.HasNeighborNetworks)
+                    {
+                        <div class="recommendation-notice">
+                            No neighbor networks detected on this band. Recommendations are based on internal AP interference only.
+                        </div>
+                    }
+                    @if (plan.Recommendations.Any(r => r.IsSoaking))
+                    {
+                        <div class="recommendation-notice">
+                            Some APs changed channels recently. The channels they just left are excluded from
+                            recommendations for a @(ChannelMemoryHelper.SoakPeriod.TotalHours.ToString("0"))-hour
+                            soak so the new channel can prove itself on measured data - this prevents
+                            ping-ponging between configs. Hover an AP's Soaking badge for details.
+                        </div>
+                    }
+
+                    <!-- How This Works -->
+                    <details class="recommendation-explainer">
+                        <summary>How This Works</summary>
+                        <div class="recommendation-explainer-content">
+                            <p>
+                                Most channel pickers count nearby networks. This builds a physical model of your RF
+                                environment, measures what is actually on each channel, and solves for the plan with
+                                the least real interference:
+                            </p>
+                            <ul>
+                                <li><strong>Signal propagation</strong> - how far each AP's signal reaches, from your floor plan, wall materials, and per-radio antenna patterns, not distance alone.</li>
+                                <li><strong>Transmit-power aware</strong> - each AP's real EIRP is applied directionally, so a low-power AP counts as a gentler neighbor.</li>
+                                <li><strong>Real contention, not raw signal</strong> - interference is measured against the CCA threshold, where radios actually defer, so barely-audible signals are not over-counted.</li>
+                                <li><strong>Measured airtime and noise floor</strong> - each channel's utilization and RF noise floor from the radios' spectrum scans, so congestion and non-Wi-Fi interference (radar, microwaves, a neighbor's gear) count even with no network visible. An AP Agent access point is read every 30 seconds, so its neighbor data is seconds old and its per-channel measurement continuous. An AP is never moved onto a channel that measures worse than where it sits.</li>
+                                <li><strong>Neighboring networks</strong> - UniFi's RF scan of networks you don't control, triangulated across all your APs. Neighbors are remembered for weeks, counting for less as a sighting ages or if it was only seen briefly, so an AP without a scan radio keeps what it learned about a channel after moving off it.</li>
+                                <li><strong>Recent measured trends</strong> - per-channel utilization, interference, and TX retry from the console's recent history, so the plan reflects a channel over time, not one snapshot. Client rates are compared per spatial stream per 20 MHz, so a channel full of 1x1 phones does not read as slow.</li>
+                                <li><strong>Long-term outcome memory</strong> - how channels you have actually run performed, kept for months beyond the console's retention, with older evidence counting for less. After a change, the old channel is not re-suggested during a @(ChannelMemoryHelper.SoakPeriod.TotalHours.ToString("0"))-hour soak. With the AP Agent the memory is keyed by the measured channel block (which matters at 320 MHz, where the channel number alone does not say which block), a move is noticed the moment it happens (UniFi Network logs nothing for a Channel AI move), and an hour on the new channel is measured against the old one; a move that measured worse ends the soak early.</li>
+                                <li><strong>Honest about the unknown</strong> - channels with no scan data are penalized for the uncertainty, so you are not pushed onto an unseen channel unless your known ones are clearly worse.</li>
+                                <li><strong>Whole-network and per-AP</strong> - minimizes total interference across the site, then checks each AP on its own, never wrecking one AP to slightly help another.</li>
+                                <li><strong>Mesh, DFS, and pin aware</strong> - mesh APs stay on their parent's channel, a Wi-Fi 7 MLO backhaul is a mesh pair on every band it runs on, DFS channels follow your preference, and a pinned radio is never moved.</li>
+                                <li><strong>Width recommendations</strong> - with AP Agent data, a narrower width when no roaming client used more than half of it this week, or a wider one when clients can use it and the air is quiet. Never on 2.4 GHz or a backhaul radio.</li>
+                            </ul>
+                            <p>Lower scores mean less interference.</p>
+                        </div>
+                    </details>
+                }
+                else
+                {
+                    <div class="recommendation-notice">
+                        No APs with radios on @_selectedBand.ToDisplayString() found. Switch to another band to see recommendations.
+                    </div>
+                }
+            </div>
+        }
+        else
+        {
+        <!-- Channel Map for Selected Band -->
+        <div class="channel-map-section">
+            <div class="section-header">
+                <h4>@_selectedBand.ToDisplayString() Channel Map</h4>
+                <span class="section-subtitle">@GetBandDescription(_selectedBand)</span>
+            </div>
+
+            <div class="channel-map">
+                @foreach (var channel in GetChannelsForBand(_selectedBand))
+                {
+                    var apsOnChannel = GetApsOnChannel(_selectedBand, channel);
+                    var isOccupied = apsOnChannel.Any();
+                    var hasActualOverlap = IsChannelOverlapped(_selectedBand, channel);
+                    var hasMeshPair = IsChannelMesh(_selectedBand, channel);
+                    var utilization = GetChannelUtilization(_selectedBand, channel);
+                    var interference = GetChannelInterference(_selectedBand, channel);
+
+                    <div class="channel-slot @(isOccupied ? "occupied" : "") @(hasActualOverlap ? "overlap" : hasMeshPair ? "mesh" : "") @GetChannelGroupClass(_selectedBand, channel)"
+                         @onclick="() => SelectChannel(_selectedBand, channel)">
+                        <div class="channel-number">@channel</div>
+                        @if (isOccupied)
+                        {
+                            <div class="channel-aps">
+                                @foreach (var ap in apsOnChannel.Take(3))
+                                {
+                                    <div class="channel-ap-dot @GetBandClass(_selectedBand) @(apsOnChannel.Count == 1 ? "dot-single" : "")" data-tooltip="@ap.Name"></div>
+                                }
+                                @if (apsOnChannel.Count > 3)
+                                {
+                                    <div class="channel-ap-more">+@(apsOnChannel.Count - 3)</div>
+                                }
+                            </div>
+                            <div class="channel-metrics">
+                                <span class="channel-util @GetUtilizationClass(utilization)">@utilization%</span>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+
+            <!-- Non-overlapping Channel Indicators (2.4 GHz only) -->
+            @if (_selectedBand == RadioBand.Band2_4GHz)
+            {
+                <div class="channel-recommendations">
+                    <span class="rec-label">Recommended non-overlapping:</span>
+                    <span class="rec-channels">1, 6, 11</span>
+                </div>
+            }
+        </div>
+
+        <!-- Selected Channel Details or AP List -->
+        @if (_selectedChannel != null)
+        {
+            var apsOnChannel = GetApsOnChannel(_selectedBand, _selectedChannel.Value);
+            var coChannelIssue = CoChannelIssueFor(_selectedBand, _selectedChannel.Value);
+            var hasActualOverlap = coChannelIssue != null;
+            // Same primary keeps the count sentence; an overlap between different primaries
+            // reaches past this channel, so the issue's own description names the blocks.
+            var overlapReachesOtherChannels = coChannelIssue != null && coChannelIssue.AffectedChannels.Count > 1;
+            var hasMeshPair = IsChannelMesh(_selectedBand, _selectedChannel.Value);
+            <div class="channel-details-section">
+                <div class="section-header">
+                    <h4>Channel @_selectedChannel Details</h4>
+                    <button class="btn btn-sm btn-ghost" @onclick="() => _selectedChannel = null">Close</button>
+                </div>
+
+                @if (hasActualOverlap)
+                {
+                    <div class="overlap-warning">
+                        <span class="warning-icon">!</span>
+                        @if (overlapReachesOtherChannels)
+                        {
+                            <span>@coChannelIssue!.Description</span>
+                        }
+                        else
+                        {
+                            <span>@apsOnChannel.Count APs are on the same channel - this may cause co-channel interference</span>
+                        }
+                    </div>
+                }
+                else if (hasMeshPair)
+                {
+                    <div class="mesh-info">
+                        <span class="mesh-icon">M</span>
+                        <span>These APs are meshing on this channel - shared channel is expected for mesh uplink</span>
+                    </div>
+                }
+
+                <div class="channel-aps-list">
+                    @foreach (var ap in apsOnChannel)
+                    {
+                        var radio = ap.Radios.FirstOrDefault(r => r.Band == _selectedBand && r.Channel == _selectedChannel);
+                        <div class="channel-ap-card">
+                            <div class="ap-info">
+                                <span class="ap-name"><DeviceIcon Model="@ap.Model" Size="md" /> @ap.Name</span>
+                                <span class="ap-model">@ap.Model</span>
+                            </div>
+                            <div class="ap-radio-details">
+                                @if (radio != null)
+                                {
+                                    <div class="detail-item">
+                                        <span class="detail-label">Width:</span>
+                                        <span class="detail-value">@(radio.ChannelWidth ?? 20) MHz</span>
+                                    </div>
+                                    @if (radio.ChannelWidth >= 40)
+                                    {
+                                        var span = GetChannelWidthSpan(radio.Band, radio.Channel!.Value, radio.ChannelWidth!.Value, radio.ExtChannel, radio.CenterChannel);
+                                        var spanOrdered = span.OrderBy(c => c).ToList();
+                                        <div class="detail-item">
+                                            <span class="detail-label">Bonded:</span>
+                                            @if (radio.Band == RadioBand.Band2_4GHz && radio.ExtChannel.HasValue)
+                                            {
+                                                var secondary = radio.ExtChannel.Value > 0 ? radio.Channel!.Value + 4 : radio.Channel!.Value - 4;
+                                                <span class="detail-value">Ch @(Math.Min(radio.Channel!.Value, secondary)) + @(Math.Max(radio.Channel!.Value, secondary))</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="detail-value">Ch @spanOrdered.First() - @spanOrdered.Last()</span>
+                                            }
+                                        </div>
+                                    }
+                                    <div class="detail-item">
+                                        <span class="detail-label">TX Power:</span>
+                                        <span class="detail-value">@(radio.TxPower?.ToString() ?? "-") dBm</span>
+                                    </div>
+                                    <div class="detail-item">
+                                        <span class="detail-label">Utilization:</span>
+                                        <span class="detail-value @GetUtilizationClass(radio.ChannelUtilization ?? 0)">
+                                            @(radio.ChannelUtilization?.ToString() ?? "-")%
+                                        </span>
+                                    </div>
+                                    <div class="detail-item">
+                                        <span class="detail-label">Interference:</span>
+                                        <span class="detail-value @GetInterferenceClass(radio.Interference ?? 0)">
+                                            @(radio.Interference?.ToString() ?? "-")%
+                                        </span>
+                                    </div>
+                                    <div class="detail-item">
+                                        <span class="detail-label">Clients:</span>
+                                        <span class="detail-value">@(radio.ClientCount?.ToString() ?? "-")</span>
+                                    </div>
+                                    @if (radio.Satisfaction.HasValue && radio.Satisfaction.Value >= 0)
+                                    {
+                                        <div class="detail-item">
+                                            <span class="detail-label">Satisfaction:</span>
+                                            <span class="detail-value @GetSatisfactionClass(radio.Satisfaction.Value)">
+                                                @(radio.Satisfaction)%
+                                            </span>
+                                        </div>
+                                    }
+                                }
+                            </div>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+        else
+        {
+            <!-- All APs Table for Selected Band -->
+            <div class="aps-band-section">
+                <div class="section-header">
+                    <h4>@_selectedBand.ToDisplayString() Radios</h4>
+                </div>
+
+                <div class="aps-band-table">
+                    <div class="aps-header">
+                        <div class="ap-col ap-name-col">Access Point</div>
+                        <div class="ap-col ap-channel-col">Channel</div>
+                        <div class="ap-col ap-width-col">Width</div>
+                        <div class="ap-col ap-power-col">TX Power</div>
+                        <div class="ap-col ap-util-col">Utilization</div>
+                        <div class="ap-col ap-interf-col">Interference</div>
+                        <div class="ap-col ap-clients-col">Clients</div>
+                    </div>
+                    @foreach (var ap in _accessPoints)
+                    {
+                        var radio = ap.Radios.FirstOrDefault(r => r.Band == _selectedBand);
+                        @if (radio != null)
+                        {
+                            <div class="aps-row clickable" @onclick="() => SelectApChannel(radio.Channel)">
+                                <div class="ap-col ap-name-col">
+                                    <span class="ap-name">
+                                        <DeviceIcon Model="@ap.Model" Size="md" /> @ap.Name
+                                        @if (ap.IsMeshChild && ap.MeshUplinkUsesBand(_selectedBand))
+                                        {
+                                            <span class="mesh-link-badge" data-tooltip="Mesh uplink - shares channel with parent">Mesh</span>
+                                        }
+                                    </span>
+                                    <span class="ap-model">@ap.Model</span>
+                                </div>
+                                <div class="ap-col ap-channel-col">
+                                    <span class="channel-badge @(IsChannelOverlapped(_selectedBand, radio.Channel) ? "overlap" : IsChannelMesh(_selectedBand, radio.Channel) ? "mesh" : "")">
+                                        @(radio.Channel?.ToString() ?? "-")
+                                    </span>
+                                </div>
+                                <div class="ap-col ap-width-col">@(radio.ChannelWidth ?? 20) MHz</div>
+                                <div class="ap-col ap-power-col">
+                                    <EirpBar Radio="radio" Model="@ap.Model" />
+                                    @if (!string.IsNullOrEmpty(radio.TxPowerMode))
+                                    {
+                                        <span class="power-mode-below">@radio.TxPowerMode</span>
+                                    }
+                                </div>
+                                <div class="ap-col ap-util-col">
+                                    <div class="util-bar-container">
+                                        <div class="util-bar @GetUtilizationClass(radio.ChannelUtilization ?? 0)"
+                                             style="width: @(radio.ChannelUtilization ?? 0)%"></div>
+                                    </div>
+                                    <span class="util-value">@(radio.ChannelUtilization?.ToString() ?? "-")%</span>
+                                </div>
+                                <div class="ap-col ap-interf-col @GetInterferenceClass(radio.Interference ?? 0)">
+                                    @(radio.Interference?.ToString() ?? "-")%
+                                </div>
+                                <div class="ap-col ap-clients-col">@(radio.ClientCount?.ToString() ?? "0")</div>
+                            </div>
+                        }
+                    }
+                </div>
+            </div>
+        }
+
+        <!-- Issues/Recommendations -->
+        @if (_channelIssues.Count > 0)
+        {
+            <div class="channel-issues-section">
+                <div class="section-header">
+                    <h4>Channel Issues</h4>
+                </div>
+
+                <IssuesList Issues="_channelIssues" ShowDetails="true" OnClientClick="OnClientClick" />
+            </div>
+        }
+        } @* end else (not showing recommendations) *@
+    }
+</div>
+
+@code {
+    [Parameter] public EventCallback<string> OnClientClick { get; set; }
+    [Parameter] public RadioBand? InitialBand { get; set; }
+    [Parameter] public int? InitialChannel { get; set; }
+    [Parameter] public bool AutoRunRecommendation { get; set; }
+
+    private bool _loading = true;
+    private List<AccessPointSnapshot> _accessPoints = new();
+    private RegulatoryChannelData? _regulatoryData;
+    private SiteHealthScore? _healthScore;
+    private RadioBand _selectedBand = RadioBand.Band5GHz;
+    private int? _selectedChannel;
+    // True once the user (or explicit navigation) picks a band, so auto-select won't override it.
+    private bool _bandManuallySelected;
+
+    // Channel disclaimer
+    private bool _channelDisclaimerDismissed;
+
+    // Channel recommendation state
+    private bool _showRecommendations;
+    private System.Threading.Timer? _ageTimer;
+
+    /// <summary>When the displayed plan was computed - the same for every band in one run.</summary>
+    private DateTime? PlanComputedAtUtc =>
+        _channelPlans.Values.FirstOrDefault(p => p.ComputedAtUtc != default)?.ComputedAtUtc;
+
+    /// <summary>
+    /// Re-render periodically so "Last computed" ages on its own. Without this the label freezes at
+    /// whatever it said when the plan loaded, which is worse than showing nothing - a plan served
+    /// from cache would keep claiming it was just computed.
+    /// </summary>
+    private void StartAgeTicker()
+    {
+        _ageTimer?.Dispose();
+        _ageTimer = new System.Threading.Timer(_ =>
+        {
+            try
+            {
+                InvokeAsync(() =>
+                {
+                    if (_showRecommendations && PlanComputedAtUtc != null) StateHasChanged();
+                });
+            }
+            catch { /* a dead circuit must not kill the timer callback */ }
+        }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+    }
+
+    public void Dispose()
+    {
+        _ageTimer?.Dispose();
+        _applyPoll?.Dispose();
+    }
+    private bool _loadingRecommendations;
+    private Dictionary<RadioBand, ChannelPlan> _channelPlans = new();
+    private bool _keepBusy;
+
+    /// <summary>
+    /// Keep or release one radio, then rebuild the plan: the kept set is part of the plan's
+    /// cache key, so the rebuild is a different question rather than a stale answer.
+    /// </summary>
+    private async Task ToggleKeepAsync(ApChannelRecommendation rec)
+    {
+        if (_keepBusy) return;
+        _keepBusy = true;
+        try
+        {
+            if (rec.IsKept)
+                await RadioKeep.ReleaseAsync(rec.ApMac, rec.Band);
+            else
+                await RadioKeep.KeepAsync(rec.ApMac, rec.Band);
+
+            var options = new RecommendationOptions { DfsPreference = _dfsPreference };
+            _channelPlans = await WiFiService.GetAllChannelRecommendationsAsync(options, forceRefresh: true);
+        }
+        finally
+        {
+            _keepBusy = false;
+        }
+    }
+    // Apply Recommended Channels: the site's run, which lives on the server and is polled while it runs.
+    private ChannelApplyRunSnapshot? _applyRun;
+    private string? _applyError;
+    private System.Threading.Timer? _applyPoll;
+    private bool _applying => _applyRun?.Running == true;
+
+    /// <summary>
+    /// Picks up a run started earlier, from this page or another. A run still going opens its band's
+    /// plan and is followed; a finished one only shows once that plan is open.
+    /// </summary>
+    private async Task LoadApplyRunAsync()
+    {
+        try
+        {
+            _applyRun = await ChannelApply.GetRunAsync();
+        }
+        catch
+        {
+            _applyRun = null; // a role that cannot read it simply sees no panel
+        }
+        if (_applyRun is not { Running: true }) return;
+        if (!_showRecommendations) await RunRecommendation();
+        _selectedBand = _applyRun.Band;
+        _bandManuallySelected = true;
+        StartApplyPolling();
+    }
+
+    private void StartApplyPolling()
+    {
+        _applyPoll?.Dispose();
+        _applyPoll = new System.Threading.Timer(_ =>
+        {
+            try { _ = InvokeAsync(PollApplyRunAsync); }
+            catch { /* a dead circuit must not kill the timer callback */ }
+        }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
+    }
+
+    private async Task PollApplyRunAsync()
+    {
+        var wasRunning = _applying;
+        _applyRun = await ChannelApply.GetRunAsync();
+        if (_applying)
+        {
+            StateHasChanged();
+            return;
+        }
+        _applyPoll?.Dispose();
+        _applyPoll = null;
+        StateHasChanged();
+        // The radios moved, so the plan and the current channels both need a fresh read.
+        if (wasRunning) await RefreshData();
+    }
+
+    private async Task CloseApply()
+    {
+        if (_applying) return;
+        _applyError = null;
+        if (_applyRun == null) return;
+        _applyRun = null;
+        await ChannelApply.DismissAsync();
+    }
+
+    /// <summary>Starts the run on the server; the panel follows it from there.</summary>
+    private async Task ApplyChannelsAsync(ChannelPlan plan)
+    {
+        if (_applying) return;
+        var (items, notApplied) = ChannelPlanApply.FromPlan(plan);
+        if (items.Count == 0) return;
+
+        _applyError = null;
+        try
+        {
+            if (!await ChannelApply.StartAsync(plan.Band, items, notApplied, plan.HearingNeighbors))
+                _applyError = "Channels are already being applied on this site.";
+            _applyRun = await ChannelApply.GetRunAsync();
+            if (_applying) StartApplyPolling();
+        }
+        catch (Exception ex)
+        {
+            _applyError = ex.Message;
+        }
+    }
+
+    private RenderFragment RenderApplyList(ChannelApplyRunSnapshot run) => @<ul class="channel-apply-list">
+        @for (var i = 0; i < run.Items.Count; i++)
+        {
+            var item = run.Items[i];
+            var outcome = run.Outcomes.FirstOrDefault(o => o.Item == item);
+            <li>
+                <span class="channel-apply-ap">@item.ApName</span>
+                <span class="channel-apply-change">
+                    <span>Ch @item.CurrentChannel / @(item.CurrentWidth) MHz</span>
+                    <span class="channel-change-arrow"><svg width="20" height="14" viewBox="0 0 20 14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 1L19 7L12 13M19 7H1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                    <span class="rec-changed">Ch @item.Channel / @(item.Width) MHz</span>
+                    @if (item.IsDfs)
+                    {
+                        <span class="dfs-badge">DFS</span>
+                    }
+                </span>
+                @if (outcome != null)
+                {
+                    <span class="@ApplyStatusClass(outcome.Status)">@ApplyStatusText(outcome)</span>
+                }
+                else if (run.Running && run.ItemWaves[i] == run.CurrentWave)
+                {
+                    <span class="spinner-sm"></span>
+                }
+            </li>
+        }
+        @foreach (var skipped in run.NotApplied)
+        {
+            <li>
+                <span class="channel-apply-ap">@skipped.Item.ApName</span>
+                <span class="text-muted">@skipped.Reason</span>
+            </li>
+        }
+    </ul>;
+
+    private static string ApplyStatusClass(ChannelApplyStatus status) => status switch
+    {
+        ChannelApplyStatus.Applied => "score-excellent",
+        ChannelApplyStatus.Unconfirmed => "score-fair",
+        ChannelApplyStatus.Failed => "score-poor",
+        _ => "text-muted"
+    };
+
+    private static string ApplyStatusText(ChannelApplyOutcome outcome) => outcome.Status switch
+    {
+        ChannelApplyStatus.Applied => "Applied",
+        ChannelApplyStatus.Unconfirmed => $"Not confirmed: {outcome.Reason}",
+        ChannelApplyStatus.Failed => $"Failed: {outcome.Reason}",
+        _ => $"Skipped: {outcome.Reason}"
+    };
+
+    private ChannelPlan? _channelPlan => _channelPlans.TryGetValue(_selectedBand, out var plan) ? plan : null;
+    private DfsPreference _dfsPreference = DfsPreference.IncludeWithPenalty;
+
+    // Calculated stats
+    private int _avgUtilization;
+    private int _avgInterference;
+    private HashSet<int> _channelsInUse = new();
+    private List<HealthIssue> _channelIssues = new();
+
+    // Width groups: maps (band, channel) -> group info for visual grouping (first group)
+    private Dictionary<(RadioBand Band, int Channel), WidthGroupInfo> _widthGroups = new();
+    // Maps (band, primaryChannel) -> group IDs for that AP's width group
+    private Dictionary<(RadioBand Band, int Channel), int> _primaryGroupIds = new();
+    // Full group data for accurate span rendering when filtering (avoids 2-slot-per-channel limit)
+    private Dictionary<(RadioBand Band, int GroupId), List<int>> _groupChannels = new();
+    // Second group for overlapping channels (renders bottom/cup when first group renders top/hat)
+    private Dictionary<(RadioBand Band, int Channel), WidthGroupInfo> _widthGroups2 = new();
+
+    private readonly RadioBand[] _bands = { RadioBand.Band2_4GHz, RadioBand.Band5GHz, RadioBand.Band6GHz };
+
+    protected override async Task OnInitializedAsync()
+    {
+        StartAgeTicker();
+        try
+        {
+            var dismissed = await SettingsService.GetGlobalAsync(SystemSettingKeys.ChannelDisclaimerDismissed);
+            _channelDisclaimerDismissed = !string.IsNullOrEmpty(dismissed) && dismissed.Equals("true", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { /* Non-critical */ }
+
+        await LoadDataAsync();
+
+        // Default the DFS toggle to match the console's Auto-Optimize configuration
+        // (dfs=true -> Include DFS, dfs=false -> Avoid DFS). Falls back to the field
+        // default when the setting is unavailable.
+        var autoOptimizeDfs = await WiFiService.GetAutoOptimizeDfsEnabledAsync();
+        if (autoOptimizeDfs.HasValue)
+            _dfsPreference = autoOptimizeDfs.Value ? DfsPreference.IncludeWithPenalty : DfsPreference.Exclude;
+
+        // Apply initial filters from parent navigation (explicit band is treated as a manual pick)
+        if (InitialBand.HasValue)
+        {
+            _selectedBand = InitialBand.Value;
+            _bandManuallySelected = true;
+        }
+        if (InitialChannel.HasValue)
+            _selectedChannel = InitialChannel.Value;
+
+        if (AutoRunRecommendation)
+            await RunRecommendation();
+
+        await LoadApplyRunAsync();
+    }
+
+    private async Task LoadDataAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        try
+        {
+            _accessPoints = await WiFiService.GetAccessPointsAsync();
+            _regulatoryData = await WiFiService.GetRegulatoryChannelsAsync();
+            _healthScore = await WiFiService.GetSiteHealthScoreAsync();
+            AnalyzeChannels();
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task RefreshData()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        try
+        {
+            _accessPoints = await WiFiService.GetAccessPointsAsync(forceRefresh: true);
+            _regulatoryData = await WiFiService.GetRegulatoryChannelsAsync();
+            _healthScore = await WiFiService.GetSiteHealthScoreAsync(forceRefresh: true);
+            AnalyzeChannels();
+
+            // Re-run recommendations if they're currently displayed
+            if (_showRecommendations)
+            {
+                var options = new RecommendationOptions { DfsPreference = _dfsPreference };
+                _channelPlans = await WiFiService.GetAllChannelRecommendationsAsync(options, forceRefresh: true);
+            }
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    private void AnalyzeChannels()
+    {
+        _channelIssues.Clear();
+        _channelsInUse.Clear();
+
+        var allRadios = _accessPoints.SelectMany(ap => ap.Radios).ToList();
+
+        // Calculate averages
+        var utilizationValues = allRadios.Where(r => r.ChannelUtilization.HasValue).Select(r => r.ChannelUtilization!.Value).ToList();
+        var interferenceValues = allRadios.Where(r => r.Interference.HasValue).Select(r => r.Interference!.Value).ToList();
+
+        _avgUtilization = utilizationValues.Count > 0 ? (int)utilizationValues.Average() : 0;
+        _avgInterference = interferenceValues.Count > 0 ? (int)interferenceValues.Average() : 0;
+
+        // Track channels in use
+        foreach (var radio in allRadios.Where(r => r.Channel.HasValue))
+        {
+            _channelsInUse.Add(radio.Channel!.Value);
+        }
+
+        // Calculate width groups for visual display
+        CalculateWidthGroups(allRadios);
+
+        // Pull channel-related issues from the health score engine
+        // (uses propagation modeling to filter false co-channel positives)
+        if (_healthScore != null)
+        {
+            _channelIssues = _healthScore.Issues
+                .Where(i => i.Dimensions.Contains(HealthDimension.ChannelHealth))
+                .ToList();
+
+        }
+    }
+
+    private void SelectChannel(RadioBand band, int channel)
+    {
+        var apsOnChannel = GetApsOnChannel(band, channel);
+        if (apsOnChannel.Any())
+        {
+            // Toggle same channel off, switch to different channel
+            _selectedChannel = _selectedChannel == channel ? null : channel;
+        }
+    }
+
+    private void SelectApChannel(int? channel)
+    {
+        if (channel.HasValue)
+        {
+            _selectedChannel = _selectedChannel == channel.Value ? null : channel.Value;
+        }
+    }
+
+    private List<int> GetChannelsForBand(RadioBand band)
+    {
+        // Use regulatory data when available to only show channels valid for this domain
+        if (_regulatoryData != null)
+        {
+            // Use raw 20 MHz channel lists (GetChannels() applies PSC filtering for 6 GHz
+            // which would hide most channels from the map)
+            var dict = band switch
+            {
+                RadioBand.Band2_4GHz => _regulatoryData.Channels2_4GHz,
+                RadioBand.Band5GHz => _regulatoryData.Channels5GHz,
+                RadioBand.Band6GHz => _regulatoryData.Channels6GHz,
+                _ => null
+            };
+
+            if (dict != null && dict.TryGetValue(20, out var regChannels) && regChannels.Length > 0)
+                return regChannels.OrderBy(c => c).ToList();
+        }
+
+        // Fallback: show all possible channels (use 13 for 2.4 GHz since 14 is Japan-only)
+        return band switch
+        {
+            RadioBand.Band2_4GHz => Enumerable.Range(1, 13).ToList(),
+            RadioBand.Band5GHz => new List<int> { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165 },
+            RadioBand.Band6GHz => Enumerable.Range(0, 59).Select(i => 1 + i * 4).ToList(),
+            _ => new List<int>()
+        };
+    }
+
+    private List<AccessPointSnapshot> GetApsOnChannel(RadioBand band, int channel)
+    {
+        return _accessPoints
+            .Where(ap => ap.Radios.Any(r => r.Band == band && r.Channel == channel))
+            .ToList();
+    }
+
+    private int GetChannelUtilization(RadioBand band, int channel)
+    {
+        var radios = _accessPoints
+            .SelectMany(ap => ap.Radios)
+            .Where(r => r.Band == band && r.Channel == channel && r.ChannelUtilization.HasValue)
+            .ToList();
+
+        return radios.Count > 0 ? (int)radios.Average(r => r.ChannelUtilization!.Value) : 0;
+    }
+
+    private int GetChannelInterference(RadioBand band, int channel)
+    {
+        var radios = _accessPoints
+            .SelectMany(ap => ap.Radios)
+            .Where(r => r.Band == band && r.Channel == channel && r.Interference.HasValue)
+            .ToList();
+
+        return radios.Count > 0 ? (int)radios.Average(r => r.Interference!.Value) : 0;
+    }
+
+    private bool IsChannelOverlapped(RadioBand band, int? channel)
+    {
+        if (!channel.HasValue) return false;
+
+        return CoChannelIssueFor(band, channel.Value) != null;
+    }
+
+    // The health engine's co-channel issues apply propagation filtering, which avoids false
+    // positives from APs too far apart to interfere. An issue can span several primaries, so
+    // it is matched on its channel set rather than its title.
+    private HealthIssue? CoChannelIssueFor(RadioBand band, int channel)
+    {
+        var bandStr = band.ToDisplayString();
+        return _channelIssues.FirstOrDefault(i =>
+            i.Title.StartsWith("Co-Channel", StringComparison.OrdinalIgnoreCase) &&
+            i.Title.Contains(bandStr) &&
+            i.AffectedChannels.Contains(channel));
+    }
+
+    private bool IsChannelMesh(RadioBand band, int? channel)
+    {
+        if (!channel.HasValue) return false;
+        var apsOnChannel = GetApsOnChannel(band, channel.Value);
+        if (apsOnChannel.Count <= 1) return false;
+
+        // Check if there are mesh pairs on this channel
+        return apsOnChannel.Any(ap =>
+            ap.IsMeshChild &&
+            !string.IsNullOrEmpty(ap.MeshParentMac) &&
+            ap.MeshUplinkUsesChannel(band, channel.Value) &&
+            apsOnChannel.Any(parent => parent.Mac.Equals(ap.MeshParentMac, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private (bool HasIssues, bool HasMesh, int ChannelCount) GetBandData(RadioBand band)
+    {
+        var radiosInBand = _accessPoints.SelectMany(ap => ap.Radios).Where(r => r.Band == band && r.Channel.HasValue).ToList();
+        var channelGroups = radiosInBand.GroupBy(r => r.Channel!.Value).ToList();
+
+        // Use health engine's propagation-filtered co-channel issues
+        var bandStr = band.ToDisplayString();
+        bool hasActualOverlap = _channelIssues.Any(i =>
+            i.Title.StartsWith("Co-Channel", StringComparison.OrdinalIgnoreCase) &&
+            i.Title.Contains(bandStr));
+
+        bool hasMesh = false;
+        foreach (var group in channelGroups.Where(g => g.Count() > 1))
+        {
+            var apsOnChannel = GetApsOnChannel(band, group.Key);
+            var nonMeshAps = WiFiAnalysisHelpers.FilterOutMeshPairs(apsOnChannel, band, group.Key);
+
+            if (apsOnChannel.Count > nonMeshAps.Count || (apsOnChannel.Count > 1 && nonMeshAps.Count == 0))
+                hasMesh = true;
+        }
+
+        return (hasActualOverlap, hasMesh, channelGroups.Count);
+    }
+
+    private string GetBandDescription(RadioBand band)
+    {
+        return band switch
+        {
+            RadioBand.Band2_4GHz => "2412-2484 MHz (20/40 MHz)",
+            RadioBand.Band5GHz => "5180-5885 MHz (20-160 MHz)",
+            RadioBand.Band6GHz => "5935-7115 MHz (20-320 MHz)",
+            _ => ""
+        };
+    }
+
+    private string GetUtilizationStatClass(int util) => util switch
+    {
+        > 70 => "stat-danger",
+        > 50 => "stat-warning",
+        _ => ""
+    };
+
+    private string GetInterferenceStatClass(int interf) => interf switch
+    {
+        > 30 => "stat-danger",
+        > 15 => "stat-warning",
+        _ => ""
+    };
+
+    private string GetUtilizationClass(int util) => util switch
+    {
+        > 70 => "util-high",
+        > 50 => "util-medium",
+        _ => "util-low"
+    };
+
+    private string GetInterferenceClass(int interf) => interf switch
+    {
+        > 30 => "interf-high",
+        > 15 => "interf-medium",
+        _ => "interf-low"
+    };
+
+    private string GetSatisfactionClass(int sat) => sat switch
+    {
+        >= 80 => "sat-excellent",
+        >= 60 => "sat-good",
+        >= 40 => "sat-fair",
+        _ => "sat-poor"
+    };
+
+    private string GetBandClass(RadioBand band) => band switch
+    {
+        RadioBand.Band2_4GHz => "band-2ghz",
+        RadioBand.Band5GHz => "band-5ghz",
+        RadioBand.Band6GHz => "band-6ghz",
+        _ => ""
+    };
+
+    // --- Channel Recommendation Methods ---
+
+    private async Task RunRecommendation()
+    {
+        _loadingRecommendations = true;
+        StateHasChanged();
+
+        try
+        {
+            var options = new RecommendationOptions
+            {
+                DfsPreference = _dfsPreference
+            };
+
+            _channelPlans = await WiFiService.GetAllChannelRecommendationsAsync(options);
+            _showRecommendations = _channelPlans.Count > 0;
+            AutoSelectBandWithRecommendations();
+            await LoadScanGapsAsync();
+            await LoadStaleScanTargetsAsync();
+        }
+        finally
+        {
+            _loadingRecommendations = false;
+            StateHasChanged();
+        }
+    }
+
+    // (AP, band) pairs whose recommendation falls back to neighbor scans because they have no recent
+    // per-channel spectrum measurement. A quick-scan fills them.
+    private List<SpectrumScanGap> _scanGaps = new();
+    private bool _scanningGaps;
+    // (AP, band) pairs that DO have scan data, but it's stale AND load-bearing on the recommendation
+    // (an uncorroborated reading is holding/deciding a channel), so a re-scan could change the advice.
+    private List<SpectrumScanGap> _staleScanTargets = new();
+    private bool _scanningStale;
+    private string? _staleScanError;
+    // Progress for the running gap scan: bands started so far, and the total to scan. Drives the
+    // "Scanning… X/N bands" label so a multi-minute serial scan reads as working, not hung.
+    private int _scanCompletedBands;
+    private int _scanTotalBands;
+    // Set when a scan fails because the UniFi account lacks Network: Full (Site Admin in older versions).
+    private string? _scanError;
+
+    private string ScanProgressLabel() =>
+        _scanTotalBands > 1
+            ? $"Scanning… {Math.Clamp(_scanCompletedBands, 1, _scanTotalBands)}/{_scanTotalBands} bands"
+            : "Scanning…";
+
+    // Disruption note tailored to the targets' scan hardware: an AP with a dedicated scan radio
+    // measures without touching its serving radios (no client impact); without one, scanning briefly
+    // steps the serving radio off-channel and a mesh parent can drop the devices meshed through it.
+    private static string ScanDisruptionNote(List<SpectrumScanGap> targets)
+    {
+        var clean = targets.Count(g => g.HasDedicatedScanRadio);
+        var disruptive = targets.Count - clean;
+        var meshNote = targets.Any(g => g.IsMeshParent && !g.HasDedicatedScanRadio)
+            ? " (and devices meshed through an AP)" : "";
+
+        if (disruptive == 0)
+            return "Won't disrupt clients.";
+        return $"May briefly interrupt {(clean == 0 ? "clients" : "some clients")}{meshNote}; best at quiet times.";
+    }
+
+    private async Task LoadScanGapsAsync()
+    {
+        try
+        {
+            _scanGaps = await WiFiService.GetSpectrumScanGapsAsync();
+        }
+        catch
+        {
+            _scanGaps = new();
+        }
+    }
+
+    // Stale-and-material targets are derived from the already-computed plan, so this is called right
+    // after each recommendation load (never blocks or alters the gap flow above).
+    private async Task LoadStaleScanTargetsAsync()
+    {
+        try
+        {
+            _staleScanTargets = await WiFiService.GetStaleScanTargetsAsync(_channelPlans);
+        }
+        catch
+        {
+            _staleScanTargets = new();
+        }
+    }
+
+    private async Task RunGapScans()
+    {
+        if (_scanningGaps || _scanGaps.Count == 0) return;
+
+        _scanningGaps = true;
+        _scanError = null;
+        _scanCompletedBands = 0;
+        _scanTotalBands = _scanGaps.Count; // one band scan per gapped (AP, band)
+        StateHasChanged();
+        try
+        {
+            var targets = _scanGaps.Select(g => (g.ApMac, g.BandCode)).ToList();
+            // Report progress on the Blazor circuit's context; Math.Max keeps the count monotonic
+            // even if concurrent APs report band starts out of order.
+            var progress = new Progress<int>(n =>
+            {
+                _scanCompletedBands = Math.Max(_scanCompletedBands, n);
+                InvokeAsync(StateHasChanged);
+            });
+            await WiFiService.RunQuickScansAsync(targets, progress);
+
+            // Re-run recommendations on the fresh spectrum data, then re-check what's still missing.
+            var options = new RecommendationOptions { DfsPreference = _dfsPreference };
+            _channelPlans = await WiFiService.GetAllChannelRecommendationsAsync(options, forceRefresh: true);
+            await LoadScanGapsAsync();
+            await LoadStaleScanTargetsAsync();
+        }
+        catch (ScanPermissionException ex)
+        {
+            _scanError = ex.Message;
+        }
+        finally
+        {
+            _scanningGaps = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task RunStaleScans()
+    {
+        if (_scanningGaps || _scanningStale || _staleScanTargets.Count == 0) return;
+
+        _scanningStale = true;
+        _staleScanError = null;
+        _scanCompletedBands = 0;
+        _scanTotalBands = _staleScanTargets.Count; // one band scan per stale (AP, band)
+        StateHasChanged();
+        try
+        {
+            var targets = _staleScanTargets.Select(g => (g.ApMac, g.BandCode)).ToList();
+            var progress = new Progress<int>(n =>
+            {
+                _scanCompletedBands = Math.Max(_scanCompletedBands, n);
+                InvokeAsync(StateHasChanged);
+            });
+            await WiFiService.RunQuickScansAsync(targets, progress);
+
+            // Re-run recommendations on the fresh spectrum data, then re-evaluate both banners.
+            var options = new RecommendationOptions { DfsPreference = _dfsPreference };
+            _channelPlans = await WiFiService.GetAllChannelRecommendationsAsync(options, forceRefresh: true);
+            await LoadScanGapsAsync();
+            await LoadStaleScanTargetsAsync();
+        }
+        catch (ScanPermissionException ex)
+        {
+            _staleScanError = ex.Message;
+        }
+        finally
+        {
+            _scanningStale = false;
+            StateHasChanged();
+        }
+    }
+
+    private bool BandHasChanges(RadioBand band) =>
+        _channelPlans.TryGetValue(band, out var plan) && plan.Recommendations.Any(r => r.IsChanged);
+
+    /// <summary>
+    /// After running the engine, land on a band that actually has recommendations instead of
+    /// the static default. Skips if the user explicitly picked a band, or if the current band
+    /// already has changes, so we never yank someone off a band they're deliberately viewing.
+    /// </summary>
+    private void AutoSelectBandWithRecommendations()
+    {
+        if (_bandManuallySelected) return;
+        if (BandHasChanges(_selectedBand)) return;
+
+        foreach (var band in _bands)
+        {
+            if (BandHasChanges(band))
+            {
+                _selectedBand = band;
+                _selectedChannel = null;
+                break;
+            }
+        }
+    }
+
+    private async Task ChangeDfsPreference(DfsPreference pref)
+    {
+        _dfsPreference = pref;
+        await RunRecommendation();
+    }
+
+    private string GetApModel(string mac)
+    {
+        return _accessPoints.FirstOrDefault(ap =>
+            ap.Mac.Equals(mac, StringComparison.OrdinalIgnoreCase))?.Model ?? "";
+    }
+
+    private static string FormatScore(double score) => score.ToString("F1");
+
+    private static string FormatPercent(double pct) => pct.ToString("F0");
+
+    private static string GetSoakTooltip(ApChannelRecommendation rec)
+    {
+        var channels = string.Join(", ", rec.SoakSuppressedChannels);
+        var chLabel = rec.SoakSuppressedChannels.Count == 1 ? "Ch" : "Channels";
+        var until = rec.SoakEndsAt.HasValue
+            ? $" until {rec.SoakEndsAt.Value.ToLocalTime():MMM d h:mm tt}"
+            : "";
+        return $"Channel changed recently. {chLabel} {channels} won't be re-suggested{until} " +
+               "so the new channel can prove itself on measured data.";
+    }
+
+    private static string GetScoreClass(double score) => score switch
+    {
+        <= 0.5 => "score-excellent",
+        <= 1.5 => "score-good",
+        <= 3.0 => "score-fair",
+        <= 5.0 => "score-poor",
+        _ => "score-bad"
+    };
+
+    private class WidthGroupInfo
+    {
+        public int Width { get; set; }          // Channel width in MHz
+        public int GroupId { get; set; }        // Unique ID for the group
+        public string Position { get; set; } = "single";  // "start", "middle", "end", "single"
+        public string ApName { get; set; } = "";
+        public RadioBand Band { get; set; }     // Band for color matching
+        public bool IsOddGroup => GroupId % 2 == 0;  // First group (0) is "odd", second (1) is "even", etc.
+    }
+
+    private void CalculateWidthGroups(List<RadioSnapshot> allRadios)
+    {
+        _widthGroups.Clear();
+        _widthGroups2.Clear();
+        _primaryGroupIds.Clear();
+        _groupChannels.Clear();
+
+        // Step 1: Collect width groups, de-duplicating by primary channel
+        // Same primary = same group (e.g., mesh APs both on channel 108)
+        // Different primaries in same span = separate groups to show overlap (e.g., 36 vs 64 in 160 MHz)
+        var uniqueGroups = new List<(RadioBand Band, int PrimaryChannel, List<int> Channels, int Width, string ApName)>();
+
+        foreach (var radio in allRadios.Where(r => r.Channel.HasValue && r.ChannelWidth.HasValue))
+        {
+            var band = radio.Band;
+            var primaryChannel = radio.Channel!.Value;
+            var width = radio.ChannelWidth!.Value;
+            var apName = _accessPoints.FirstOrDefault(ap => ap.Radios.Contains(radio))?.Name ?? "";
+
+            var spannedChannels = GetChannelWidthSpan(band, primaryChannel, width, radio.ExtChannel, radio.CenterChannel);
+            var orderedChannels = spannedChannels.OrderBy(c => c).ToList();
+
+            // De-duplicate by primary channel - same primary = same group
+            var alreadyExists = uniqueGroups.Any(g =>
+                g.Band == band &&
+                g.PrimaryChannel == primaryChannel);
+
+            if (!alreadyExists)
+            {
+                uniqueGroups.Add((band, primaryChannel, orderedChannels, width, apName));
+            }
+        }
+
+        // Step 2: Sort by band then primary channel, and assign group IDs PER BAND
+        var sortedGroups = uniqueGroups
+            .OrderBy(g => g.Band)
+            .ThenBy(g => g.PrimaryChannel)
+            .ToList();
+
+        // Step 3: Assign group IDs per band and populate _widthGroups
+        var groupIdPerBand = new Dictionary<RadioBand, int>();
+
+        foreach (var group in sortedGroups)
+        {
+            // Get or initialize group ID counter for this band
+            if (!groupIdPerBand.TryGetValue(group.Band, out var groupId))
+            {
+                groupId = 0;
+            }
+
+            var channels = group.Channels;
+
+            for (int i = 0; i < channels.Count; i++)
+            {
+                var ch = channels[i];
+                var position = channels.Count == 1 ? "single"
+                    : i == 0 ? "start"
+                    : i == channels.Count - 1 ? "end"
+                    : "middle";
+
+                var key = (group.Band, ch);
+                var groupInfo = new WidthGroupInfo
+                {
+                    Width = group.Width,
+                    GroupId = groupId,
+                    Position = position,
+                    ApName = group.ApName,
+                    Band = group.Band
+                };
+
+                if (!_widthGroups.ContainsKey(key))
+                {
+                    _widthGroups[key] = groupInfo;
+                }
+                else if (!_widthGroups2.ContainsKey(key))
+                {
+                    // Second group for this channel - store for additive rendering
+                    _widthGroups2[key] = groupInfo;
+                }
+                // Third+ groups ignored for now
+            }
+
+            // Map primary channel to its group ID and store full channel list
+            _primaryGroupIds[(group.Band, group.PrimaryChannel)] = groupId;
+            _groupChannels[(group.Band, groupId)] = channels;
+
+            // Increment group ID for this band
+            groupIdPerBand[group.Band] = groupId + 1;
+        }
+    }
+
+    private List<int> GetChannelWidthSpan(RadioBand band, int primaryChannel, int width, int? extChannel = null, int? centerChannel = null) =>
+        ChannelSpanHelper.GetChannelWidthSpan(band, primaryChannel, width, extChannel, centerChannel);
+
+    private string GetChannelGroupClass(RadioBand band, int channel)
+    {
+        var key = (band, channel);
+        if (_widthGroups.TryGetValue(key, out var info))
+        {
+            // Determine which groups to show when a channel is selected
+            // Use primary channel lookup to find the correct group for the clicked AP
+            int? selectedGroupId = null;
+            if (_selectedChannel.HasValue)
+            {
+                var primaryKey = (band, _selectedChannel.Value);
+                selectedGroupId = _primaryGroupIds.TryGetValue(primaryKey, out var gid) ? gid : -1;
+            }
+
+            bool showGroup1 = !_selectedChannel.HasValue || info.GroupId == selectedGroupId;
+            bool hasGroup2 = _widthGroups2.TryGetValue(key, out var info2);
+            bool showGroup2 = hasGroup2 && (!_selectedChannel.HasValue || info2!.GroupId == selectedGroupId);
+
+            // Neither group matches the selection - check if this channel was dropped as 3rd+ group
+            if (!showGroup1 && !showGroup2)
+                return GetDroppedGroupClass(band, channel, selectedGroupId);
+
+            // If only group2 matches, promote it to primary rendering (::before)
+            if (!showGroup1 && showGroup2)
+            {
+                info = info2!;
+                showGroup2 = false;
+            }
+
+            var bandClass = info.Band switch
+            {
+                RadioBand.Band2_4GHz => "band-2ghz",
+                RadioBand.Band5GHz => "band-5ghz",
+                RadioBand.Band6GHz => "band-6ghz",
+                _ => ""
+            };
+            // Keep original top/bottom position for consistency
+            var oddEvenClass = info.IsOddGroup ? "group-odd" : "group-even";
+
+            // Both groups visible - render as overlapping
+            if (showGroup2)
+            {
+                var bandClass2 = info2!.Band switch
+                {
+                    RadioBand.Band2_4GHz => "band-2ghz",
+                    RadioBand.Band5GHz => "band-5ghz",
+                    RadioBand.Band6GHz => "band-6ghz",
+                    _ => ""
+                };
+                var oddEvenClass2 = info2.IsOddGroup ? "group-odd" : "group-even";
+                return $"width-group {bandClass} group-{info.Position} {oddEvenClass} " +
+                       $"has-group2 group2-{bandClass2} group2-{info2.Position} group2-{oddEvenClass2} width-overlap-hatched";
+            }
+
+            return $"width-group {bandClass} group-{info.Position} {oddEvenClass}";
+        }
+
+        // Channel not in _widthGroups at all - check if it belongs to the selected group (dropped as 3rd+)
+        if (_selectedChannel.HasValue)
+        {
+            var primaryKey = (band, _selectedChannel.Value);
+            var selGid = _primaryGroupIds.TryGetValue(primaryKey, out var gid) ? gid : -1;
+            return GetDroppedGroupClass(band, channel, selGid);
+        }
+        return "";
+    }
+
+    /// <summary>
+    /// Renders a channel that was dropped from _widthGroups (3rd+ overlapping group)
+    /// by reconstructing its position from the group's full channel list.
+    /// </summary>
+    private string GetDroppedGroupClass(RadioBand band, int channel, int? selectedGroupId)
+    {
+        if (!selectedGroupId.HasValue) return "";
+
+        var groupKey = (band, selectedGroupId.Value);
+        if (!_groupChannels.TryGetValue(groupKey, out var channels) || !channels.Contains(channel))
+            return "";
+
+        var bandClass = band switch
+        {
+            RadioBand.Band2_4GHz => "band-2ghz",
+            RadioBand.Band5GHz => "band-5ghz",
+            RadioBand.Band6GHz => "band-6ghz",
+            _ => ""
+        };
+        var oddEvenClass = selectedGroupId.Value % 2 == 0 ? "group-odd" : "group-even";
+        var position = channels.Count == 1 ? "single"
+            : channel == channels[0] ? "start"
+            : channel == channels[^1] ? "end"
+            : "middle";
+
+        return $"width-group {bandClass} group-{position} {oddEvenClass}";
+    }
+
+    private async Task DismissChannelDisclaimerAsync()
+    {
+        _channelDisclaimerDismissed = true;
+        try
+        {
+            await SettingsService.SetGlobalAsync(SystemSettingKeys.ChannelDisclaimerDismissed, "true");
+        }
+        catch { /* Still hide it */ }
+    }
+}

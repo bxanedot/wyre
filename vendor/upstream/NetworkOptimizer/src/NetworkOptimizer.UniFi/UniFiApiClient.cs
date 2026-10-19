@@ -1,0 +1,4173 @@
+using System.Net;
+using System.Net.Http.Json;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using NetworkOptimizer.Core;
+using NetworkOptimizer.Core.Models;
+using NetworkOptimizer.UniFi.Models;
+using Polly;
+
+namespace NetworkOptimizer.UniFi;
+
+/// <summary>
+/// Full-featured UniFi Controller API client with cookie-based authentication
+/// Handles all quirks of the unofficial UniFi API including:
+/// - Cookie-based session management (like browser)
+/// - CSRF token handling
+/// - Automatic re-authentication on 401/403 and on transient 502/503/504 from a reverse proxy
+/// - Retry logic with Polly
+/// - Self-signed certificate handling
+/// - UniFi OS (UDM/UCG) vs standalone controller path detection
+///
+/// For UniFi OS devices (UDM, UCG), the Network Application is proxied at:
+///   /proxy/network/api/s/{site}/...
+/// For standalone controllers, the path is:
+///   /api/s/{site}/...
+/// </summary>
+public class UniFiApiClient : IDisposable
+{
+    private readonly ILogger<UniFiApiClient> _logger;
+    private readonly string _controllerUrl;
+    private readonly string _username;
+    private readonly string _password;
+    private readonly string? _apiKey;
+    private readonly string _site;
+    private readonly bool _ignoreSSLErrors;
+
+    /// <summary>Loopback port of this site's agent tunnel proxy, or null for a direct connection.</summary>
+    private readonly int? _agentProxyPort;
+    private HttpClient? _httpClient;
+    private CookieContainer? _cookieContainer;
+    private string? _csrfToken;
+    private readonly IAsyncPolicy _retryPolicy;
+    private readonly SemaphoreSlim _authLock = new(1, 1);
+    // Set in Dispose() before the HttpClient is torn down. A concurrent reconnect
+    // can dispose this client while a data call is in flight; the flag and the
+    // ObjectDisposedException catch in ExecuteRequestAsync turn that into a benign
+    // skip instead of a disposed-object crash.
+    private volatile bool _disposed;
+    private List<UniFiDeviceResponse>? _cachedDeviceResponses;
+    private DateTime _deviceResponseCacheTime = DateTime.MinValue;
+    private static readonly TimeSpan DeviceResponseCacheTtl = TimeSpan.FromSeconds(15);
+    // networkconf is site config, not state: a minute stale is invisible to every periodic
+    // reader, and without this each device discovery and gateway-IP lookup fetched it again.
+    private List<UniFiNetworkConfig>? _cachedNetworkConfigs;
+    private DateTime _networkConfigCacheTime = DateTime.MinValue;
+    private static readonly TimeSpan NetworkConfigCacheTtl = TimeSpan.FromSeconds(60);
+    private bool _isAuthenticated = false;
+    private DateTime _lastApiKeyRevalidationAttempt = DateTime.MinValue;
+    private static readonly TimeSpan ApiKeyRevalidationInterval = TimeSpan.FromSeconds(60);
+
+    /// <summary>When the Console last rejected this client's password (401/403 on the login), or MinValue.</summary>
+    private DateTime _passwordRejectedAt = DateTime.MinValue;
+
+    /// <summary>
+    /// How often a rejected password is tried again. Sized to stay far under a Console's failed-login
+    /// lockout, so a changed password never locks the account before the new one is saved.
+    /// </summary>
+    public static readonly TimeSpan RejectedPasswordRetryInterval = TimeSpan.FromMinutes(5);
+
+    /// <summary>Whether this client's last login was refused because of its password.</summary>
+    public bool PasswordRejected => _passwordRejectedAt != DateTime.MinValue;
+
+    /// <summary>
+    /// A 429 on the login is the Console's login attempt limit. It counts every login, correct or not
+    /// (about 5 in a few seconds), sends no Retry-After, and cleared within a minute when left alone.
+    /// The hold doubles from 10 s per consecutive 429 and stops at 60 s, so a connection is never
+    /// left down for long once the limit clears.
+    /// </summary>
+    public static readonly TimeSpan LoginLimitInitialBackoff = TimeSpan.FromSeconds(10);
+
+    /// <summary>The longest hold after consecutive 429s on the login.</summary>
+    public static readonly TimeSpan LoginLimitMaxBackoff = TimeSpan.FromSeconds(60);
+
+    private DateTime _loginLimitedUntil = DateTime.MinValue;
+    private TimeSpan _loginLimitBackoff = TimeSpan.Zero;
+
+    /// <summary>When the login attempt limit next allows a login, or MinValue.</summary>
+    public DateTime LoginLimitedUntil => _loginLimitedUntil;
+
+    /// <summary>The hold set by the last 429 on the login, or zero after a successful login.</summary>
+    public TimeSpan LoginLimitBackoff => _loginLimitBackoff;
+
+    /// <summary>Carries the login attempt limit hold over from the client this one replaces.</summary>
+    public void CarryLoginLimit(DateTime limitedUntil, TimeSpan backoff)
+    {
+        _loginLimitedUntil = limitedUntil;
+        _loginLimitBackoff = backoff;
+    }
+    private bool _isUniFiOs = false; // True for UDM/UCG, false for standalone controller
+    private bool _pathDetected = false;
+    private bool _useStandaloneLogin = false; // True for standalone Network controllers (uses /api/login)
+    private string? _lastLoginError;
+    private string? _lastApiError;
+    private string? _lastApiErrorCode;
+    // Set on a 405 from the Network app (a CloudKey serves neither endpoint). Expires after an hour and
+    // dies with this client, which is rebuilt on every Console connect, so a stray 405 cannot stick.
+    private static readonly TimeSpan UnsupportedEndpointBackoff = TimeSpan.FromHours(1);
+    private long _trafficFlowsUnsupportedUntilTicks;
+    private long _threatLogUnsupportedUntilTicks;
+
+    /// <summary>
+    /// Gets the last login error message (e.g., rate limiting, SSL errors)
+    /// </summary>
+    public string? LastLoginError => _lastLoginError;
+
+    /// <summary>
+    /// Gets the last API error message from a site-specific API call
+    /// </summary>
+    public string? LastApiError => _lastApiError;
+
+    /// <summary>
+    /// Gets the last API error code (e.g., "api.err.NoSiteContext")
+    /// </summary>
+    public string? LastApiErrorCode => _lastApiErrorCode;
+
+    /// <summary>
+    /// Whether this client uses API key authentication instead of username/password
+    /// </summary>
+    public bool UseApiKey => !string.IsNullOrEmpty(_apiKey);
+
+    /// <summary>
+    /// Raised after every real login/validation attempt with the outcome and, on failure,
+    /// the login error. Lets the owning connection service track consecutive auth failures
+    /// (console restarting, upgrading, or unreachable) for alerting. Not raised for the
+    /// already-authenticated fast path. Handlers must be cheap and must not call back into
+    /// this client - the event fires while the auth lock is held.
+    /// </summary>
+    public event Action<bool, string?>? AuthProbeCompleted;
+
+    /// <summary>
+    /// Raised when consecutive timeouts show the console has stopped answering. Carries the client
+    /// that saw them so a subscriber can ignore one that is no longer its live client.
+    /// </summary>
+    public event Action<UniFiApiClient>? ConsoleWentSilent;
+
+    /// <summary>
+    /// True for an HttpClient timeout, false for a caller cancelling. Both arrive as
+    /// TaskCanceledException; only the timeout says anything about the console.
+    /// </summary>
+    private static bool IsRequestTimeout(Exception ex) => ex.InnerException is TimeoutException;
+
+    /// <summary>Consecutive request timeouts before the console counts as silent.</summary>
+    private const int SilentTimeoutStreak = 2;
+
+    /// <summary>How long requests fail instantly once it is silent, before one probes for its return.</summary>
+    private static readonly TimeSpan SilentCooldown = TimeSpan.FromSeconds(30);
+
+    private int _consecutiveTimeouts;
+    private long _silentUntilTicks;
+
+    public UniFiApiClient(
+        ILogger<UniFiApiClient> logger,
+        string controllerHost,
+        string username,
+        string password,
+        string site = "default",
+        bool ignoreSSLErrors = true,
+        string? apiKey = null,
+        int? agentProxyPort = null)
+    {
+        _agentProxyPort = agentProxyPort;
+        _logger = logger;
+        _controllerUrl = controllerHost.StartsWith("https://") ? controllerHost : $"https://{controllerHost}";
+        _username = username;
+        _password = password;
+        _apiKey = apiKey;
+        _site = site;
+        _ignoreSSLErrors = ignoreSSLErrors;
+
+        // Configure retry policy for transient failures. A console reached through
+        // an agent tunnel is dialed via a loopback proxy; when that
+        // tunnel is black-holed the proxy fast-fails the open, but this retry sits
+        // ABOVE the proxy and would otherwise stack the full 2+4+8s (~14s)
+        // exponential backoff onto every request - which reads as a frozen site
+        // switch on that site for the whole ~90s before the watchdog flips the
+        // console to awaiting-agent. Retrying a dead tunnel can't help, so
+        // agent-proxied consoles get a single quick retry. Directly-connected
+        // consoles keep the full backoff - a real transient blip there is worth
+        // riding out.
+        var viaAgentProxy = _agentProxyPort is not null;
+
+        void OnRetry(Exception exception, TimeSpan timespan, int retryCount, Context context) =>
+            _logger.LogWarning("Retry {RetryCount} after {Timespan}s due to {Exception}",
+                retryCount, timespan.TotalSeconds, exception.Message);
+
+        // Split by meaning: a refused or reset connection returns in milliseconds and is often a
+        // real blip, so it keeps the full backoff. A timeout means the console went silent after
+        // the handshake, which no backoff can clear, and each retry costs another full 15s.
+        var timeoutRetry = Policy
+            .Handle<TaskCanceledException>(IsRequestTimeout)
+            .WaitAndRetryAsync(1, _ => TimeSpan.FromMilliseconds(500), OnRetry);
+        var transientRetry = Policy
+            .Handle<HttpRequestException>()
+            .WaitAndRetryAsync(
+                retryCount: viaAgentProxy ? 1 : 3,
+                sleepDurationProvider: retryAttempt => viaAgentProxy
+                    ? TimeSpan.FromMilliseconds(500)
+                    : TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+                onRetry: OnRetry);
+        _retryPolicy = Policy.WrapAsync(transientRetry, timeoutRetry);
+
+        InitializeHttpClient();
+    }
+
+    /// <summary>
+    /// Runs an HTTP request through the shared retry policy, treating a disposed
+    /// client as a benign no-op. When a concurrent reconnect disposes this client's
+    /// <see cref="_httpClient"/> before or during the request, there is no live
+    /// client to complete against, so we return the same "couldn't complete" value
+    /// these methods already yield on failure (null / false / default) instead of
+    /// surfacing an <see cref="ObjectDisposedException"/> to the caller. Only ever
+    /// taken during teardown - never against a live client - so the happy path and
+    /// single-site installs are behavior-identical.
+    /// </summary>
+    internal async Task<T> ExecuteRequestAsync<T>(Func<Task<T>> action)
+    {
+        if (_disposed) return default!;
+
+        // A console that answers TCP and then goes quiet costs a full timeout on every call, and a
+        // page makes many - that is what reads as a frozen UI. Once it has proven silent, fail them
+        // instantly and let one through per cooldown to notice it came back, so this cannot latch.
+        if (DateTime.UtcNow.Ticks < Interlocked.Read(ref _silentUntilTicks)) return default!;
+
+        try
+        {
+            var result = await _retryPolicy.ExecuteAsync(action);
+            Interlocked.Exchange(ref _consecutiveTimeouts, 0);
+            Interlocked.Exchange(ref _silentUntilTicks, 0);
+            return result;
+        }
+        catch (ObjectDisposedException)
+        {
+            _logger.LogDebug("UniFi API request skipped: client was disposed by a concurrent reconnect");
+            return default!;
+        }
+        catch (TaskCanceledException ex)
+        {
+            // Rethrown, not swallowed: callers already turn this into their own failure result and
+            // their error reporting should not change just because we counted it. A caller
+            // cancelling (page navigation, site switch, shutdown) throws the same type and says
+            // nothing about the console, so it must never count toward silence.
+            if (IsRequestTimeout(ex)
+                && Interlocked.Increment(ref _consecutiveTimeouts) >= SilentTimeoutStreak)
+            {
+                Interlocked.Exchange(ref _silentUntilTicks, (DateTime.UtcNow + SilentCooldown).Ticks);
+                ConsoleWentSilent?.Invoke(this);
+            }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The message handler a console connection runs on. Cookie handling is declared identically on
+    /// both paths: UniFi's password sign-in is cookie-based, so a handler without a cookie container
+    /// authenticates and then forgets it has. Only the DIALLING differs - a tunnelled console keeps
+    /// its own URL (and so its Host header and TLS SNI) and is connected to at the loopback proxy.
+    /// </summary>
+    internal static HttpMessageHandler CreateHandler(
+        CookieContainer cookies, bool ignoreSslErrors, int? agentProxyPort)
+    {
+        if (agentProxyPort is { } proxyPort)
+        {
+            var sockets = new SocketsHttpHandler
+            {
+                CookieContainer = cookies,
+                UseCookies = true,
+                ConnectCallback = async (context, cancellationToken) =>
+                {
+                    var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+                    {
+                        NoDelay = true,
+                    };
+                    try
+                    {
+                        await socket.ConnectAsync(IPAddress.Loopback, proxyPort, cancellationToken);
+                        return new NetworkStream(socket, ownsSocket: true);
+                    }
+                    catch
+                    {
+                        socket.Dispose();
+                        throw;
+                    }
+                },
+            };
+
+            if (ignoreSslErrors)
+                sockets.SslOptions.RemoteCertificateValidationCallback = (sender, cert, chain, errors) => true;
+
+            return sockets;
+        }
+
+        var direct = new HttpClientHandler
+        {
+            CookieContainer = cookies,
+            UseCookies = true
+        };
+
+        // UniFi controllers typically use self-signed certificates.
+        // This setting allows bypassing SSL validation when enabled (default: true).
+        if (ignoreSslErrors)
+            direct.ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true;
+
+        return direct;
+    }
+
+    private void InitializeHttpClient()
+    {
+        _cookieContainer = new CookieContainer();
+
+        // A tunnelled console keeps its own URL and is DIALLED at the loopback proxy instead. Pointing
+        // the URL itself at 127.0.0.1 would be simpler, but the Host header and the TLS SNI come from
+        // the URL - so a console sitting behind a name-routing reverse proxy (the usual shape for
+        // UniFi OS Server) would be asked for by an address that proxy has no vhost for, and answer
+        // 404 no matter how good the credentials are.
+        var handler = CreateHandler(_cookieContainer, _ignoreSSLErrors, _agentProxyPort);
+
+        _httpClient = new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromSeconds(15)
+        };
+
+        _httpClient.DefaultRequestHeaders.Add("Accept", "application/json");
+        _httpClient.DefaultRequestHeaders.Add("User-Agent", "NetworkOptimizer.UniFi/1.0");
+
+        // API key auth: set header once, no login/cookies/CSRF needed
+        if (!string.IsNullOrEmpty(_apiKey))
+        {
+            _httpClient.DefaultRequestHeaders.Add("X-API-KEY", _apiKey);
+        }
+    }
+
+    /// <summary>
+    /// Detects whether this is a UniFi OS controller or standalone Network controller
+    /// by checking the login page endpoints.
+    /// - UniFi OS (UDM/UCG): GET /login returns 200 → use /api/auth/login
+    /// - Standalone Network: GET /login returns 404, /manage/account/login exists → use /api/login
+    /// </summary>
+    private async Task DetectLoginTypeAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Detecting login type (UniFi OS vs standalone Network controller)...");
+
+        try
+        {
+            // Try GET /login - UniFi OS returns 200, standalone returns 404
+            var response = await _httpClient!.GetAsync($"{_controllerUrl}/login", cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                // UniFi OS - use /api/auth/login
+                _useStandaloneLogin = false;
+                _logger.LogDebug("Detected UniFi OS login page - will use /api/auth/login");
+                return;
+            }
+
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                // Check for standalone Network controller login page
+                _logger.LogDebug("GET /login returned 404, checking for standalone Network controller...");
+
+                var manageResponse = await _httpClient!.GetAsync(
+                    $"{_controllerUrl}/manage/account/login",
+                    cancellationToken);
+
+                if (manageResponse.IsSuccessStatusCode)
+                {
+                    // Standalone Network controller - use /api/login
+                    _useStandaloneLogin = true;
+                    _logger.LogInformation("Detected standalone UniFi Network controller - will use /api/login");
+                    return;
+                }
+            }
+        }
+        catch (TaskCanceledException ex)
+        {
+            // Timeout or cancellation - host is unreachable, don't bother trying login
+            _logger.LogDebug("Login type detection timed out: {Message}", ex.Message);
+            throw;
+        }
+        catch (HttpRequestException ex)
+        {
+            // Connection refused, DNS failure, etc. - host is unreachable
+            _logger.LogDebug("Login type detection failed: {Message}", ex.Message);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Login type detection failed: {Message}", ex.Message);
+        }
+
+        // Default to UniFi OS (most common modern scenario)
+        _useStandaloneLogin = false;
+        _logger.LogDebug("Defaulting to UniFi OS login endpoint");
+    }
+
+    /// <summary>
+    /// Authenticates with the UniFi controller using cookie-based auth (like a browser)
+    /// </summary>
+    public async Task<bool> LoginAsync(CancellationToken cancellationToken = default)
+    {
+        await _authLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_isAuthenticated)
+            {
+                _logger.LogDebug("Already authenticated, skipping login");
+                return true;
+            }
+
+            // API key auth: validate by making a test API call instead of logging in
+            if (UseApiKey)
+            {
+                _logger.LogInformation("Using API key authentication with UniFi controller at {Url}", _controllerUrl);
+
+                // Validate the API key by hitting the sites endpoint
+                try
+                {
+                    var validateResponse = await _httpClient!.GetAsync($"{_controllerUrl}/proxy/network/api/self/sites", cancellationToken);
+
+                    if (!validateResponse.IsSuccessStatusCode)
+                    {
+                        _lastLoginError = validateResponse.StatusCode == HttpStatusCode.Unauthorized || validateResponse.StatusCode == HttpStatusCode.Forbidden
+                            ? "Invalid API key. Check that it was copied correctly and has not been revoked."
+                            : IsConsoleUnavailable(validateResponse.StatusCode)
+                                ? ConsoleUnavailableMessage
+                                : $"API key validation failed with status {(int)validateResponse.StatusCode}.";
+                        _logger.LogWarning("API key validation failed: {StatusCode}", validateResponse.StatusCode);
+                        AuthProbeCompleted?.Invoke(false, _lastLoginError);
+                        return false;
+                    }
+
+                    _isAuthenticated = true;
+                    await DetectControllerTypeAsync(cancellationToken);
+                    _logger.LogInformation("API key authentication validated (UniFi OS: {IsUniFiOs})", _isUniFiOs);
+                    AuthProbeCompleted?.Invoke(true, null);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _lastLoginError = ParseExceptionError(ex);
+                    _logger.LogError(ex, "Exception validating API key");
+                    AuthProbeCompleted?.Invoke(false, _lastLoginError);
+                    return false;
+                }
+            }
+
+            // Every call that finds the session gone signs in again. With a password the Console has
+            // rejected, that is a failed login per call, which locks the account and then refuses the
+            // new password too. A rejected password is retried once per interval instead.
+            if (DateTime.UtcNow - _passwordRejectedAt < RejectedPasswordRetryInterval)
+            {
+                _logger.LogDebug("Skipping login to {Url}: its password was rejected at {RejectedAt:u}", _controllerUrl, _passwordRejectedAt);
+                return false;
+            }
+
+            // Each login during the limit is another attempt against it.
+            if (DateTime.UtcNow < _loginLimitedUntil)
+            {
+                _logger.LogDebug("Skipping login to {Url}: login attempt limit, next try at {Until:u}", _controllerUrl, _loginLimitedUntil);
+                return false;
+            }
+
+            _logger.LogInformation("Authenticating with UniFi controller at {Url}", _controllerUrl);
+
+            // Reset client to clear old cookies
+            InitializeHttpClient();
+
+            // Detect which login endpoint to use (5s timeout per call, not shared)
+            using var detectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            detectCts.CancelAfter(TimeSpan.FromSeconds(5));
+            await DetectLoginTypeAsync(detectCts.Token);
+
+            var loginRequest = new UniFiLoginRequest
+            {
+                Username = _username,
+                Password = _password,
+                Remember = false,
+                Strict = true
+            };
+
+            // Use appropriate login endpoint based on controller type
+            var loginUrl = _useStandaloneLogin
+                ? $"{_controllerUrl}/api/login"
+                : $"{_controllerUrl}/api/auth/login";
+
+            _logger.LogDebug("Using login endpoint: {LoginUrl}", loginUrl);
+
+            var content = new StringContent(
+                JsonSerializer.Serialize(loginRequest),
+                Encoding.UTF8,
+                "application/json");
+
+            using var loginCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            loginCts.CancelAfter(TimeSpan.FromSeconds(5));
+            var response = await _httpClient!.PostAsync(loginUrl, content, loginCts.Token);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogError("Login failed with status {StatusCode} (Retry-After: {RetryAfter}): {Error}",
+                    response.StatusCode, response.Headers.RetryAfter?.ToString() ?? "none", errorBody);
+
+                // Parse error response for user-friendly message
+                _lastLoginError = ParseLoginError(response.StatusCode, errorBody);
+                if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                    _passwordRejectedAt = DateTime.UtcNow;
+                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    _loginLimitBackoff = _loginLimitBackoff == TimeSpan.Zero
+                        ? LoginLimitInitialBackoff
+                        : TimeSpan.FromTicks(Math.Min(_loginLimitBackoff.Ticks * 2, LoginLimitMaxBackoff.Ticks));
+                    _loginLimitedUntil = DateTime.UtcNow + _loginLimitBackoff;
+                }
+                AuthProbeCompleted?.Invoke(false, _lastLoginError);
+                return false;
+            }
+
+            _passwordRejectedAt = DateTime.MinValue;
+            _loginLimitedUntil = DateTime.MinValue;
+            _loginLimitBackoff = TimeSpan.Zero;
+
+            // Extract CSRF token from response headers
+            if (response.Headers.TryGetValues("X-Csrf-Token", out var csrfTokens))
+            {
+                _csrfToken = csrfTokens.FirstOrDefault();
+                if (!string.IsNullOrEmpty(_csrfToken))
+                {
+                    _httpClient.DefaultRequestHeaders.Remove("X-Csrf-Token");
+                    _httpClient.DefaultRequestHeaders.Add("X-Csrf-Token", _csrfToken);
+                    _logger.LogDebug("CSRF token acquired");
+                }
+            }
+
+            // Verify cookies were set
+            var cookies = _cookieContainer!.GetCookies(new Uri(_controllerUrl));
+            var hasCookies = cookies.Count > 0;
+
+            if (!hasCookies)
+            {
+                _logger.LogWarning("No cookies received after login - authentication may fail");
+            }
+            else
+            {
+                _logger.LogDebug("Received {CookieCount} cookies from controller", cookies.Count);
+            }
+
+            _isAuthenticated = true;
+            _logger.LogInformation("Successfully authenticated with UniFi controller");
+
+            // Detect controller type after successful authentication
+            await DetectControllerTypeAsync(cancellationToken);
+
+            AuthProbeCompleted?.Invoke(true, null);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Exception during login");
+            _lastLoginError = ParseExceptionError(ex);
+            AuthProbeCompleted?.Invoke(false, _lastLoginError);
+            return false;
+        }
+        finally
+        {
+            // On a reconnect the client (and its _authLock) can be disposed while this login
+            // is still in flight; Release() would then throw ObjectDisposedException out of the
+            // finally and surface as a scary "Cannot access a disposed object" console-connection
+            // error. There's nothing to release on a disposed semaphore, so ignore just that case.
+            try { _authLock.Release(); }
+            catch (ObjectDisposedException) { }
+        }
+    }
+
+    /// <summary>
+    /// Parses login error response from the controller
+    /// </summary>
+    private string ParseLoginError(HttpStatusCode statusCode, string errorBody)
+    {
+        try
+        {
+            // Try to parse JSON error response
+            using var doc = JsonDocument.Parse(errorBody);
+            var root = doc.RootElement;
+
+            // Check for message field (UniFi error format)
+            if (root.TryGetProperty("message", out var messageElement))
+            {
+                var message = messageElement.GetString();
+                if (!string.IsNullOrEmpty(message))
+                {
+                    // Add context for rate limiting
+                    if (statusCode == HttpStatusCode.TooManyRequests ||
+                        message.Contains("limit", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return $"Rate limited: {message}. Wait a few minutes before trying again.";
+                    }
+                    return message;
+                }
+            }
+
+            // Check for error field
+            if (root.TryGetProperty("error", out var errorElement))
+            {
+                var error = errorElement.GetString();
+                if (!string.IsNullOrEmpty(error))
+                    return error;
+            }
+        }
+        catch
+        {
+            // JSON parsing failed, use status code
+        }
+
+        // Fallback based on status code
+        return statusCode switch
+        {
+            HttpStatusCode.Unauthorized => "Invalid username or password",
+            HttpStatusCode.Forbidden => "Access denied. Check user permissions.",
+            HttpStatusCode.TooManyRequests => "Too many login attempts against UniFi Console. Wait a few minutes before trying again.",
+            HttpStatusCode.ServiceUnavailable or HttpStatusCode.BadGateway or HttpStatusCode.GatewayTimeout => ConsoleUnavailableMessage,
+            _ => $"Authentication failed (HTTP {(int)statusCode})"
+        };
+    }
+
+    /// <summary>
+    /// Parses exception for user-friendly error message
+    /// </summary>
+    private string ParseExceptionError(Exception ex)
+    {
+        // Check for SSL/TLS certificate errors
+        if (ex is HttpRequestException httpEx)
+        {
+            var message = ex.Message;
+            var innerMessage = ex.InnerException?.Message ?? "";
+
+            // SSL certificate validation failure
+            if (message.Contains("SSL", StringComparison.OrdinalIgnoreCase) ||
+                innerMessage.Contains("certificate", StringComparison.OrdinalIgnoreCase) ||
+                innerMessage.Contains("RemoteCertificate", StringComparison.OrdinalIgnoreCase))
+            {
+                // Provide specific guidance based on certificate error type
+                if (innerMessage.Contains("RemoteCertificateNameMismatch"))
+                {
+                    return "SSL certificate error: The certificate doesn't match the hostname. Enable 'Ignore SSL Errors' in settings, or use the correct hostname.";
+                }
+                if (innerMessage.Contains("RemoteCertificateChainErrors"))
+                {
+                    return "SSL certificate error: Self-signed or untrusted certificate. Enable 'Ignore SSL Errors' in settings.";
+                }
+                return "SSL certificate error: Unable to establish secure connection. Enable 'Ignore SSL Errors' in settings.";
+            }
+
+            // Connection refused
+            if (message.Contains("Connection refused", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("actively refused", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Connection refused. Check if the controller is running and the URL is correct.";
+            }
+
+            // Host not found
+            if (message.Contains("No such host", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("host is known", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Host not found. Check the controller URL.";
+            }
+
+            // Timeout
+            if (message.Contains("timed out", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Connection timed out. Check network connectivity and firewall settings.";
+            }
+        }
+
+        // Timeout from HttpClient.Timeout (TaskCanceledException, not HttpRequestException)
+        if (ex is TaskCanceledException ||
+            ex.Message.Contains("HttpClient.Timeout", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Connection timed out. Check the console URL and firewall/VPN settings.";
+        }
+
+        // Generic fallback
+        return ex.Message;
+    }
+
+    /// <summary>Shown when the console's reverse proxy reports the backend down (502/503/504).</summary>
+    private const string ConsoleUnavailableMessage =
+        "The UniFi Console is temporarily unavailable (it may be restarting or upgrading, or its reverse proxy can't reach it). Retrying automatically.";
+
+    /// <summary>
+    /// A reverse proxy in front of a self-hosted UniFi OS Server / Network application returns
+    /// 502/503/504 while the backend is restarting, upgrading, or reprovisioning - the console
+    /// is momentarily unreachable, not misconfigured. Callers treat these like a stale session:
+    /// transient, self-healing, and worth surfacing as "temporarily unavailable" rather than a
+    /// hard failure.
+    /// </summary>
+    private static bool IsConsoleUnavailable(HttpStatusCode status) =>
+        status is HttpStatusCode.BadGateway
+            or HttpStatusCode.ServiceUnavailable
+            or HttpStatusCode.GatewayTimeout;
+
+    /// <summary>
+    /// Status codes that should trigger a re-authenticate-and-retry rather than failing the call
+    /// outright: 401/403 (a stale or rejected session) and the gateway-unavailable family
+    /// (<see cref="IsConsoleUnavailable"/>). Resetting the auth state on these feeds the connection
+    /// service's recovery and connection alerting the same way a 401/403 does, instead of leaving
+    /// the client wedged "connected" while every console call fails with 502.
+    /// </summary>
+    private static bool IsRecoverableAuthFailure(HttpStatusCode status) =>
+        status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+            || IsConsoleUnavailable(status);
+
+    /// <summary>
+    /// Ensures we're authenticated, re-authenticating if necessary.
+    /// For API key auth a 401/403 usually means the Network application was restarting or
+    /// wedged (upgrades, provisioning), not that the key was revoked - the proxy returns
+    /// auth errors while the app is down. Re-validate the key, throttled so a genuinely
+    /// revoked key costs at most one probe per interval instead of one per API call.
+    /// </summary>
+    private async Task<bool> EnsureAuthenticatedAsync(CancellationToken cancellationToken = default)
+    {
+        if (_isAuthenticated)
+            return true;
+
+        if (UseApiKey)
+        {
+            if (DateTime.UtcNow - _lastApiKeyRevalidationAttempt < ApiKeyRevalidationInterval)
+                return false;
+            _lastApiKeyRevalidationAttempt = DateTime.UtcNow;
+        }
+
+        return await LoginAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Builds the correct API path based on whether this is UniFi OS or standalone controller
+    /// </summary>
+    private string BuildApiPath(string endpoint)
+    {
+        // For UniFi OS (UDM/UCG), APIs are proxied through /proxy/network
+        string url;
+        if (_isUniFiOs)
+        {
+            url = $"{_controllerUrl}/proxy/network/api/s/{_site}/{endpoint}";
+        }
+        else
+        {
+            // For standalone controllers
+            url = $"{_controllerUrl}/api/s/{_site}/{endpoint}";
+        }
+        _logger.LogTrace("BuildApiPath: _isUniFiOs={IsUniFiOs}, endpoint={Endpoint}, url={Url}", _isUniFiOs, endpoint, url);
+        return url;
+    }
+
+    /// <summary>
+    /// Builds the correct V2 API path based on whether this is UniFi OS or standalone controller
+    /// </summary>
+    private string BuildV2ApiPath(string endpoint)
+    {
+        // For UniFi OS (UDM/UCG), V2 APIs are proxied through /proxy/network
+        string url;
+        if (_isUniFiOs)
+        {
+            url = $"{_controllerUrl}/proxy/network/v2/api/{endpoint}";
+        }
+        else
+        {
+            // For standalone controllers
+            url = $"{_controllerUrl}/v2/api/{endpoint}";
+        }
+        _logger.LogTrace("BuildV2ApiPath: _isUniFiOs={IsUniFiOs}, endpoint={Endpoint}, url={Url}", _isUniFiOs, endpoint, url);
+        return url;
+    }
+
+    /// <summary>
+    /// Builds a path under the Network app's own root - what it serves outside /api, such as the
+    /// DPI favicons - on either console kind.
+    /// </summary>
+    private string BuildNetworkAppPath(string path) =>
+        _isUniFiOs ? $"{_controllerUrl}/proxy/network/{path}" : $"{_controllerUrl}/{path}";
+
+    /// <summary>
+    /// GET v2/api/info - the console's display name (system.name), e.g. "[Console] Home".
+    /// Uses the shared V2 path builder so it is correct for UniFi OS and self-hosted alike.
+    /// </summary>
+    public async Task<string?> GetConsoleNameAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var response = await _httpClient!.GetAsync(BuildV2ApiPath("info"), cancellationToken);
+            if (!response.IsSuccessStatusCode)
+                return null;
+            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("system", out var system)
+                && system.TryGetProperty("name", out var name))
+            {
+                var value = name.GetString();
+                return string.IsNullOrWhiteSpace(value) ? null : value;
+            }
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to fetch console name from v2/api/info");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Detects whether this is a UniFi OS device (UDM/UCG) or standalone controller
+    /// by trying the /proxy/network path first (more common for modern deployments)
+    /// </summary>
+    private async Task DetectControllerTypeAsync(CancellationToken cancellationToken = default)
+    {
+        if (_pathDetected)
+            return;
+
+        if (_useStandaloneLogin)
+        {
+            _isUniFiOs = false;
+            _pathDetected = true;
+            _logger.LogInformation("Using standalone API paths (confirmed by login detection)");
+            return;
+        }
+
+        _logger.LogDebug("Detecting controller type (UniFi OS vs standalone)...");
+
+        // Try UniFi OS path first (UDM/UCG) - this is the modern path
+        var unifiOsProbeUrl = $"{_controllerUrl}/proxy/network/api/s/{_site}/stat/sysinfo";
+        try
+        {
+            _logger.LogDebug("Probing UniFi OS path: {Url}", unifiOsProbeUrl);
+            var response = await _httpClient!.GetAsync(unifiOsProbeUrl, cancellationToken);
+            _logger.LogDebug("UniFi OS probe response: {StatusCode} ({StatusCodeInt})", response.StatusCode, (int)response.StatusCode);
+
+            if (response.IsSuccessStatusCode)
+            {
+                _isUniFiOs = true;
+                _pathDetected = true;
+                _logger.LogDebug("Detected UniFi OS device (UDM/UCG) - using /proxy/network path");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("UniFi OS path test failed: {Message}", ex.Message);
+        }
+
+        // Fall back to standalone controller path
+        var standaloneProbeUrl = $"{_controllerUrl}/api/s/{_site}/stat/sysinfo";
+        try
+        {
+            _logger.LogDebug("Probing standalone path: {Url}", standaloneProbeUrl);
+            var response = await _httpClient!.GetAsync(standaloneProbeUrl, cancellationToken);
+            _logger.LogDebug("Standalone probe response: {StatusCode} ({StatusCodeInt})", response.StatusCode, (int)response.StatusCode);
+
+            if (response.IsSuccessStatusCode)
+            {
+                _isUniFiOs = false;
+                _pathDetected = true;
+                _logger.LogInformation("Detected standalone UniFi Controller - using /api path");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Standalone path test failed: {Message}", ex.Message);
+        }
+
+        // Default to UniFi OS path if detection fails (most common modern scenario)
+        _isUniFiOs = true;
+        _pathDetected = true;
+        _logger.LogWarning("Could not detect controller type, defaulting to UniFi OS path");
+    }
+
+    /// <summary>
+    /// Gets whether this is a UniFi OS device (UDM/UCG)
+    /// </summary>
+    public bool IsUniFiOs => _isUniFiOs;
+
+    /// <summary>
+    /// Gets whether this is a standalone Network controller (uses /api/login instead of /api/auth/login)
+    /// </summary>
+    public bool IsStandaloneNetworkController => _useStandaloneLogin;
+
+    /// <summary>
+    /// Executes an API call with automatic re-authentication on 401/403 and on a
+    /// reverse proxy's 502/503/504 while the console backend is restarting (<see cref="IsRecoverableAuthFailure"/>)
+    /// </summary>
+    /// <summary>The <c>meta.msg</c> error code from a refused call's body, or null when there is none.</summary>
+    private static string? TryReadApiErrorCode(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            return doc.RootElement.TryGetProperty("meta", out var meta)
+                && meta.TryGetProperty("msg", out var msg)
+                && msg.ValueKind == JsonValueKind.String
+                ? msg.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private async Task<T?> ExecuteApiCallAsync<T>(
+        Func<Task<HttpResponseMessage>> apiCall,
+        CancellationToken cancellationToken = default,
+        bool throwOnPermissionError = false,
+        string? permissionErrorMessage = null,
+        bool throwOnApiError = false) where T : class
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            _logger.LogError("Failed to authenticate before API call");
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await apiCall();
+
+            // A 403 with api.err.NoPermission means the credentials are valid but lack the required
+            // access level - re-authenticating won't fix it. Surface it (for mutative callers that
+            // opt in) instead of looping through a pointless re-auth that just spams the log.
+            if (throwOnPermissionError && response.StatusCode == HttpStatusCode.Forbidden)
+            {
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                if (body.Contains("api.err.NoPermission", StringComparison.OrdinalIgnoreCase))
+                    throw new UniFiPermissionException(permissionErrorMessage ??
+                        "The UniFi account lacks permission to run RF spectrum scans. In UniFi Network, " +
+                        "give this account Network: Full (Site Admin in older versions), then try again.");
+            }
+
+            // Handle authentication failures
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode}, re-authenticating...", response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed");
+                    return null;
+                }
+
+                // Retry the call with new authentication
+                response = await apiCall();
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogError("API call failed with status {StatusCode}: {Error}",
+                    response.StatusCode, errorBody);
+                if (throwOnApiError && TryReadApiErrorCode(errorBody) is { } code)
+                    throw new UniFiApiErrorException(code, (int)response.StatusCode);
+                return null;
+            }
+
+            try
+            {
+                var result = await response.Content.ReadFromJsonAsync<T>(cancellationToken: cancellationToken);
+                return result;
+            }
+            catch (System.Text.Json.JsonException ex) when (ex is not UniFiNonJsonResponseException)
+            {
+                // The console serves HTML (login/error page) instead of JSON while it's
+                // rebooting or mid-firmware-upgrade. Re-throw with a one-line diagnosis
+                // instead of the raw parser error. The content is buffered, so it can be
+                // re-read here after the failed deserialization.
+                string? body = null;
+                try { body = await response.Content.ReadAsStringAsync(cancellationToken); }
+                catch { /* keep the original parse error context if the body is unreadable */ }
+                throw UniFiNonJsonResponseException.Create(
+                    (int)response.StatusCode,
+                    response.Content.Headers.ContentType?.MediaType,
+                    body,
+                    ex);
+            }
+        });
+    }
+
+    #region Device Management APIs
+
+    /// <summary>
+    /// GET /proxy/network/api/s/{site}/stat/device (UniFi OS) or
+    /// GET /api/s/{site}/stat/device (standalone) - Get all UniFi devices
+    /// Returns the large device payload with all port profiles, switch port details, etc.
+    /// </summary>
+    public async Task<List<UniFiDeviceResponse>> GetDevicesAsync(CancellationToken cancellationToken = default, bool useCache = true)
+    {
+        if (useCache && _cachedDeviceResponses != null
+            && DateTime.UtcNow - _deviceResponseCacheTime < DeviceResponseCacheTtl)
+        {
+            _logger.LogTrace("Returning cached device response ({Count} devices, age {Age:F1}s)",
+                _cachedDeviceResponses.Count,
+                (DateTime.UtcNow - _deviceResponseCacheTime).TotalSeconds);
+            return _cachedDeviceResponses;
+        }
+
+        _logger.LogTrace("Fetching all devices from site {Site} (useCache={UseCache})", _site, useCache);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiDeviceResponse>>(
+            () => _httpClient!.GetAsync(BuildApiPath("stat/device"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogTrace("Retrieved {Count} devices", response.Data.Count);
+            _cachedDeviceResponses = response.Data;
+            _deviceResponseCacheTime = DateTime.UtcNow;
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve devices or received non-ok response");
+        return new List<UniFiDeviceResponse>();
+    }
+
+    /// <summary>
+    /// GET stat/device - Get all devices as raw JSON string
+    /// Used by audit engine which needs the complete raw payload
+    /// </summary>
+    public async Task<string?> GetDevicesRawJsonAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching raw device JSON from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(BuildApiPath("stat/device"), cancellationToken);
+
+            // Handle authentication failures (session expired)
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} fetching raw device JSON, re-authenticating...", response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while fetching raw device JSON");
+                    return null;
+                }
+
+                // Retry with new authentication
+                response = await _httpClient!.GetAsync(BuildApiPath("stat/device"), cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogDebug("Retrieved raw device JSON ({Length} bytes)", json.Length);
+                return json;
+            }
+
+            _logger.LogWarning("Failed to retrieve raw device JSON: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// GET /proxy/network/api/s/{site}/stat/device/{mac} (UniFi OS) or
+    /// GET /api/s/{site}/stat/device/{mac} (standalone) - Get specific device by MAC address
+    /// </summary>
+    public async Task<UniFiDeviceResponse?> GetDeviceAsync(string mac, CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching device {Mac} from site {Site}", mac, _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiDeviceResponse>>(
+            () => _httpClient!.GetAsync(BuildApiPath($"stat/device/{mac}"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok" && response.Data.Count > 0)
+        {
+            return response.Data[0];
+        }
+
+        _logger.LogWarning("Device {Mac} not found", mac);
+        return null;
+    }
+
+    /// <summary>
+    /// PUT rest/device/{id} - set the channel and width of one or more of a device's radios. Sends
+    /// only those radios (see <see cref="RadioChannelUpdate.ToRequestJson"/>); the console provisions
+    /// the device, which moves within seconds and briefly drops the clients on each moved radio.
+    /// </summary>
+    /// <param name="deviceId">The device document id (<c>_id</c>), not the MAC.</param>
+    /// <param name="radios">The radios to move.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>
+    /// The device as stored after the write, or null when refused. Its <c>cfgversion</c> is still the
+    /// previous one: the console mints the new version when it provisions the device.
+    /// </returns>
+    /// <exception cref="UniFiPermissionException">The UniFi account cannot change device settings.</exception>
+    [VendorSpecific("UniFi", "rest/device PUT; GET on rest/device returns 404, so reads go through stat/device")]
+    public async Task<UniFiDeviceResponse?> UpdateDeviceRadioChannelsAsync(
+        string deviceId,
+        IReadOnlyList<RadioChannelUpdate> radios,
+        CancellationToken cancellationToken = default)
+    {
+        if (radios.Count == 0) return null;
+
+        var json = RadioChannelUpdate.ToRequestJson(radios);
+        _logger.LogDebug("Updating radio channels on device {DeviceId}: {Body}", deviceId, json);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiDeviceResponse>>(
+            () => _httpClient!.PutAsync(
+                BuildApiPath($"rest/device/{deviceId}"),
+                new StringContent(json, Encoding.UTF8, "application/json"),
+                cancellationToken),
+            cancellationToken,
+            throwOnPermissionError: true,
+            permissionErrorMessage: "The UniFi account lacks permission to change device settings. In UniFi Network, " +
+                "give this account Network: Full (Site Admin in older versions), then try again.");
+
+        if (response?.Meta.Rc == "ok" && response.Data.Count > 0)
+        {
+            _logger.LogInformation("Updated radio channels on device {DeviceId} (cfgversion {CfgVersion})",
+                deviceId, response.Data[0].CfgVersion);
+            return response.Data[0];
+        }
+
+        _logger.LogWarning("Failed to update radio channels on device {DeviceId}", deviceId);
+        return null;
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/device - Get all device types including Protect devices
+    /// This v2 API returns network_devices, protect_devices, access_devices, etc.
+    /// Only available on UniFi OS controllers (UDM, UCG, etc.)
+    /// </summary>
+    public async Task<UniFiAllDevicesResponse?> GetAllDevicesV2Async(CancellationToken cancellationToken = default)
+    {
+        if (!_isUniFiOs)
+        {
+            _logger.LogDebug("V2 device API not available on standalone controllers");
+            return null;
+        }
+
+        _logger.LogTrace("Fetching all device types (v2 API) from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var url = BuildV2ApiPath($"site/{_site}/device");
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var result = await response.Content.ReadFromJsonAsync<UniFiAllDevicesResponse>(cancellationToken: cancellationToken);
+                if (result != null)
+                {
+                    var protectCount = result.ProtectDevices?.Count ?? 0;
+                    var networkCount = result.NetworkDevices?.Count ?? 0;
+                    _logger.LogTrace("Retrieved {NetworkCount} network devices and {ProtectCount} Protect devices (v2 API)",
+                        networkCount, protectCount);
+                }
+                return result;
+            }
+
+            _logger.LogWarning("Failed to retrieve devices from v2 API: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// Get UniFi Protect devices that require Security VLAN placement
+    /// Returns a collection of cameras, doorbells, NVRs, and AI processors with their names
+    /// </summary>
+    public async Task<ProtectCameraCollection> GetProtectCamerasAsync(CancellationToken cancellationToken = default)
+    {
+        var result = new ProtectCameraCollection();
+
+        var allDevices = await GetAllDevicesV2Async(cancellationToken);
+        if (allDevices?.ProtectDevices == null)
+        {
+            return result;
+        }
+
+        foreach (var device in allDevices.ProtectDevices)
+        {
+            if (device.RequiresSecurityVlan)
+            {
+                var name = !string.IsNullOrEmpty(device.Name) ? device.Name : device.Model ?? "Protect Device";
+                result.Add(device.Mac, name, device.ConnectionNetworkId, device.IsNvr, device.UplinkMac);
+
+                var deviceType = device.IsCamera ? "camera" :
+                                 device.IsDoorbell ? "doorbell" :
+                                 device.IsNvr ? "NVR" :
+                                 device.IsVideoProcessor ? "AI processor" : "device";
+                _logger.LogDebug("Found Protect {DeviceType}: {Name} ({Model}) - MAC: {Mac}, NetworkId: {NetworkId}",
+                    deviceType, device.Name, device.Model, device.Mac, device.ConnectionNetworkId ?? "null");
+            }
+        }
+
+        _logger.LogInformation("Found {Count} Protect devices requiring Security VLAN", result.Count);
+
+        if (allDevices.DriveDevices != null)
+        {
+            foreach (var drive in allDevices.DriveDevices)
+            {
+                if (!string.IsNullOrEmpty(drive.Mac))
+                {
+                    result.AddDriveDevice(drive.Mac);
+                    _logger.LogDebug("Found Drive device: {Name} ({Model}) - MAC: {Mac}",
+                        drive.Name, drive.Model, drive.Mac);
+                }
+            }
+
+            if (result.DriveDeviceCount > 0)
+            {
+                _logger.LogInformation("Found {Count} Drive (UNAS) devices excluded from camera detection", result.DriveDeviceCount);
+            }
+        }
+
+        return result;
+    }
+
+    #endregion
+
+    #region Client Management APIs
+
+    /// <summary>
+    /// GET stat/sta - Get all connected clients
+    /// </summary>
+    public async Task<List<UniFiClientResponse>> GetClientsAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching all clients from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiClientResponse>>(
+            () => _httpClient!.GetAsync(BuildApiPath("stat/sta"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Retrieved {Count} clients", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve clients or received non-ok response");
+        return new List<UniFiClientResponse>();
+    }
+
+    /// <summary>
+    /// GET stat/sta/{mac} - Get specific client by MAC address
+    /// </summary>
+    public async Task<UniFiClientResponse?> GetClientAsync(string mac, CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching client {Mac} from site {Site}", mac, _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiClientResponse>>(
+            () => _httpClient!.GetAsync(BuildApiPath($"stat/sta/{mac}"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok" && response.Data.Count > 0)
+        {
+            return response.Data[0];
+        }
+
+        _logger.LogWarning("Client {Mac} not found", mac);
+        return null;
+    }
+
+    /// <summary>
+    /// GET stat/user/{mac} - a client's stored record (its <c>_id</c>, alias, and fixed IP),
+    /// online or not. <c>rest/user?mac=</c> ignores the filter, so this is the lookup by MAC.
+    /// </summary>
+    [VendorSpecific("UniFi", "stat/user/{mac}; rest/user ignores a mac query parameter")]
+    public async Task<UniFiClientResponse?> GetKnownClientAsync(string mac, CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching known client {Mac} from site {Site}", mac, _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiClientResponse>>(
+            () => _httpClient!.GetAsync(BuildApiPath($"stat/user/{mac.ToLowerInvariant()}"), cancellationToken),
+            cancellationToken);
+
+        return response?.Meta.Rc == "ok" && response.Data.Count > 0 ? response.Data[0] : null;
+    }
+
+    /// <summary>
+    /// PUT rest/user/{id} - write a client's settings. Only the fields set on
+    /// <paramref name="update"/> are sent; the Console keeps the stored value of the rest. Use
+    /// <see cref="UniFiClientUpdate.FromRecord"/> to send the full form as UniFi Network does.
+    /// </summary>
+    /// <param name="userId">The client record id (<c>_id</c>), not the MAC.</param>
+    /// <param name="update">The fields to write. The Console enforces no length limit on <c>name</c> (65,536 characters stored).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The client as stored after the write, or null when it failed without an error code.</returns>
+    /// <exception cref="UniFiPermissionException">The UniFi account cannot change client settings.</exception>
+    /// <exception cref="UniFiApiErrorException">The Console refused the write with a code, such as
+    /// <c>api.err.DuplicateFixedIP</c> (another client holds the address) or <c>api.err.InvalidFixedIP</c>
+    /// (outside the client's network).</exception>
+    [VendorSpecific("UniFi", "rest/user PUT")]
+    public async Task<UniFiClientResponse?> UpdateClientAsync(
+        string userId,
+        UniFiClientUpdate update,
+        CancellationToken cancellationToken = default)
+    {
+        var json = update.ToRequestJson();
+        _logger.LogDebug("Updating client record {UserId}: {Body}", userId, json);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiClientResponse>>(
+            () => _httpClient!.PutAsync(
+                BuildApiPath($"rest/user/{userId}"),
+                new StringContent(json, Encoding.UTF8, "application/json"),
+                cancellationToken),
+            cancellationToken,
+            throwOnPermissionError: true,
+            permissionErrorMessage: "The UniFi account lacks permission to change client settings. In UniFi Network, " +
+                "give this account Network: Full (Site Admin in older versions), then try again.",
+            throwOnApiError: true);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Updated client record {UserId}", userId);
+            if (response.Data.Count > 0) return response.Data[0];
+
+            // A write that changes nothing answers ok with no data; the record is read back instead.
+            var current = await ExecuteApiCallAsync<UniFiApiResponse<UniFiClientResponse>>(
+                () => _httpClient!.GetAsync(BuildApiPath($"rest/user/{userId}"), cancellationToken),
+                cancellationToken);
+            return current?.Meta.Rc == "ok" && current.Data.Count > 0 ? current.Data[0] : null;
+        }
+
+        _logger.LogWarning("Failed to update client record {UserId}", userId);
+        return null;
+    }
+
+    /// <summary>
+    /// Sets a client's alias, sending only <c>name</c>. An empty name clears the alias and UniFi
+    /// Network shows the hostname again.
+    /// </summary>
+    /// <returns>The client as stored after the write, or null when the client is unknown or the write was refused.</returns>
+    /// <exception cref="UniFiPermissionException">The UniFi account cannot change client settings.</exception>
+    public async Task<UniFiClientResponse?> SetClientNameAsync(string mac, string name, CancellationToken cancellationToken = default)
+    {
+        var record = await GetKnownClientAsync(mac, cancellationToken);
+        if (record == null || string.IsNullOrEmpty(record.Id))
+        {
+            _logger.LogWarning("Cannot rename client {Mac}: no client record", mac);
+            return null;
+        }
+        return await UpdateClientAsync(record.Id, new UniFiClientUpdate { Name = name }, cancellationToken);
+    }
+
+    /// <summary>
+    /// Sets or removes a client's DHCP reservation (UniFi Network's Fixed IP Address). Removing it
+    /// also turns off the client's Local DNS Record, as UniFi Network does; the address and DNS
+    /// name stay on the record, dormant. Setting it leaves the Local DNS Record as it is.
+    /// </summary>
+    /// <param name="mac">The client's MAC address.</param>
+    /// <param name="fixedIp">The address to reserve, or null to remove the reservation.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The client as stored after the write, or null when the client is unknown or the write was refused.</returns>
+    /// <exception cref="UniFiPermissionException">The UniFi account cannot change client settings.</exception>
+    [VendorSpecific("UniFi", "rest/user PUT; UniFi Network's form clears local_dns_record_enabled with use_fixedip")]
+    public async Task<UniFiClientResponse?> SetClientFixedIpAsync(string mac, string? fixedIp, CancellationToken cancellationToken = default)
+    {
+        var record = await GetKnownClientAsync(mac, cancellationToken);
+        if (record == null || string.IsNullOrEmpty(record.Id))
+        {
+            _logger.LogWarning("Cannot set fixed IP on client {Mac}: no client record", mac);
+            return null;
+        }
+        var update = fixedIp == null
+            ? new UniFiClientUpdate { UseFixedIp = false, LocalDnsRecordEnabled = false }
+            : new UniFiClientUpdate { UseFixedIp = true, FixedIp = fixedIp };
+        return await UpdateClientAsync(record.Id, update, cancellationToken);
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/wifiman/{clientIp}/ - Get WiFiman realtime client data.
+    /// Returns signal, noise, channel, band, link rates, experience, and nearest neighbors.
+    /// </summary>
+    public async Task<WiFiManClientResponse?> GetWiFiManClientAsync(string clientIp, CancellationToken cancellationToken = default)
+    {
+        _logger.LogTrace("Fetching WiFiman data for client {Ip} from site {Site}", clientIp, _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+            return null;
+
+        try
+        {
+            var url = BuildV2ApiPath($"site/{_site}/wifiman/{clientIp}/");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogDebug("WiFiman endpoint returned {StatusCode} for {Ip}", response.StatusCode, clientIp);
+                return null;
+            }
+
+            var result = await response.Content.ReadFromJsonAsync<WiFiManClientResponse>(cancellationToken: cancellationToken);
+            if (result != null)
+            {
+                _logger.LogTrace("WiFiman data for {Ip}: signal={Signal}, channel={Channel}, band={Band}",
+                    clientIp, result.Signal, result.Channel, result.WlanBand);
+            }
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "WiFiman endpoint failed for {Ip}", clientIp);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// GET rest/user - Get all known users (includes historical clients)
+    /// </summary>
+    public async Task<List<UniFiClientResponse>> GetAllKnownClientsAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching all known users from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiClientResponse>>(
+            () => _httpClient!.GetAsync(BuildApiPath("rest/user"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Retrieved {Count} known users", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve known users or received non-ok response");
+        return new List<UniFiClientResponse>();
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/clients/active - Get currently active clients with full details
+    /// This endpoint returns IP addresses even for UX/UX7 connected clients (unlike stat/sta)
+    /// </summary>
+    public Task<List<UniFiClientDetailResponse>> GetActiveClientsAsync(CancellationToken cancellationToken = default) =>
+        GetActiveClientsAsync(includeUnifiDevices: false, cancellationToken);
+
+    /// <summary>
+    /// GET v2/api/site/{site}/clients/active, optionally with the devices this console's UniFi apps own.
+    /// </summary>
+    /// <param name="includeUnifiDevices">Also list devices this console's UniFi apps own (Protect cameras, a UNAS),
+    /// which the endpoint otherwise leaves out, each with unifi_device set.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<List<UniFiClientDetailResponse>> GetActiveClientsAsync(
+        bool includeUnifiDevices,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching active clients from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return new List<UniFiClientDetailResponse>();
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var url = BuildV2ApiPath($"site/{_site}/clients/active" + (includeUnifiDevices ? "?includeUnifiDevices=true" : ""));
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                // Read raw JSON first so we can log it if deserialization fails
+                // (v2 API may return paginated wrapper instead of flat array on some controller versions)
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+
+                try
+                {
+                    var clients = System.Text.Json.JsonSerializer.Deserialize<List<UniFiClientDetailResponse>>(json);
+                    _logger.LogDebug("Retrieved {Count} active clients", clients?.Count ?? 0);
+                    return clients ?? new List<UniFiClientDetailResponse>();
+                }
+                catch (System.Text.Json.JsonException ex)
+                {
+                    // Log the start of the response to help diagnose the structure
+                    var preview = json.Length > 200 ? json[..200] + "..." : json;
+                    _logger.LogWarning(ex, "Failed to deserialize active clients response. Preview: {Preview}", preview);
+                    return new List<UniFiClientDetailResponse>();
+                }
+            }
+
+            _logger.LogWarning("Failed to retrieve active clients: {StatusCode}", response.StatusCode);
+            return new List<UniFiClientDetailResponse>();
+        });
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/clients/history - Get client history (includes offline devices)
+    /// </summary>
+    /// <param name="withinHours">How far back to look (default 720 = 30 days)</param>
+    public async Task<List<UniFiClientDetailResponse>> GetClientHistoryAsync(
+        int withinHours = 720,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching client history (within {Hours} hours) from site {Site}", withinHours, _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return new List<UniFiClientDetailResponse>();
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var url = BuildV2ApiPath($"site/{_site}/clients/history?withinHours={withinHours}");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var clients = await response.Content.ReadFromJsonAsync<List<UniFiClientDetailResponse>>(
+                    cancellationToken: cancellationToken);
+
+                _logger.LogDebug("Retrieved {Count} historical clients", clients?.Count ?? 0);
+                return clients ?? new List<UniFiClientDetailResponse>();
+            }
+
+            _logger.LogWarning("Failed to retrieve client history: {StatusCode}", response.StatusCode);
+            return new List<UniFiClientDetailResponse>();
+        });
+    }
+
+    #endregion
+
+    #region Firewall Management APIs
+
+    /// <summary>
+    /// GET rest/firewallrule - Get all firewall rules
+    /// </summary>
+    public async Task<List<UniFiFirewallRule>> GetFirewallRulesAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching firewall rules from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiFirewallRule>>(
+            () => _httpClient!.GetAsync(BuildApiPath("rest/firewallrule"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Retrieved {Count} firewall rules", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve firewall rules or received non-ok response");
+        return new List<UniFiFirewallRule>();
+    }
+
+    /// <summary>
+    /// GET rest/firewallrule - Get all firewall rules as raw JSON (legacy v1 API).
+    /// Use this for parsing rules through FirewallRuleParser when the v2 policies API is unavailable.
+    /// </summary>
+    public async Task<JsonDocument?> GetLegacyFirewallRulesRawAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching legacy firewall rules (raw) from site {Site}", _site);
+
+        try
+        {
+            var response = await _httpClient!.GetAsync(BuildApiPath("rest/firewallrule"), cancellationToken);
+
+            // Handle authentication failures (session expired)
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} fetching legacy firewall rules, re-authenticating...", response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while fetching legacy firewall rules");
+                    return null;
+                }
+
+                response = await _httpClient!.GetAsync(BuildApiPath("rest/firewallrule"), cancellationToken);
+            }
+
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+            var doc = JsonDocument.Parse(json);
+
+            // Check for successful API response
+            if (doc.RootElement.TryGetProperty("meta", out var meta) &&
+                meta.TryGetProperty("rc", out var rc) &&
+                rc.GetString() == "ok" &&
+                doc.RootElement.TryGetProperty("data", out var data))
+            {
+                var count = data.ValueKind == JsonValueKind.Array ? data.GetArrayLength() : 0;
+                _logger.LogInformation("Retrieved {Count} legacy firewall rules (raw)", count);
+                return doc;
+            }
+
+            _logger.LogWarning("Legacy firewall rules response did not have expected format");
+            doc.Dispose();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch legacy firewall rules");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// GET rest/firewallgroup - Get all firewall groups (address groups, port groups)
+    /// </summary>
+    public async Task<List<UniFiFirewallGroup>> GetFirewallGroupsAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching firewall groups from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiFirewallGroup>>(
+            () => _httpClient!.GetAsync(BuildApiPath("rest/firewallgroup"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Retrieved {Count} firewall groups", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve firewall groups or received non-ok response");
+        return new List<UniFiFirewallGroup>();
+    }
+
+    /// <summary>
+    /// GET stat/portforward - Get all port forwarding rules (UPnP and static)
+    /// Returns both dynamic UPnP mappings and configured static port forwards
+    /// </summary>
+    public async Task<List<UniFiPortForwardRule>> GetPortForwardRulesAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching port forwarding rules from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiPortForwardRule>>(
+            () => _httpClient!.GetAsync(BuildApiPath("stat/portforward"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            var upnpCount = response.Data.Count(r => r.IsUpnp == 1);
+            var staticCount = response.Data.Count - upnpCount;
+            _logger.LogInformation("Retrieved {Count} port forwarding rules ({UpnpCount} UPnP, {StaticCount} static)",
+                response.Data.Count, upnpCount, staticCount);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve port forwarding rules or received non-ok response");
+        return new List<UniFiPortForwardRule>();
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/firewall/zone - Get all firewall zones.
+    /// Returns the predefined zones (internal, external, gateway, vpn, hotspot, dmz)
+    /// and which networks are assigned to each zone.
+    /// </summary>
+    public async Task<List<UniFiFirewallZone>> GetFirewallZonesAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching firewall zones from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            _logger.LogWarning("Failed to authenticate when fetching firewall zones");
+            return [];
+        }
+
+        try
+        {
+            var url = BuildV2ApiPath($"site/{_site}/firewall/zone");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Failed to retrieve firewall zones: {StatusCode}", response.StatusCode);
+                return [];
+            }
+
+            var zones = await response.Content.ReadFromJsonAsync<List<UniFiFirewallZone>>(cancellationToken: cancellationToken);
+
+            if (zones != null)
+            {
+                _logger.LogInformation("Retrieved {Count} firewall zones", zones.Count);
+                return zones;
+            }
+
+            _logger.LogWarning("Failed to deserialize firewall zones response");
+            return [];
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch firewall zones");
+            return [];
+        }
+    }
+
+    #endregion
+
+    #region Network Configuration APIs
+
+    /// <summary>
+    /// GET rest/networkconf - Get all network/VLAN configurations.
+    /// Successful results are cached for <see cref="NetworkConfigCacheTtl"/>; pass
+    /// <paramref name="useCache"/> false to read the console directly (the Security Audit does,
+    /// so a re-run right after a config change grades the new config).
+    /// </summary>
+    public async Task<List<UniFiNetworkConfig>> GetNetworkConfigsAsync(CancellationToken cancellationToken = default, bool useCache = true)
+    {
+        if (useCache && _cachedNetworkConfigs != null
+            && DateTime.UtcNow - _networkConfigCacheTime < NetworkConfigCacheTtl)
+        {
+            return _cachedNetworkConfigs;
+        }
+
+        _logger.LogTrace("Fetching network configs from site {Site} (useCache={UseCache})", _site, useCache);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiNetworkConfig>>(
+            () => _httpClient!.GetAsync(BuildApiPath("rest/networkconf"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogTrace("Retrieved {Count} network configs", response.Data.Count);
+            _cachedNetworkConfigs = response.Data;
+            _networkConfigCacheTime = DateTime.UtcNow;
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve network configs or received non-ok response");
+        return new List<UniFiNetworkConfig>();
+    }
+
+    /// <summary>
+    /// Get WAN configurations only (filtered from network configs)
+    /// Returns networks with purpose = "wan". <paramref name="useCache"/> is passed through to
+    /// <see cref="GetNetworkConfigsAsync"/>; Smart Queues state lives on these rows, so Adaptive SQM
+    /// reads them fresh.
+    /// </summary>
+    public async Task<List<UniFiNetworkConfig>> GetWanConfigsAsync(CancellationToken cancellationToken = default, bool useCache = true)
+    {
+        var allConfigs = await GetNetworkConfigsAsync(cancellationToken, useCache);
+        var wanConfigs = allConfigs
+            .Where(c => c.Purpose.Equals("wan", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        _logger.LogDebug("Found {Count} WAN configurations", wanConfigs.Count);
+        return wanConfigs;
+    }
+
+    /// <summary>
+    /// GET rest/portconf - Get all port profiles.
+    /// Port profiles define configuration templates that can be applied to switch ports.
+    /// When a port has a portconf_id, its settings (forward mode, isolation, etc.) come from the profile.
+    /// </summary>
+    public async Task<List<UniFiPortProfile>> GetPortProfilesAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching port profiles from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiPortProfile>>(
+            () => _httpClient!.GetAsync(BuildApiPath("rest/portconf"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Retrieved {Count} port profiles", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve port profiles or received non-ok response");
+        return new List<UniFiPortProfile>();
+    }
+
+    /// <summary>
+    /// GET rest/wlanconf - Get all WLAN (WiFi network) configurations.
+    /// Returns full WLAN settings including mlo_enabled, security settings, etc.
+    /// </summary>
+    public async Task<List<UniFiWlanConfig>> GetWlanConfigurationsAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching WLAN configurations from site {Site}", _site);
+
+        try
+        {
+            var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiWlanConfig>>(
+                () => _httpClient!.GetAsync(BuildApiPath("rest/wlanconf"), cancellationToken),
+                cancellationToken);
+
+            if (response?.Meta.Rc == "ok")
+            {
+                _logger.LogDebug("Retrieved {Count} WLAN configurations", response.Data.Count);
+                return response.Data;
+            }
+
+            _logger.LogWarning("Failed to retrieve WLAN configurations or received non-ok response");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error fetching or parsing WLAN configurations");
+        }
+
+        return new List<UniFiWlanConfig>();
+    }
+
+    /// <summary>
+    /// PUT rest/networkconf/{id} - Update network configuration
+    /// Used to enable/disable networks, VPNs, etc.
+    /// </summary>
+    public async Task<bool> UpdateNetworkConfigAsync(
+        string configId,
+        UniFiNetworkConfig updatedConfig,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Updating network config {ConfigId}", configId);
+
+        var content = new StringContent(
+            JsonSerializer.Serialize(updatedConfig),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiNetworkConfig>>(
+            () => _httpClient!.PutAsync(
+                BuildApiPath($"rest/networkconf/{configId}"),
+                content,
+                cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Successfully updated network config {ConfigId}", configId);
+            return true;
+        }
+
+        _logger.LogWarning("Failed to update network config {ConfigId}", configId);
+        return false;
+    }
+
+    #endregion
+
+    #region System Information APIs
+
+    /// <summary>
+    /// GET stat/sysinfo - Get controller system info (includes licensing fingerprint)
+    /// </summary>
+    public async Task<UniFiSysInfo?> GetSystemInfoAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching system info from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiSysInfoResponse>(
+            () => _httpClient!.GetAsync(BuildApiPath("stat/sysinfo"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok" && response.Data.Count > 0)
+        {
+            var sysInfo = response.Data[0];
+            _logger.LogInformation("Retrieved system info - Controller: {Name} v{Version}",
+                sysInfo.Name, sysInfo.Version);
+
+            if (!string.IsNullOrEmpty(sysInfo.AnonymousControllerId))
+            {
+                _logger.LogDebug("Controller fingerprint: {ControllerId}", sysInfo.AnonymousControllerId);
+            }
+
+            return sysInfo;
+        }
+
+        _logger.LogWarning("Failed to retrieve system info or received non-ok response");
+        return null;
+    }
+
+    /// <summary>
+    /// GET /api/self - Get information about the current logged-in user
+    /// Note: This endpoint doesn't use the /proxy/network prefix even on UniFi OS
+    /// </summary>
+    public async Task<JsonDocument?> GetSelfInfoAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching self info");
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync($"{_controllerUrl}/api/self", cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                return JsonDocument.Parse(json);
+            }
+
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// GET stat/health - Get site health information
+    /// </summary>
+    public async Task<JsonDocument?> GetSiteHealthAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching site health for {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(BuildApiPath("stat/health"), cancellationToken);
+
+            // Handle authentication failures (session expired)
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} fetching site health, re-authenticating...", response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while fetching site health");
+                    return null;
+                }
+
+                response = await _httpClient!.GetAsync(BuildApiPath("stat/health"), cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                return JsonDocument.Parse(json);
+            }
+
+            return null;
+        });
+    }
+
+    #endregion
+
+    #region Traffic Management APIs
+
+    /// <summary>
+    /// GET v2/api/site/{site}/trafficroutes - the site's policy-based routes.
+    /// <para>
+    /// A v2 endpoint, so the payload is a bare array rather than the meta/data envelope the v1
+    /// calls unwrap. Best effort: an empty list whenever it cannot be read, since a caller asking
+    /// which WAN a device is pinned to treats "no route" and "could not look" the same way.
+    /// </para>
+    /// </summary>
+    public async Task<List<UniFiTrafficRouteResponse>> GetTrafficRoutesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching traffic routes for site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return new List<UniFiTrafficRouteResponse>();
+        }
+
+        var routes = await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(
+                BuildV2ApiPath($"site/{_site}/trafficroutes"),
+                cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogDebug("Traffic routes returned {Status}", response.StatusCode);
+                return null;
+            }
+
+            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+            return JsonSerializer.Deserialize<List<UniFiTrafficRouteResponse>>(json);
+        });
+
+        _logger.LogDebug("Retrieved {Count} traffic route(s)", routes?.Count ?? 0);
+        return routes ?? new List<UniFiTrafficRouteResponse>();
+    }
+
+    /// <summary>
+    /// PUT v2/api/site/{site}/trafficroutes/{id} - Update traffic route
+    /// </summary>
+    public async Task<bool> UpdateTrafficRouteAsync(
+        string routeId,
+        JsonDocument route,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Updating traffic route {RouteId}", routeId);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return false;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var content = new StringContent(
+                route.RootElement.GetRawText(),
+                Encoding.UTF8,
+                "application/json");
+
+            var response = await _httpClient!.PutAsync(
+                BuildV2ApiPath($"site/{_site}/trafficroutes/{routeId}"),
+                content,
+                cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("Successfully updated traffic route {RouteId}", routeId);
+                return true;
+            }
+
+            var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
+            _logger.LogWarning("Failed to update traffic route {RouteId}: {Error}", routeId, errorBody);
+            return false;
+        });
+    }
+
+    #endregion
+
+    #region Statistics APIs
+
+    /// <summary>
+    /// GET stat/report/hourly.site - Get hourly site statistics
+    /// </summary>
+    public async Task<JsonDocument?> GetHourlySiteStatsAsync(
+        DateTime? start = null,
+        DateTime? end = null,
+        CancellationToken cancellationToken = default)
+    {
+        var startTime = start ?? DateTime.UtcNow.AddHours(-24);
+        var endTime = end ?? DateTime.UtcNow;
+
+        var startMs = new DateTimeOffset(startTime).ToUnixTimeMilliseconds();
+        var endMs = new DateTimeOffset(endTime).ToUnixTimeMilliseconds();
+
+        _logger.LogDebug("Fetching hourly site stats from {Start} to {End}", startTime, endTime);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var url = $"{BuildApiPath("stat/report/hourly.site")}?start={startMs}&end={endMs}";
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                return JsonDocument.Parse(json);
+            }
+
+            return null;
+        });
+    }
+
+    #endregion
+
+    #region Site Management
+
+    /// <summary>
+    /// GET api/self/sites - Get all sites accessible to the current user
+    /// Note: On UniFi OS this also needs the /proxy/network prefix
+    /// </summary>
+    public async Task<JsonDocument?> GetSitesAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching all sites");
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        // Build URL - self/sites endpoint also uses the proxy path on UniFi OS
+        var url = _isUniFiOs
+            ? $"{_controllerUrl}/proxy/network/api/self/sites"
+            : $"{_controllerUrl}/api/self/sites";
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                return JsonDocument.Parse(json);
+            }
+
+            return null;
+        });
+    }
+
+    #endregion
+
+    #region Settings APIs
+
+    /// <summary>
+    /// GET rest/setting - Get all site settings (includes DoH, DNS, etc.)
+    /// </summary>
+    public async Task<JsonDocument?> GetSettingsRawAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching settings from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(BuildApiPath("rest/setting"), cancellationToken);
+
+            // Handle authentication failures (session expired)
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} fetching settings, re-authenticating...", response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while fetching settings");
+                    return null;
+                }
+
+                response = await _httpClient!.GetAsync(BuildApiPath("rest/setting"), cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogDebug("Retrieved settings ({Length} bytes)", json.Length);
+                return JsonDocument.Parse(json);
+            }
+
+            _logger.LogWarning("Failed to retrieve settings: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// GET stat/current-channel - Get regulatory channel availability data.
+    /// Returns per-band, per-width channel lists for the site's regulatory domain.
+    /// </summary>
+    public async Task<JsonDocument?> GetCurrentChannelDataAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching current channel data from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(BuildApiPath("stat/current-channel"), cancellationToken);
+
+            // Handle authentication failures (session expired)
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} fetching current channel data, re-authenticating...", response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while fetching current channel data");
+                    return null;
+                }
+
+                response = await _httpClient!.GetAsync(BuildApiPath("stat/current-channel"), cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogDebug("Retrieved current channel data ({Length} bytes)", json.Length);
+                return JsonDocument.Parse(json);
+            }
+
+            _logger.LogWarning("Failed to retrieve current channel data: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// Check if UPnP is enabled in the USG settings
+    /// </summary>
+    public async Task<bool> GetUpnpEnabledAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var settings = await GetSettingsRawAsync(cancellationToken);
+            if (settings == null) return true; // Assume enabled if we can't fetch
+
+            if (settings.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in data.EnumerateArray())
+                {
+                    if (item.TryGetProperty("key", out var key) && key.GetString() == "usg")
+                    {
+                        if (item.TryGetProperty("upnp_enabled", out var upnpEnabled))
+                        {
+                            return upnpEnabled.GetBoolean();
+                        }
+                    }
+                }
+            }
+
+            return true; // Assume enabled if not found
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to check UPnP enabled status");
+            return true; // Assume enabled on error
+        }
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/qos-rules - Get QoS rules (traffic shaping, app-based bandwidth limits)
+    /// </summary>
+    public async Task<JsonDocument?> GetQosRulesRawAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching QoS rules from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var url = BuildV2ApiPath($"site/{_site}/qos-rules");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogDebug("Retrieved QoS rules ({Length} bytes)", json.Length);
+                return JsonDocument.Parse(json);
+            }
+
+            _logger.LogWarning("Failed to retrieve QoS rules: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/wan/enriched-configuration - Get enriched WAN configuration
+    /// Includes load balance type (failover-only vs weighted) and provider details.
+    /// </summary>
+    public async Task<JsonDocument?> GetWanEnrichedConfigRawAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching WAN enriched config from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var url = BuildV2ApiPath($"site/{_site}/wan/enriched-configuration");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogDebug("Retrieved WAN enriched config ({Length} bytes)", json.Length);
+                return JsonDocument.Parse(json);
+            }
+
+            _logger.LogWarning("Failed to retrieve WAN enriched config: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/firewall-policies - Get firewall policies (new v2 API)
+    /// This endpoint provides detailed firewall policy configuration including DNS blocking rules
+    /// </summary>
+    public async Task<JsonDocument?> GetFirewallPoliciesRawAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching firewall policies from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var url = BuildV2ApiPath($"site/{_site}/firewall-policies");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogDebug("Retrieved firewall policies ({Length} bytes)", json.Length);
+                return JsonDocument.Parse(json);
+            }
+
+            _logger.LogWarning("Failed to retrieve firewall policies: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/nat - Get NAT rules (DNAT/SNAT)
+    /// This endpoint provides NAT rule configuration for DNS redirection detection
+    /// </summary>
+    public async Task<JsonDocument?> GetNatRulesRawAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching NAT rules from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var url = BuildV2ApiPath($"site/{_site}/nat");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogDebug("Retrieved NAT rules ({Length} bytes)", json.Length);
+                return JsonDocument.Parse(json);
+            }
+
+            _logger.LogWarning("Failed to retrieve NAT rules: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/firewall-rules/combined-traffic-firewall-rules?originType=all
+    /// Returns combined traffic/firewall rules including app-based rules.
+    /// This API is used to get app-based DNS blocking rules that use application IDs
+    /// instead of port numbers.
+    /// </summary>
+    public async Task<JsonDocument?> GetCombinedTrafficFirewallRulesRawAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching combined traffic firewall rules from site {Site}", _site);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var url = BuildV2ApiPath($"site/{_site}/firewall-rules/combined-traffic-firewall-rules?originType=all");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogDebug("Retrieved combined traffic firewall rules ({Length} bytes)", json.Length);
+                return JsonDocument.Parse(json);
+            }
+
+            _logger.LogWarning("Failed to retrieve combined traffic firewall rules: {StatusCode}", response.StatusCode);
+            return null;
+        });
+    }
+
+    #endregion
+
+    #region Fingerprint Database APIs
+
+    /// <summary>
+    /// GET v2/api/fingerprint_devices/{index} - Get fingerprint database
+    /// The database is split across multiple indices (0-n)
+    /// </summary>
+    public async Task<UniFiFingerprintDatabase?> GetFingerprintDatabaseAsync(
+        int index = 0,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching fingerprint database index {Index}", index);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var url = BuildV2ApiPath($"fingerprint_devices/{index}");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                return await response.Content.ReadFromJsonAsync<UniFiFingerprintDatabase>(
+                    cancellationToken: cancellationToken);
+            }
+
+            _logger.LogDebug("Fingerprint database index {Index} returned {StatusCode}",
+                index, response.StatusCode);
+            return null;
+        });
+    }
+
+    /// <summary>
+    /// Get the complete fingerprint database by fetching all indices
+    /// </summary>
+    public async Task<UniFiFingerprintDatabase> GetCompleteFingerprintDatabaseAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var combined = new UniFiFingerprintDatabase();
+        var maxIndices = 15; // UniFi typically has indices 0-10+
+        var indicesFetched = 0;
+
+        for (int i = 0; i <= maxIndices; i++)
+        {
+            var db = await GetFingerprintDatabaseAsync(i, cancellationToken);
+            if (db == null)
+            {
+                _logger.LogDebug("Fingerprint database: fetched {Count} indices (0-{Last})",
+                    indicesFetched, i - 1);
+                break;
+            }
+
+            combined.Merge(db);
+            indicesFetched++;
+            _logger.LogDebug("Merged fingerprint index {Index} - Total devices: {Count}",
+                i, combined.DevIds.Count);
+        }
+
+        _logger.LogInformation("Loaded fingerprint database: {DevTypes} device types, {Vendors} vendors, {Devices} devices",
+            combined.DevTypeIds.Count, combined.VendorIds.Count, combined.DevIds.Count);
+
+        return combined;
+    }
+
+    #endregion
+
+    /// <summary>
+    /// Logout from the controller (optional, as cookies typically expire)
+    /// </summary>
+    public async Task<bool> LogoutAsync(CancellationToken cancellationToken = default)
+    {
+        if (!_isAuthenticated)
+            return true;
+
+        // API key auth is stateless - no session to log out of
+        if (UseApiKey)
+        {
+            _isAuthenticated = false;
+            _logger.LogDebug("API key auth - no logout needed");
+            return true;
+        }
+
+        try
+        {
+            _logger.LogDebug("Logging out from UniFi controller");
+
+            var response = await _httpClient!.PostAsync(
+                $"{_controllerUrl}/api/logout",
+                null,
+                cancellationToken);
+
+            _isAuthenticated = false;
+            _csrfToken = null;
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("Successfully logged out");
+                return true;
+            }
+
+            _logger.LogWarning("Logout returned status {StatusCode}", response.StatusCode);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Exception during logout");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Validates that the configured site ID exists on this controller.
+    /// Call this after login to verify the site is accessible.
+    /// </summary>
+    /// <returns>Tuple of (success, error message if failed)</returns>
+    public async Task<(bool Success, string? Error)> ValidateSiteAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Validating site '{Site}' on controller", _site);
+
+        // Clear any previous API errors
+        _lastApiError = null;
+        _lastApiErrorCode = null;
+
+        try
+        {
+            // Make a minimal site-specific call to verify the site exists
+            var url = BuildApiPath("stat/sysinfo");
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (IsConsoleUnavailable(response.StatusCode))
+            {
+                return (false, ConsoleUnavailableMessage);
+            }
+
+            if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Forbidden)
+            {
+                return (false, "Authentication failed. Check your credentials or API key.");
+            }
+
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            // A console mid-reboot or mid-firmware-upgrade serves its web UI - or a proxy's holding
+            // page - to every request, including API ones. Parsing that raised the JSON reader's
+            // own words at the user ("'<' is an invalid start of a value. LineNumber: 0"), which
+            // describes our parser rather than their console and reads like a bug in us. The
+            // condition is temporary and resolves with no action, so say that.
+            if (LooksLikeHtml(body))
+            {
+                _logger.LogInformation(
+                    "Site validation got a web page instead of API data - console likely restarting or upgrading");
+                return (false, "The UniFi Console returned a web page instead of API data, which usually "
+                    + "means it is restarting or upgrading. This clears on its own once it is back.");
+            }
+
+            // Parse the response to check for API-level errors
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("meta", out var meta))
+            {
+                var rc = meta.TryGetProperty("rc", out var rcProp) ? rcProp.GetString() : null;
+                var msg = meta.TryGetProperty("msg", out var msgProp) ? msgProp.GetString() : null;
+
+                if (rc != "ok")
+                {
+                    _lastApiError = msg;
+                    _lastApiErrorCode = msg;
+
+                    _logger.LogWarning("Site validation failed: {Error}", msg);
+
+                    // Provide user-friendly error messages for known error codes
+                    if (msg == "api.err.NoSiteContext")
+                    {
+                        var error = $"Invalid Site ID: The site '{_site}' does not exist on this controller.";
+                        return (false, error);
+                    }
+
+                    return (false, $"API error: {msg}");
+                }
+            }
+
+            _logger.LogDebug("Site '{Site}' validated successfully", _site);
+            return (true, null);
+        }
+        catch (JsonException ex)
+        {
+            // Same situation reached by a shape LooksLikeHtml does not catch - a redirect stub, a
+            // captive portal, a truncated body. The reader's message is never useful to a user.
+            _logger.LogInformation(ex, "Site validation could not parse the console's response as JSON");
+            return (false, "The UniFi Console did not return valid API data, which usually means it is "
+                + "restarting or upgrading. This clears on its own once it is back.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Exception during site validation");
+            return (false, $"Failed to validate site: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Whether a response body is a web page rather than API data. A UniFi Console serves its UI
+    /// to every request while it reboots or applies a firmware update, so this is the ordinary
+    /// shape of "come back in a minute", not a malformed reply.
+    /// </summary>
+    private static bool LooksLikeHtml(string? body)
+    {
+        var trimmed = body?.TrimStart();
+        return !string.IsNullOrEmpty(trimmed)
+            && (trimmed[0] == '<' || trimmed.StartsWith("<!", StringComparison.Ordinal));
+    }
+
+    #region Wi-Fi Optimizer APIs
+
+    /// <summary>
+    /// POST stat/report/{granularity}.site - Get site-wide Wi-Fi metrics time series
+    /// </summary>
+    /// <param name="granularity">Report granularity: 5minutes, hourly, daily</param>
+    /// <param name="startMs">Start time in Unix milliseconds</param>
+    /// <param name="endMs">End time in Unix milliseconds</param>
+    /// <param name="attrs">Attributes to fetch (e.g., ap-ng-cu_total, ap-na-tx_retries)</param>
+    public async Task<JsonElement> PostSiteReportAsync(
+        string granularity,
+        long startMs,
+        long endMs,
+        string[] attrs,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching {Granularity} site report with {AttrCount} attributes", granularity, attrs.Length);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildApiPath($"stat/report/{granularity}.site");
+        var payload = new
+        {
+            attrs,
+            start = startMs,
+            end = endMs
+        };
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var content = new StringContent(
+                JsonSerializer.Serialize(payload),
+                System.Text.Encoding.UTF8,
+                "application/json");
+
+            var response = await _httpClient!.PostAsync(url, content, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("data", out var data))
+                {
+                    return data.Clone();
+                }
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogWarning("Site report request failed: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+            }
+
+            return default;
+        });
+    }
+
+    /// <summary>
+    /// POST stat/report/{granularity}.ap - Get per-AP Wi-Fi metrics time series
+    /// </summary>
+    /// <param name="granularity">Report granularity: 5minutes, hourly, daily</param>
+    /// <param name="apMacs">AP MAC addresses to filter by</param>
+    /// <param name="startMs">Start time in Unix milliseconds</param>
+    /// <param name="endMs">End time in Unix milliseconds</param>
+    /// <param name="attrs">Attributes to fetch (e.g., ng-cu_total, na-cu_total - note: no 'ap-' prefix for .ap endpoint)</param>
+    public async Task<JsonElement> PostApReportAsync(
+        string granularity,
+        string[] apMacs,
+        long startMs,
+        long endMs,
+        string[] attrs,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching {Granularity} AP report for {ApCount} APs", granularity, apMacs.Length);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildApiPath($"stat/report/{granularity}.ap");
+        var payload = new
+        {
+            attrs,
+            macs = apMacs,
+            start = startMs,
+            end = endMs
+        };
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var content = new StringContent(
+                JsonSerializer.Serialize(payload),
+                System.Text.Encoding.UTF8,
+                "application/json");
+
+            var response = await _httpClient!.PostAsync(url, content, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("data", out var data))
+                {
+                    return data.Clone();
+                }
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogWarning("AP report request failed: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+            }
+
+            return default;
+        });
+    }
+
+    /// <summary>
+    /// POST stat/report/{granularity}.user - Get per-client Wi-Fi metrics time series
+    /// </summary>
+    /// <param name="granularity">Report granularity: 5minutes, hourly, daily</param>
+    /// <param name="clientMac">Client MAC address</param>
+    /// <param name="startMs">Start time in Unix milliseconds</param>
+    /// <param name="endMs">End time in Unix milliseconds</param>
+    /// <param name="attrs">Attributes to fetch (e.g., signal, tx_retries)</param>
+    public async Task<JsonElement> PostUserReportAsync(
+        string granularity,
+        string clientMac,
+        long startMs,
+        long endMs,
+        string[] attrs,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching {Granularity} user report for {ClientMac}", granularity, clientMac);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildApiPath($"stat/report/{granularity}.user");
+        var payload = new
+        {
+            attrs,
+            macs = new[] { clientMac },
+            oid = clientMac,  // Required by UniFi API
+            start = startMs,
+            end = endMs
+        };
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var content = new StringContent(
+                JsonSerializer.Serialize(payload),
+                System.Text.Encoding.UTF8,
+                "application/json");
+
+            var response = await _httpClient!.PostAsync(url, content, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("data", out var data))
+                {
+                    return data.Clone();
+                }
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogWarning("User report request failed: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+            }
+
+            return default;
+        });
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/traffic - every client's WAN usage by DPI application over a window, in
+    /// the client's frame. Site-wide: callers pick their MAC. Gateway-side for every client, so a
+    /// Wi-Fi client's local traffic is not in it. includeUnidentified is required: without it the
+    /// console drops the traffic its DPI could not name (category 255), which a speed test to an
+    /// unknown server is entirely, and the totals no longer match the Network app's.
+    /// </summary>
+    public async Task<UniFiClientTrafficResponse?> GetClientTrafficByAppAsync(
+        DateTime from,
+        DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var startMs = new DateTimeOffset(from.ToUniversalTime()).ToUnixTimeMilliseconds();
+        var endMs = new DateTimeOffset(to.ToUniversalTime()).ToUnixTimeMilliseconds();
+        var url = BuildV2ApiPath($"site/{_site}/traffic?start={startMs}&end={endMs}&includeUnidentified=true");
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Client traffic request failed: {StatusCode}", response.StatusCode);
+                return null;
+            }
+            return await response.Content.ReadFromJsonAsync<UniFiClientTrafficResponse>(cancellationToken: cancellationToken);
+        });
+    }
+
+    /// <summary>
+    /// POST v2/api/site/{site}/app-traffic-rate - a client's WAN traffic over a window in 5-minute
+    /// buckets, from the same DPI tally as <see cref="GetClientTrafficByAppAsync"/> (the Network
+    /// app's Internet Activity graph). The buckets sum to that call's totals. Empty when the
+    /// console cannot answer. The endpoint also takes several MACs (rows concatenated, unlabeled)
+    /// or none (the whole site, each bucket with a top_app); neither is modelled here.
+    /// </summary>
+    public async Task<List<UniFiTrafficRateBucket>> GetClientTrafficRateAsync(
+        string clientMac,
+        DateTime from,
+        DateTime to,
+        CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return new List<UniFiTrafficRateBucket>();
+        }
+
+        var startMs = new DateTimeOffset(from.ToUniversalTime()).ToUnixTimeMilliseconds();
+        var endMs = new DateTimeOffset(to.ToUniversalTime()).ToUnixTimeMilliseconds();
+        var url = BuildV2ApiPath($"site/{_site}/app-traffic-rate?start={startMs}&end={endMs}&includeUnidentified=true");
+
+        var buckets = await ExecuteRequestAsync(async () =>
+        {
+            var content = new StringContent(
+                JsonSerializer.Serialize(new { client_macs = new[] { clientMac } }),
+                Encoding.UTF8,
+                "application/json");
+            var response = await _httpClient!.PostAsync(url, content, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Client traffic rate request failed: {StatusCode}", response.StatusCode);
+                return null;
+            }
+            return await response.Content.ReadFromJsonAsync<List<UniFiTrafficRateBucket>>(cancellationToken: cancellationToken);
+        });
+        return buckets ?? new List<UniFiTrafficRateBucket>();
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex DpiIconDomainPattern =
+        new("^[a-z0-9][a-z0-9.-]*$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// GET dpi_icons/{domain}/favicon.ico - the favicon the Network app shows for a DPI application,
+    /// served by the console itself. Null when the console has none.
+    /// </summary>
+    public async Task<(byte[] Bytes, string ContentType)?> GetDpiIconAsync(string domain, CancellationToken cancellationToken = default)
+    {
+        if (!DpiIconDomainPattern.IsMatch(domain)) return null;
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var url = BuildNetworkAppPath($"dpi_icons/{domain}/favicon.ico");
+        return await ExecuteRequestAsync<(byte[] Bytes, string ContentType)?>(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+            var type = response.Content.Headers.ContentType?.MediaType ?? "";
+            if (!response.IsSuccessStatusCode || !type.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogDebug("DPI icon for {Domain}: {StatusCode} {ContentType}", domain, (int)response.StatusCode, type);
+                return null;
+            }
+            var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+            return bytes.Length == 0 ? null : (bytes, type);
+        });
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/wlan/enriched-configuration - Get WLAN configurations with stats
+    /// </summary>
+    public async Task<JsonElement> GetWlanEnrichedConfigurationAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching WLAN enriched configuration");
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildV2ApiPath($"site/{_site}/wlan/enriched-configuration");
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                return doc.RootElement.Clone();
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogWarning("WLAN enriched config request failed: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+            }
+
+            return default;
+        });
+    }
+
+    /// <summary>
+    /// POST v2/api/site/{site}/wifi-connectivity/roaming/topology - Get roaming topology and statistics
+    /// </summary>
+    public async Task<JsonElement> GetRoamingTopologyAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching roaming topology");
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildV2ApiPath($"site/{_site}/wifi-connectivity/roaming/topology");
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            // This endpoint requires POST with empty body
+            var content = new StringContent("{}", System.Text.Encoding.UTF8, "application/json");
+            var response = await _httpClient!.PostAsync(url, content, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                return doc.RootElement.Clone();
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogWarning("Roaming topology request failed: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+            }
+
+            return default;
+        });
+    }
+
+    /// <summary>
+    /// GET v2/api/site/{site}/system-log/client-connection/{mac} - Get client connection events (connects, disconnects, roams)
+    /// </summary>
+    /// <param name="clientMac">Client MAC address</param>
+    /// <param name="limit">Maximum number of events to return (default 200)</param>
+    public async Task<JsonElement> GetClientConnectionEventsAsync(
+        string clientMac,
+        int limit = 200,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching client connection events for {ClientMac}", clientMac);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildV2ApiPath($"site/{_site}/system-log/client-connection/{clientMac}?mac={clientMac}&separateConnectionSignalParam=false&limit={limit}");
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                return doc.RootElement.Clone();
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogWarning("Client connection events request failed: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+            }
+
+            return default;
+        });
+    }
+
+    /// <summary>
+    /// POST v2/api/site/{site}/system-log/all - Get AP channel change events from the system log
+    /// </summary>
+    public async Task<JsonElement> GetApChannelChangeEventsAsync(
+        DateTimeOffset start,
+        DateTimeOffset end,
+        string? apMac = null,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching AP channel change events from {Start} to {End}, AP={ApMac}", start, end, apMac ?? "all");
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildV2ApiPath($"site/{_site}/system-log/all");
+
+        var body = new Dictionary<string, object>
+        {
+            ["searchText"] = "",
+            ["severities"] = new[] { "LOW", "MEDIUM", "HIGH", "VERY_HIGH" },
+            ["categories"] = new[] { "UNIFI_DEVICES" },
+            ["events"] = new[] { "AP_CHANGED_CHANNELS" },
+            ["subcategories"] = new[] { "SYSTEM_WIFI" },
+            ["type"] = "GENERAL",
+            ["timestampFrom"] = start.ToUnixTimeMilliseconds(),
+            ["timestampTo"] = end.ToUnixTimeMilliseconds(),
+            ["pageNumber"] = 0,
+            ["pageSize"] = 500,
+            ["adminIds"] = Array.Empty<string>(),
+            ["clientDeviceMacs"] = apMac != null ? new[] { apMac } : Array.Empty<string>()
+        };
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var content = new StringContent(
+                JsonSerializer.Serialize(body),
+                System.Text.Encoding.UTF8,
+                "application/json");
+
+            var response = await _httpClient!.PostAsync(url, content, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                return doc.RootElement.Clone();
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogWarning("AP channel change events request failed: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+            }
+
+            return default;
+        });
+    }
+
+    /// <summary>
+    /// GET /api/s/{site}/stat/rogueap - Get neighboring Wi-Fi networks detected by APs
+    /// </summary>
+    /// <param name="startTime">Start time for filtering (optional, defaults to 1 day ago). UniFi UI uses 30m, 1h, 1D, 1W, 1M ranges.</param>
+    /// <param name="endTime">End time for filtering (optional, defaults to now)</param>
+    /// <param name="cancellationToken">Cancellation token</param>
+    public async Task<List<UniFiRogueApResponse>> GetRogueApsAsync(
+        DateTimeOffset? startTime = null,
+        DateTimeOffset? endTime = null,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching rogue/neighboring APs");
+
+        var end = endTime ?? DateTimeOffset.UtcNow;
+        var start = startTime ?? end.AddDays(-1);
+
+        var startSeconds = start.ToUnixTimeSeconds();
+        var endSeconds = end.ToUnixTimeSeconds();
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiRogueApResponse>>(
+            () => _httpClient!.GetAsync(BuildApiPath($"stat/rogueap?start={startSeconds}&end={endSeconds}"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Found {Count} rogue/neighboring APs", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve rogue APs or received non-ok response");
+        return new List<UniFiRogueApResponse>();
+    }
+
+    /// <summary>
+    /// GET /api/s/{site}/stat/spectrum-scan/{mac} - per-AP RF spectrum scan results held from the
+    /// AP's last scan (per-channel utilization % / interference dBm across each band). Returns null
+    /// if the AP has no cached scan or the call fails. Does NOT trigger a scan - see
+    /// <see cref="TriggerQuickScanAsync"/>.
+    /// </summary>
+    public async Task<UniFiSpectrumScanResponse?> GetSpectrumScanAsync(
+        string apMac,
+        CancellationToken cancellationToken = default)
+    {
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiSpectrumScanResponse>>(
+            () => _httpClient!.GetAsync(BuildApiPath($"stat/spectrum-scan/{apMac}"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+            return response.Data.FirstOrDefault();
+
+        _logger.LogDebug("No cached spectrum scan for AP {Mac}", apMac);
+        return null;
+    }
+
+    /// <summary>
+    /// POST /api/s/{site}/cmd/devmgr - trigger a quick RF spectrum scan on an AP's band. A quick
+    /// scan does NOT disconnect clients (unlike a full scan), but it still takes time per band, so
+    /// this is intended for background/scheduled refresh - never inline with a recommendation
+    /// request. Read the results later via <see cref="GetSpectrumScanAsync"/>.
+    /// </summary>
+    /// <param name="apMac">AP MAC address.</param>
+    /// <param name="band">UniFi band code: "ng" (2.4 GHz), "na" (5 GHz), "6e" (6 GHz).</param>
+    /// <param name="bandwidthMhz">Scan bandwidth in MHz (e.g. 20).</param>
+    public async Task<bool> TriggerQuickScanAsync(
+        string apMac,
+        string band,
+        int bandwidthMhz = 20,
+        CancellationToken cancellationToken = default)
+    {
+        var body = new Dictionary<string, object>
+        {
+            ["mac"] = apMac,
+            ["scan-band"] = band,
+            ["scan-bw"] = bandwidthMhz,
+            ["cmd"] = "quick-scan"
+        };
+        var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+
+        // Opt into permission-error surfacing: this is a mutative call, so a NoPermission 403 is a
+        // real, actionable failure (insufficient role) rather than a transient/auth-expiry hiccup.
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () => _httpClient!.PostAsync(BuildApiPath("cmd/devmgr"), content, cancellationToken),
+            cancellationToken,
+            throwOnPermissionError: true);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Triggered quick scan on AP {Mac} band {Band}", apMac, band);
+            return true;
+        }
+
+        _logger.LogWarning("Failed to trigger quick scan on AP {Mac} band {Band}", apMac, band);
+        return false;
+    }
+
+    #endregion
+
+    #region Firmware APIs
+
+    /// <summary>
+    /// GET rest/setting - the site's `super_fwupdate` section: the release channel UniFi devices
+    /// follow and the channel options this console offers. Returns null when the section is missing
+    /// or the settings call fails.
+    /// </summary>
+    [VendorSpecific("UniFi", "rest/setting super_fwupdate section")]
+    public async Task<UniFiFirmwareUpdateSettings?> GetFirmwareUpdateSettingsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        using var settings = await GetSettingsRawAsync(cancellationToken);
+        if (settings == null)
+        {
+            _logger.LogWarning("Could not read settings, so no firmware channel is available for site {Site}", _site);
+            return null;
+        }
+
+        var section = UniFiFirmwareUpdateSettings.FromSettingsResponse(settings);
+        if (section == null)
+        {
+            _logger.LogWarning("Settings for site {Site} carry no {Key} section", _site, UniFiFirmwareUpdateSettings.SettingKey);
+            return null;
+        }
+
+        _logger.LogDebug("Device firmware channel for site {Site} is {Channel}", _site, section.FirmwareChannel);
+        return section;
+    }
+
+    /// <summary>
+    /// GET rest/setting - whether UniFi's own nightly device auto-upgrade is on. Null when it
+    /// cannot be read.
+    /// </summary>
+    [VendorSpecific("UniFi", "rest/setting mgmt section")]
+    public async Task<bool?> GetDeviceAutoUpgradeEnabledAsync(CancellationToken cancellationToken = default)
+    {
+        using var settings = await GetSettingsRawAsync(cancellationToken);
+        if (settings == null)
+        {
+            _logger.LogDebug("Could not read settings, so the auto-upgrade flag is unknown for site {Site}", _site);
+            return null;
+        }
+
+        return UniFiMgmtSettings.FromSettingsResponse(settings)?.AutoUpgrade;
+    }
+
+    /// <summary>
+    /// POST set/setting/mgmt - turns UniFi's own nightly device auto-upgrade on or off. The body
+    /// names only `auto_upgrade`, never the rest of the section, which carries SSH credentials.
+    /// </summary>
+    /// <param name="enabled">Whether UniFi upgrades devices on its own schedule.</param>
+    [VendorSpecific("UniFi", "set/setting/mgmt auto_upgrade-only partial write")]
+    public async Task<bool> SetDeviceAutoUpgradeAsync(bool enabled, CancellationToken cancellationToken = default)
+    {
+        var body = UniFiMgmtSettings.BuildAutoUpgradeWriteBody(enabled);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () =>
+            {
+                var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                return _httpClient!.PostAsync(BuildApiPath($"set/setting/{UniFiMgmtSettings.SettingKey}"), content, cancellationToken);
+            },
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Set device auto-upgrade for site {Site} to {Enabled}", _site, enabled);
+            return true;
+        }
+
+        _logger.LogWarning("Failed to set device auto-upgrade for site {Site} to {Enabled}", _site, enabled);
+        return false;
+    }
+
+    /// <summary>
+    /// POST set/setting/super_fwupdate - change the release channel UniFi devices follow. A
+    /// read-modify-write: the existing `_id` and `sso_enabled` are carried back unchanged.
+    /// <para>
+    /// Writes the `super_fwupdate` section and nothing else. The UniFi UI also re-POSTs `mgmt` when
+    /// saving that page, which re-sends SSH credentials - never do that here.
+    /// </para>
+    /// </summary>
+    /// <param name="channel">"release" (GA), "release-candidate", or "beta" (EA).</param>
+    [VendorSpecific("UniFi", "set/setting/super_fwupdate read-modify-write")]
+    public async Task<bool> SetDeviceFirmwareChannelAsync(
+        string channel,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+
+        var current = await GetFirmwareUpdateSettingsAsync(cancellationToken);
+        if (current == null)
+        {
+            _logger.LogError("Cannot set the device firmware channel: the current {Key} setting could not be read",
+                UniFiFirmwareUpdateSettings.SettingKey);
+            return false;
+        }
+
+        var body = UniFiFirmwareUpdateSettings.BuildChannelWriteBody(current, channel);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () =>
+            {
+                var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                return _httpClient!.PostAsync(
+                    BuildApiPath($"set/setting/{UniFiFirmwareUpdateSettings.SettingKey}"),
+                    content,
+                    cancellationToken);
+            },
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Set the device firmware channel for site {Site} to {Channel}", _site, channel);
+            return true;
+        }
+
+        _logger.LogWarning("Failed to set the device firmware channel for site {Site} to {Channel}", _site, channel);
+        return false;
+    }
+
+    /// <summary>
+    /// POST cmd/productinfo {"cmd":"check-firmware-update"} - the half of the console's "Check for
+    /// Updates" that re-derives each device's pending target against the channel in force.
+    /// Accepted immediately and worked in the background, so rc:ok says nothing about it finishing.
+    /// </summary>
+    [VendorSpecific("UniFi", "cmd/productinfo check-firmware-update")]
+    public async Task<bool> TriggerDeviceFirmwareCheckAsync(CancellationToken cancellationToken = default)
+    {
+        var body = new Dictionary<string, object> { ["cmd"] = "check-firmware-update" };
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () =>
+            {
+                var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                return _httpClient!.PostAsync(BuildApiPath("cmd/productinfo"), content, cancellationToken);
+            },
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Asked site {Site} to re-check device firmware", _site);
+            return true;
+        }
+
+        _logger.LogWarning("Failed to trigger the device firmware check for site {Site}", _site);
+        return false;
+    }
+
+    /// <summary>
+    /// POST cmd/firmware {"cmd":"list-available"} - the newest build per model on the console's
+    /// CURRENT channel, each with a direct image URL and md5. Also the hook for confirming a channel
+    /// change took effect: change the channel, re-run this, and the URLs follow.
+    /// </summary>
+    [VendorSpecific("UniFi", "cmd/firmware list-available")]
+    public async Task<List<UniFiFirmwareCatalogEntry>> ListAvailableFirmwareAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var body = new Dictionary<string, object> { ["cmd"] = "list-available" };
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiFirmwareCatalogEntry>>(
+            () =>
+            {
+                var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                return _httpClient!.PostAsync(BuildApiPath("cmd/firmware"), content, cancellationToken);
+            },
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Firmware catalog for site {Site} carries {Count} entries", _site, response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to read the firmware catalog for site {Site}", _site);
+        return new List<UniFiFirmwareCatalogEntry>();
+    }
+
+    /// <summary>
+    /// POST cmd/devmgr {"cmd":"upgrade"} - upgrade a device to the console's pending target for it
+    /// (the catalog build at the console's current channel). This is the executor's primary command.
+    /// <para>
+    /// The console answers rc:ok the moment it ACCEPTS the command, and the flash is asynchronous.
+    /// Acceptance is not success and neither is an observed reboot: a live revert produced rc:ok and
+    /// a full down/up cycle on the SAME version. Callers must verify by observed state plus a
+    /// version comparison after the device is back, and escalate to the SSH path when the device
+    /// never enters Upgrading/Down within a grace window.
+    /// </para>
+    /// </summary>
+    /// <param name="mac">Device MAC in any separator form; sent lowercase-colonized.</param>
+    [VendorSpecific("UniFi", "cmd/devmgr upgrade")]
+    public async Task<bool> TriggerDeviceUpgradeAsync(
+        string mac,
+        CancellationToken cancellationToken = default)
+    {
+        var body = UniFiDeviceUpgradeCommand.BuildUpgradeBody(mac);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () =>
+            {
+                var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                return _httpClient!.PostAsync(BuildApiPath("cmd/devmgr"), content, cancellationToken);
+            },
+            cancellationToken);
+
+        if (UniFiDeviceUpgradeCommand.IsAccepted(response))
+        {
+            _logger.LogInformation("Console accepted an upgrade command for device {Mac}", body["mac"]);
+            return true;
+        }
+
+        _logger.LogWarning("Console refused the upgrade command for device {Mac}", body["mac"]);
+        return false;
+    }
+
+    /// <summary>
+    /// POST cmd/devmgr {"cmd":"upgrade-external"} - upgrade or revert a device to an arbitrary
+    /// firmware image URL.
+    /// <para>
+    /// Known to be unreliable: a live revert commanded while the device was mid-provision returned
+    /// rc:ok, cycled the device, and brought it back on the SAME version - the scheduled flash was
+    /// lost in the inform cycle. Treat this as a first attempt only; SSH (`upgrade &lt;url&gt;`) is
+    /// the reliability path, and rollback is SSH-first. Command only a steadily Connected device,
+    /// and verify the version after it returns.
+    /// </para>
+    /// </summary>
+    /// <param name="mac">Device MAC in any separator form; sent lowercase-colonized.</param>
+    /// <param name="url">Direct firmware image URL, from the console catalog or the release feed.</param>
+    [VendorSpecific("UniFi", "cmd/devmgr upgrade-external")]
+    public async Task<bool> TriggerDeviceExternalUpgradeAsync(
+        string mac,
+        string url,
+        CancellationToken cancellationToken = default)
+    {
+        var body = UniFiDeviceUpgradeCommand.BuildExternalUpgradeBody(mac, url);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () =>
+            {
+                var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                return _httpClient!.PostAsync(BuildApiPath("cmd/devmgr"), content, cancellationToken);
+            },
+            cancellationToken);
+
+        if (UniFiDeviceUpgradeCommand.IsAccepted(response))
+        {
+            _logger.LogInformation("Console accepted an external upgrade command for device {Mac}", body["mac"]);
+            return true;
+        }
+
+        _logger.LogWarning("Console refused the external upgrade command for device {Mac}", body["mac"]);
+        return false;
+    }
+
+    /// <summary>
+    /// PATCH /api/system/updates/channels - set the UniFi Network application channel, the UniFi OS
+    /// channel, or both. Console-level, so it does NOT go through /proxy/network. The console
+    /// answers 204 No Content on success.
+    /// </summary>
+    /// <param name="networkAppChannel">UniFi Network application channel, or null to leave it alone.</param>
+    /// <param name="unifiOsChannel">UniFi OS (console firmware) channel, or null to leave it alone.</param>
+    [VendorSpecific("UniFi", "console-level PATCH /api/system/updates/channels")]
+    public async Task<bool> SetConsoleUpdateChannelsAsync(
+        string? networkAppChannel,
+        string? unifiOsChannel,
+        CancellationToken cancellationToken = default)
+    {
+        var request = UniFiConsoleUpdateChannelsRequest.Build(networkAppChannel, unifiOsChannel);
+        if (request == null)
+        {
+            _logger.LogWarning("SetConsoleUpdateChannelsAsync called with no channel to set");
+            return false;
+        }
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return false;
+        }
+
+        var url = $"{_controllerUrl}/api/system/updates/channels";
+        var payload = JsonSerializer.Serialize(request);
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.PatchAsync(
+                url,
+                new StringContent(payload, Encoding.UTF8, "application/json"),
+                cancellationToken);
+
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} setting console update channels, re-authenticating...",
+                    response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while setting console update channels");
+                    return false;
+                }
+
+                response = await _httpClient!.PatchAsync(
+                    url,
+                    new StringContent(payload, Encoding.UTF8, "application/json"),
+                    cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation(
+                    "Set console update channels (Network application: {NetworkChannel}, UniFi OS: {OsChannel})",
+                    networkAppChannel ?? "unchanged", unifiOsChannel ?? "unchanged");
+                return true;
+            }
+
+            var error = await response.Content.ReadAsStringAsync(cancellationToken);
+            _logger.LogError("Failed to set console update channels: {StatusCode} - {Error}",
+                response.StatusCode, error);
+            return false;
+        });
+    }
+
+    /// <summary>
+    /// PATCH /api/system - turns off one console auto-update schedule: UniFi OS or the UniFi
+    /// Network application. Console-level, so it does NOT go through /proxy/network, and an API-key
+    /// connection cannot reach it.
+    /// </summary>
+    /// <param name="scheduleKey"><see cref="UniFiConsoleAutoUpdateRequest.UniFiOs"/> or <see cref="UniFiConsoleAutoUpdateRequest.NetworkApplication"/>.</param>
+    [VendorSpecific("UniFi", "console-level PATCH /api/system autoUpdates")]
+    public async Task<bool> DisableConsoleAutoUpdateAsync(string scheduleKey, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(scheduleKey);
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return false;
+        }
+
+        var url = $"{_controllerUrl}/api/system";
+        var payload = JsonSerializer.Serialize(UniFiConsoleAutoUpdateRequest.BuildDisable(scheduleKey));
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.PatchAsync(
+                url, new StringContent(payload, Encoding.UTF8, "application/json"), cancellationToken);
+
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} turning off the {Schedule} auto-update, re-authenticating...",
+                    response.StatusCode, scheduleKey);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while turning off the {Schedule} auto-update", scheduleKey);
+                    return false;
+                }
+
+                response = await _httpClient!.PatchAsync(
+                    url, new StringContent(payload, Encoding.UTF8, "application/json"), cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("Turned off the console's {Schedule} auto-update", scheduleKey);
+                return true;
+            }
+
+            var error = await response.Content.ReadAsStringAsync(cancellationToken);
+            _logger.LogError("Failed to turn off the console's {Schedule} auto-update: {StatusCode} - {Error}",
+                scheduleKey, response.StatusCode, error);
+            return false;
+        });
+    }
+
+    /// <summary>
+    /// GET /api/system - the console-level UniFi OS view: current channel, the builds it knows
+    /// about (with publish dates, download URLs and changelog links), and any update in flight.
+    /// Console-level, so it does NOT go through /proxy/network. Only the fields this feature needs
+    /// are mapped.
+    /// </summary>
+    [VendorSpecific("UniFi", "console-level GET /api/system")]
+    public async Task<UniFiConsoleSystemInfo?> GetConsoleSystemInfoAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var url = $"{_controllerUrl}/api/system";
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} fetching console system info, re-authenticating...",
+                    response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while fetching console system info");
+                    return null;
+                }
+
+                response = await _httpClient!.GetAsync(url, cancellationToken);
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Failed to fetch console system info: {StatusCode}", response.StatusCode);
+                return null;
+            }
+
+            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            try
+            {
+                var info = JsonSerializer.Deserialize<UniFiConsoleSystemInfo>(json);
+                if (info != null)
+                {
+                    _logger.LogDebug(
+                        "Console {Name}: UniFi OS channel {Channel}, standalone={Standalone}",
+                        info.Name, info.Firmware?.ReleaseChannel, info.IsStandaloneConsole);
+                }
+                return info;
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Could not parse console system info");
+                return null;
+            }
+        });
+    }
+
+    /// <summary>
+    /// POST /api/controllers/network/update - start the UniFi Network application update to the
+    /// latest build on the console's application channel. Console-level, so it does NOT go through
+    /// /proxy/network; the console answers 204 No Content on accept, and the application restarts
+    /// while it installs. Watch progress via <see cref="GetConsoleSystemInfoAsync"/>.
+    /// </summary>
+    [VendorSpecific("UniFi", "console-level POST /api/controllers/network/update")]
+    public async Task<bool> TriggerNetworkApplicationUpdateAsync(CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return false;
+        }
+
+        var url = $"{_controllerUrl}/api/controllers/network/update";
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.PostAsync(url, content: null, cancellationToken);
+
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} triggering the Network application update, re-authenticating...",
+                    response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while triggering the Network application update");
+                    return false;
+                }
+
+                response = await _httpClient!.PostAsync(url, content: null, cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("Console accepted the UniFi Network application update");
+                return true;
+            }
+
+            var error = await response.Content.ReadAsStringAsync(cancellationToken);
+            _logger.LogError("Failed to trigger the Network application update: {StatusCode} - {Error}",
+                response.StatusCode, error);
+            return false;
+        });
+    }
+
+    /// <summary>
+    /// POST /api/firmware/update - start the UniFi OS (console firmware) update to the latest
+    /// build on the console's firmware channel. Console-level, empty body, 204-style accept.
+    /// <para>
+    /// Cloud Gateway consoles ONLY: callers must never issue this against a standalone
+    /// unifi-os-server console (check <see cref="UniFiConsoleSystemInfo.IsStandaloneConsole"/>) -
+    /// those are custom deploys the app must not update. The console (and for remote sites the
+    /// tunnel) goes dark during the cycle; watch <see cref="GetConsoleSystemInfoAsync"/> after.
+    /// </para>
+    /// </summary>
+    [VendorSpecific("UniFi", "console-level POST /api/firmware/update")]
+    public async Task<bool> TriggerUniFiOsUpdateAsync(CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return false;
+        }
+
+        var url = $"{_controllerUrl}/api/firmware/update";
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.PostAsync(url, content: null, cancellationToken);
+
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} triggering the UniFi OS update, re-authenticating...",
+                    response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while triggering the UniFi OS update");
+                    return false;
+                }
+
+                response = await _httpClient!.PostAsync(url, content: null, cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("Console accepted the UniFi OS update");
+                return true;
+            }
+
+            var error = await response.Content.ReadAsStringAsync(cancellationToken);
+            _logger.LogError("Failed to trigger the UniFi OS update: {StatusCode} - {Error}",
+                response.StatusCode, error);
+            return false;
+        });
+    }
+
+    /// <summary>
+    /// POST /api/controllers/checkUpdates - ask the console to refresh its application-update
+    /// availability now (the console-level analog of the device catalog's "Check for Updates").
+    /// Console-level, 204 accept; read the result back via <see cref="GetConsoleSystemInfoAsync"/>.
+    /// </summary>
+    /// <param name="controllers">Application names to check, e.g. "network".</param>
+    [VendorSpecific("UniFi", "console-level POST /api/controllers/checkUpdates")]
+    public async Task<bool> TriggerConsoleAppUpdateCheckAsync(
+        IEnumerable<string> controllers,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(controllers);
+        var list = controllers.Where(c => !string.IsNullOrWhiteSpace(c)).ToList();
+        if (list.Count == 0) return false;
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return false;
+        }
+
+        var url = $"{_controllerUrl}/api/controllers/checkUpdates";
+        var payload = JsonSerializer.Serialize(new Dictionary<string, object> { ["controllersToCheck"] = list });
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.PostAsync(
+                url, new StringContent(payload, Encoding.UTF8, "application/json"), cancellationToken);
+
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _isAuthenticated = false;
+                if (!await LoginAsync(cancellationToken)) return false;
+                response = await _httpClient!.PostAsync(
+                    url, new StringContent(payload, Encoding.UTF8, "application/json"), cancellationToken);
+            }
+
+            if (response.IsSuccessStatusCode) return true;
+            _logger.LogWarning("Console application update check failed: {StatusCode}", response.StatusCode);
+            return false;
+        });
+    }
+
+    /// <summary>
+    /// GET /api/firmware/update - the pending UniFi OS build for this console (same entry shape
+    /// as the /api/system firmware entries: version, publish date, download and changelog links).
+    /// POST on the same path triggers it. Returns null when unreadable.
+    /// </summary>
+    [VendorSpecific("UniFi", "console-level GET /api/firmware/update")]
+    public async Task<UniFiConsoleFirmwareRelease?> GetUniFiOsPendingUpdateAsync(CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var url = $"{_controllerUrl}/api/firmware/update";
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.GetAsync(url, cancellationToken);
+
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _isAuthenticated = false;
+                if (!await LoginAsync(cancellationToken)) return null;
+                response = await _httpClient!.GetAsync(url, cancellationToken);
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogDebug("Pending UniFi OS update read returned {StatusCode}", response.StatusCode);
+                return null;
+            }
+
+            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+            try
+            {
+                return JsonSerializer.Deserialize<UniFiConsoleFirmwareRelease>(json);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Could not parse the pending UniFi OS update");
+                return null;
+            }
+        });
+    }
+
+    /// <summary>
+    /// POST /api/cloud/backup - run a console backup. Console-level, empty body; the response
+    /// carries an overall flag plus per-application/service outcomes. Same shape on Cloud Gateway
+    /// and standalone consoles. Returns null when the call itself failed.
+    /// </summary>
+    [VendorSpecific("UniFi", "console-level POST /api/cloud/backup")]
+    public async Task<UniFiConsoleBackupResult?> TriggerConsoleBackupAsync(CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var url = $"{_controllerUrl}/api/cloud/backup";
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var response = await _httpClient!.PostAsync(url, content: null, cancellationToken);
+
+            if (IsRecoverableAuthFailure(response.StatusCode))
+            {
+                _logger.LogWarning("Got {StatusCode} triggering a console backup, re-authenticating...",
+                    response.StatusCode);
+                _isAuthenticated = false;
+
+                if (!await LoginAsync(cancellationToken))
+                {
+                    _logger.LogError("Re-authentication failed while triggering a console backup");
+                    return null;
+                }
+
+                response = await _httpClient!.PostAsync(url, content: null, cancellationToken);
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogError("Failed to trigger a console backup: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+                return null;
+            }
+
+            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+            try
+            {
+                var result = JsonSerializer.Deserialize<UniFiConsoleBackupResult>(json);
+                if (result != null)
+                {
+                    _logger.LogInformation("Console backup finished (success={Success}, components={Count})",
+                        result.Success, result.Controllers.Count + result.Services.Count);
+                }
+                return result;
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Could not parse the console backup response");
+                return null;
+            }
+        });
+    }
+
+    /// <summary>
+    /// GET stat/widget/warnings - the console's own pre-flight signals (upgradable devices, EOL/LTS
+    /// counts, low disk space). Optional: the shape varies across UniFi Network versions, so this
+    /// returns null on anything unexpected rather than failing a rollout.
+    /// </summary>
+    [VendorSpecific("UniFi", "stat/widget/warnings; shape varies by Network version")]
+    public async Task<UniFiFirmwareWarnings?> GetFirmwareWarningsWidgetAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return await ExecuteRequestAsync<UniFiFirmwareWarnings?>(async () =>
+        {
+            try
+            {
+                var response = await _httpClient!.GetAsync(
+                    BuildApiPath("stat/widget/warnings"), cancellationToken);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogDebug("Warnings widget returned {StatusCode} for site {Site}",
+                        response.StatusCode, _site);
+                    return null;
+                }
+
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                var warnings = UniFiFirmwareWarnings.TryParse(json);
+
+                if (warnings == null)
+                    _logger.LogDebug("Warnings widget for site {Site} did not match a shape we read", _site);
+
+                return warnings;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "Warnings widget unavailable for site {Site}", _site);
+                return null;
+            }
+        });
+    }
+
+    #endregion
+
+    #region Threat Management APIs
+
+    /// <summary>
+    /// GET /api/s/{site}/stat/ips/event - Get IPS/IDS events (v1 API).
+    /// Returns Suricata alerts from the gateway's IPS engine.
+    /// </summary>
+    public async Task<List<UniFiIpsEvent>> GetIpsEventsAsync(
+        DateTimeOffset start,
+        DateTimeOffset end,
+        int limit = 3000,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogTrace("Fetching IPS events from {Start} to {End}", start, end);
+
+        var body = new
+        {
+            start = start.ToUnixTimeSeconds(),
+            end = end.ToUnixTimeSeconds(),
+            _limit = limit
+        };
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiIpsEvent>>(
+            () =>
+            {
+                var content = new StringContent(
+                    JsonSerializer.Serialize(body),
+                    Encoding.UTF8,
+                    "application/json");
+                return _httpClient!.PostAsync(BuildApiPath("stat/ips/event"), content, cancellationToken);
+            },
+            cancellationToken);
+
+        if (response?.Data != null)
+        {
+            _logger.LogTrace("Found {Count} IPS events", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogDebug("No IPS events returned (v1 API may not be available)");
+        return [];
+    }
+
+    /// <summary>
+    /// POST v2/api/site/{site}/system-log/all - Get threat management events from system log (v2 API).
+    /// Uses the same pattern as GetApChannelChangeEventsAsync.
+    /// </summary>
+    public async Task<JsonElement> GetThreatLogEventsAsync(
+        DateTimeOffset start,
+        DateTimeOffset end,
+        int pageNumber = 0,
+        int pageSize = 500,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogTrace("Fetching threat log events from {Start} to {End}, page {Page}", start, end, pageNumber);
+
+        if (DateTime.UtcNow.Ticks < Interlocked.Read(ref _threatLogUnsupportedUntilTicks))
+            return default;
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildV2ApiPath($"site/{_site}/system-log/all");
+
+        var body = new Dictionary<string, object>
+        {
+            ["searchText"] = "",
+            ["severities"] = new[] { "LOW", "MEDIUM", "HIGH", "VERY_HIGH" },
+            ["categories"] = new[] { "SECURITY" },
+            ["events"] = Array.Empty<string>(),
+            ["subcategories"] = new[] { "SECURITY_INTRUSION_PREVENTION" },
+            ["type"] = "GENERAL",
+            ["timestampFrom"] = start.ToUnixTimeMilliseconds(),
+            ["timestampTo"] = end.ToUnixTimeMilliseconds(),
+            ["pageNumber"] = pageNumber,
+            ["pageSize"] = pageSize,
+            ["adminIds"] = Array.Empty<string>(),
+            ["clientDeviceMacs"] = Array.Empty<string>()
+        };
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var content = new StringContent(
+                JsonSerializer.Serialize(body),
+                Encoding.UTF8,
+                "application/json");
+
+            var response = await _httpClient!.PostAsync(url, content, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                return doc.RootElement.Clone();
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                if (response.StatusCode == HttpStatusCode.MethodNotAllowed)
+                {
+                    Interlocked.Exchange(ref _threatLogUnsupportedUntilTicks, (DateTime.UtcNow + UnsupportedEndpointBackoff).Ticks);
+                    _logger.LogInformation("UniFi Network on this Console does not serve threat log events (405); skipping them for an hour");
+                }
+                else
+                {
+                    _logger.LogWarning("Threat log events request failed: {StatusCode} - {Error}",
+                        response.StatusCode, error);
+                }
+            }
+
+            return default;
+        });
+    }
+
+    /// <summary>
+    /// POST v2/api/site/{site}/traffic-flows - Get traffic flow data for threat analysis.
+    /// Returns rich flow data including risk assessment, direction, and service labels.
+    /// </summary>
+    public async Task<JsonElement> GetTrafficFlowsAsync(
+        DateTimeOffset start,
+        DateTimeOffset end,
+        int pageNumber = 0,
+        int pageSize = 500,
+        string[]? riskFilter = null,
+        string[]? actionFilter = null,
+        string[]? directionFilter = null,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogTrace("Fetching traffic flows from {Start} to {End}, page {Page}", start, end, pageNumber);
+
+        if (DateTime.UtcNow.Ticks < Interlocked.Read(ref _trafficFlowsUnsupportedUntilTicks))
+            return default;
+
+        if (!await EnsureAuthenticatedAsync(cancellationToken))
+        {
+            return default;
+        }
+
+        var url = BuildV2ApiPath($"site/{_site}/traffic-flows");
+
+        var body = new Dictionary<string, object>
+        {
+            ["risk"] = riskFilter ?? Array.Empty<string>(),
+            ["action"] = actionFilter ?? Array.Empty<string>(),
+            ["direction"] = directionFilter ?? Array.Empty<string>(),
+            ["protocol"] = Array.Empty<string>(),
+            ["policy"] = Array.Empty<string>(),
+            ["policy_type"] = Array.Empty<string>(),
+            ["service"] = Array.Empty<string>(),
+            ["source_host"] = Array.Empty<string>(),
+            ["source_mac"] = Array.Empty<string>(),
+            ["source_ip"] = Array.Empty<string>(),
+            ["source_port"] = Array.Empty<string>(),
+            ["source_network_id"] = Array.Empty<string>(),
+            ["source_domain"] = Array.Empty<string>(),
+            ["source_zone_id"] = Array.Empty<string>(),
+            ["source_region"] = Array.Empty<string>(),
+            ["destination_host"] = Array.Empty<string>(),
+            ["destination_mac"] = Array.Empty<string>(),
+            ["destination_ip"] = Array.Empty<string>(),
+            ["destination_port"] = Array.Empty<string>(),
+            ["destination_network_id"] = Array.Empty<string>(),
+            ["destination_domain"] = Array.Empty<string>(),
+            ["destination_zone_id"] = Array.Empty<string>(),
+            ["destination_region"] = Array.Empty<string>(),
+            ["in_network_id"] = Array.Empty<string>(),
+            ["out_network_id"] = Array.Empty<string>(),
+            ["next_ai_query"] = Array.Empty<string>(),
+            ["except_for"] = Array.Empty<string>(),
+            ["timestampFrom"] = start.ToUnixTimeMilliseconds(),
+            ["timestampTo"] = end.ToUnixTimeMilliseconds(),
+            ["pageNumber"] = pageNumber,
+            ["search_text"] = "",
+            ["pageSize"] = pageSize,
+            ["skip_count"] = pageNumber > 0 // only count on first page
+        };
+
+        return await ExecuteRequestAsync(async () =>
+        {
+            var content = new StringContent(
+                JsonSerializer.Serialize(body),
+                Encoding.UTF8,
+                "application/json");
+
+            var response = await _httpClient!.PostAsync(url, content, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                return doc.RootElement.Clone();
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                if (response.StatusCode == HttpStatusCode.MethodNotAllowed)
+                {
+                    Interlocked.Exchange(ref _trafficFlowsUnsupportedUntilTicks, (DateTime.UtcNow + UnsupportedEndpointBackoff).Ticks);
+                    _logger.LogInformation("UniFi Network on this Console does not serve traffic flows (405); skipping them for an hour");
+                }
+                else
+                {
+                    _logger.LogWarning("Traffic flows request failed: {StatusCode} - {Error}",
+                        response.StatusCode, error);
+                }
+            }
+
+            return default;
+        });
+    }
+
+    #endregion
+
+    #region Support File (UniFi OS endpoint, username/password only)
+
+    /// <summary>
+    /// Kicks off support file generation on the UniFi OS console. Returns immediately;
+    /// poll with <see cref="IsSupportFileReadyAsync"/> until the file is ready.
+    /// Requires a username/password session - API key connections will get 403.
+    /// </summary>
+    public async Task<bool> GenerateSupportFileAsync(bool recreate, bool networkOnly = true, CancellationToken ct = default)
+    {
+        if (!await EnsureAuthenticatedAsync(ct)) return false;
+        var url = $"{_controllerUrl}/api/support/file/generate";
+        _logger.LogDebug("Support file generate: POST {Url} (networkOnly={NetworkOnly})", url, networkOnly);
+        var json = networkOnly
+            ? (recreate ? """{"recreate":true,"requiredDevices":{},"targets":["network","uos"]}"""
+                        : """{"recreate":false,"requiredDevices":{},"targets":["network","uos"]}""")
+            : (recreate ? """{"recreate":true}"""
+                        : """{"recreate":false}""");
+        var body = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+        var response = await _httpClient!.PostAsync(url, body, ct);
+        _logger.LogDebug("Support file generate response: {StatusCode}", response.StatusCode);
+        if (!response.IsSuccessStatusCode && response.StatusCode != System.Net.HttpStatusCode.NoContent)
+        {
+            var error = await response.Content.ReadAsStringAsync(ct);
+            _logger.LogWarning("Support file generate failed: {StatusCode} {Error}", response.StatusCode, error);
+        }
+        return response.StatusCode == System.Net.HttpStatusCode.NoContent ||
+               response.IsSuccessStatusCode;
+    }
+
+    /// <summary>
+    /// Checks whether a support file is ready for download. Returns true when the file is
+    /// available, false when generation is still in progress (HTTP 423 Locked).
+    /// </summary>
+    public async Task<bool> IsSupportFileReadyAsync(CancellationToken ct = default)
+    {
+        if (!await EnsureAuthenticatedAsync(ct)) return false;
+        var request = new HttpRequestMessage(HttpMethod.Head,
+            $"{_controllerUrl}/api/support/file/download");
+        var response = await _httpClient!.SendAsync(request, ct);
+        return response.IsSuccessStatusCode;
+    }
+
+    /// <summary>
+    /// Downloads the support file. Returns the response stream and the filename from the
+    /// custom Filename header. Caller must dispose the stream. Returns null if the download
+    /// fails or the file isn't ready.
+    /// </summary>
+    public async Task<(Stream stream, string filename)?> DownloadSupportFileAsync(CancellationToken ct = default)
+    {
+        if (!await EnsureAuthenticatedAsync(ct)) return null;
+        var response = await _httpClient!.GetAsync(
+            $"{_controllerUrl}/api/support/file/download",
+            HttpCompletionOption.ResponseHeadersRead, ct);
+
+        if (!response.IsSuccessStatusCode)
+            return null;
+
+        var filename = "support-file.tgz";
+        if (response.Headers.TryGetValues("Filename", out var filenames))
+        {
+            var fn = filenames.FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(fn)) filename = fn;
+        }
+
+        return (await response.Content.ReadAsStreamAsync(ct), filename);
+    }
+
+    #endregion
+
+    public void Dispose()
+    {
+        // Flag first so any in-flight/queued request skips instead of racing the
+        // HttpClient teardown (see ExecuteRequestAsync).
+        _disposed = true;
+        _authLock?.Dispose();
+        _httpClient?.Dispose();
+        GC.SuppressFinalize(this);
+    }
+}

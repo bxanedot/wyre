@@ -1,0 +1,78 @@
+@using NetworkOptimizer.Web.Services.Licensing
+@implements IDisposable
+@inject LicenseStateService LicenseState
+
+@if (RestrictedCount > 0)
+{
+    <div class="connection-banner license-restricted-banner">
+        <div class="banner-content">
+            <span class="banner-icon">!</span>
+            <div class="banner-text">
+                <strong>Sites restricted by licensing</strong>
+                <span>@RestrictedSentence</span>
+            </div>
+            <a href="/settings?tab=application#licensing" class="btn btn-primary">Open Settings</a>
+        </div>
+    </div>
+}
+@if (GraceCount > 0)
+{
+    <div class="connection-banner">
+        <div class="banner-content">
+            <span class="banner-icon">!</span>
+            <div class="banner-text">
+                <strong>License attention needed</strong>
+                <span>@GraceSentence</span>
+            </div>
+            <a href="/settings?tab=application#licensing" class="btn btn-primary">Open Settings</a>
+        </div>
+    </div>
+}
+
+@code {
+    private int RestrictedCount =>
+        LicenseState.Snapshot?.States.Values.Count(s => s.State == SiteLicenseState.Restricted) ?? 0;
+
+    private int GraceCount =>
+        LicenseState.Snapshot?.States.Values.Count(s => s.State == SiteLicenseState.Grace) ?? 0;
+
+    private string RestrictedSentence =>
+        RestrictedCount == 1
+            ? "1 site is restricted by licensing. Historic data remains available."
+            : $"{RestrictedCount} sites are restricted by licensing. Historic data remains available.";
+
+    private string GraceSentence
+    {
+        get
+        {
+            var sites = GraceCount == 1 ? "1 site loses" : $"{GraceCount} sites lose";
+            var days = SoonestGraceDays == 1 ? "1 day" : $"{SoonestGraceDays} days";
+            return $"{sites} operations in {days} - renew or reassign in Settings > Application > Licensing.";
+        }
+    }
+
+    private int SoonestGraceDays
+    {
+        get
+        {
+            var soonest = LicenseState.Snapshot?.States.Values
+                .Where(s => s.State == SiteLicenseState.Grace && s.GraceDeadline != null)
+                .Select(s => s.GraceDeadline!.Value)
+                .OrderBy(d => d)
+                .Cast<DateTime?>()
+                .FirstOrDefault();
+            return soonest is { } deadline
+                ? Math.Max(0, (int)Math.Ceiling((deadline - DateTime.UtcNow).TotalDays))
+                : 0;
+        }
+    }
+
+    protected override void OnInitialized()
+    {
+        LicenseState.OnStateChanged += HandleStateChanged;
+    }
+
+    private void HandleStateChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => LicenseState.OnStateChanged -= HandleStateChanged;
+}

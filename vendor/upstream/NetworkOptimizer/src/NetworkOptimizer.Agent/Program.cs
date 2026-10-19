@@ -1,0 +1,495 @@
+using System.Net.Http.Json;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using NetworkOptimizer.Agent;
+using NetworkOptimizer.AgentProtocol;
+
+// On-site agent skeleton: enrolls against the central Network Optimizer server
+// with a one-time token, persists its agent key and site slug, then heartbeats.
+// Monitoring, speed test serving, and the gRPC tunnel build on this loop.
+
+var configPath = args.Length > 0
+    ? args[0]
+    : Environment.GetEnvironmentVariable("NO_AGENT_CONFIG") ?? "agent.json";
+
+if (!File.Exists(configPath))
+{
+    Console.Error.WriteLine($"Config not found: {configPath}");
+    Console.Error.WriteLine("""
+        Create agent.json:
+        {
+          "serverUrl": "https://your-network-optimizer:8042",
+          "enrollmentToken": "noa_...",
+          "ignoreSslErrors": false
+        }
+        Generate the enrollment token in Settings > Multi-Site > Agents.
+        """);
+    return 1;
+}
+
+var config = JsonSerializer.Deserialize<AgentConfig>(File.ReadAllText(configPath), AgentJson.Options)
+    ?? throw new InvalidOperationException("Invalid agent config");
+if (string.IsNullOrWhiteSpace(config.ServerUrl))
+{
+    Console.Error.WriteLine("serverUrl is required");
+    return 1;
+}
+
+// The agent refuses cleartext transport outright: serverUrl and tunnelUrl must
+// be https. TLS is terminated by the reverse proxy fronting the central server,
+// which re-encrypts to the tunnel listener's own self-signed TLS behind it;
+// self-signed certificates work with ignoreSslErrors, but plain http never does
+// - the tunnel carries SNMP credentials and proxied console traffic.
+static bool IsHttpsUrl(string url) =>
+    Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps;
+
+if (!IsHttpsUrl(config.ServerUrl))
+{
+    Console.Error.WriteLine(
+        $"Refusing non-HTTPS serverUrl '{config.ServerUrl}'. The agent only connects over HTTPS; " +
+        "use the https:// address of the reverse proxy fronting the central server " +
+        "(self-signed certificates: set \"ignoreSslErrors\": true).");
+    return 1;
+}
+if (!string.IsNullOrEmpty(config.TunnelUrl) && !IsHttpsUrl(config.TunnelUrl))
+{
+    Console.Error.WriteLine(
+        $"Refusing non-HTTPS tunnelUrl '{config.TunnelUrl}'. Publish the agent tunnel through the " +
+        "gRPC-capable reverse proxy (see the agent README) and use its https:// address.");
+    return 1;
+}
+
+// Proxy dial policy: hardcoded site-local fence (RFC1918 / IPv6 local) unless the
+// operator pins an explicit CIDR list in agent.json, which fully replaces it. The
+// policy is agent-owned on purpose - nothing the server sends over the tunnel can
+// widen it. An invalid entry aborts startup: failing loud beats silently running
+// with a partial pin.
+var proxyPolicy = NetworkOptimizer.Core.Helpers.ProxyDialPolicy.SiteLocal;
+if (config.ProxyAllowedCidrs != null)
+{
+    var pinned = NetworkOptimizer.Core.Helpers.ProxyDialPolicy.FromPinnedCidrs(config.ProxyAllowedCidrs, out var policyError);
+    if (pinned == null)
+    {
+        Console.Error.WriteLine($"Invalid proxyAllowedCidrs in {configPath}: {policyError}");
+        return 1;
+    }
+    proxyPolicy = pinned;
+    Console.WriteLine($"Proxy dials pinned to {pinned.PinnedCount} operator-configured CIDR(s)");
+}
+else
+{
+    Console.WriteLine("Proxy dials restricted to site-local addresses (RFC1918 / IPv6 local)");
+}
+
+var version = Assembly.GetExecutingAssembly()
+    .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "dev";
+
+// The agent's primary LAN IPv4 on the site network. The central server points
+// site clients at this address for LAN speed tests, since its own address is
+// unreachable from a remote site's LAN. Reported on enrollment and each heartbeat.
+// NO_AGENT_LAN_IP overrides auto-detection for deployments where it can't see the
+// real LAN address (e.g. Docker bridge mode instead of host, or multi-NIC hosts).
+var lanIpOverride = Environment.GetEnvironmentVariable("NO_AGENT_LAN_IP");
+
+// The port the speed test page is served on, for the announcement to the server. nginx is what
+// actually listens, so both have to resolve it the same way: the environment variable first (the
+// container's entrypoint moves nginx's listener from it), then whatever agent.json records, then
+// the built-in default. An agent enrolled before the port was configurable has the old 3000 in its
+// config and keeps serving it - upgrading should not move a port that clients and firewall rules
+// already know about. New installs get the current default instead.
+static int SpeedTestPagePort(NetworkOptimizer.Agent.AgentConfig cfg) =>
+    int.TryParse(Environment.GetEnvironmentVariable("AGENT_SPEEDTEST_PORT"), out var p) && p > 0
+        ? p
+        : cfg.LanSpeedTestPort;
+var lanIp = !string.IsNullOrWhiteSpace(lanIpOverride)
+    ? lanIpOverride.Trim()
+    : NetworkOptimizer.Core.Helpers.NetworkUtilities.DetectLocalIpFromInterfaces();
+// lanIp is one address chosen for the server to reach this agent back on. The full set goes
+// alongside it so the server can recognise the host by an address it already knows, which the
+// single choice cannot do on a gateway - see LocalUnicastAddresses.
+var localIps = NetworkOptimizer.Core.Helpers.NetworkUtilities.LocalUnicastAddresses();
+
+var handler = new HttpClientHandler();
+if (config.IgnoreSslErrors)
+    handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+// Short timeout: this client only carries enrollment and heartbeats. The
+// default 100s meant a heartbeat against an offline server host (SYN black
+// hole, e.g. host down for maintenance) hung for the full 100s per attempt.
+using var http = new HttpClient(handler)
+{
+    BaseAddress = new Uri(config.ServerUrl.TrimEnd('/') + "/"),
+    Timeout = TimeSpan.FromSeconds(15)
+};
+
+// Enroll once: exchange the one-time token for a persistent agent key
+if (string.IsNullOrEmpty(config.AgentKey))
+{
+    if (string.IsNullOrWhiteSpace(config.EnrollmentToken))
+    {
+        Console.Error.WriteLine("No agentKey and no enrollmentToken in config - nothing to do");
+        return 1;
+    }
+
+    Console.WriteLine("Enrolling with central server...");
+    var response = await http.PostAsJsonAsync("api/public/agents/enrollments",
+        new { token = config.EnrollmentToken, version, lanIp }, AgentJson.Options);
+    if (!response.IsSuccessStatusCode)
+    {
+        Console.Error.WriteLine($"Enrollment failed: {response.StatusCode} {await response.Content.ReadAsStringAsync()}");
+        return 1;
+    }
+
+    var enrollment = await response.Content.ReadFromJsonAsync<EnrollmentResponse>(AgentJson.Options)
+        ?? throw new InvalidOperationException("Empty enrollment response");
+    // The server's dedicated tunnel port isn't publicly addressable on its own,
+    // and the agent only speaks HTTPS to the reverse proxy - so the tunnel
+    // address is never derived automatically. It must be pinned explicitly to
+    // the https address the reverse proxy publishes for the tunnel; until then
+    // the agent stays on REST heartbeats.
+    if (config.TunnelUrl == null && enrollment.TunnelPort is int tunnelPort)
+    {
+        Console.WriteLine(
+            $"The server offers an agent tunnel (port {tunnelPort}), but the agent connects over HTTPS only. " +
+            "Publish the tunnel through the gRPC-capable reverse proxy (see the agent README) and set " +
+            "\"tunnelUrl\" to its https:// address in agent.json.");
+    }
+    config = config with { AgentKey = enrollment.AgentKey, SiteSlug = enrollment.SiteSlug, EnrollmentToken = null };
+    File.WriteAllText(configPath, JsonSerializer.Serialize(config, AgentJson.WriteOptions));
+    Console.WriteLine($"Enrolled for site '{config.SiteSlug}'. Agent key saved to {configPath}.");
+}
+
+Console.WriteLine($"Agent v{version} running for site '{config.SiteSlug}' against {config.ServerUrl}");
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+// systemd stops deliver SIGTERM to the whole control group: the agent itself AND
+// its child processes (in-flight ping probes, iperf3). Without this handler the
+// agent ignored SIGTERM, kept its loops and tunnel alive for systemd's full 90s
+// stop timeout (then got SIGKILLed), and - worse - parsed its killed ping
+// children as real packet loss and reported it upstream, planting a false loss
+// spike on every agent stop/update. Cancelling here makes the shutdown immediate
+// and flips the cancellation guards so in-flight probe results are discarded.
+using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+{
+    ctx.Cancel = true;
+    cts.Cancel();
+});
+
+// LAN speed test (independent of the tunnel - site clients hit the agent
+// directly). nginx serves the OpenSpeedTest page + the throughput-critical
+// transfer legs on config.LanSpeedTestPort; this loopback relay only forwards
+// result posts to the central server with the site slug.
+SpeedTestServer? speedTestServer = null;
+Task? iperf3Task = null;
+if (config.LanSpeedTest)
+{
+    try
+    {
+        speedTestServer = SpeedTestServer.Create(config.ServerUrl, config.SiteSlug ?? "", config.IgnoreSslErrors);
+        speedTestServer.Start();
+        Console.WriteLine($"LAN speed test results relay on 127.0.0.1:{SpeedTestServer.RelayPort} (nginx fronts the page + transfer legs on port {config.LanSpeedTestPort})");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Speed test server failed to start: {ex.Message}");
+    }
+    // Relay client-initiated iperf3 results (captured off iperf3 -s -J) to the central server,
+    // tagged with the site slug - the iperf3 analog of the OpenSpeedTest result relay above.
+    iperf3Task = Iperf3Runner.RunAsync(
+        speedTestServer is { } relayServer ? relayServer.PostIperf3ResultAsync : null, cts.Token);
+}
+
+// Monitoring collectors and their store-and-forward buffer live for the whole
+// process, not per tunnel connection: probing and SNMP polling continue on the
+// last pushed config while the tunnel is down - exactly when outage data
+// matters most - and the buffered backlog (12 h / 64 MB caps, oldest dropped
+// first) replays over the tunnel on reconnect. Only started when a tunnel is
+// configured; without one no config ever arrives and there is nothing to run.
+ResultBuffer? resultBuffer = null;
+ProbeRunner? probeRunner = null;
+SnmpRunner? snmpRunner = null;
+ConntrackRunner? conntrackRunner = null;
+UciInformCapture? uciCapture = null;
+Task? uciCaptureTask = null;
+Task? probeTask = null;
+Task? snmpTask = null;
+Task? conntrackTask = null;
+Task? watchdogTask = null;
+
+// Capabilities for the hello. conntrack-accounting only when the installer said this is a
+// gateway AND the conntrack source proved readable right now - a permissions or module
+// surprise downgrades to "not capable", never to a lie.
+var conntrackCapable = config.OnGateway == true && ConntrackRunner.SourceReadable();
+// UCI informs cross the gateway's WAN port, so only an on-gateway agent can see them.
+var uciCaptureCapable = config.OnGateway == true && UciInformCapture.Available();
+var capabilityList = new List<string>();
+if (conntrackCapable) capabilityList.Add("conntrack-accounting");
+if (uciCaptureCapable) capabilityList.Add(UciInformCapture.Capability);
+var capabilities = capabilityList.ToArray();
+if (config.OnGateway == true)
+{
+    Console.WriteLine(conntrackCapable
+        ? "Conntrack accounting available (on-gateway, byte counters readable)"
+        : "On-gateway install, but conntrack byte counters are not readable - conntrack accounting unavailable");
+    Console.WriteLine(uciCaptureCapable
+        ? "UCI inform capture available (packet socket opens)"
+        : "On-gateway install, but a packet socket cannot be opened - UCI inform capture unavailable");
+}
+var spoolPath = Path.Combine(
+    Path.GetDirectoryName(Path.GetFullPath(configPath)) ?? ".", "result-spool.bin");
+
+// How far back from a stop a result may have been corrupted by it: the longest a ping burst can
+// still be running when the signal lands. Generous rather than tight - losing a few seconds of
+// samples at a restart costs nothing next to a false loss spike that outlives it.
+var shutdownBoundary = TimeSpan.FromSeconds(5);
+
+// Best-effort spool of the unacked backlog for the next process to replay.
+// Called on graceful shutdown and by the async-I/O watchdog right before its
+// restart exit, so restarts don't cost the outage data the buffer exists for.
+void SaveSpool()
+{
+    if (resultBuffer is not { Count: > 0 })
+        return;
+    // Anything measured in the last few seconds may have had its ping children killed underneath it
+    // by the same signal that is stopping us, which reads as loss it never saw. Drop that tail
+    // rather than persist it - see ResultBuffer.DropTail.
+    var poisoned = resultBuffer.DropTail(shutdownBoundary);
+    if (resultBuffer.Count == 0)
+    {
+        if (poisoned > 0)
+            Console.WriteLine($"Discarded {poisoned} result message(s) measured across the shutdown");
+        return;
+    }
+    var count = resultBuffer.Count;
+    resultBuffer.SaveTo(spoolPath);
+    Console.WriteLine($"Spooled {count} unsent result message(s) for the next start"
+        + (poisoned > 0 ? $"; discarded {poisoned} measured across the shutdown" : ""));
+}
+
+if (!string.IsNullOrEmpty(config.TunnelUrl))
+{
+    resultBuffer = new ResultBuffer();
+    if (File.Exists(spoolPath))
+    {
+        try
+        {
+            var restored = resultBuffer.LoadFrom(spoolPath);
+            if (restored > 0)
+                Console.WriteLine($"Restored {restored} spooled result message(s) from the previous run");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Result spool restore failed: {ex.Message}");
+        }
+        try { File.Delete(spoolPath); } catch { }
+    }
+    probeRunner = new ProbeRunner(resultBuffer.Enqueue, config.ProbeSourceIp);
+    snmpRunner = new SnmpRunner(resultBuffer.Enqueue);
+    probeTask = probeRunner.RunAsync(cts.Token);
+    snmpTask = snmpRunner.RunAsync(cts.Token);
+    if (conntrackCapable)
+    {
+        conntrackRunner = new ConntrackRunner(resultBuffer.Enqueue);
+        conntrackTask = conntrackRunner.RunAsync(cts.Token);
+    }
+    if (uciCaptureCapable)
+    {
+        uciCapture = new UciInformCapture();
+        uciCaptureTask = uciCapture.RunAsync(cts.Token);
+    }
+}
+
+// Restart-based self-heal for a wedged async socket engine (every install
+// mode restarts the agent on exit); spools the backlog first so the restart
+// is lossless. Deliberately outside the tunnel block: heartbeat-only agents
+// die of the same wedge (async HTTP) and need the same cure - without a
+// buffer the spool callback is a no-op.
+watchdogTask = AsyncIoWatchdog.RunAsync(SaveSpool, cts.Token);
+
+// Prefer the persistent gRPC tunnel; REST heartbeats keep the agent visible as
+// Online whenever the tunnel is unavailable (tunnel disabled server-side, an
+// older server, or a network drop between reconnect attempts).
+while (!cts.IsCancellationRequested)
+{
+    if (!string.IsNullOrEmpty(config.TunnelUrl))
+    {
+        using var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+        var tunnel = new TunnelClient();
+        var proxyHandler = new ProxyHandler(tunnel, proxyPolicy);
+        var iperf3ClientRunner = new Iperf3ClientRunner(tunnel);
+        var uwnClientRunner = new UwnClientRunner(tunnel);
+        var probeRequestRunner = new ProbeRequestRunner(tunnel);
+        tunnel.OnProbeConfig = probeRunner!.UpdateConfig;
+        tunnel.OnSnmpConfig = snmpRunner!.UpdateConfig;
+        if (conntrackRunner != null)
+        {
+            tunnel.OnConntrackConfig = conntrackRunner.UpdateConfig;
+            // Live batches ride this tunnel directly (superseded by the next window, so a lost
+            // one costs nothing); the ~6s aggregates ride the result buffer like everything else.
+            conntrackRunner.LiveSend = tunnel.TrySend;
+        }
+        if (uciCapture != null)
+        {
+            tunnel.OnUciCaptureConfig = uciCapture.UpdateConfig;
+            uciCapture.LiveSend = tunnel.TrySend;
+        }
+        tunnel.OnWanSpeedTestConfig = wanConfig => speedTestServer?.UpdateWanServers(
+            wanConfig.Servers.Select(s => new SpeedTestServer.WanServerEntry(s.ServerId, s.Url)).ToList(),
+            wanConfig.DefaultServerId);
+        tunnel.OnSnmpOidQuery = snmpRunner.HandleOidQueryAsync;
+        tunnel.OnProxyOpen = proxyHandler.HandleOpenAsync;
+        tunnel.OnProxyData = proxyHandler.HandleDataAsync;
+        tunnel.OnProxyClose = proxyHandler.HandleClose;
+        tunnel.OnIperf3Request = iperf3ClientRunner.HandleAsync;
+        tunnel.OnUwnRequest = uwnClientRunner.HandleAsync;
+        tunnel.OnProbeRequest = probeRequestRunner.HandleAsync;
+        // Server confirms persisted result frames; trim them from the buffer so
+        // only unacked data is retained for replay.
+        tunnel.OnResultAck = seq => resultBuffer!.MarkAcked(seq);
+        var backlog = resultBuffer!.Count;
+        if (backlog > 0)
+            Console.WriteLine($"Buffered backlog: {backlog} result message(s) (~{resultBuffer.ApproxBytes / 1024} KB) will flush once the tunnel connects");
+        var droppedOffline = resultBuffer.TakeDroppedCount();
+        if (droppedOffline > 0)
+            Console.Error.WriteLine($"Result buffer caps dropped the {droppedOffline} oldest message(s) while the tunnel was down");
+
+        var drainTask = tunnel.DrainResultsAsync(resultBuffer, connectionCts.Token);
+        try
+        {
+            // Announce the port only when a speed test server is actually up. An agent that
+            // serves none - a gateway install, or one where the server failed to start - has no
+            // port to give, and claiming a port would advertise a listener that is not there.
+            // Source binding is a platform capability, not a setting: it rides the
+            // native ping binary, so the server only offers a WAN context an
+            // interface bind where the agent can actually honor one.
+            await tunnel.RunAsync(config.TunnelUrl, config.AgentKey!, version, lanIp, localIps,
+                speedTestServer != null ? SpeedTestPagePort(config) : 0,
+                speedTestServer != null,
+                NetworkOptimizer.Monitoring.Probes.LocalProbeExecutor.SupportsSourceBinding,
+                config.OnGateway, capabilities,
+                config.IgnoreSslErrors, cts.Token);
+            Console.Error.WriteLine("Tunnel closed by server, reconnecting...");
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            break;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Tunnel error: {ex.Message}");
+        }
+        finally
+        {
+            if (conntrackRunner != null) conntrackRunner.LiveSend = null;
+            if (uciCapture != null) uciCapture.LiveSend = null;
+            connectionCts.Cancel();
+            // Nothing to salvage: the drain only peeks, so every unacked frame is
+            // still in the buffer and replays on the next connection.
+            try { await drainTask; } catch (OperationCanceledException) { }
+        }
+    }
+
+    try
+    {
+        var response = await http.PostAsJsonAsync("api/public/agents/heartbeats",
+            new { agentKey = config.AgentKey, version, lanIp }, AgentJson.Options, cts.Token);
+        if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            Console.Error.WriteLine("Heartbeat rejected: agent disabled or key revoked");
+        else if (!response.IsSuccessStatusCode)
+            Console.Error.WriteLine($"Heartbeat failed: {response.StatusCode}");
+    }
+    // The when-guard matters: HttpClient's timeout surfaces as TaskCanceledException
+    // (an OperationCanceledException), so an unguarded catch here mistook a timed-out
+    // heartbeat for shutdown and exited the reconnect loop - permanently, since the
+    // shutdown path then awaited the still-running iperf3 task. That zombied every
+    // agent whose server host was powered off long enough to black-hole a heartbeat.
+    catch (OperationCanceledException) when (cts.IsCancellationRequested)
+    {
+        break;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Heartbeat error: {ex.Message}");
+    }
+
+    try { await Task.Delay(TimeSpan.FromSeconds(30), cts.Token); }
+    catch (OperationCanceledException) { break; }
+}
+
+if (speedTestServer != null)
+    await speedTestServer.DisposeAsync();
+if (iperf3Task != null)
+{
+    try { await iperf3Task; } catch (OperationCanceledException) { }
+}
+if (probeTask != null)
+{
+    try { await probeTask; } catch (OperationCanceledException) { }
+}
+if (snmpTask != null)
+{
+    try { await snmpTask; } catch (OperationCanceledException) { }
+}
+if (conntrackTask != null)
+{
+    try { await conntrackTask; } catch (OperationCanceledException) { }
+}
+if (uciCaptureTask != null)
+{
+    try { await uciCaptureTask; } catch (OperationCanceledException) { }
+}
+if (watchdogTask != null)
+{
+    try { await watchdogTask; } catch (OperationCanceledException) { }
+}
+
+try
+{
+    SaveSpool();
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"Result spool save failed: {ex.Message}");
+}
+
+Console.WriteLine("Agent stopped");
+return 0;
+
+namespace NetworkOptimizer.Agent
+{
+    /// <summary>Agent configuration file contents (agent.json).</summary>
+    /// <remarks>
+    /// ProxyAllowedCidrs: operator pin for tunnel proxy dial targets (IPs or CIDRs).
+    /// When present it fully replaces the built-in site-local fence - both the
+    /// narrowing knob (pin to a management VLAN) and the only escape hatch for a
+    /// public-IP target. Include every subnet holding the UniFi Console, gateway,
+    /// devices used for SSH/speed tests, and modem/ONT/hotspot status pages.
+    /// </remarks>
+    public record AgentConfig(
+        string ServerUrl,
+        string? EnrollmentToken,
+        string? AgentKey,
+        string? SiteSlug,
+        bool IgnoreSslErrors,
+        string? TunnelUrl = null,
+        string? ProbeSourceIp = null,
+        bool LanSpeedTest = false,
+        int LanSpeedTestPort = 24443,
+        IReadOnlyList<string>? ProxyAllowedCidrs = null,
+        // Written by the installers at install time (#1108): the gateway installer writes true,
+        // install-native.sh false. NULLABLE on purpose - an agent.json predating the key must
+        // send ABSENT on the hello so the server stays on its IP-correlation path; defaulting
+        // to false here would authoritatively misclassify every pre-flag gateway install the
+        // moment its binary was upgraded.
+        bool? OnGateway = null);
+
+    public record EnrollmentResponse(string AgentKey, string SiteSlug, int? TunnelPort = null);
+
+    public static class AgentJson
+    {
+        public static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web);
+        public static readonly JsonSerializerOptions WriteOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
+    }
+}

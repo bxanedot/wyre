@@ -1,0 +1,410 @@
+using NetworkOptimizer.Audit.Models;
+using NetworkOptimizer.Audit.Scoring;
+using NetworkOptimizer.Core.Enums;
+
+using AuditSeverity = NetworkOptimizer.Audit.Models.AuditSeverity;
+
+namespace NetworkOptimizer.Audit.Rules;
+
+/// <summary>
+/// Checks device VLAN placement and provides recommendations.
+/// Consolidates logic shared between wired and wireless IoT/Camera rules.
+/// </summary>
+public static class VlanPlacementChecker
+{
+    /// <summary>
+    /// Result of a VLAN placement check
+    /// </summary>
+    public record PlacementResult(
+        bool IsCorrectlyPlaced,
+        bool IsLowRisk,
+        NetworkInfo? RecommendedNetwork,
+        string RecommendedNetworkLabel,
+        AuditSeverity Severity,
+        int ScoreImpact,
+        bool IsAllowedBySettings = false);
+
+    /// <summary>
+    /// Check if an IoT device is correctly placed on an IoT, Security, Media, or Gaming VLAN.
+    /// </summary>
+    /// <param name="category">Device category from detection</param>
+    /// <param name="currentNetwork">The network the device is currently on</param>
+    /// <param name="allNetworks">All available networks</param>
+    /// <param name="defaultScoreImpact">Default score impact if not low-risk</param>
+    /// <returns>Placement result with recommendation</returns>
+    public static PlacementResult CheckIoTPlacement(
+        ClientDeviceCategory category,
+        NetworkInfo? currentNetwork,
+        List<NetworkInfo> allNetworks,
+        int defaultScoreImpact = 10)
+        => CheckIoTPlacement(category, currentNetwork, allNetworks, defaultScoreImpact, null, null);
+
+    /// <summary>
+    /// Check if an IoT device is correctly placed on an IoT, Security, Media, or Gaming VLAN,
+    /// with optional device allowance settings.
+    /// </summary>
+    /// <param name="category">Device category from detection</param>
+    /// <param name="currentNetwork">The network the device is currently on</param>
+    /// <param name="allNetworks">All available networks</param>
+    /// <param name="defaultScoreImpact">Default score impact if not low-risk</param>
+    /// <param name="allowanceSettings">Settings for allowing devices on main network</param>
+    /// <param name="vendorName">Vendor name for device-specific allowances</param>
+    /// <returns>Placement result with recommendation</returns>
+    public static PlacementResult CheckIoTPlacement(
+        ClientDeviceCategory category,
+        NetworkInfo? currentNetwork,
+        List<NetworkInfo> allNetworks,
+        int defaultScoreImpact,
+        DeviceAllowanceSettings? allowanceSettings,
+        string? vendorName)
+    {
+        // IoT devices can be on IoT or Security networks (fully isolated).
+        // Media networks accept entertainment devices (streaming, TVs, media players, speakers, consoles)
+        // but NOT security devices (locks, cameras, hubs) since Guest can access Media.
+        // Game consoles are also correctly placed on Gaming networks (their purpose-built network).
+        var isMediaDevice = category is ClientDeviceCategory.StreamingDevice
+            or ClientDeviceCategory.SmartTV
+            or ClientDeviceCategory.MediaPlayer
+            or ClientDeviceCategory.SmartSpeaker
+            or ClientDeviceCategory.GameConsole;
+        var isCorrectlyPlaced = currentNetwork != null &&
+            (currentNetwork.Purpose == NetworkPurpose.IoT ||
+             currentNetwork.Purpose == NetworkPurpose.Security ||
+             (currentNetwork.Purpose == NetworkPurpose.Media && isMediaDevice) ||
+             (currentNetwork.Purpose == NetworkPurpose.Gaming && category == ClientDeviceCategory.GameConsole));
+
+        // Find the IoT network to recommend (prefer lower VLAN number)
+        var iotNetwork = allNetworks
+            .Where(n => n.Purpose == NetworkPurpose.IoT)
+            .OrderBy(n => n.VlanId)
+            .FirstOrDefault();
+
+        var recommendedLabel = iotNetwork != null
+            ? $"{iotNetwork.Name} ({iotNetwork.VlanId})"
+            : "IoT VLAN";
+
+        // Low-risk IoT devices get Recommended severity
+        var isLowRisk = category.IsLowRiskIoT();
+        var severity = isLowRisk ? AuditSeverity.Recommended : AuditSeverity.Critical;
+        var scoreImpact = isLowRisk ? ScoreConstants.LowRiskIoTImpact : defaultScoreImpact;
+        var isAllowedBySettings = false;
+
+        // Check if device is explicitly allowed on main network
+        if (allowanceSettings != null && isLowRisk)
+        {
+            var isAllowed = category switch
+            {
+                ClientDeviceCategory.StreamingDevice => allowanceSettings.IsStreamingDeviceAllowed(vendorName),
+                ClientDeviceCategory.SmartTV => allowanceSettings.IsSmartTVAllowed(vendorName),
+                ClientDeviceCategory.SmartSpeaker => allowanceSettings.IsSmartSpeakerAllowed(vendorName),
+                ClientDeviceCategory.MediaPlayer => allowanceSettings.IsMediaPlayerAllowed(),
+                _ => false
+            };
+
+            if (isAllowed)
+            {
+                severity = AuditSeverity.Informational;
+                scoreImpact = 0; // User explicitly allows this - no score penalty
+                isAllowedBySettings = true;
+            }
+        }
+
+        return new PlacementResult(
+            IsCorrectlyPlaced: isCorrectlyPlaced,
+            IsLowRisk: isLowRisk,
+            RecommendedNetwork: iotNetwork,
+            RecommendedNetworkLabel: recommendedLabel,
+            Severity: severity,
+            ScoreImpact: scoreImpact,
+            IsAllowedBySettings: isAllowedBySettings);
+    }
+
+    /// <summary>
+    /// Check if a printer is correctly placed.
+    /// If Printer VLAN exists, device is always flagged as incorrectly placed unless on Printer VLAN.
+    /// AllowPrintersOnMainNetwork controls severity: true = Informational, false = Recommended.
+    /// If no Printer VLAN exists, IoT or Security is acceptable.
+    /// </summary>
+    /// <param name="currentNetwork">The network the device is currently on</param>
+    /// <param name="allNetworks">All available networks</param>
+    /// <param name="defaultScoreImpact">Default score impact</param>
+    /// <param name="allowanceSettings">Settings for allowing devices on main network</param>
+    /// <returns>Placement result with recommendation</returns>
+    public static PlacementResult CheckPrinterPlacement(
+        NetworkInfo? currentNetwork,
+        List<NetworkInfo> allNetworks,
+        int defaultScoreImpact,
+        DeviceAllowanceSettings? allowanceSettings)
+    {
+        // Check if user allows printers on main/IoT network (lenient mode)
+        var isAllowed = allowanceSettings?.AllowPrintersOnMainNetwork ?? true;
+
+        // Find the best network to recommend
+        // Priority: Printer VLAN > IoT VLAN
+        var printerNetwork = allNetworks
+            .Where(n => n.Purpose == NetworkPurpose.Printer)
+            .OrderBy(n => n.VlanId)
+            .FirstOrDefault();
+
+        var iotNetwork = allNetworks
+            .Where(n => n.Purpose == NetworkPurpose.IoT)
+            .OrderBy(n => n.VlanId)
+            .FirstOrDefault();
+
+        // Determine if correctly placed based on available networks and settings:
+        // - Printer VLAN is always the ideal placement
+        // - If Printer VLAN exists: always suggest it (Info if lenient, Recommended if strict)
+        // - If no Printer VLAN: IoT or Security is acceptable
+        bool isCorrectlyPlaced;
+        if (currentNetwork?.Purpose == NetworkPurpose.Printer)
+        {
+            // Always correct on Printer VLAN
+            isCorrectlyPlaced = true;
+        }
+        else if (printerNetwork != null)
+        {
+            // Printer VLAN exists but device not on it: always flag
+            // Severity controlled by isAllowed (Info vs Recommended)
+            isCorrectlyPlaced = false;
+        }
+        else
+        {
+            // No Printer VLAN: IoT or Security is acceptable
+            isCorrectlyPlaced = currentNetwork != null &&
+                (currentNetwork.Purpose == NetworkPurpose.IoT ||
+                 currentNetwork.Purpose == NetworkPurpose.Security);
+        }
+
+        NetworkInfo? recommendedNetwork;
+        string recommendedLabel;
+
+        if (printerNetwork != null)
+        {
+            recommendedNetwork = printerNetwork;
+            recommendedLabel = $"{printerNetwork.Name} ({printerNetwork.VlanId})";
+        }
+        else if (iotNetwork != null)
+        {
+            recommendedNetwork = iotNetwork;
+            recommendedLabel = $"{iotNetwork.Name} ({iotNetwork.VlanId})";
+        }
+        else
+        {
+            recommendedNetwork = null;
+            recommendedLabel = "Printer or IoT VLAN";
+        }
+
+        // If allowed: Informational (no score impact, purely advisory)
+        // If not allowed: Recommended severity with score impact
+        var severity = isAllowed ? AuditSeverity.Informational : AuditSeverity.Recommended;
+        var scoreImpact = isAllowed ? 0 : defaultScoreImpact;
+
+        return new PlacementResult(
+            IsCorrectlyPlaced: isCorrectlyPlaced,
+            IsLowRisk: true, // Printers are always low-risk
+            RecommendedNetwork: recommendedNetwork,
+            RecommendedNetworkLabel: recommendedLabel,
+            Severity: severity,
+            ScoreImpact: scoreImpact,
+            IsAllowedBySettings: isAllowed);
+    }
+
+    /// <summary>
+    /// Check if a camera/surveillance device is correctly placed on a Security VLAN.
+    /// NVRs are also accepted on Management VLANs since they are infrastructure devices.
+    /// </summary>
+    /// <param name="currentNetwork">The network the device is currently on</param>
+    /// <param name="allNetworks">All available networks</param>
+    /// <param name="defaultScoreImpact">Default score impact (cameras are always high-risk)</param>
+    /// <param name="isNvr">Whether this device is an NVR (allowed on Management VLAN)</param>
+    /// <returns>Placement result with recommendation</returns>
+    public static PlacementResult CheckCameraPlacement(
+        NetworkInfo? currentNetwork,
+        List<NetworkInfo> allNetworks,
+        int defaultScoreImpact = 8,
+        bool isNvr = false)
+    {
+        // Cameras should only be on Security networks
+        // NVRs are also accepted on Management VLANs (they are infrastructure devices)
+        var isCorrectlyPlaced = currentNetwork?.Purpose == NetworkPurpose.Security
+            || (isNvr && currentNetwork?.Purpose == NetworkPurpose.Management);
+
+        // Find networks to recommend
+        var securityNetwork = allNetworks
+            .Where(n => n.Purpose == NetworkPurpose.Security)
+            .OrderBy(n => n.VlanId)
+            .FirstOrDefault();
+
+        string recommendedLabel;
+        NetworkInfo? recommendedNetwork;
+
+        if (isNvr)
+        {
+            // For NVRs, recommend Management VLAN as the primary target
+            var managementNetwork = allNetworks
+                .Where(n => n.Purpose == NetworkPurpose.Management)
+                .OrderBy(n => n.VlanId)
+                .FirstOrDefault();
+
+            recommendedNetwork = managementNetwork ?? securityNetwork;
+
+            if (managementNetwork != null && securityNetwork != null)
+                recommendedLabel = $"{managementNetwork.Name} ({managementNetwork.VlanId}) or {securityNetwork.Name} ({securityNetwork.VlanId})";
+            else if (managementNetwork != null)
+                recommendedLabel = $"{managementNetwork.Name} ({managementNetwork.VlanId})";
+            else if (securityNetwork != null)
+                recommendedLabel = $"{securityNetwork.Name} ({securityNetwork.VlanId})";
+            else
+                recommendedLabel = "Management or Security VLAN";
+        }
+        else
+        {
+            recommendedNetwork = securityNetwork;
+            recommendedLabel = securityNetwork != null
+                ? $"{securityNetwork.Name} ({securityNetwork.VlanId})"
+                : "Security VLAN";
+        }
+
+        // Cameras and NVRs are always high-risk - always Critical severity
+        return new PlacementResult(
+            IsCorrectlyPlaced: isCorrectlyPlaced,
+            IsLowRisk: false,
+            RecommendedNetwork: recommendedNetwork,
+            RecommendedNetworkLabel: recommendedLabel,
+            Severity: AuditSeverity.Critical,
+            ScoreImpact: defaultScoreImpact);
+    }
+
+    /// <summary>
+    /// Build common metadata for VLAN placement issues
+    /// </summary>
+    public static Dictionary<string, object> BuildMetadata(
+        DeviceDetectionResult detection,
+        NetworkInfo? currentNetwork,
+        bool? isLowRisk = null)
+    {
+        var metadata = new Dictionary<string, object>
+        {
+            { "device_type", detection.CategoryName },
+            { "device_category", detection.Category.ToString() },
+            { "detection_source", detection.Source.ToString() },
+            { "detection_confidence", detection.ConfidenceScore },
+            { "vendor", detection.VendorName ?? "Unknown" },
+            { "current_network_purpose", currentNetwork?.Purpose.ToString() ?? "Unknown" }
+        };
+
+        if (isLowRisk.HasValue)
+        {
+            metadata["is_low_risk_device"] = isLowRisk.Value;
+        }
+
+        // Add configurable settings link for device types that have user-configurable allowances
+        var settingsKey = detection.Category switch
+        {
+            ClientDeviceCategory.StreamingDevice => "streaming-devices",
+            ClientDeviceCategory.SmartTV => "smart-tvs",
+            ClientDeviceCategory.SmartSpeaker => "media-players", // Smart speakers are media devices
+            ClientDeviceCategory.MediaPlayer => "media-players",
+            ClientDeviceCategory.Printer => "printers",
+            _ => null
+        };
+
+        if (settingsKey != null)
+        {
+            metadata["configurable_setting"] = settingsKey;
+        }
+
+        return metadata;
+    }
+
+    /// <summary>
+    /// Common hint text for VLAN recommendations when device may be misclassified.
+    /// </summary>
+    public const string ReclassifyHint = "If a device is misclassified, change its Device Icon / Fingerprint in UniFi Network.";
+
+    /// <summary>
+    /// Hint text for warning-level issues on device types that have a configurable allowance setting.
+    /// </summary>
+    public const string SettingsAllowHint = "or allow this device type in Settings";
+
+    /// <summary>
+    /// Hint text for info-level issues where user has allowed a device type in settings.
+    /// </summary>
+    public const string SettingsIsolateHint = "Change in Settings if you want to isolate this device type.";
+
+    /// <summary>
+    /// Check if a device category has a user-configurable allowance setting.
+    /// </summary>
+    public static bool HasConfigurableSetting(ClientDeviceCategory category) => category switch
+    {
+        ClientDeviceCategory.StreamingDevice => true,
+        ClientDeviceCategory.SmartTV => true,
+        ClientDeviceCategory.SmartSpeaker => true,
+        ClientDeviceCategory.MediaPlayer => true,
+        ClientDeviceCategory.Printer => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// Build the message and recommended action for an IoT device VLAN placement issue.
+    /// Centralizes messaging logic shared between wired and wireless IoT rules.
+    /// </summary>
+    public static (string Message, string RecommendedAction) GetIoTMessaging(
+        PlacementResult placement,
+        ClientDeviceCategory category,
+        string categoryName,
+        string networkName)
+    {
+        if (placement.IsAllowedBySettings)
+        {
+            return (
+                $"{categoryName} allowed per Settings on {networkName} VLAN",
+                SettingsIsolateHint);
+        }
+
+        var message = $"{categoryName} on {networkName} VLAN - should be isolated";
+        string recommendedAction;
+
+        if (HasConfigurableSetting(category))
+        {
+            var moveAction = GetMoveRecommendation(placement.RecommendedNetworkLabel, includeReclassifyHint: false);
+            recommendedAction = $"{moveAction} {SettingsAllowHint}. {ReclassifyHint}";
+        }
+        else
+        {
+            recommendedAction = GetMoveRecommendation(placement.RecommendedNetworkLabel);
+        }
+
+        return (message, recommendedAction);
+    }
+
+    /// <summary>
+    /// Build a VLAN move recommendation with optional reclassify hint.
+    /// </summary>
+    /// <param name="networkLabel">Target network label (e.g., "IoT (64)" or "Security VLAN")</param>
+    /// <param name="includeReclassifyHint">Whether to append the reclassify hint</param>
+    public static string GetMoveRecommendation(string networkLabel, bool includeReclassifyHint = true)
+    {
+        var action = $"Move to {networkLabel}";
+        return includeReclassifyHint
+            ? $"{action}. {ReclassifyHint}"
+            : action;
+    }
+
+    /// <summary>
+    /// Build a VLAN move recommendation from a placement result with fallback.
+    /// </summary>
+    /// <param name="placement">Placement result from Check*Placement methods</param>
+    /// <param name="fallbackAction">Action when no target network exists (e.g., "Create IoT VLAN")</param>
+    /// <param name="includeReclassifyHint">Whether to append the reclassify hint</param>
+    public static string GetMoveRecommendation(PlacementResult placement, string fallbackAction, bool includeReclassifyHint = true)
+    {
+        var action = placement.RecommendedNetwork != null
+            ? $"Move to {placement.RecommendedNetworkLabel}"
+            : fallbackAction;
+
+        return includeReclassifyHint
+            ? $"{action}. {ReclassifyHint}"
+            : action;
+    }
+}

@@ -1,0 +1,82 @@
+using Microsoft.EntityFrameworkCore;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Services;
+using NetworkOptimizer.Web.Services;
+using NetworkOptimizer.Web.Services.Authorization;
+
+namespace NetworkOptimizer.Web.Endpoints;
+
+public static class MonitoringInvestigateEndpoints
+{
+    public static void Map(WebApplication app)
+    {
+        // Gate 2 (design doc 06): the whole group carries authorization metadata, which is what
+        // architecture test A1 checks. The policy short-circuits when the install has
+        // authentication disabled (GlobalRoleHandler).
+        var group = app.MapGroup("").RequireAuthorization(Policies.RequireViewer);
+
+        group.MapGet("/api/monitoring/investigate/packet-loss", async (
+            MonitoringInfluxClient influx,
+            SiteDbContextFactory siteDbFactory,
+            SiteContextService siteContext,
+            DateTime? before,
+            DateTime? after,
+            CancellationToken ct) =>
+        {
+            await using var dbForIds = siteDbFactory.CreateForSite(siteContext.Slug, siteContext.IsDefault);
+            var enabledIds = await dbForIds.MonitoringTargets.AsNoTracking()
+                .Where(t => t.Enabled)
+                .Select(t => t.TargetId)
+                .ToListAsync(ct);
+            var result = await influx.FindRecentLossEventAsync(
+                before?.ToUniversalTime(), after?.ToUniversalTime(), enabledIds, ct);
+            if (result == null)
+                return Results.Ok(new { found = false });
+
+            string? targetName = null;
+            if (!string.IsNullOrEmpty(result.TargetId))
+            {
+                await using var db = siteDbFactory.CreateForSite(siteContext.Slug, siteContext.IsDefault);
+                targetName = await db.MonitoringTargets.AsNoTracking()
+                    .Where(t => t.TargetId == result.TargetId)
+                    .Select(t => t.Name)
+                    .FirstOrDefaultAsync(ct);
+            }
+
+            var category = result.TargetType switch
+            {
+                "accessisp" => "AccessIsp",
+                "transit" => "Transit",
+                _ => "InternetService"
+            };
+
+            return Results.Ok(new
+            {
+                found = true,
+                timestamp = result.Timestamp.ToString("o"),
+                category,
+                targetName,
+                lossPercent = result.LossPercent
+            });
+        });
+
+        group.MapGet("/api/monitoring/investigate/sfp-anomaly", async (
+            MonitoringInfluxClient influx,
+            CancellationToken ct) =>
+        {
+            var result = await influx.FindRecentSfpAnomalyAsync(ct);
+            if (result == null)
+                return Results.Ok(new { found = false });
+
+            return Results.Ok(new
+            {
+                found = true,
+                timestamp = result.Timestamp.ToString("o"),
+                metric = result.Metric,
+                value = result.Value,
+                deviceMac = result.DeviceMac,
+                portName = result.PortName
+            });
+        });
+    }
+}

@@ -1,0 +1,809 @@
+@using Microsoft.AspNetCore.Components.Web
+@using NetworkOptimizer.Web.Components
+@inject Microsoft.AspNetCore.Mvc.ViewFeatures.IFileVersionProvider FileVersionProvider
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <base href="/" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="@FileVersionProvider.AddFileVersionToPath("/", "css/app.css")" />
+    @* Font Awesome Free 6, brands and solid: the marks the Data tab's application list shows. *@
+    <link rel="stylesheet" href="@FileVersionProvider.AddFileVersionToPath("/", "lib/fontawesome/css/fontawesome.min.css")" />
+    <link rel="stylesheet" href="@FileVersionProvider.AddFileVersionToPath("/", "lib/fontawesome/css/brands.min.css")" />
+    <link rel="stylesheet" href="@FileVersionProvider.AddFileVersionToPath("/", "lib/fontawesome/css/solid.min.css")" />
+    <!-- PWA icons and manifest -->
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#1a2029" />
+    <meta name="msapplication-TileColor" content="#1a2029" />
+    <meta name="msapplication-TileImage" content="mstile-150x150.png" />
+    <!-- Custom Blazor reconnect modal styles -->
+    <style>
+        #components-reconnect-modal {
+            position: fixed;
+            inset: 0;
+            z-index: 10000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+        #components-reconnect-modal.components-reconnect-show,
+        #components-reconnect-modal.components-reconnect-failed,
+        #components-reconnect-modal.components-reconnect-rejected {
+            display: flex;
+        }
+        #components-reconnect-modal .reconnect-dialog {
+            background-color: #161618;
+            color: #ededef;
+            padding: 2rem 3rem;
+            border-radius: 6px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+            text-align: center;
+            min-width: 20rem;
+        }
+        #components-reconnect-modal .reconnect-dialog p {
+            margin: 0;
+            font-size: 1rem;
+        }
+        #components-reconnect-modal .reconnect-spinner {
+            width: 2rem;
+            height: 2rem;
+            margin: 0 auto 1rem;
+            border: 3px solid rgba(255, 255, 255, 0.2);
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: reconnect-spin 0.8s linear infinite;
+        }
+        @@keyframes reconnect-spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+    <!-- Tippy.js for interactive tooltips/popovers -->
+    <script src="https://unpkg.com/@@popperjs/core@2"></script>
+    <script src="https://unpkg.com/tippy.js@6"></script>
+    <!-- Three.js importmap. Vendored under /lib/three/. Used by the 3D LAN flow map (spec 5.7). -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "/lib/three/three.module.js",
+            "three/addons/": "/lib/three/addons/"
+        }
+    }
+    </script>
+    <HeadOutlet @rendermode="RenderMode.InteractiveServer" />
+</head>
+
+<body>
+    <script>
+        // Apply kiosk mode before the app renders so the sidebar never flashes
+        // in on a kiosk display. Per-device preference; see Settings > UI / Display.
+        try {
+            if (localStorage.getItem('networkOptimizerKioskMode') === '1') {
+                document.body.classList.add('kiosk-mode');
+            }
+        } catch (e) { }
+    </script>
+    <Routes />
+
+    <!-- Custom reconnect modal (prevents Blazor from injecting shadow DOM version) -->
+    <div id="components-reconnect-modal">
+        <div class="reconnect-dialog">
+            <div class="reconnect-spinner"></div>
+            <p>Reconnecting...</p>
+        </div>
+    </div>
+
+    <script>window.__noSiteDefault = "@(NetworkOptimizer.Web.Services.SiteManagementService.DefaultSiteSlug)";</script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/passkey.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/federated-login.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/site-context.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/collapse-reveal.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/chart-defaults.js")"></script>
+    <script src="_framework/blazor.web.js"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/scrollRestoration.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/updateCheck.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/steppedScaleBar.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/tour.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/map-address-search.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/map-satellite.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "lib/heic2any.min.js")"></script>
+    <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/floorPlanEditor.js")"></script>
+    @if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DEMO_MODE_MAPPINGS")))
+    {
+        <script src="@FileVersionProvider.AddFileVersionToPath("/", "js/demo-mask.js")"></script>
+    }
+    <script>
+        // Kiosk mode: per-device (localStorage), forces the collapsed hamburger
+        // layout at any width so a mini-display shows just the content.
+        function setKioskMode(enabled) {
+            try {
+                if (enabled) {
+                    localStorage.setItem('networkOptimizerKioskMode', '1');
+                    document.body.classList.add('kiosk-mode');
+                } else {
+                    localStorage.removeItem('networkOptimizerKioskMode');
+                    document.body.classList.remove('kiosk-mode');
+                }
+            } catch (e) { }
+        }
+
+        function getKioskMode() {
+            try {
+                return localStorage.getItem('networkOptimizerKioskMode') === '1';
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function downloadFile(fileName, contentType, base64Data) {
+            const linkSource = `data:${contentType};base64,${base64Data}`;
+            const downloadLink = document.createElement('a');
+            downloadLink.href = linkSource;
+            downloadLink.download = fileName;
+            downloadLink.click();
+        }
+
+        // Copy a shared secret from the sibling input, stripping the grouping spaces. The key is
+        // displayed in groups of four because that is what a human can read back, but an
+        // authenticator app wants the bare base32 string.
+        function copySecretFromInput(button) {
+            const input = button.previousElementSibling;
+            const text = input.value.replace(/\s+/g, '');
+
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text);
+            } else {
+                input.select();
+                input.setSelectionRange(0, 99999);
+                document.execCommand('copy');
+            }
+            input.blur();
+
+            const icon = button.querySelector('.copy-icon');
+            const check = button.querySelector('.copy-check');
+            if (icon && check) {
+                icon.style.display = 'none';
+                check.style.display = 'inline-flex';
+                setTimeout(function () {
+                    icon.style.display = 'inline-flex';
+                    check.style.display = 'none';
+                }, 1500);
+            }
+        }
+
+        // Copy a command block's text. Same tick-swap feedback as the input copiers; the text comes
+        // from the sibling <pre>, whose textContent is exactly what was rendered.
+        function copyFromCodeBlock(button) {
+            const block = button.parentElement.querySelector('pre');
+            if (!block) return;
+            const text = block.textContent;
+
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text);
+            } else {
+                const scratch = document.createElement('textarea');
+                scratch.value = text;
+                scratch.setAttribute('readonly', '');
+                scratch.style.position = 'absolute';
+                scratch.style.left = '-9999px';
+                document.body.appendChild(scratch);
+                scratch.select();
+                document.execCommand('copy');
+                document.body.removeChild(scratch);
+            }
+
+            const icon = button.querySelector('.copy-icon');
+            const check = button.querySelector('.copy-check');
+            if (icon && check) {
+                icon.style.display = 'none';
+                check.style.display = 'inline-flex';
+                setTimeout(function () {
+                    icon.style.display = 'inline-flex';
+                    check.style.display = 'none';
+                }, 1500);
+            }
+        }
+
+        // Copy text from sibling input element with visual feedback
+        function copyFromInput(button) {
+            const input = button.previousElementSibling;
+            const text = input.value;
+
+            // Try modern API first (requires HTTPS)
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text);
+            } else {
+                // Fallback for HTTP contexts
+                input.select();
+                input.setSelectionRange(0, 99999);
+                document.execCommand('copy');
+            }
+            input.blur();
+
+            // Visual feedback
+            const icon = button.querySelector('.copy-icon');
+            const check = button.querySelector('.copy-check');
+            icon.style.display = 'none';
+            check.style.display = 'inline';
+            setTimeout(() => {
+                icon.style.display = 'inline';
+                check.style.display = 'none';
+            }, 2000);
+        }
+
+        // Tooltip text is data, not markup: a device name or firmware string from the console
+        // must never run on hover. Only a sibling .tooltip-content block or an explicit
+        // data-tooltip-html opt-in renders as HTML; everything else is escaped here, with
+        // newlines kept as line breaks.
+        function tooltipContent(el) {
+            var raw = el.dataset.tooltip || '';
+            if (el.hasAttribute('data-tooltip-html')) return raw;
+            return raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/\n/g, '<br>');
+        }
+
+        // Initialize Tippy.js tooltips
+        function initTooltips() {
+            // Find all tooltip icons with content siblings
+            document.querySelectorAll('.tooltip-icon').forEach(function(icon) {
+                // Already built: a Blazor re-render swaps only the attribute, so push the new text
+                // into the instance rather than leaving the text it was built with.
+                if (icon._tippy) {
+                    if (icon.dataset.tooltip && icon._tippy.props.content !== tooltipContent(icon)) {
+                        icon._tippy.setContent(tooltipContent(icon));
+                    }
+                    return;
+                }
+
+                // Get content from sibling or data attribute
+                const contentEl = icon.nextElementSibling;
+                let content;
+
+                // Check for wide tooltip class
+                let isWide = false;
+                if (contentEl && contentEl.classList.contains('tooltip-content')) {
+                    content = contentEl.innerHTML;
+                    isWide = contentEl.classList.contains('tooltip-wide');
+                    contentEl.style.display = 'none'; // Hide the original content element
+                } else if (icon.dataset.tooltip) {
+                    content = tooltipContent(icon);
+                } else {
+                    return;
+                }
+
+                var iconOpts = {
+                    content: content,
+                    allowHTML: true,
+                    interactive: true,
+                    interactiveBorder: 10,
+                    trigger: 'mouseenter click',
+                    hideOnClick: true,
+                    delay: [100, 200],
+                    placement: 'top',
+                    theme: 'custom',
+                    appendTo: document.body,
+                    maxWidth: isWide ? 'min(100vw - 10px, 400px)' : 'min(100vw - 10px, 360px)',
+                    onShow(instance) {
+                        // Close other open tooltips
+                        document.querySelectorAll('.tooltip-icon').forEach(function(other) {
+                            if (other !== icon && other._tippy) {
+                                other._tippy.hide();
+                            }
+                        });
+                    },
+                    onMount(instance) {
+                        // Hide tooltip when clicking links inside it (before Blazor navigation)
+                        instance.popper.querySelectorAll('a').forEach(function(link) {
+                            link.addEventListener('click', function() {
+                                instance.unmount();
+                            });
+                        });
+                    },
+                    onClickOutside(instance, event) {
+                        instance.hide();
+                    }
+                };
+                // An icon that DOES something on click must not also open on click: the click
+                // re-renders or navigates, the reference element goes away mid-show, and the popper
+                // is left parented to the body with nothing to position against - it strands itself
+                // in the top-left corner and no longer has a reference to hide it. Hover still shows
+                // it; touch gets nothing, which is what it already got, since the tap acts instead.
+                if (icon.hasAttribute('data-tooltip-hover-only')) {
+                    iconOpts.trigger = 'mouseenter';
+                    iconOpts.touch = false;
+                }
+                tippy(icon, iconOpts);
+            });
+
+            // Simple tooltips for elements with data-tooltip (not .tooltip-icon)
+            document.querySelectorAll('[data-tooltip]:not(.tooltip-icon)').forEach(function(el) {
+                // Destroy existing tippy if content changed (Blazor may reuse elements)
+                if (el._tippy) {
+                    if (el._tippy.props.content === tooltipContent(el)) {
+                        return; // Content unchanged, keep existing
+                    }
+                    el._tippy.destroy();
+                }
+                var isInteractive = el.hasAttribute('data-tooltip-interactive');
+                var opts = {
+                    content: tooltipContent(el),
+                    allowHTML: true,
+                    trigger: el.hasAttribute('data-tooltip-hover') ? 'mouseenter' : 'mouseenter click',
+                    hideOnClick: true,
+                    delay: [100, 200],
+                    placement: 'top',
+                    theme: 'custom',
+                    appendTo: document.body,
+                    maxWidth: el.hasAttribute('data-tooltip-wrap')
+                        ? 'min(100vw - 10px, 320px)'
+                        : el.hasAttribute('data-tooltip-wide')
+                            ? 'min(100vw - 10px, 400px)'
+                            : 'min(100vw - 10px, 360px)',
+                    onShow: function(instance) {
+                        // Suppress if an adjacent sibling already shows the same tooltip
+                        var ref = instance.reference;
+                        var siblings = [ref.previousElementSibling, ref.nextElementSibling];
+                        for (var i = 0; i < siblings.length; i++) {
+                            var sib = siblings[i];
+                            if (sib && sib._tippy && sib._tippy.state.isVisible &&
+                                sib._tippy.props.content === instance.props.content) {
+                                return false; // Cancel showing
+                            }
+                        }
+                    }
+                };
+                if (isInteractive) {
+                    opts.interactive = true;
+                    opts.interactiveBorder = 10;
+                    opts.onMount = function(instance) {
+                        instance.popper.querySelectorAll('a').forEach(function(link) {
+                            link.addEventListener('click', function() { instance.unmount(); });
+                        });
+                    };
+                }
+                if (el.hasAttribute('data-tooltip-follow')) {
+                    opts.followCursor = true;
+                }
+                if (el.hasAttribute('data-tooltip-hover-only') || el.tagName === 'BUTTON') {
+                    opts.trigger = 'mouseenter';
+                    opts.touch = false;
+                }
+                // Touch-only override for references inside a link. Safari gives a link descendant
+                // no sticky hover, so a mouseenter trigger flashes; on touch use click alone.
+                // Hover devices keep the normal trigger, so the desktop hover is unchanged.
+                // Never on an anchor or button itself - swallowing their click would kill the
+                // navigation or action they exist for. This is for a plain element sitting inside
+                // one, where the tap has no job other than opening the tooltip.
+                if (el.hasAttribute('data-tooltip-click') &&
+                    el.tagName !== 'A' && el.tagName !== 'BUTTON' &&
+                    window.matchMedia && window.matchMedia('(hover: none)').matches) {
+                    opts.trigger = 'click';
+                    // The tap opens the tooltip instead of following the link it sits in. Only on
+                    // touch: a hover device shows the tooltip without clicking, so it keeps the link.
+                    if (!el.__tooltipClickGuard) {
+                        el.__tooltipClickGuard = true;
+                        el.addEventListener('click', function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                        });
+                    }
+                }
+                var delayMs = parseInt(el.dataset.tooltipDelay, 10);
+                if (!isNaN(delayMs)) {
+                    opts.delay = [delayMs, 200];
+                }
+                tippy(el, opts);
+                el.setAttribute('data-tooltip-bound', '');
+            });
+        }
+
+        // Periodically check for new/stale tooltips (handles Blazor element reuse and dynamic content)
+        setInterval(function() {
+            // Elements Blazor kept but whose data-tooltip it removed - the tooltip is no longer true
+            // and would otherwise hover forever. Found by the marker set at bind time: a tippy
+            // instance is a JS property, so there is nothing to select on without one. This used to
+            // name three classes, which meant every other dynamic tooltip in the app went stale.
+            document.querySelectorAll('[data-tooltip-bound]:not([data-tooltip])').forEach(function(el) {
+                if (el._tippy) el._tippy.destroy();
+                el.removeAttribute('data-tooltip-bound');
+            });
+
+            // Icons Blazor kept but whose data-tooltip changed: initTooltips only runs when nodes
+            // are added, so this scan is what sees an attribute-only change.
+            document.querySelectorAll('.tooltip-icon[data-tooltip]').forEach(function(icon) {
+                if (icon._tippy && icon._tippy.props.content !== tooltipContent(icon)) {
+                    icon._tippy.setContent(tooltipContent(icon));
+                }
+            });
+
+            document.querySelectorAll('[data-tooltip]:not(.tooltip-icon)').forEach(function(el) {
+                var isInteractive = el.hasAttribute('data-tooltip-interactive');
+                var opts = {
+                    content: tooltipContent(el),
+                    allowHTML: true,
+                    trigger: el.hasAttribute('data-tooltip-hover') ? 'mouseenter' : 'mouseenter click',
+                    hideOnClick: true,
+                    delay: [100, 200],
+                    placement: 'top',
+                    theme: 'custom',
+                    appendTo: document.body,
+                    maxWidth: el.hasAttribute('data-tooltip-wrap')
+                        ? 'min(100vw - 10px, 320px)'
+                        : el.hasAttribute('data-tooltip-wide')
+                            ? 'min(100vw - 10px, 400px)'
+                            : 'min(100vw - 10px, 360px)',
+                    onShow: function(instance) {
+                        var ref = instance.reference;
+                        var siblings = [ref.previousElementSibling, ref.nextElementSibling];
+                        for (var i = 0; i < siblings.length; i++) {
+                            var sib = siblings[i];
+                            if (sib && sib._tippy && sib._tippy.state.isVisible &&
+                                sib._tippy.props.content === instance.props.content) {
+                                return false;
+                            }
+                        }
+                    }
+                };
+                if (isInteractive) {
+                    opts.interactive = true;
+                    opts.interactiveBorder = 10;
+                    opts.onMount = function(instance) {
+                        instance.popper.querySelectorAll('a').forEach(function(link) {
+                            link.addEventListener('click', function() { instance.unmount(); });
+                        });
+                    };
+                }
+                if (el.hasAttribute('data-tooltip-follow')) {
+                    opts.followCursor = true;
+                }
+                if (el.hasAttribute('data-tooltip-hover-only') || el.tagName === 'BUTTON') {
+                    opts.trigger = 'mouseenter';
+                    opts.touch = false;
+                }
+                // Touch-only override for references inside a link. Safari gives a link descendant
+                // no sticky hover, so a mouseenter trigger flashes; on touch use click alone.
+                // Hover devices keep the normal trigger, so the desktop hover is unchanged.
+                // Never on an anchor or button itself - swallowing their click would kill the
+                // navigation or action they exist for. This is for a plain element sitting inside
+                // one, where the tap has no job other than opening the tooltip.
+                if (el.hasAttribute('data-tooltip-click') &&
+                    el.tagName !== 'A' && el.tagName !== 'BUTTON' &&
+                    window.matchMedia && window.matchMedia('(hover: none)').matches) {
+                    opts.trigger = 'click';
+                    // The tap opens the tooltip instead of following the link it sits in. Only on
+                    // touch: a hover device shows the tooltip without clicking, so it keeps the link.
+                    if (!el.__tooltipClickGuard) {
+                        el.__tooltipClickGuard = true;
+                        el.addEventListener('click', function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                        });
+                    }
+                }
+                var delayMs = parseInt(el.dataset.tooltipDelay, 10);
+                if (!isNaN(delayMs)) {
+                    opts.delay = [delayMs, 200];
+                }
+                if (el._tippy) {
+                    // Update existing tooltip if content changed
+                    if (el._tippy.props.content !== tooltipContent(el)) {
+                        el._tippy.destroy();
+                        tippy(el, opts);
+                    }
+                } else {
+                    // Initialize new tooltip for dynamically added element
+                    tippy(el, opts);
+                }
+                el.setAttribute('data-tooltip-bound', '');
+            });
+        }, 500);
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', initTooltips);
+
+        // Clean up tippy elements before navigation (covers absolute /path and relative ./path links)
+        document.addEventListener('click', function(e) {
+            var link = e.target.closest('a[href^="/"], a[href^="./"]');
+            if (link) {
+                // Destroy the instances, not just their poppers: one left alive on an element Blazor
+                // then removes re-mounts in the top-left corner and cannot be dismissed.
+                document.querySelectorAll('[data-tooltip-bound]').forEach(function(el) {
+                    if (el._tippy) el._tippy.destroy();
+                    el.removeAttribute('data-tooltip-bound');
+                });
+                document.querySelectorAll('.tooltip-icon').forEach(function(el) {
+                    if (el._tippy) el._tippy.destroy();
+                });
+                document.querySelectorAll('[data-tippy-root]').forEach(function(el) {
+                    el.remove();
+                });
+            }
+        });
+
+        // Also watch for DOM changes (for dynamic content)
+        const observer = new MutationObserver(function(mutations) {
+            let shouldInit = false;
+            let shouldTabScroll = false;
+            mutations.forEach(function(mutation) {
+                if (mutation.addedNodes.length) {
+                    mutation.addedNodes.forEach(function(node) {
+                        if (node.nodeType === 1) {
+                            // Check for tooltip elements
+                            if (node.classList?.contains('tooltip-icon') ||
+                                node.querySelector?.('.tooltip-icon') ||
+                                node.hasAttribute?.('data-tooltip') ||
+                                node.querySelector?.('[data-tooltip]')) {
+                                shouldInit = true;
+                            }
+                            // A tab bar that has just rendered, so the open tab is revealed on
+                            // arrival instead of after the next poll a second later.
+                            if (node.classList?.contains('wifi-view-tabs') ||
+                                node.querySelector?.('.wifi-view-tabs')) {
+                                shouldTabScroll = true;
+                            }
+                        }
+                    });
+                }
+            });
+            if (shouldInit) {
+                setTimeout(initTooltips, 50);
+            }
+            if (shouldTabScroll) {
+                requestAnimationFrame(updateTabScrollState);
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        // Scrollable tab bar overflow detection
+        function updateTabScrollState() {
+            document.querySelectorAll('.wifi-view-tabs-wrapper').forEach(function(wrapper) {
+                var tabs = wrapper.querySelector('.wifi-view-tabs');
+                if (!tabs) return;
+                var hasOverflow = tabs.scrollWidth > tabs.clientWidth + 1;
+                wrapper.classList.toggle('has-overflow', hasOverflow);
+                wrapper.classList.toggle('at-start', tabs.scrollLeft <= 20);
+                wrapper.classList.toggle('at-end', tabs.scrollLeft + tabs.clientWidth >= tabs.scrollWidth - 20);
+                revealActiveTab(tabs);
+            });
+        }
+
+        // A deep link can open a tab that sits off the end of the strip, which on a phone reads as
+        // the wrong tab being open - the bar shows the first few and the one in use is out of sight.
+        // Bring it into view when it CHANGES, which covers arriving on a link and leaves a reader
+        // who has scrolled the strip by hand alone: only a new tab moves it, never a stray render.
+        var tabScrollSeen = new WeakMap();
+        function revealActiveTab(tabs) {
+            var active = tabs.querySelector('.wifi-view-tab.active');
+            if (!active) return;
+            // Keyed by name, not by element: a re-render can hand back a new node for the same
+            // tab, and treating that as a change would haul a hand-scrolled strip back again.
+            var name = active.textContent.trim();
+            var seen = tabScrollSeen.get(tabs);
+            if (seen === name) return;
+            var arriving = seen === undefined;
+            tabScrollSeen.set(tabs, name);
+            if (tabs.scrollWidth <= tabs.clientWidth + 1) return;
+
+            // Measured from the boxes rather than offsetLeft: the buttons' offsetParent is the
+            // wrapper, whose scroll buttons sit outside the scroller and would skew every reading.
+            var strip = tabs.getBoundingClientRect();
+            var tab = active.getBoundingClientRect();
+            if (tab.left >= strip.left && tab.right <= strip.right) return;
+
+            // Centered, then clamped - which is what keeps the first and last tabs flush with their
+            // end of the strip instead of stranding a half-width of empty space beside them.
+            var centered = tabs.scrollLeft + (tab.left - strip.left) - (strip.width - tab.width) / 2;
+            var furthest = tabs.scrollWidth - tabs.clientWidth;
+            tabs.scrollTo({
+                left: Math.max(0, Math.min(centered, furthest)),
+                behavior: arriving ? 'auto' : 'smooth',
+            });
+        }
+        // Update on scroll
+        document.addEventListener('scroll', function(e) {
+            if (e.target.classList && e.target.classList.contains('wifi-view-tabs')) {
+                var wrapper = e.target.closest('.wifi-view-tabs-wrapper');
+                if (wrapper) {
+                    var tabs = e.target;
+                    wrapper.classList.toggle('at-start', tabs.scrollLeft <= 20);
+                    wrapper.classList.toggle('at-end', tabs.scrollLeft + tabs.clientWidth >= tabs.scrollWidth - 20);
+                }
+            }
+        }, true);
+        // Update on resize and periodically for Blazor dynamic content
+        window.addEventListener('resize', updateTabScrollState);
+        setInterval(updateTabScrollState, 1000);
+
+        // Auto-reload when Blazor reconnects after a real disconnection
+        // After server restart, client state is stale and causes loading issues
+        // But don't reload on quick reconnects during normal page refresh
+        const reconnectModal = document.getElementById('components-reconnect-modal');
+        if (reconnectModal) {
+            let disconnectedAt = null;
+            let reloading = false;
+            let stuckSpinnerTimer = null;
+            const MIN_DISCONNECT_TIME_MS = 1500; // Only reload if disconnected > 1.5s
+            const STUCK_SPINNER_MS = 5000;       // Probe cadence while the spinner is up
+            const HEALTH_TIMEOUT_MS = 2000;      // Give the liveness probe this long to answer
+
+            // A reload tears down the page (circuit, Blazor's retries, our timers), so
+            // whichever recovery path fires first wins; the guard just stops a later
+            // tick from calling reload again after one is already in flight.
+            function safeReload() {
+                if (reloading) return;
+                reloading = true;
+                window.scrollRestoration.reload();
+            }
+
+            // Endless-spinner safety hatch. Blazor can sit in the "reconnecting" state
+            // indefinitely when the socket is wedged (dead but still open to it) or its
+            // retries stall - the page stays frozen behind the modal with no class
+            // transition for the observer to react to. While the spinner is up, probe
+            // the server every few seconds: if the SERVER answers, the circuit is wedged
+            // but the app is fine, so reload into a fresh page; if it doesn't answer it's
+            // a restart/outage, so do nothing and let Blazor keep retrying (reloading into
+            // a dead server would only strand us). The ?probe= marker distinguishes these
+            // from deploy health checks in the access logs.
+            async function serverAlive() {
+                const ctrl = new AbortController();
+                const t = setTimeout(() => ctrl.abort(), HEALTH_TIMEOUT_MS);
+                try {
+                    const resp = await fetch('/api/health?probe=reconnect', { signal: ctrl.signal, cache: 'no-store' });
+                    return resp.ok;
+                } catch {
+                    return false;
+                } finally {
+                    clearTimeout(t);
+                }
+            }
+
+            function startStuckSpinnerWatch() {
+                if (stuckSpinnerTimer) return;
+                stuckSpinnerTimer = setInterval(async function () {
+                    if (await serverAlive()) safeReload();
+                }, STUCK_SPINNER_MS);
+            }
+
+            function stopStuckSpinnerWatch() {
+                if (stuckSpinnerTimer) {
+                    clearInterval(stuckSpinnerTimer);
+                    stuckSpinnerTimer = null;
+                }
+            }
+
+            const reconnectObserver = new MutationObserver(function(mutations) {
+                mutations.forEach(function(mutation) {
+                    if (mutation.attributeName === 'class') {
+                        const classList = reconnectModal.classList;
+                        const isShowing = classList.contains('components-reconnect-show');
+                        const isFailed = classList.contains('components-reconnect-failed') ||
+                                        classList.contains('components-reconnect-rejected');
+
+                        if (isShowing && !disconnectedAt) {
+                            // Record when we started showing the reconnect modal
+                            disconnectedAt = Date.now();
+                            startStuckSpinnerWatch();
+                        } else if (!isShowing && !isFailed && disconnectedAt) {
+                            // Successfully reconnected - only reload if we were disconnected long enough
+                            const disconnectDuration = Date.now() - disconnectedAt;
+                            disconnectedAt = null;
+                            stopStuckSpinnerWatch();
+                            if (disconnectDuration >= MIN_DISCONNECT_TIME_MS) {
+                                safeReload();
+                            }
+                        } else if (isFailed) {
+                            disconnectedAt = null;
+                            stopStuckSpinnerWatch();
+                            safeReload();
+                        }
+                    }
+                });
+            });
+            reconnectObserver.observe(reconnectModal, { attributes: true });
+        }
+
+        // PWA / mobile resume recovery. When the app is backgrounded, iOS and
+        // Android suspend the tab and its Blazor WebSocket can die, but on resume
+        // Blazor often does NOT surface the reconnect modal (the socket still
+        // looks open to it), so the page sits on its stale prerender with frozen
+        // loading spinners until a manual refresh. Rather than reload on a blind
+        // timer - which threw away scroll position and in-page state even when
+        // the circuit had actually survived the backgrounding - PROBE the circuit
+        // on resume and only reload when it's genuinely dead. A live circuit
+        // answers the round-trip in a few ms; a dead-but-open socket never
+        // replies, so the timeout tells us a reload is really needed. The
+        // reconnect-modal observer above covers the case where Blazor detects the
+        // drop itself, so defer to it when it's showing.
+        (function () {
+            const STALE_HIDDEN_MS = 30000;
+            const PROBE_TIMEOUT_MS = 2500;
+            let hiddenAt = null;
+
+            function blazorHandlingDrop() {
+                const m = document.getElementById('components-reconnect-modal');
+                return !!m && (
+                    m.classList.contains('components-reconnect-show') ||
+                    m.classList.contains('components-reconnect-failed') ||
+                    m.classList.contains('components-reconnect-rejected'));
+            }
+
+            async function serverIsUp() {
+                const ctrl = new AbortController();
+                const t = setTimeout(() => ctrl.abort(), 2000);
+                try {
+                    const resp = await fetch('/api/health?probe=resume',
+                        { signal: ctrl.signal, cache: 'no-store' });
+                    return resp.ok;
+                } catch { return false; }
+                finally { clearTimeout(t); }
+            }
+
+            async function circuitAlive() {
+                if (!window.DotNet) return false;
+                try {
+                    await Promise.race([
+                        DotNet.invokeMethodAsync('NetworkOptimizer.Web', 'Ping'),
+                        new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error('probe timeout')), PROBE_TIMEOUT_MS))
+                    ]);
+                    return true;
+                } catch {
+                    return false;
+                }
+            }
+
+            document.addEventListener('visibilitychange', async function () {
+                if (document.visibilityState === 'hidden') {
+                    hiddenAt = Date.now();
+                    return;
+                }
+                if (hiddenAt === null) return;
+                const hiddenMs = Date.now() - hiddenAt;
+                hiddenAt = null;
+                if (hiddenMs < STALE_HIDDEN_MS) return;
+
+                // iOS/Android suspend setInterval while backgrounded, so the
+                // stuck-spinner timer may be dead. Probe the server ourselves.
+                // Retry: mobile network stacks take a few seconds to re-attach
+                // after resume (Wi-Fi rejoin, cellular radio wake).
+                const GIVE_UP_AFTER_MS = 12000;
+                const deadline = Date.now() + GIVE_UP_AFTER_MS;
+
+                if (blazorHandlingDrop()) {
+                    while (Date.now() < deadline) {
+                        if (!blazorHandlingDrop()) break;
+                        if (await serverIsUp()) { window.scrollRestoration.reload(); return; }
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+                    return;
+                }
+
+                // No modal - probe the circuit. One probe isn't enough: Blazor
+                // is often mid-reconnect on resume and the first ping times out
+                // on a circuit that's about to work.
+                while (Date.now() < deadline) {
+                    if (blazorHandlingDrop()) {
+                        if (await serverIsUp()) window.scrollRestoration.reload();
+                        return;
+                    }
+                    if (await circuitAlive()) return;
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+                // Still no circuit and no modal - server may be down. Reload
+                // only if it answers; otherwise we'd strand on a blank page.
+                if (await serverIsUp()) window.scrollRestoration.reload();
+            });
+        })();
+    </script>
+</body>
+
+</html>

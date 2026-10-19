@@ -1,0 +1,331 @@
+<#
+.SYNOPSIS
+    Resets the Network Optimizer admin password on Windows.
+
+.DESCRIPTION
+    Stops the NetworkOptimizer service, clears the admin password from the
+    SQLite database, restarts the service, and extracts the auto-generated
+    temporary password from the log file.
+
+.PARAMETER InstallDir
+    Override the install directory. By default, auto-detected from the
+    Windows service registration or defaults to
+    "C:\Program Files\Ozark Connect\Network Optimizer".
+
+.PARAMETER Force
+    Skip the confirmation prompt.
+
+.PARAMETER TimeoutSeconds
+    How long to wait for the service to become healthy (default: 60).
+
+.EXAMPLE
+    .\reset-password.ps1
+    .\reset-password.ps1 -Force
+    .\reset-password.ps1 -InstallDir "D:\NetworkOptimizer"
+#>
+
+[CmdletBinding()]
+param(
+    [string]$InstallDir,
+    [switch]$Force,
+    [int]$TimeoutSeconds = 60
+)
+
+$ErrorActionPreference = 'Stop'
+
+# =============================================================================
+# Require Administrator
+# =============================================================================
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Host "ERROR: This script must be run as Administrator." -ForegroundColor Red
+    Write-Host "Right-click PowerShell and select 'Run as administrator', then try again."
+    exit 1
+}
+
+# =============================================================================
+# Constants
+# =============================================================================
+$ServiceName = "NetworkOptimizer"
+$DbFileName  = "network_optimizer.db"
+$HealthUrl   = "http://localhost:8042/api/health"
+
+# =============================================================================
+# Auto-detect Install Directory
+# =============================================================================
+if (-not $InstallDir) {
+    # Try 1: Get path from Windows service
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+    if ($svc -and $svc.PathName) {
+        $exePath = $svc.PathName -replace '"', ''
+        $InstallDir = Split-Path $exePath -Parent
+    }
+
+    # Try 2: Registry (WiX installer writes InstallFolder)
+    if (-not $InstallDir) {
+        $regPaths = @(
+            "HKLM:\SOFTWARE\Ozark Connect\Network Optimizer",
+            "HKLM:\SOFTWARE\WOW6432Node\Ozark Connect\Network Optimizer"
+        )
+        foreach ($rp in $regPaths) {
+            if (Test-Path $rp) {
+                $regVal = Get-ItemProperty $rp -Name "InstallFolder" -ErrorAction SilentlyContinue
+                if ($regVal) { $InstallDir = $regVal.InstallFolder; break }
+            }
+        }
+    }
+
+    # Try 3: Default path
+    if (-not $InstallDir) {
+        $InstallDir = "C:\Program Files\Ozark Connect\Network Optimizer"
+    }
+}
+
+Write-Host ""
+Write-Host "Network Optimizer - Password Reset" -ForegroundColor Cyan
+Write-Host "===================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Install directory: $InstallDir"
+
+# =============================================================================
+# Verify database exists
+# =============================================================================
+$dbPath = Join-Path $InstallDir "data\$DbFileName"
+if (-not (Test-Path $dbPath)) {
+    Write-Host "ERROR: Database not found at $dbPath" -ForegroundColor Red
+    Write-Host "Use -InstallDir to specify the correct installation directory."
+    exit 1
+}
+
+Write-Host "Database found:    $dbPath" -ForegroundColor Green
+
+# =============================================================================
+# Check for sqlite3
+# =============================================================================
+$sqlite3 = Get-Command sqlite3 -ErrorAction SilentlyContinue
+if (-not $sqlite3) {
+    # Check in the install directory (bundled with WiX installer)
+    $bundled = Join-Path $InstallDir "sqlite3.exe"
+    if (Test-Path $bundled) {
+        $sqlite3Path = $bundled
+    } else {
+        Write-Host ""
+        Write-Host "ERROR: sqlite3 not found in PATH or install directory." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Install it with:  winget install SQLite.SQLite" -ForegroundColor Yellow
+        Write-Host "Then restart this terminal and try again."
+        exit 1
+    }
+} else {
+    $sqlite3Path = $sqlite3.Source
+}
+
+Write-Host "sqlite3:           $sqlite3Path" -ForegroundColor Green
+Write-Host ""
+
+function Invoke-Sql {
+    param([string]$Query)
+    # Some of these run against tables an older install predates. A missing table exits sqlite3
+    # non-zero, which PowerShell 7.4+ turns into a terminating error under
+    # $ErrorActionPreference = 'Stop' - so swallow it rather than abort a reset that has
+    # already succeeded.
+    try { & $sqlite3Path $dbPath $Query 2>$null } catch { }
+}
+
+# Sign-in reads AspNetUsers.PasswordHash, and the app only copies the legacy password across
+# when the admin account does not exist yet. So on an install that has already migrated,
+# clearing AdminSettings alone regenerates and prints a password that is then refused at the
+# login page. Copy the freshly generated hash across ourselves.
+#
+# The hash is copied, never re-derived, so this needs no crypto and no plaintext. It is written
+# in the old dotted PBKDF2 format, which the app still accepts and quietly upgrades on first
+# sign-in. The account is updated, never deleted: deleting it cannot be undone and would take
+# the admin's site memberships and roles with it.
+function Sync-IdentityAdmin {
+    $hasIdentity = Invoke-Sql "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='AspNetUsers';"
+    if ($hasIdentity -ne '1') {
+        return   # pre-Identity install: the legacy row is the whole story
+    }
+
+    # The app writes the new hash while it starts; wait for it rather than race it.
+    $legacyHash = $null
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
+        $legacyHash = Invoke-Sql "SELECT ifnull(Password,'') FROM AdminSettings LIMIT 1;"
+        if ($legacyHash) { break }
+        Start-Sleep -Seconds 1
+    }
+
+    if (-not $legacyHash) {
+        Write-Host "WARNING: Could not read the regenerated password; the admin account was left unchanged." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Applying the new password to the admin account..." -NoNewline
+    Invoke-Sql @"
+UPDATE AspNetUsers
+   SET PasswordHash = '$legacyHash',
+       PasswordIsTemporary = 1,
+       IsEnabled = 1,
+       LockoutEnd = NULL,
+       AccessFailedCount = 0,
+       SecurityStamp = lower(hex(randomblob(16)))
+ WHERE NormalizedUserName = 'ADMIN';
+"@ | Out-Null
+    Write-Host " done." -ForegroundColor Green
+}
+
+# The reset only restores the password. Two other settings can still turn the login away,
+# and from the login page both look exactly like a wrong password - so say so here rather
+# than leave someone retyping a password that was never the problem. Neither is changed
+# automatically: one would weaken the install's SSO policy, the other would throw away an
+# MFA enrollment.
+function Write-BlockerWarnings {
+    $ssoOnly = Invoke-Sql "SELECT Value FROM SystemSettings WHERE Key = 'auth.local_login_disabled';"
+    if ($ssoOnly -eq 'true') {
+        Write-Host ""
+        Write-Host "WARNING: Local logins are disabled on this install (single sign-on only)." -ForegroundColor Yellow
+        Write-Host "         The password below will be refused until an administrator re-enables" -ForegroundColor Yellow
+        Write-Host "         local login, or you restart with NETOPT_RECOVERY=1 to bypass it once." -ForegroundColor Yellow
+    }
+
+    $mfaOn = Invoke-Sql "SELECT TwoFactorEnabled FROM AspNetUsers WHERE NormalizedUserName = 'ADMIN';"
+    if ($mfaOn -eq '1') {
+        Write-Host ""
+        Write-Host "WARNING: The admin account has two-factor authentication enabled." -ForegroundColor Yellow
+        Write-Host "         You will still be asked for your authenticator code after signing in." -ForegroundColor Yellow
+        Write-Host "         Use a saved recovery code if you no longer have the authenticator." -ForegroundColor Yellow
+    }
+}
+
+# =============================================================================
+# Confirm with user
+# =============================================================================
+if (-not $Force) {
+    Write-Host "This will:" -ForegroundColor Yellow
+    Write-Host "  1. Stop the NetworkOptimizer service"
+    Write-Host "  2. Clear the admin password from the database"
+    Write-Host "  3. Restart the service"
+    Write-Host "  4. Display the new auto-generated temporary password"
+    Write-Host ""
+    $confirm = Read-Host "Continue? (y/N)"
+    if ($confirm -notmatch '^[Yy]') {
+        Write-Host "Cancelled."
+        exit 0
+    }
+    Write-Host ""
+}
+
+# =============================================================================
+# Stop the service
+# =============================================================================
+$svcObj = Get-Service $ServiceName -ErrorAction SilentlyContinue
+if (-not $svcObj) {
+    Write-Host "ERROR: Service '$ServiceName' not found." -ForegroundColor Red
+    Write-Host "Is Network Optimizer installed as a Windows service?"
+    exit 1
+}
+
+if ($svcObj.Status -eq 'Running') {
+    Write-Host "Stopping service..." -NoNewline
+    Stop-Service $ServiceName -Force
+    $svcObj.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+    Write-Host " done." -ForegroundColor Green
+} else {
+    Write-Host "Service is already stopped." -ForegroundColor Yellow
+}
+
+# =============================================================================
+# Clear admin password
+# =============================================================================
+Write-Host "Clearing admin password..." -NoNewline
+& $sqlite3Path $dbPath "UPDATE AdminSettings SET Password = NULL, Enabled = 0;"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host " FAILED." -ForegroundColor Red
+    Write-Host "sqlite3 returned exit code $LASTEXITCODE"
+    exit 1
+}
+Write-Host " done." -ForegroundColor Green
+
+# =============================================================================
+# Start the service
+# =============================================================================
+Write-Host "Starting service..." -NoNewline
+Start-Service $ServiceName
+Write-Host " done." -ForegroundColor Green
+
+# =============================================================================
+# Wait for health endpoint
+# =============================================================================
+Write-Host "Waiting for application to start..." -NoNewline
+$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+$healthy = $false
+
+while ((Get-Date) -lt $deadline) {
+    try {
+        $resp = Invoke-WebRequest -Uri $HealthUrl -UseBasicParsing -TimeoutSec 3 -ErrorAction SilentlyContinue
+        if ($resp.StatusCode -eq 200) {
+            $healthy = $true
+            break
+        }
+    } catch {
+        # Not ready yet
+    }
+    Start-Sleep -Seconds 2
+    Write-Host "." -NoNewline
+}
+
+if ($healthy) {
+    Write-Host " ready!" -ForegroundColor Green
+} else {
+    Write-Host " timed out." -ForegroundColor Yellow
+    Write-Host "The service may still be starting. Check the logs manually."
+}
+
+# =============================================================================
+# Extract password from log
+# =============================================================================
+Write-Host ""
+$logDir = Join-Path $InstallDir "logs"
+$today = (Get-Date).ToString("yyyyMMdd")
+$logFile = Join-Path $logDir "networkoptimizer-$today.log"
+
+Sync-IdentityAdmin
+Write-BlockerWarnings
+Write-Host ""
+
+$password = $null
+if (Test-Path $logFile) {
+    # Find the last occurrence of the password line after AUTO-GENERATED banner
+    $logContent = Get-Content $logFile -Tail 100
+    for ($i = $logContent.Count - 1; $i -ge 0; $i--) {
+        if ($logContent[$i] -match 'Password:\s+(\S+)') {
+            $password = $Matches[1]
+            break
+        }
+    }
+}
+
+if ($password) {
+    Write-Host "===================================" -ForegroundColor Green
+    Write-Host "  Password reset successful!" -ForegroundColor Green
+    Write-Host "===================================" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  Temporary password: $password" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Log in to Network Optimizer with this password,"
+    Write-Host "  then go to Settings to set a permanent one."
+    Write-Host ""
+} else {
+    Write-Host "Password reset completed, but could not extract the new password from logs." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Check the log file manually:"
+    Write-Host "  $logFile" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Or look for the password in the Windows Event Viewer under Application logs."
+    Write-Host "Search for 'AUTO-GENERATED' in the log output."
+    Write-Host ""
+}

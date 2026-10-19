@@ -1,0 +1,2371 @@
+using System.Net;
+using FluentAssertions;
+using Microsoft.Extensions.Logging;
+using Moq;
+using Moq.Protected;
+using NetworkOptimizer.Audit.Dns;
+using NetworkOptimizer.Audit.Models;
+using Xunit;
+
+namespace NetworkOptimizer.Audit.Tests.Dns;
+
+[Collection("ThirdPartyDns")]
+public class ThirdPartyDnsDetectorTests : IDisposable
+{
+    private readonly Mock<ILogger<ThirdPartyDnsDetector>> _loggerMock;
+
+    public ThirdPartyDnsDetectorTests()
+    {
+        // Mock DNS resolver to avoid real network calls and timeouts
+        DohProviderRegistry.DnsResolver = _ => Task.FromResult<string?>(null);
+        _loggerMock = new Mock<ILogger<ThirdPartyDnsDetector>>();
+    }
+
+    public void Dispose()
+    {
+        DohProviderRegistry.ResetDnsResolver();
+        // Restore the assembly-wide safe default rather than nulling out the override.
+        // The module initializer in TestAssemblyInit sets this once at assembly load;
+        // nulling it here would expose subsequent tests to the real DNS+HTTPS probe.
+        TestAssemblyInit.SetSafeDefault();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_NextDnsDetected_FlagsProviderAsNextDns()
+    {
+        // Pi-hole and AdGuard Home probes return 404 (not detected). NextDNS probe
+        // override returns a successful detection. Result should record IsNextDns=true
+        // and the provider name should propagate up to the orchestration layer.
+        ThirdPartyDnsDetector.NextDnsProbeOverride = (ip, ct) =>
+            Task.FromResult<(bool, string?)>((true, "fp1234567890abcdef"));
+
+        var httpClient = CreateMockHttpClient(HttpStatusCode.NotFound);
+        var detector = CreateDetector(httpClient);
+
+        var networks = new List<NetworkInfo>
+        {
+            new()
+            {
+                Id = "net1",
+                DhcpEnabled = true,
+                Name = "Trusted",
+                VlanId = 1,
+                Subnet = "10.0.0.0/24",
+                Gateway = "10.0.0.1",
+                DnsServers = new List<string> { "10.0.100.251" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].DnsServerIp.Should().Be("10.0.100.251");
+        result[0].IsNextDns.Should().BeTrue();
+        result[0].NextDnsProfile.Should().Be("fp1234567890abcdef");
+        result[0].IsPihole.Should().BeFalse();
+        result[0].IsAdGuardHome.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("NextDNS CLI");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_NextDnsProbeReturnsFalse_NoNextDnsFlag()
+    {
+        // All three probes fail to identify the resolver. Result should still be
+        // recorded as a third-party DNS, but with no specific provider attribution.
+        ThirdPartyDnsDetector.NextDnsProbeOverride = (ip, ct) =>
+            Task.FromResult<(bool, string?)>((false, null));
+
+        var httpClient = CreateMockHttpClient(HttpStatusCode.NotFound);
+        var detector = CreateDetector(httpClient);
+
+        var networks = new List<NetworkInfo>
+        {
+            new()
+            {
+                Id = "net1",
+                DhcpEnabled = true,
+                Name = "Trusted",
+                VlanId = 1,
+                Subnet = "10.0.0.0/24",
+                Gateway = "10.0.0.1",
+                DnsServers = new List<string> { "10.0.100.251" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsNextDns.Should().BeFalse();
+        result[0].NextDnsProfile.Should().BeNull();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_PiholeDetected_DoesNotRunNextDnsProbe()
+    {
+        // If Pi-hole is detected first, the NextDNS probe override should never
+        // be invoked. Use a probe that would fail the test if called to enforce this.
+        var nextDnsProbeCalled = false;
+        ThirdPartyDnsDetector.NextDnsProbeOverride = (ip, ct) =>
+        {
+            nextDnsProbeCalled = true;
+            return Task.FromResult<(bool, string?)>((false, null));
+        };
+
+        // Mock HTTP client returns a valid Pi-hole API response on the probe URL
+        var piholeResponse = @"{""dns"":true,""https_port"":443,""took"":0.001}";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, piholeResponse);
+        var detector = CreateDetector(httpClient);
+
+        var networks = new List<NetworkInfo>
+        {
+            new()
+            {
+                Id = "net1",
+                DhcpEnabled = true,
+                Name = "Trusted",
+                VlanId = 1,
+                Subnet = "10.0.0.0/24",
+                Gateway = "10.0.0.1",
+                DnsServers = new List<string> { "10.0.100.10" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeTrue();
+        result[0].IsNextDns.Should().BeFalse();
+        nextDnsProbeCalled.Should().BeFalse("NextDNS probe should be skipped when Pi-hole is detected first");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_TechnitiumDnsDetected_FlagsProviderAsTechnitiumDns()
+    {
+        var technitiumResponse = @"<html><head><title>Technitium DNS Server</title><script src=""js/common.js""></script><script src=""js/main.js""></script><script src=""js/auth.js""></script></head><body>Technitium</body></html>";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, technitiumResponse);
+        var detector = CreateDetector(httpClient);
+
+        var networks = new List<NetworkInfo>
+        {
+            new()
+            {
+                Id = "net1",
+                DhcpEnabled = true,
+                Name = "Trusted",
+                VlanId = 1,
+                Subnet = "10.0.0.0/24",
+                Gateway = "10.0.0.1",
+                DnsServers = new List<string> { "10.0.2.4" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].DnsServerIp.Should().Be("10.0.2.4");
+        result[0].IsTechnitiumDns.Should().BeTrue();
+        result[0].IsPihole.Should().BeFalse();
+        result[0].IsAdGuardHome.Should().BeFalse();
+        result[0].IsNextDns.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Technitium DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_TechnitiumStatusApiDetected_FlagsProviderAsTechnitiumDns()
+    {
+        const string baseUrl = "http://10.10.20.30:5380";
+        var httpClient = CreateRequestAwareMockHttpClient(request =>
+        {
+            if (request.RequestUri?.AbsoluteUri == $"{baseUrl}/api/status")
+            {
+                return new HttpResponseMessage
+                {
+                    StatusCode = HttpStatusCode.OK,
+                    Content = new StringContent("""{"hasDefaultCredentials":false,"ssoEnabled":true,"server":"technitium.example.local","status":"ok"}""")
+                };
+            }
+
+            return new HttpResponseMessage { StatusCode = HttpStatusCode.NotFound };
+        });
+        var detector = CreateDetector(httpClient);
+
+        var result = await detector.DetectThirdPartyDnsAsync(CreateTechnitiumTestNetworks(), customUrl: baseUrl);
+
+        result.Should().ContainSingle();
+        result[0].IsTechnitiumDns.Should().BeTrue();
+        result[0].DnsProviderName.Should().Be("Technitium DNS");
+    }
+
+    [Theory]
+    [InlineData("{\"status\":\"ok\"}")]
+    [InlineData("{\"status\":\"ok\",\"hasDefaultCredentials\":false}")]
+    [InlineData("{\"status\":\"ok\",\"ssoEnabled\":true}")]
+    [InlineData("{\"status\":\"ok\",\"hasDefaultCredentials\":false,\"ssoEnabled\":\"true\"}")]
+    [InlineData("not-json")]
+    public async Task DetectThirdPartyDnsAsync_NonTechnitiumStatusResponse_NotDetectedAsTechnitiumDns(string statusResponse)
+    {
+        var httpClient = CreateRequestAwareMockHttpClient(request =>
+        {
+            if (request.RequestUri?.AbsolutePath == "/api/status")
+            {
+                return new HttpResponseMessage
+                {
+                    StatusCode = HttpStatusCode.OK,
+                    Content = new StringContent(statusResponse)
+                };
+            }
+
+            return new HttpResponseMessage { StatusCode = HttpStatusCode.NotFound };
+        });
+        var detector = CreateDetector(httpClient);
+
+        var result = await detector.DetectThirdPartyDnsAsync(CreateTechnitiumTestNetworks(), customUrl: "http://10.10.20.30:5380");
+
+        result.Should().ContainSingle();
+        result[0].IsTechnitiumDns.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_TechnitiumStatusUnavailable_FallsBackToHtmlDetection()
+    {
+        const string baseUrl = "http://10.10.20.30:5380";
+        var requestedPaths = new List<string>();
+        var technitiumResponse = @"<html><head><title>Technitium DNS Server</title><script src=""js/common.js""></script></head><body>Technitium</body></html>";
+        var httpClient = CreateRequestAwareMockHttpClient(request =>
+        {
+            requestedPaths.Add(request.RequestUri?.AbsolutePath ?? "");
+
+            if (request.RequestUri?.GetLeftPart(UriPartial.Authority) == baseUrl &&
+                request.RequestUri.AbsolutePath == "/")
+            {
+                return new HttpResponseMessage
+                {
+                    StatusCode = HttpStatusCode.OK,
+                    Content = new StringContent(technitiumResponse)
+                };
+            }
+
+            return new HttpResponseMessage { StatusCode = HttpStatusCode.NotFound };
+        });
+        var detector = CreateDetector(httpClient);
+
+        var result = await detector.DetectThirdPartyDnsAsync(CreateTechnitiumTestNetworks(), customUrl: baseUrl);
+
+        requestedPaths.Should().Contain("/api/status");
+        result.Should().ContainSingle();
+        result[0].IsTechnitiumDns.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_TechnitiumTitleWithoutAssets_NotDetectedAsTechnitiumDns()
+    {
+        var technitiumLikeResponse = @"<html><head><title>Technitium DNS Server</title></head><body>Technitium</body></html>";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, technitiumLikeResponse);
+        var detector = CreateDetector(httpClient);
+
+        var networks = new List<NetworkInfo>
+        {
+            new()
+            {
+                Id = "net1",
+                DhcpEnabled = true,
+                Name = "Trusted",
+                VlanId = 1,
+                Subnet = "10.0.0.0/24",
+                Gateway = "10.0.0.1",
+                DnsServers = new List<string> { "10.0.2.4" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsTechnitiumDns.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    private static List<NetworkInfo> CreateTechnitiumTestNetworks()
+    {
+        return
+        [
+            new NetworkInfo
+            {
+                Id = "net1",
+                DhcpEnabled = true,
+                Name = "Trusted",
+                VlanId = 1,
+                Subnet = "10.10.20.0/24",
+                Gateway = "10.10.20.1",
+                DnsServers = ["10.10.20.30"]
+            }
+        ];
+    }
+
+    private ThirdPartyDnsDetector CreateDetector(HttpClient? httpClient = null)
+    {
+        httpClient ??= new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+        return new ThirdPartyDnsDetector(_loggerMock.Object, httpClient);
+    }
+
+    private static HttpClient CreateMockHttpClient(HttpStatusCode statusCode, string content = "")
+    {
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(new HttpResponseMessage
+            {
+                StatusCode = statusCode,
+                Content = new StringContent(content)
+            });
+
+        return new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+    }
+
+    private static HttpClient CreateRequestAwareMockHttpClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
+    {
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage request, CancellationToken _) => responseFactory(request));
+
+        return new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+    }
+
+    private static HttpClient CreateTimeoutHttpClient()
+    {
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new TaskCanceledException("Request timed out"));
+
+        return new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+    }
+
+    /// <summary>
+    /// Creates a mock HTTP client that returns different responses based on URL path
+    /// </summary>
+    private static HttpClient CreateUrlAwareMockHttpClient(Dictionary<string, (HttpStatusCode Status, string Content)> responses)
+    {
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
+            {
+                var path = request.RequestUri?.AbsolutePath ?? "";
+
+                foreach (var kvp in responses)
+                {
+                    if (path.Contains(kvp.Key))
+                    {
+                        return new HttpResponseMessage
+                        {
+                            StatusCode = kvp.Value.Status,
+                            Content = new StringContent(kvp.Value.Content)
+                        };
+                    }
+                }
+
+                return new HttpResponseMessage { StatusCode = HttpStatusCode.NotFound };
+            });
+
+        return new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+    }
+
+    /// <summary>
+    /// Creates a mock HTTP client that returns different responses based on port and path
+    /// </summary>
+    private static HttpClient CreatePortAwareMockHttpClient(Dictionary<(int Port, string Path), (HttpStatusCode Status, string Content)> responses)
+    {
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
+            {
+                var port = request.RequestUri?.Port ?? 0;
+                var path = request.RequestUri?.AbsolutePath ?? "";
+
+                foreach (var kvp in responses)
+                {
+                    if (kvp.Key.Port == port && path.Contains(kvp.Key.Path))
+                    {
+                        return new HttpResponseMessage
+                        {
+                            StatusCode = kvp.Value.Status,
+                            Content = new StringContent(kvp.Value.Content)
+                        };
+                    }
+                }
+
+                return new HttpResponseMessage { StatusCode = HttpStatusCode.NotFound };
+            });
+
+        return new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+    }
+
+    /// <summary>
+    /// Creates a mock HTTP client that returns different responses based on IP and path
+    /// </summary>
+    private static HttpClient CreateIpAwareMockHttpClient(Dictionary<(string Ip, string Path), (HttpStatusCode Status, string Content)> responses)
+    {
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
+            {
+                var host = request.RequestUri?.Host ?? "";
+                var path = request.RequestUri?.AbsolutePath ?? "";
+
+                foreach (var kvp in responses)
+                {
+                    if (kvp.Key.Ip == host && path.Contains(kvp.Key.Path))
+                    {
+                        return new HttpResponseMessage
+                        {
+                            StatusCode = kvp.Value.Status,
+                            Content = new StringContent(kvp.Value.Content)
+                        };
+                    }
+                }
+
+                return new HttpResponseMessage { StatusCode = HttpStatusCode.NotFound };
+            });
+
+        return new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+    }
+
+    // Note: IsRfc1918Address tests moved to NetworkUtilitiesTests.cs (IsPrivateIpAddress)
+
+    #region DetectThirdPartyDnsAsync - Basic Tests
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_EmptyNetworks_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>();
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_NetworkWithoutDhcp_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = false,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_NetworkWithNoDnsServers_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = null
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_NetworkWithEmptyDnsServers_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string>()
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_DnsMatchesGateway_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.1" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_PublicDns_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "8.8.8.8", "1.1.1.1" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    #endregion
+
+    #region DetectThirdPartyDnsAsync - Third-Party Detection Tests
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_ThirdPartyLanDns_DetectsCorrectly()
+    {
+        var httpClient = CreateTimeoutHttpClient(); // Pi-hole probe fails
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].DnsServerIp.Should().Be("192.168.1.5");
+        result[0].NetworkName.Should().Be("Corporate");
+        result[0].NetworkVlanId.Should().Be(10);
+        result[0].IsLanIp.Should().BeTrue();
+        result[0].IsPihole.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_MultipleDnsServers_DetectsAll()
+    {
+        var httpClient = CreateTimeoutHttpClient();
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5", "192.168.1.6" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(2);
+        result.Should().Contain(r => r.DnsServerIp == "192.168.1.5");
+        result.Should().Contain(r => r.DnsServerIp == "192.168.1.6");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_MultipleNetworks_DetectsAll()
+    {
+        var httpClient = CreateTimeoutHttpClient();
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            },
+            new NetworkInfo
+            {
+                Id = "net2",
+                Name = "IoT",
+                VlanId = 20,
+                DhcpEnabled = true,
+                Gateway = "192.168.2.1",
+                DnsServers = new List<string> { "192.168.1.5" } // Same DNS server
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(2);
+        result.Should().Contain(r => r.NetworkName == "Corporate");
+        result.Should().Contain(r => r.NetworkName == "IoT");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_MixedDnsServers_DetectsOnlyThirdParty()
+    {
+        var httpClient = CreateTimeoutHttpClient();
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.1", "192.168.1.5", "8.8.8.8" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].DnsServerIp.Should().Be("192.168.1.5");
+    }
+
+    #endregion
+
+    #region Pi-hole Detection Tests
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_PiholeDetected_SetsIsPiholeTrue()
+    {
+        // Pi-hole v6+ /api/info/login response format
+        var piholeResponse = @"{""dns"":true,""https_port"":0,""took"":0.00001}";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, piholeResponse);
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeTrue();
+        result[0].DnsProviderName.Should().Be("Pi-hole");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_PiholeWithDnsTrue_DetectsAsPihole()
+    {
+        // Pi-hole v6+ /api/info/login response with dns:true indicates Pi-hole
+        var piholeResponse = @"{""dns"":true,""https_port"":443,""took"":0.001}";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, piholeResponse);
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeTrue();
+        result[0].PiholeVersion.Should().Be("detected");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_ResponseWithoutDnsProperty_NotDetectedAsPihole()
+    {
+        // Response that doesn't contain "dns" property should not be detected as Pi-hole
+        var notPiholeResponse = @"{""https_port"":443,""took"":0.001}";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, notPiholeResponse);
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_HttpError_TreatsAsNonPihole()
+    {
+        var httpClient = CreateMockHttpClient(HttpStatusCode.NotFound);
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_NonPiholeJsonResponse_TreatsAsNonPihole()
+    {
+        var nonPiholeResponse = @"{""message"":""Hello World""}";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, nonPiholeResponse);
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_Timeout_TreatsAsNonPihole()
+    {
+        var httpClient = CreateTimeoutHttpClient();
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    #endregion
+
+    #region AdGuard Home Detection Tests
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_AdGuardHomeDetected_SetsIsAdGuardHomeTrue()
+    {
+        // AdGuard Home login.html with JS reference
+        var loginHtml = @"<html><head><script src=""login.abc123.js""></script></head></html>";
+        var jsContent = @"var app = { name: 'AdGuard Home' };";
+
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.NotFound, "") },
+            { "/login.html", (HttpStatusCode.OK, loginHtml) },
+            { "/login.abc123.js", (HttpStatusCode.OK, jsContent) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsAdGuardHome.Should().BeTrue();
+        result[0].IsPihole.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("AdGuard Home");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_AdGuardHomeWithVersion_DetectsVersion()
+    {
+        var loginHtml = @"<html><head><script src=""login.v0.107.js""></script></head></html>";
+        var jsContent = @"AdGuard Home v0.107.0";
+
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.NotFound, "") },
+            { "/login.html", (HttpStatusCode.OK, loginHtml) },
+            { "/login.v0.107.js", (HttpStatusCode.OK, jsContent) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Test Network",
+                VlanId = 20,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.10" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsAdGuardHome.Should().BeTrue();
+        result[0].AdGuardHomeVersion.Should().Be("detected");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_AdGuardHomeNoJsMatch_NotDetected()
+    {
+        // login.html without proper JS reference
+        var loginHtml = @"<html><head><script src=""other.js""></script></head></html>";
+
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.NotFound, "") },
+            { "/login.html", (HttpStatusCode.OK, loginHtml) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsAdGuardHome.Should().BeFalse();
+        result[0].IsPihole.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_AdGuardHomeJsWithoutAdGuardString_NotDetected()
+    {
+        var loginHtml = @"<html><head><script src=""login.abc.js""></script></head></html>";
+        var jsContent = @"var app = { name: 'Some Other App' };";
+
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.NotFound, "") },
+            { "/login.html", (HttpStatusCode.OK, loginHtml) },
+            { "/login.abc.js", (HttpStatusCode.OK, jsContent) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsAdGuardHome.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_AdGuardHomeLoginPageNotFound_NotDetected()
+    {
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.NotFound, "") },
+            { "/login.html", (HttpStatusCode.NotFound, "") }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsAdGuardHome.Should().BeFalse();
+        result[0].IsPihole.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_AdGuardHomeJsFileFails_NotDetected()
+    {
+        var loginHtml = @"<html><head><script src=""login.abc.js""></script></head></html>";
+
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.NotFound, "") },
+            { "/login.html", (HttpStatusCode.OK, loginHtml) },
+            { "/login.abc.js", (HttpStatusCode.InternalServerError, "") }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsAdGuardHome.Should().BeFalse();
+    }
+
+    #endregion
+
+    #region Detection Priority Tests (Pi-hole takes precedence)
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_PiholeTakesPrecedenceOverAdGuardHome()
+    {
+        // Both Pi-hole and AdGuard Home endpoints respond, but Pi-hole is checked first
+        var piholeResponse = @"{""dns"":true,""https_port"":0,""took"":0.00001}";
+        var loginHtml = @"<html><head><script src=""login.abc.js""></script></head></html>";
+        var jsContent = @"AdGuard Home";
+
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.OK, piholeResponse) },
+            { "/login.html", (HttpStatusCode.OK, loginHtml) },
+            { "/login.abc.js", (HttpStatusCode.OK, jsContent) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeTrue();
+        result[0].IsAdGuardHome.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Pi-hole");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_PiholeFailsAdGuardHomeSucceeds()
+    {
+        // Pi-hole endpoint fails, AdGuard Home is tried next
+        var loginHtml = @"<html><head><script src=""login.xyz.js""></script></head></html>";
+        var jsContent = @"AdGuard Home Dashboard";
+
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.NotFound, "") },
+            { "/login.html", (HttpStatusCode.OK, loginHtml) },
+            { "/login.xyz.js", (HttpStatusCode.OK, jsContent) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse();
+        result[0].IsAdGuardHome.Should().BeTrue();
+        result[0].DnsProviderName.Should().Be("AdGuard Home");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_BothProbesFail_GenericThirdPartyDns()
+    {
+        var httpClient = CreateUrlAwareMockHttpClient(new Dictionary<string, (HttpStatusCode, string)>
+        {
+            { "/api/info/login", (HttpStatusCode.NotFound, "") },
+            { "/login.html", (HttpStatusCode.NotFound, "") }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse();
+        result[0].IsAdGuardHome.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    #endregion
+
+    #region Custom Port Tests
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_CustomPort_PiholeDetected()
+    {
+        var piholeResponse = @"{""dns"":true}";
+        var httpClient = CreatePortAwareMockHttpClient(new Dictionary<(int, string), (HttpStatusCode, string)>
+        {
+            { (8888, "/api/info/login"), (HttpStatusCode.OK, piholeResponse) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks, customPort: 8888);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_CustomPort_AdGuardHomeDetected()
+    {
+        var loginHtml = @"<html><head><script src=""login.custom.js""></script></head></html>";
+        var jsContent = @"AdGuard Home";
+
+        var httpClient = CreatePortAwareMockHttpClient(new Dictionary<(int, string), (HttpStatusCode, string)>
+        {
+            { (3080, "/api/info/login"), (HttpStatusCode.NotFound, "") },
+            { (3080, "/login.html"), (HttpStatusCode.OK, loginHtml) },
+            { (3080, "/login.custom.js"), (HttpStatusCode.OK, jsContent) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks, customPort: 3080);
+
+        result.Should().HaveCount(1);
+        result[0].IsAdGuardHome.Should().BeTrue();
+        result[0].DnsProviderName.Should().Be("AdGuard Home");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_CustomPortFails_FallsBackToDefaultPorts()
+    {
+        var piholeResponse = @"{""dns"":true}";
+        var httpClient = CreatePortAwareMockHttpClient(new Dictionary<(int, string), (HttpStatusCode, string)>
+        {
+            { (9999, "/api/info/login"), (HttpStatusCode.NotFound, "") }, // Custom port fails
+            { (80, "/api/info/login"), (HttpStatusCode.OK, piholeResponse) } // Default port succeeds
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks, customPort: 9999);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_ZeroCustomPort_IgnoredUsesDefaults()
+    {
+        var piholeResponse = @"{""dns"":true}";
+        var httpClient = CreatePortAwareMockHttpClient(new Dictionary<(int, string), (HttpStatusCode, string)>
+        {
+            { (80, "/api/info/login"), (HttpStatusCode.OK, piholeResponse) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks, customPort: 0);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeTrue();
+    }
+
+    #endregion
+
+    #region Multiple Networks and Providers Tests
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_DifferentProvidersOnDifferentNetworks()
+    {
+        var piholeResponse = @"{""dns"":true}";
+        var loginHtml = @"<html><head><script src=""login.test.js""></script></head></html>";
+        var jsContent = @"AdGuard Home";
+
+        var httpClient = CreateIpAwareMockHttpClient(new Dictionary<(string, string), (HttpStatusCode, string)>
+        {
+            // Pi-hole at 192.168.1.5
+            { ("192.168.1.5", "/api/info/login"), (HttpStatusCode.OK, piholeResponse) },
+            // AdGuard Home at 192.168.1.10
+            { ("192.168.1.10", "/api/info/login"), (HttpStatusCode.NotFound, "") },
+            { ("192.168.1.10", "/login.html"), (HttpStatusCode.OK, loginHtml) },
+            { ("192.168.1.10", "/login.test.js"), (HttpStatusCode.OK, jsContent) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            },
+            new NetworkInfo
+            {
+                Id = "net2",
+                Name = "IoT",
+                VlanId = 20,
+                DhcpEnabled = true,
+                Gateway = "192.168.2.1",
+                DnsServers = new List<string> { "192.168.1.10" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(2);
+
+        var piholeResult = result.First(r => r.NetworkName == "Corporate");
+        piholeResult.IsPihole.Should().BeTrue();
+        piholeResult.IsAdGuardHome.Should().BeFalse();
+        piholeResult.DnsProviderName.Should().Be("Pi-hole");
+
+        var adguardResult = result.First(r => r.NetworkName == "IoT");
+        adguardResult.IsPihole.Should().BeFalse();
+        adguardResult.IsAdGuardHome.Should().BeTrue();
+        adguardResult.DnsProviderName.Should().Be("AdGuard Home");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_SameAdGuardHomeMultipleNetworks_ProbesOnce()
+    {
+        var loginHtml = @"<html><head><script src=""login.shared.js""></script></head></html>";
+        var jsContent = @"AdGuard Home";
+
+        var callCount = 0;
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
+            {
+                callCount++;
+                var path = request.RequestUri?.AbsolutePath ?? "";
+
+                if (path.Contains("/api/info/login"))
+                    return new HttpResponseMessage { StatusCode = HttpStatusCode.NotFound };
+
+                if (path.Contains("/login.html"))
+                    return new HttpResponseMessage { StatusCode = HttpStatusCode.OK, Content = new StringContent(loginHtml) };
+
+                if (path.Contains("/login.shared.js"))
+                    return new HttpResponseMessage { StatusCode = HttpStatusCode.OK, Content = new StringContent(jsContent) };
+
+                return new HttpResponseMessage { StatusCode = HttpStatusCode.NotFound };
+            });
+
+        var httpClient = new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Network1",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            },
+            new NetworkInfo
+            {
+                Id = "net2",
+                Name = "Network2",
+                VlanId = 20,
+                DhcpEnabled = true,
+                Gateway = "192.168.2.1",
+                DnsServers = new List<string> { "192.168.1.5" } // Same DNS
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(2);
+        result.Should().AllSatisfy(r =>
+        {
+            r.IsAdGuardHome.Should().BeTrue();
+            r.DnsProviderName.Should().Be("AdGuard Home");
+        });
+
+        // Should only probe once, not twice
+        // Pi-hole: 3 ports tried, AdGuard: 1 port (found on first try = 2 requests: login.html + js)
+        // Total should be ~5 requests max, not 10
+        callCount.Should().BeLessThanOrEqualTo(6);
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_NetworkWithBothProvidersDnsServers()
+    {
+        var piholeResponse = @"{""dns"":true}";
+        var loginHtml = @"<html><head><script src=""login.test.js""></script></head></html>";
+        var jsContent = @"AdGuard Home";
+
+        var httpClient = CreateIpAwareMockHttpClient(new Dictionary<(string, string), (HttpStatusCode, string)>
+        {
+            // Pi-hole at 192.168.1.5
+            { ("192.168.1.5", "/api/info/login"), (HttpStatusCode.OK, piholeResponse) },
+            // AdGuard Home at 192.168.1.6
+            { ("192.168.1.6", "/api/info/login"), (HttpStatusCode.NotFound, "") },
+            { ("192.168.1.6", "/login.html"), (HttpStatusCode.OK, loginHtml) },
+            { ("192.168.1.6", "/login.test.js"), (HttpStatusCode.OK, jsContent) }
+        });
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5", "192.168.1.6" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(2);
+
+        var piholeResult = result.First(r => r.DnsServerIp == "192.168.1.5");
+        piholeResult.IsPihole.Should().BeTrue();
+        piholeResult.DnsProviderName.Should().Be("Pi-hole");
+
+        var adguardResult = result.First(r => r.DnsServerIp == "192.168.1.6");
+        adguardResult.IsAdGuardHome.Should().BeTrue();
+        adguardResult.DnsProviderName.Should().Be("AdGuard Home");
+    }
+
+    #endregion
+
+    #region Edge Cases
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_NullDnsServerInList_SkipsNull()
+    {
+        var httpClient = CreateTimeoutHttpClient();
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { null!, "", "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].DnsServerIp.Should().Be("192.168.1.5");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_DifferentSubnets_DetectsAll()
+    {
+        var httpClient = CreateTimeoutHttpClient();
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "10.0.0.1",
+                DnsServers = new List<string> { "192.168.1.5" } // Different subnet
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].DnsServerIp.Should().Be("192.168.1.5");
+        result[0].IsLanIp.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_SameDnsServerMultipleNetworks_ProbesOnce()
+    {
+        // Track how many times the HTTP handler is called
+        var callCount = 0;
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(() =>
+            {
+                callCount++;
+                return new HttpResponseMessage
+                {
+                    StatusCode = HttpStatusCode.NotFound
+                };
+            });
+
+        var httpClient = new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            },
+            new NetworkInfo
+            {
+                Id = "net2",
+                Name = "IoT",
+                VlanId = 20,
+                DhcpEnabled = true,
+                Gateway = "192.168.2.1",
+                DnsServers = new List<string> { "192.168.1.5" } // Same DNS server
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(2);
+        // HTTP handler should only be called once per unique IP
+        // Pi-hole probe: 3 attempts (port 80, 443, 8080)
+        // AdGuard Home probe: 3 attempts (port 80, 443, 3000)
+        // Technitium DNS probe: 8 attempts (status API and HTML on ports 5380, 53443, 80, 443)
+        callCount.Should().BeLessThanOrEqualTo(14);
+    }
+
+    #endregion
+
+    #region DetectExternalDns Tests
+
+    [Fact]
+    public void DetectExternalDns_EmptyNetworks_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>();
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_NetworkWithGatewayAsDns_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Home",
+                VlanId = 1,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24",
+                DnsServers = new List<string> { "192.168.1.1" } // Gateway as DNS
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_NetworkWithInternalDns_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Home",
+                VlanId = 1,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24",
+                DnsServers = new List<string> { "192.168.1.5" } // Internal DNS (Pi-hole)
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_NetworkWithPublicDns_ReturnsExternalDns()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Home",
+                VlanId = 1,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24",
+                DnsServers = new List<string> { "1.1.1.1" } // Cloudflare
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().HaveCount(1);
+        result[0].DnsServerIp.Should().Be("1.1.1.1");
+        result[0].NetworkName.Should().Be("Home");
+        result[0].IsPublicDns.Should().BeTrue();
+        result[0].ProviderName.Should().Be("Cloudflare");
+    }
+
+    [Fact]
+    public void DetectExternalDns_NetworkWithGoogleDns_ReturnsProviderName()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Office",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "10.0.0.1",
+                Subnet = "10.0.0.0/24",
+                DnsServers = new List<string> { "8.8.8.8", "8.8.4.4" }
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().HaveCount(2);
+        result.Should().AllSatisfy(r =>
+        {
+            r.IsPublicDns.Should().BeTrue();
+            r.ProviderName.Should().Be("Google");
+        });
+    }
+
+    [Fact]
+    public void DetectExternalDns_PrivateDnsOutsideSubnets_ReturnsWithIsPublicFalse()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Home",
+                VlanId = 1,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24",
+                DnsServers = new List<string> { "192.168.3.254" } // Private but different subnet
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().HaveCount(1);
+        result[0].DnsServerIp.Should().Be("192.168.3.254");
+        result[0].IsPublicDns.Should().BeFalse();
+        result[0].ProviderName.Should().BeNull();
+    }
+
+    [Fact]
+    public void DetectExternalDns_DnsInAnotherConfiguredSubnet_ReturnsEmptyList()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Home",
+                VlanId = 1,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24",
+                DnsServers = new List<string> { "192.168.10.5" } // DNS in IoT subnet
+            },
+            new NetworkInfo
+            {
+                Id = "net2",
+                Name = "IoT",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.10.1",
+                Subnet = "192.168.10.0/24",
+                DnsServers = new List<string> { "192.168.10.1" }
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        // 192.168.10.5 is in the IoT subnet, so it's internal
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_MultipleNetworksWithExternalDns_ReturnsAll()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Home",
+                VlanId = 1,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24",
+                DnsServers = new List<string> { "1.1.1.1" }
+            },
+            new NetworkInfo
+            {
+                Id = "net2",
+                Name = "Printing",
+                VlanId = 20,
+                DhcpEnabled = true,
+                Gateway = "192.168.20.1",
+                Subnet = "192.168.20.0/24",
+                DnsServers = new List<string> { "8.8.8.8" }
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().HaveCount(2);
+        result.Should().Contain(r => r.NetworkName == "Home" && r.ProviderName == "Cloudflare");
+        result.Should().Contain(r => r.NetworkName == "Printing" && r.ProviderName == "Google");
+    }
+
+    [Fact]
+    public void DetectExternalDns_NetworkWithoutDhcp_Skipped()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Static",
+                VlanId = 99,
+                DhcpEnabled = false,
+                Gateway = "10.0.0.1",
+                Subnet = "10.0.0.0/24",
+                DnsServers = new List<string> { "1.1.1.1" }
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData("9.9.9.9", "Quad9")]
+    [InlineData("208.67.222.222", "OpenDNS")]
+    [InlineData("94.140.14.14", "AdGuard DNS")]
+    [InlineData("45.90.28.0", "NextDNS")]
+    [InlineData("45.90.28.109", "NextDNS")]
+    [InlineData("45.90.30.0", "NextDNS")]
+    [InlineData("76.76.2.0", "ControlD")]
+    [InlineData("76.76.10.11", "ControlD")]
+    public void DetectExternalDns_KnownProviders_ReturnsCorrectProviderName(string dnsIp, string expectedProvider)
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Test",
+                VlanId = 1,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24",
+                DnsServers = new List<string> { dnsIp }
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().HaveCount(1);
+        result[0].ProviderName.Should().Be(expectedProvider);
+        result[0].IsPublicDns.Should().BeTrue();
+    }
+
+    [Fact]
+    public void DetectExternalDns_UnknownPublicDns_ReturnsNullProviderName()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Test",
+                VlanId = 1,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24",
+                DnsServers = new List<string> { "4.4.4.4" } // Some random public IP
+            }
+        };
+
+        var result = detector.DetectExternalDns(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPublicDns.Should().BeTrue();
+        result[0].ProviderName.Should().BeNull();
+    }
+
+    #endregion
+
+    #region DetectExternalDns IPv6 Tests
+
+    private static NetworkInfo DualStack(string id, string name, int vlan, List<string>? ipv6Dns,
+        List<string>? ipv4Dns = null, bool enabled = true, bool dhcp = true, string? ipv6Prefix = null) => new()
+    {
+        Id = id,
+        Name = name,
+        VlanId = vlan,
+        Enabled = enabled,
+        DhcpEnabled = dhcp,
+        Gateway = $"192.0.2.{vlan}",
+        Subnet = $"192.0.2.{vlan}/32",
+        DnsServers = ipv4Dns,
+        HasIpv6 = true,
+        Ipv6Subnets = [ipv6Prefix ?? $"2001:db8:{vlan}::/64"],
+        Ipv6DnsServers = ipv6Dns
+    };
+
+    [Fact]
+    public void DetectExternalDns_Ipv6PublicResolver_ReportedEvenWhenIpv4UsesGateway()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:4860:4860::8888"]) };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle();
+        result[0].DnsServerIp.Should().Be("2001:4860:4860::8888");
+        result[0].NetworkName.Should().Be("Home");
+        result[0].IsPublicDns.Should().BeTrue();
+        result[0].ProviderName.Should().Be("Google");
+    }
+
+    [Theory]
+    [InlineData("2606:4700:4700::1111", "Cloudflare")]
+    [InlineData("2620:fe::fe", "Quad9")]
+    [InlineData("2620:119:35::35", "OpenDNS")]
+    [InlineData("2a07:a8c0::ab:cd12", "NextDNS")]
+    [InlineData("2001:4860:4860:0:0:0:0:8888", "Google")] // Expanded form still identified
+    [InlineData("2a10:50c0::ad1:ff", "AdGuard DNS")]       // Same name as the IPv4 AdGuard servers
+    [InlineData("2a0d:2a00:1::", "CleanBrowsing")]
+    [InlineData("2a01:4f8:1c0c:8274::1", "LibreDNS")]
+    [InlineData("2606:1a40::2", "ControlD")]
+    [InlineData("2606:1a40:f000::11", "ControlD")]
+    public void DetectExternalDns_Ipv6KnownProviders_ReturnsProviderName(string dnsIp, string expectedProvider)
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, [dnsIp]) };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle().Which.ProviderName.Should().Be(expectedProvider);
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6DnsInOwnPrefix_NotReported()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:db8:10::53"]) };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6DnsInAnotherNetworksPrefix_NotReported()
+    {
+        var networks = new List<NetworkInfo>
+        {
+            DualStack("n1", "Home", 10, ["2001:db8:20::53"]),
+            DualStack("n2", "Servers", 20, null)
+        };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6LinkLocalDns_NotReported()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["fe80::1"]) };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6UlaOutsideKnownPrefixes_ReportedAsPrivate()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["fd00:99::53"]) };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle();
+        result[0].IsPublicDns.Should().BeFalse();
+        result[0].ProviderName.Should().BeNull();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6UnknownGlobal_AllPrefixesKnown_ReportedAsPublic()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:db8:ffff::53"]) };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle();
+        result[0].IsPublicDns.Should().BeTrue();
+        result[0].ProviderName.Should().BeNull();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6UnknownGlobal_WithUnknownDelegatedPrefix_NotReported()
+    {
+        // The unknown PD prefix may hold this server, so no claim is made either way
+        var pdWithoutPrefix = new NetworkInfo { Id = "pd", Name = "Gaming", VlanId = 69, DhcpEnabled = true, HasIpv6 = true };
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:db8:ffff::53"]), pdWithoutPrefix };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6KnownResolver_WithUnknownDelegatedPrefix_StillReported()
+    {
+        var pdWithoutPrefix = new NetworkInfo { Id = "pd", Name = "Gaming", VlanId = 69, DhcpEnabled = true, HasIpv6 = true };
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2620:fe::fe"]), pdWithoutPrefix };
+
+        CreateDetector().DetectExternalDns(networks).Should().ContainSingle().Which.ProviderName.Should().Be("Quad9");
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6DisabledNetwork_Skipped()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:4860:4860::8888"], enabled: false) };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6DnsOnNetworkWithoutIpv4Dhcp_StillReported()
+    {
+        // RA RDNSS hands the server out without DHCP, so the IPv4 DHCP flag does not gate IPv6
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:4860:4860::8888"], dhcp: false) };
+
+        CreateDetector().DetectExternalDns(networks).Should().ContainSingle();
+    }
+
+    [Fact]
+    public void DetectExternalDns_DualStack_Ipv4ResultsUnchangedAndIpv6Appended()
+    {
+        var networks = new List<NetworkInfo>
+        {
+            DualStack("n1", "Home", 10, ["2606:4700:4700::1111"], ipv4Dns: ["1.1.1.1"]),
+            DualStack("n2", "IoT", 20, null, ipv4Dns: ["8.8.8.8"])
+        };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Select(r => (r.NetworkName, r.DnsServerIp, r.ProviderName, r.IsPublicDns)).Should().Equal(
+            ("Home", "1.1.1.1", "Cloudflare", true),
+            ("IoT", "8.8.8.8", "Google", true),
+            ("Home", "2606:4700:4700::1111", "Cloudflare", true));
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv4Only_NoIpv6Results()
+    {
+        // IPv4 regression guard: networks without IPv6 produce exactly the IPv4 results
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Home", VlanId = 1, DhcpEnabled = true, Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24", DnsServers = ["1.1.1.1", "192.168.1.1"] }
+        };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle().Which.DnsServerIp.Should().Be("1.1.1.1");
+    }
+
+    #endregion
+
+    #region Pi-hole Detection Edge Cases
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_PiholeWithDnsFalse_NotDetectedAsPihole()
+    {
+        // Pi-hole response where dns property is false
+        var piholeResponse = @"{""dns"":false,""https_port"":443}";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, piholeResponse);
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse(); // dns: false means not active Pi-hole
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_PiholeMalformedJsonWithDnsString_NotFalsePositive()
+    {
+        // Malformed JSON that contains "dns" string - should NOT false-positive as Pi-hole
+        var malformedResponse = @"{""dns"":true, this is invalid json}";
+        var httpClient = CreateMockHttpClient(HttpStatusCode.OK, malformedResponse);
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse(); // Malformed JSON should not be treated as Pi-hole
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_CustomPortTriedBeforeDefaultPorts()
+    {
+        // Custom port 8888 succeeds, should not try default port 80
+        var piholeResponse = @"{""dns"":true}";
+
+        var callOrder = new List<int>();
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
+            {
+                var port = request.RequestUri?.Port ?? 0;
+                callOrder.Add(port);
+
+                if (port == 8888)
+                {
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(piholeResponse)
+                    };
+                }
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            });
+
+        var httpClient = new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks, customPort: 8888);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeTrue();
+        // Custom port 8888 should be tried first (HTTP then HTTPS)
+        callOrder.First().Should().Be(8888);
+        // Should stop after finding Pi-hole, not try default ports
+        callOrder.Should().NotContain(80);
+        callOrder.Should().NotContain(443);
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_HttpRequestException_TreatsAsNonPihole()
+    {
+        // HttpRequestException (connection refused, etc.)
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new HttpRequestException("Connection refused"));
+
+        var httpClient = new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse();
+        result[0].IsAdGuardHome.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("Third-Party LAN DNS");
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_GenericException_TreatsAsNonPihole()
+    {
+        // Generic exception (e.g., socket error)
+        var handlerMock = new Mock<HttpMessageHandler>();
+        handlerMock
+            .Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ThrowsAsync(new InvalidOperationException("Unexpected error"));
+
+        var httpClient = new HttpClient(handlerMock.Object) { Timeout = TimeSpan.FromSeconds(3) };
+
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new NetworkInfo
+            {
+                Id = "net1",
+                Name = "Corporate",
+                VlanId = 10,
+                DhcpEnabled = true,
+                Gateway = "192.168.1.1",
+                DnsServers = new List<string> { "192.168.1.5" }
+            }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsPihole.Should().BeFalse();
+        result[0].IsAdGuardHome.Should().BeFalse();
+    }
+
+    #endregion
+
+    #region Gateway DNS Probe Tests
+
+    [Fact]
+    public async Task ProbeGatewayDnsAsync_NextDnsOnGateway_DetectsAcrossAllNetworks()
+    {
+        ThirdPartyDnsDetector.NextDnsProbeOverride = (ip, ct) =>
+            ip == "192.168.1.1"
+                ? Task.FromResult<(bool, string?)>((true, "abc123"))
+                : Task.FromResult<(bool, string?)>((false, null));
+
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Default", VlanId = 1, Enabled = true, DhcpEnabled = true,
+                    Subnet = "192.168.1.0/24", Gateway = "192.168.1.1" },
+            new() { Id = "n2", Name = "IoT", VlanId = 20, Enabled = true, DhcpEnabled = true,
+                    Subnet = "192.168.20.0/24", Gateway = "192.168.1.1" }
+        };
+
+        var result = await detector.ProbeGatewayDnsAsync(networks);
+
+        result.Should().HaveCount(2);
+        result.Should().AllSatisfy(r =>
+        {
+            r.IsNextDns.Should().BeTrue();
+            r.DnsServerIp.Should().Be("192.168.1.1");
+            r.NextDnsProfile.Should().Be("abc123");
+            r.DnsProviderName.Should().Be("NextDNS CLI");
+        });
+        result.Select(r => r.NetworkName).Should().BeEquivalentTo("Default", "IoT");
+    }
+
+    [Fact]
+    public async Task ProbeGatewayDnsAsync_ControlDOnGateway_DetectsIt()
+    {
+        ThirdPartyDnsDetector.ControlDProbeOverride = (ip, ct) =>
+            Task.FromResult(ip == "192.168.1.1");
+
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Default", VlanId = 1, Enabled = true, DhcpEnabled = true,
+                    Subnet = "192.168.1.0/24", Gateway = "192.168.1.1" }
+        };
+
+        var result = await detector.ProbeGatewayDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsControlD.Should().BeTrue();
+        result[0].IsNextDns.Should().BeFalse();
+        result[0].DnsServerIp.Should().Be("192.168.1.1");
+        result[0].DnsProviderName.Should().Be("ControlD");
+    }
+
+    [Fact]
+    public async Task ProbeGatewayDnsAsync_NothingOnGateway_ReturnsEmpty()
+    {
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Default", VlanId = 1, Enabled = true, DhcpEnabled = true,
+                    Subnet = "192.168.1.0/24", Gateway = "192.168.1.1" }
+        };
+
+        var result = await detector.ProbeGatewayDnsAsync(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ProbeGatewayDnsAsync_SkipsNetworksWithCustomDns()
+    {
+        ThirdPartyDnsDetector.NextDnsProbeOverride = (ip, ct) =>
+            Task.FromResult<(bool, string?)>((true, "abc123"));
+
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Default", VlanId = 1, Enabled = true, DhcpEnabled = true,
+                    Subnet = "192.168.1.0/24", Gateway = "192.168.1.1",
+                    DnsServers = new List<string> { "10.0.0.53" } }
+        };
+
+        var result = await detector.ProbeGatewayDnsAsync(networks);
+
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ProbeGatewayDnsAsync_ExplicitGatewayDns_StillProbes()
+    {
+        ThirdPartyDnsDetector.ControlDProbeOverride = (ip, ct) =>
+            Task.FromResult(ip == "192.168.1.1");
+
+        var detector = CreateDetector();
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Default", VlanId = 1, Enabled = true, DhcpEnabled = true,
+                    Subnet = "192.168.1.0/24", Gateway = "192.168.1.1",
+                    DnsServers = new List<string> { "192.168.1.1" } }
+        };
+
+        var result = await detector.ProbeGatewayDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsControlD.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task DetectThirdPartyDnsAsync_ControlDOnLanServer_DetectsIt()
+    {
+        ThirdPartyDnsDetector.ControlDProbeOverride = (ip, ct) =>
+            Task.FromResult(ip == "10.0.100.53");
+
+        var httpClient = CreateMockHttpClient(HttpStatusCode.NotFound);
+        var detector = CreateDetector(httpClient);
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Trusted", VlanId = 1, Enabled = true, DhcpEnabled = true,
+                    Subnet = "10.0.0.0/24", Gateway = "10.0.0.1",
+                    DnsServers = new List<string> { "10.0.100.53" } }
+        };
+
+        var result = await detector.DetectThirdPartyDnsAsync(networks);
+
+        result.Should().HaveCount(1);
+        result[0].IsControlD.Should().BeTrue();
+        result[0].IsPihole.Should().BeFalse();
+        result[0].IsNextDns.Should().BeFalse();
+        result[0].DnsProviderName.Should().Be("ControlD");
+    }
+
+    #endregion
+}

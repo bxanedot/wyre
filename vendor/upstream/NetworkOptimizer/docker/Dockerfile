@@ -1,0 +1,201 @@
+# Multi-stage build for Network Optimizer
+# Stage 1: Build stage with full .NET SDK
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+
+# Version passed from CI/CD (MinVer can't access .git in Docker context)
+ARG VERSION=0.0.0-alpha.0
+
+WORKDIR /src
+
+# Copy solution file, build props, NuGet config, and all project files first for layer caching
+COPY ["NetworkOptimizer.sln", "./"]
+COPY ["Directory.Build.props", "./"]
+COPY ["nuget.config", "./"]
+COPY ["packages/", "packages/"]
+COPY ["src/NetworkOptimizer.Core/NetworkOptimizer.Core.csproj", "src/NetworkOptimizer.Core/"]
+COPY ["src/NetworkOptimizer.Web/NetworkOptimizer.Web.csproj", "src/NetworkOptimizer.Web/"]
+COPY ["src/NetworkOptimizer.UniFi/NetworkOptimizer.UniFi.csproj", "src/NetworkOptimizer.UniFi/"]
+COPY ["src/NetworkOptimizer.Audit/NetworkOptimizer.Audit.csproj", "src/NetworkOptimizer.Audit/"]
+COPY ["src/NetworkOptimizer.Sqm/NetworkOptimizer.Sqm.csproj", "src/NetworkOptimizer.Sqm/"]
+COPY ["src/NetworkOptimizer.Monitoring/NetworkOptimizer.Monitoring.csproj", "src/NetworkOptimizer.Monitoring/"]
+COPY ["src/NetworkOptimizer.Storage/NetworkOptimizer.Storage.csproj", "src/NetworkOptimizer.Storage/"]
+COPY ["src/NetworkOptimizer.AgentProtocol/NetworkOptimizer.AgentProtocol.csproj", "src/NetworkOptimizer.AgentProtocol/"]
+COPY ["src/NetworkOptimizer.Reports/NetworkOptimizer.Reports.csproj", "src/NetworkOptimizer.Reports/"]
+COPY ["src/NetworkOptimizer.Diagnostics/NetworkOptimizer.Diagnostics.csproj", "src/NetworkOptimizer.Diagnostics/"]
+COPY ["src/NetworkOptimizer.WiFi/NetworkOptimizer.WiFi.csproj", "src/NetworkOptimizer.WiFi/"]
+COPY ["src/NetworkOptimizer.Alerts/NetworkOptimizer.Alerts.csproj", "src/NetworkOptimizer.Alerts/"]
+COPY ["src/NetworkOptimizer.Threats/NetworkOptimizer.Threats.csproj", "src/NetworkOptimizer.Threats/"]
+
+# Restore dependencies
+RUN dotnet restore "src/NetworkOptimizer.Web/NetworkOptimizer.Web.csproj"
+
+# Copy all source files
+COPY src/ src/
+
+# Grpc.Tools' bundled linux_arm64 protoc segfaults (exit 139) under dotnet on native
+# arm64 runners (grpc/grpc#26032, #38538). Use the distro's protoc there; amd64 keeps
+# the bundled one so its build is unchanged. Only branches carrying AgentProtocol (.proto)
+# run protoc at all.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Build and publish Web UI (includes all dependent projects)
+# MinVerVersionOverride tells MinVer to use this version instead of reading git tags
+RUN if [ "$TARGETARCH" = "arm64" ]; then export PROTOBUF_PROTOC=/usr/bin/protoc; fi; \
+    dotnet publish "src/NetworkOptimizer.Web/NetworkOptimizer.Web.csproj" \
+    -c Release \
+    -o /app/publish \
+    --no-restore \
+    -p:MinVerVersionOverride=${VERSION}
+
+# Stage 2: Build uwnspeedtest Go binaries
+# - Container's native arch: for server-side WAN speed tests (local execution)
+# - linux/arm64: for gateway-direct WAN speed tests (deployed via SSH to UniFi gateways)
+FROM golang:1.22-alpine AS uwnspeedtest-build
+ARG VERSION=""
+ARG TARGETARCH=amd64
+WORKDIR /src
+# Copy both modules (uwnspeedtest imports cfspeedtest/speedtest)
+COPY src/cfspeedtest/ cfspeedtest/
+COPY src/uwnspeedtest/ uwnspeedtest/
+WORKDIR /src/uwnspeedtest
+# Build for container's target architecture (local server-side tests)
+# VERSION override only applies when explicitly passed (GHA releases); otherwise uses main.go static version
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath \
+    -ldflags "-s -w ${VERSION:+-X main.version=${VERSION}}" \
+    -o /uwnspeedtest-local .
+# Build for gateway (always linux/arm64, deployed to UniFi gateways via SSH)
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w ${VERSION:+-X main.version=${VERSION}}" \
+    -o /uwnspeedtest-gateway .
+
+# Stage 2.5: Build wansteer Go binary (gateway-only, always linux/arm64)
+# WAN Steering daemon - manages iptables rules to load-balance traffic across multiple WANs
+FROM golang:1.22-alpine AS wansteer-build
+ARG VERSION=""
+WORKDIR /src
+COPY src/wansteer/ wansteer/
+WORKDIR /src/wansteer
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w ${VERSION:+-X main.version=${VERSION}}" \
+    -o /wansteer-gateway .
+
+# Stage 2.6: Build apagent Go binaries (access-point-only: linux/arm/v7, linux/arm64, 32-bit MIPS)
+# AP Agent - on-AP Wi-Fi telemetry. U7-class APs are armv7l; arm64 is for UniFi OS gateways with
+# Wi-Fi (UDR7, UX7, UCG-Industrial). MIPS is built in both byte orders (U6-Lite is little-endian,
+# UAP-AC big), soft-float for FPU-less SoCs.
+FROM golang:1.22-alpine AS apagent-build
+ARG VERSION=""
+WORKDIR /src
+COPY src/apagent/ apagent/
+WORKDIR /src/apagent
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath \
+    -ldflags "-s -w ${VERSION:+-X main.version=${VERSION}}" \
+    -o /apagent-ap . && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w ${VERSION:+-X main.version=${VERSION}}" \
+    -o /apagent-arm64 . && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w ${VERSION:+-X main.version=${VERSION}}" \
+    -o /apagent-mipsle . && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w ${VERSION:+-X main.version=${VERSION}}" \
+    -o /apagent-mips .
+
+# Stage 3: Build iperf3 from source for latest version
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS iperf-build
+
+# iperf3 version - check https://github.com/esnet/iperf/releases for updates
+ARG IPERF3_VERSION=3.20
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build iperf3 from source
+WORKDIR /tmp
+RUN curl -fLO --retry 3 --retry-delay 5 https://github.com/esnet/iperf/releases/download/${IPERF3_VERSION}/iperf-${IPERF3_VERSION}.tar.gz \
+    && tar xzf iperf-${IPERF3_VERSION}.tar.gz \
+    && cd iperf-${IPERF3_VERSION} \
+    && ./configure --prefix=/usr/local \
+    && make \
+    && make install
+
+# Stage 4: Runtime stage with ASP.NET runtime only
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+ARG TARGETARCH=amd64
+WORKDIR /app
+
+# Install necessary utilities (without iperf3 - we copy it from build)
+# Note: openssh-client and sshpass removed - SSH.NET handles SSH natively
+RUN apt-get update && apt-get install -y \
+    curl \
+    iputils-ping \
+    traceroute \
+    dnsutils \
+    libcap2-bin \
+    libssl3 \
+    gosu \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    # ICMP traceroute (`traceroute -I`) opens a raw socket and requires
+    # CAP_NET_RAW. The app process runs unprivileged (USER app, UID 1654),
+    # so without the file capability the Network Tools ICMP trace and the
+    # upstream tracer both fail with "Operation not permitted". UDP
+    # traceroute works without elevated caps and stays unaffected.
+    && setcap cap_net_raw+ep /usr/bin/traceroute.db
+
+# Copy iperf3 from build stage
+COPY --from=iperf-build /usr/local/bin/iperf3 /usr/local/bin/
+COPY --from=iperf-build /usr/local/lib/libiperf* /usr/local/lib/
+RUN ldconfig
+
+# Copy published application
+COPY --from=build /app/publish .
+
+# Copy uwnspeedtest binaries:
+# - Local binary for server-side WAN speed tests (matches container arch)
+# - Gateway binary for deployment via SSH to UniFi gateways (always linux/arm64)
+RUN mkdir -p /app/tools
+COPY --from=uwnspeedtest-build /uwnspeedtest-local /app/tools/uwnspeedtest-linux-${TARGETARCH:-amd64}
+COPY --from=uwnspeedtest-build /uwnspeedtest-gateway /app/tools/uwnspeedtest-linux-arm64
+
+# Copy wansteer binary (gateway-only, deployed via SSH to UniFi gateways)
+COPY --from=wansteer-build /wansteer-gateway /app/tools/wansteer-linux-arm64
+
+# Copy apagent binary (access-point-only, pushed via SSH into tmpfs on each AP)
+COPY --from=apagent-build /apagent-ap /app/tools/apagent-linux-arm
+COPY --from=apagent-build /apagent-arm64 /app/tools/apagent-linux-arm64
+COPY --from=apagent-build /apagent-mipsle /app/tools/apagent-linux-mipsle
+COPY --from=apagent-build /apagent-mips /app/tools/apagent-linux-mips
+
+# Create directories for volumes
+RUN mkdir -p /app/data /app/ssh-keys /app/logs
+
+# Set environment variables
+ENV ASPNETCORE_ENVIRONMENT=Production \
+    ASPNETCORE_HTTP_PORTS=8042 \
+    DOTNET_RUNNING_IN_CONTAINER=true \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+
+# Expose ports
+EXPOSE 8042
+EXPOSE 5201
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8042/api/health || exit 1
+
+# Set ownership for app directories
+RUN chown -R app:app /app
+
+# Copy entrypoint script
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Run as root initially; entrypoint will fix volume permissions then drop to app user
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,305 @@
+@if (Device != null)
+{
+    var deviceHref = $"/monitoring?tab=devices&device={Uri.EscapeDataString(Device.Mac ?? "")}";
+    <a href="@deviceHref" class="device-card device-card-link device-@Device.StatusInfo.CssClass">
+        <div class="device-header">
+            <div class="device-icon">
+                @{
+                    var imagePath = GetDeviceImagePath(Device.Model);
+                }
+                @if (!string.IsNullOrEmpty(imagePath))
+                {
+                    <img src="@imagePath" alt="@Device.Model" class="device-image" />
+                }
+                else
+                {
+                    <span class="device-emoji">@GetDeviceIcon(Device.Type)</span>
+                }
+            </div>
+            <div class="device-info">
+                <h4 class="device-name">@Device.Name</h4>
+                <div class="device-meta">
+                    <span class="device-type">@Device.TypeDisplayName</span>
+                    <div class="device-status">
+                        <span class="status-dot @Device.StatusInfo.CssClass"></span>
+                        <span class="status-text">@Device.StatusInfo.Label</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="device-body">
+            <div class="device-detail">
+                <span class="detail-label">IP Address:</span>
+                <span class="detail-value">@Device.IpAddress</span>
+            </div>
+            @if (!string.IsNullOrEmpty(Device.Model))
+            {
+                <div class="device-detail">
+                    <span class="detail-label">Model:</span>
+                    <span class="detail-value">@Device.Model</span>
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(Device.Firmware))
+            {
+                <div class="device-detail">
+                    <span class="detail-label">Firmware:</span>
+                    <span class="detail-value">@Device.Firmware</span>
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(Device.Uptime))
+            {
+                @* The tour anchor only lands where the feature can actually be shown:
+                   an uptime with no reboot reason has no tooltip to demonstrate. *@
+                <div class="device-detail" data-tour="@(string.IsNullOrEmpty(UptimeTooltip) ? null : "device-uptime")">
+                    <span class="detail-label">Uptime:</span>
+                    @* Icon only while the reboot is recent news; the hover on the value stays for
+                       good. It leads the value: left of a value reads as information about it,
+                       right of it reads as an action. *@
+                    @if (ShowRebootIcon)
+                    {
+                        <span class="reboot-reason-icon @(Device.RebootWasUnexpected ? "reboot-unexpected" : "")"
+                              data-tooltip="@UptimeTooltip" data-tooltip-click>@(Device.RebootWasUnexpected ? "⚠" : "↻")</span>
+                    }
+                    <span class="detail-value uptime-value @(UptimeTooltip is null ? null : "has-reboot-reason")"
+                          data-tooltip="@UptimeTooltip" data-tooltip-click>@Device.Uptime</span>
+                </div>
+            }
+            @if (Device.ClientCount.HasValue)
+            {
+                <div class="device-detail">
+                    <span class="detail-label">Clients:</span>
+                    <span class="detail-value">@Device.ClientCount</span>
+                </div>
+            }
+            @if (HasLiveData)
+            {
+                <div class="device-live-stats">
+                    @if (Device.LiveCpuPercent.HasValue || Device.LiveMemoryPercent.HasValue || Device.LiveTemperatureC.HasValue)
+                    {
+                        <div class="device-health-stats">
+                            @if (Device.LiveCpuPercent.HasValue)
+                            {
+                                <span>CPU @($"{Device.LiveCpuPercent.Value:0}%")</span>
+                            }
+                            @if (Device.LiveMemoryPercent.HasValue)
+                            {
+                                <span>Mem @($"{Device.LiveMemoryPercent.Value:0}%")</span>
+                            }
+                            @if (Device.LiveTemperatureC.HasValue)
+                            {
+                                <span>@($"{Device.LiveTemperatureC.Value:0} °C")</span>
+                            }
+                        </div>
+                    }
+                    @if (Device.LiveLatencyMs.HasValue)
+                    {
+                        <div class="device-latency @(Device.LiveLossPercent > 5 ? "latency-degraded" : "")">
+                            <span class="latency-label">Ping</span>
+                            <span class="latency-value">@($"{Device.LiveLatencyMs.Value:0.000} ms")</span>
+                            @if (Device.LiveLossPercent > 0)
+                            {
+                                <span class="latency-loss">@($"{Device.LiveLossPercent:0.#}% loss")</span>
+                            }
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+        @if (Device.SuricataUpgradeAvailable)
+        {
+            <div class="device-upgrade-bar"
+                 data-tooltip="A newer Suricata IDS/IPS engine is available. UniFi Network -&gt; Settings -&gt; CyberSecure to upgrade."
+                 data-tooltip-hover-only>
+                <span class="device-upgrade-icon">i</span>
+                <span>CyberSecure upgrade available</span>
+            </div>
+        }
+    </a>
+}
+
+<style>
+    .uptime-value.has-reboot-reason {
+        cursor: help;
+    }
+
+    .reboot-reason-icon {
+        margin-left: auto;
+        margin-right: 1rem;
+        margin-top: -0.5px;
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        cursor: help;
+    }
+
+    .reboot-reason-icon.reboot-unexpected {
+        color: var(--warning-color);
+    }
+
+    .device-image {
+        width: 48px;
+        height: 48px;
+        object-fit: contain;
+    }
+
+    .device-emoji {
+        font-size: 2rem;
+    }
+
+    .device-card-link {
+        text-decoration: none;
+        color: inherit;
+        display: block;
+    }
+    .device-card-link:hover {
+        border-color: var(--primary-color);
+    }
+
+    .device-live-stats {
+        margin-top: 0.5rem;
+        padding-top: 0.5rem;
+        border-top: 1px solid var(--bg-tertiary);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        font-size: 0.85rem;
+    }
+    .device-rate {
+        display: flex;
+        gap: 0.5rem;
+    }
+    .device-rate .rate-down {
+        color: var(--speed-download-color);
+    }
+    .device-rate .rate-up {
+        color: var(--speed-upload-color);
+    }
+    .device-latency {
+        color: var(--text-secondary);
+    }
+    .device-latency.latency-degraded {
+        color: var(--warning-color);
+    }
+    .device-latency .latency-label {
+        color: var(--text-muted);
+        margin-right: 0.25rem;
+    }
+    .device-latency .latency-loss {
+        color: var(--danger-color);
+        margin-left: 0.25rem;
+    }
+    .device-health-stats {
+        display: flex;
+        gap: 0.75rem;
+        color: var(--text-muted);
+        font-size: 0.8rem;
+    }
+
+    .device-upgrade-bar {
+        margin-top: 0.5rem;
+        padding: 0.35rem 0.5rem;
+        border-radius: var(--border-radius);
+        background: rgba(71, 151, 255, 0.12);
+        color: var(--info-color);
+        font-size: 0.75rem;
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+    }
+    .device-upgrade-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: var(--info-color);
+        color: var(--text-primary);
+        font-size: 0.65rem;
+        font-weight: 700;
+        flex-shrink: 0;
+    }
+</style>
+
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Core.Enums
+@inject IWebHostEnvironment Environment
+
+@code {
+    [Parameter]
+    public DeviceInfo? Device { get; set; }
+
+    private bool HasLiveData => Device != null
+        && (Device.LiveRateInBps.HasValue
+            || Device.LiveRateOutBps.HasValue
+            || Device.LiveLatencyMs.HasValue
+            || Device.LiveCpuPercent.HasValue);
+
+    /// <summary>A reboot stops being news after a day, so the icon retires and only the hover stays.</summary>
+    private const long RecentRebootSeconds = 24 * 60 * 60;
+
+    private bool ShowRebootIcon => Device != null
+        && !string.IsNullOrEmpty(Device.RebootReason)
+        && Device.UptimeSeconds is > 0 and < RecentRebootSeconds;
+
+    /// <summary>
+    /// Hover text for the uptime value: the reason the device is on this boot, with the evidence
+    /// under it. Null when no reason is known - the uptime speaks for itself, so there is nothing
+    /// worth a tooltip, and Blazor omits the attribute entirely.
+    /// </summary>
+    private string? UptimeTooltip
+    {
+        get
+        {
+            if (Device == null || string.IsNullOrEmpty(Device.RebootReason))
+                return null;
+
+            var reason = $"Last restart: {Device.RebootReason}";
+            return string.IsNullOrEmpty(Device.RebootReasonDetail)
+                ? reason
+                : $"{reason} - {Device.RebootReasonDetail}";
+        }
+    }
+
+    private static string FormatBps(double? bps)
+    {
+        if (!bps.HasValue) return "-";
+        var v = bps.Value;
+        if (v >= 1_000_000_000) return $"{v / 1_000_000_000:0.##} Gbps";
+        if (v >= 1_000_000) return $"{v / 1_000_000:0.##} Mbps";
+        if (v >= 1_000) return $"{v / 1_000:0.##} Kbps";
+        return $"{v:0} bps";
+    }
+
+    private string? GetDeviceImagePath(string? model)
+    {
+        if (string.IsNullOrEmpty(model))
+            return null;
+
+        // Convention: model name lowercase + .png (e.g., "UCG-Fiber" → "ucg-fiber.png")
+        var imageFile = $"{model.ToLowerInvariant()}.png";
+        var imagePath = Path.Combine(Environment.WebRootPath, "images", "devices", imageFile);
+
+        if (File.Exists(imagePath))
+            return $"/images/devices/{imageFile}";
+
+        return null;
+    }
+
+    // Fallback icons when device image is unavailable
+    private string GetDeviceIcon(DeviceType deviceType)
+    {
+        return deviceType switch
+        {
+            DeviceType.Gateway => "🌐",
+            DeviceType.Switch => "🔀",
+            DeviceType.AccessPoint => "📡",
+            DeviceType.CellularModem => "📶",
+            DeviceType.BuildingBridge => "🌉",
+            DeviceType.CloudKey => "☁️",
+            DeviceType.DeviceBridge => "🔗",
+            DeviceType.SmartPower => "⚡",
+            _ => "🖥️"
+        };
+    }
+}

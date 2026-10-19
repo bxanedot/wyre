@@ -1,0 +1,102 @@
+using NetworkOptimizer.Core.Helpers;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// The address this install is reached at from outside, as the operator declared it. One tier ladder,
+/// read from configuration at startup, with a named entry point per use - because the three callers
+/// legitimately stop at different rungs, and re-deriving the ladder in each of them is how they drifted
+/// apart in the first place.
+///
+///   REVERSE_PROXIED_HOST_NAME  ->  https://host[:REVERSE_PROXIED_PORT]   (443 implied when unset)
+///   HOST_NAME                  ->  http://host:8042
+///   HOST_IP                    ->  http://ip:8042
+/// </summary>
+public sealed class CanonicalBaseUrlProvider
+{
+    /// <summary>
+    /// Reverse-proxied only, so always HTTPS. Null otherwise, rather than degrading: agents require
+    /// HTTPS, and http://host:8042 is not a valid agent endpoint.
+    /// </summary>
+    public string? HttpsUrl { get; }
+
+    /// <summary>
+    /// The declared host. Excludes HOST_IP, because the canonical-host redirect uses this and an
+    /// install that sets only HOST_IP means to stay reachable at any address - forcing it onto one
+    /// would be the opposite of what it asked for.
+    /// </summary>
+    public string? Url { get; }
+
+    /// <summary>
+    /// The whole ladder, HOST_IP included. For absolute URLs handed to a third party that will dial
+    /// them back - OIDC redirect_uri, SAML EntityId and ACS. On an IP-only install the alternative is
+    /// deriving them from whichever address a request arrived on, which varies and then does not match
+    /// what the operator registered with their provider.
+    /// </summary>
+    public string? UrlForCallbacks { get; }
+
+    public CanonicalBaseUrlProvider(IConfiguration configuration)
+    {
+        // The proxy's own front-end port folds into the host here, before anything downstream sees
+        // it, so every consumer of this ladder keeps treating the result as one opaque authority.
+        var proxiedAuthority = NetworkUtilities.ComposeAuthority(
+            configuration["REVERSE_PROXIED_HOST_NAME"],
+            configuration["REVERSE_PROXIED_PORT"],
+            defaultPort: 443);
+
+        HttpsUrl = Normalize(proxiedAuthority, "https", port: null);
+        Url = HttpsUrl ?? Normalize(configuration["HOST_NAME"], "http", port: "8042");
+        UrlForCallbacks = Url ?? Normalize(configuration["HOST_IP"], "http", port: "8042");
+    }
+
+    /// <summary>An absolute callback URL for a path, or null when nothing is declared.</summary>
+    public string? CallbackUriFor(string path)
+    {
+        if (UrlForCallbacks is null)
+            return null;
+        return string.IsNullOrEmpty(path)
+            ? UrlForCallbacks
+            : UrlForCallbacks + (path.StartsWith('/') ? path : "/" + path);
+    }
+
+    /// <summary>
+    /// Requests that must reach the local listener as addressed, instead of being redirected to the
+    /// canonical host.
+    ///
+    /// The agent tunnel is gRPC, which cannot follow an HTTP redirect: a 302 here silently breaks the
+    /// tunnel whenever a reverse proxy forwards the gRPC path without presenting the canonical Host
+    /// (e.g. Caddy proxying to the https://localhost tunnel upstream sends Host: localhost, so the app
+    /// sees a non-canonical host and redirects the Connect stream to death - while REST heartbeats
+    /// still land and keep the agent showing online). gRPC is machine-to-machine and has no
+    /// canonical-host concern.
+    ///
+    /// The health endpoint is polled on the loopback listener by installers and process supervisors
+    /// running on this box. Redirecting those to the canonical host makes a purely local readiness
+    /// check depend on public DNS, the proxy's certificate and the proxy being reachable from inside
+    /// the host, so a healthy install can report as failed.
+    ///
+    /// Deliberately narrow. Everything else stays subject to enforcement, the anonymous /api/public
+    /// endpoints included: something posting to the raw origin rather than the canonical URL is
+    /// misconfigured, and the redirect is how it gets told.
+    /// </summary>
+    public static bool ShouldBypassRedirect(HttpRequest request)
+    {
+        if (request.Path.Equals("/api/health", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return request.ContentType?.StartsWith(
+            "application/grpc",
+            StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    /// <summary>The settings are bare hosts; tolerate an operator who included the scheme anyway.</summary>
+    private static string? Normalize(string? value, string scheme, string? port)
+    {
+        var host = value?.Trim();
+        if (string.IsNullOrEmpty(host))
+            return null;
+        if (host.Contains("://"))
+            return host.TrimEnd('/');
+        return port is null ? $"{scheme}://{host}" : $"{scheme}://{host}:{port}";
+    }
+}

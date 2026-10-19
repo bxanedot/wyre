@@ -1,0 +1,775 @@
+namespace NetworkOptimizer.Web.Services.Monitoring.IspHealth;
+
+/// <summary>
+/// Detects internet-unreachable outages: spans where the destination/internet targets go
+/// to near-total packet loss while probes keep reporting. The reporting requirement is the
+/// crux of the gap-vs-outage distinction - when the UniFi Console (gateway) drops, the
+/// Monitoring Agent stops probing, so there are no samples at all and nothing is flagged; a
+/// real upstream outage keeps the gateway up and the Monitoring Agent records 100% loss.
+/// Detection is
+/// group-based on the internet tier alone (shape-independent), because an outage is scored
+/// by duration regardless of which hops dropped. The per-hop series shape the event only:
+/// the deepest hop that stayed reachable is where the break sat, and each hop's recovery
+/// time draws the inside-out heal (validated on a real AT&T outage where the OLT recovered
+/// ~10 min before the upstream). Thresholds live in <see cref="IspHealthOptions"/>.
+/// </summary>
+public static class OutageDetector
+{
+    /// <summary>
+    /// One monitored hop, carried for the outage shape and break attribution. <paramref name="Groupable"/>
+    /// hops (the per-target access ISP rows) that end up sharing an outage signature are collapsed
+    /// into one waterfall row; non-groupable hops (transit clusters, internet endpoints) always
+    /// stay on their own. <paramref name="AsnLabel"/> is the ASN-level label a row prefers over its
+    /// per-target <paramref name="Name"/> (the PTR hostname); the detector disambiguates when one
+    /// ASN owns several rows. Null AsnLabel (internet endpoints) falls back to <paramref name="Name"/>.
+    /// <paramref name="KnownPosition"/> is false for rows absent from the persisted trace map - their
+    /// Depth is a fabricated sort position (they sort last), so they can shape the outage but must
+    /// never anchor "break upstream of X" attribution. <paramref name="IsInternet"/> marks internet
+    /// endpoint rows (destinations reached over diverse paths, not points on THE path) - they trigger
+    /// and shape outages but likewise never anchor attribution: "break upstream of a destination"
+    /// says nothing.
+    /// <paramref name="AsnNumber"/> is the row's real ASN, used ONLY by the partial pass's
+    /// independence gate. It is deliberately separate from <paramref name="AsnLabel"/>: internet rows
+    /// keep a null AsnLabel so each destination still shows its own name ("AWS us-west-1"), but
+    /// several regional endpoints of one provider must not read as several independent networks.
+    /// Zero means unattributed, and such a row falls back to counting as its own network.
+    /// </summary>
+    public sealed record Hop(string Name, int Depth, IReadOnlyList<LatencySample> Series, bool Groupable = false, string? AsnLabel = null, bool IsGateway = false, bool KnownPosition = true, bool IsInternet = false, int AsnNumber = 0);
+
+    /// <param name="triggerTargets">The internet/destination loss series whose near-total loss defines an outage.</param>
+    /// <param name="hops">Every monitored hop, ordered by distance (Depth ascending = nearest first), for the shape.</param>
+    /// <param name="triggerSampleSeconds">The trigger/hop series' aggregation interval. Long windows
+    /// arrive coarsely aggregated and stop-stamped, so a sample's darkness happened up to this many
+    /// seconds before its stamp; the gateway-dark (Local scope) test reaches back by it.</param>
+    public static List<OutageEvent> Detect(
+        IReadOnlyList<IReadOnlyList<LatencySample>> triggerTargets,
+        IReadOnlyList<Hop> hops,
+        IspHealthOptions options,
+        double triggerSampleSeconds = 0)
+    {
+        if (triggerTargets.Count == 0) return new List<OutageEvent>();
+
+        var windowSize = TimeSpan.FromSeconds(options.OutageBucketSeconds);
+        var triggerByBucket = BucketTargets(triggerTargets, windowSize);
+
+        // Outage buckets: enough internet targets reporting (a bucket with none is a
+        // monitoring gap, not an outage), and a strong majority of them dark.
+        var outageBuckets = triggerByBucket
+            .Where(kv => kv.Value.Count >= options.OutageMinReportingTargets
+                && DarkFraction(kv.Value, options) >= options.OutageCoverageFraction)
+            .Select(kv => kv.Key)
+            .OrderBy(t => t)
+            .ToList();
+
+        var hopBuckets = hops.ToDictionary(h => h, h => BucketTargets(new[] { h.Series }, windowSize));
+
+        // Contiguous runs of outage buckets (gap of one window ends a run), then coalesce
+        // runs separated by a short healthy gap (OutageMaxGapSeconds) OR by a pure monitoring
+        // gap of any length (see the merge loop). One real outage dips below the dark-fraction
+        // gate for a bucket or two during staggered onset/recovery (targets go dark and heal at
+        // slightly different times) - without the coalesce that shatters it into several events.
+        // Sealing the gap before duration-filtering also lets two sub-min-duration runs straddling
+        // a blip add up to one qualifying outage.
+        var runs = new List<(DateTime Start, DateTime End)>();
+        for (var i = 0; i < outageBuckets.Count;)
+        {
+            var j = i;
+            while (j + 1 < outageBuckets.Count && outageBuckets[j + 1] - outageBuckets[j] <= windowSize)
+                j++;
+            runs.Add((outageBuckets[i], outageBuckets[j] + windowSize)); // through the last dark bucket
+            i = j + 1;
+        }
+
+        // Reporting buckets (enough targets to judge reachability) in time order, for the gap-
+        // continuity test below. A dark bucket is already inside a run, so a reporting bucket landing
+        // in the gap between two runs is by construction a NON-dark one - observed reachability.
+        var reportingBuckets = triggerByBucket
+            .Where(kv => kv.Value.Count >= options.OutageMinReportingTargets)
+            .Select(kv => kv.Key)
+            .OrderBy(t => t)
+            .ToList();
+
+        var maxGap = TimeSpan.FromSeconds(options.OutageMaxGapSeconds);
+        var merged = new List<(DateTime Start, DateTime End)>();
+        foreach (var run in runs)
+        {
+            // Coalesce this run into the previous outage when EITHER the healthy gap between them is
+            // brief (a staggered onset/recovery dip, per the comment above), OR nothing reachable was
+            // ever OBSERVED across the gap: a stretch with no adequately-reporting bucket is missing
+            // data, not a recovery, so an outage spanning it never actually ended. Without the second
+            // clause a long outage whose probe stream drops out mid-event (e.g. a LAN/gateway outage
+            // that stops the agent from recording anything) shatters into several runs that each snap
+            // forward to the one true recovery instant, surfacing as a stack of overlapping events.
+            if (merged.Count > 0
+                && (run.Start - merged[^1].End <= maxGap
+                    || !HasReportingBucketBetween(reportingBuckets, merged[^1].End, run.Start)))
+                merged[^1] = (merged[^1].Start, run.End);
+            else
+                merged.Add(run);
+        }
+
+        var events = new List<OutageEvent>();
+        var minDuration = TimeSpan.FromSeconds(options.OutageMinDurationSeconds);
+        var darkTriggerBuckets = new HashSet<DateTime>(outageBuckets);
+        foreach (var (start, end) in merged)
+        {
+            if (end - start < minDuration) continue;
+            events.Add(BuildEvent(start, end, triggerTargets, hops, hopBuckets, darkTriggerBuckets, triggerSampleSeconds, options));
+        }
+        return events;
+    }
+
+    /// <summary>
+    /// Detects brief partial-loss disruptions: short windows where many independent path targets
+    /// degrade together (loss >= <see cref="IspHealthOptions.OutagePartialLossPct"/>) without any
+    /// reaching the near-total dark threshold. Distinct from <see cref="Detect"/> (blackouts) - it
+    /// keys on coincident breadth across targets and ASNs, the signal that partial loss is a real
+    /// path event rather than one lossy probe target. The breadth gate uses a wider bucket than the
+    /// blackout pass because partial loss is route-specific: independent targets degrade at slightly
+    /// different instants, so they only land together over a longer window. Windows overlapping a
+    /// blackout in <paramref name="darkWindows"/> are skipped so the two passes don't double-count.
+    /// </summary>
+    /// <param name="pathHops">Every monitored path hop for breadth and shape; a gateway hop is
+    /// excluded from both and consulted only for the Local (gateway-dark) scope.</param>
+    /// <param name="darkWindows">Blackout outage spans already found by <see cref="Detect"/>, to exclude.</param>
+    /// <param name="pathSampleSeconds">The path series' aggregation interval - see the
+    /// equivalent parameter on <see cref="Detect"/>.</param>
+    public static List<OutageEvent> DetectPartial(
+        IReadOnlyList<Hop> pathHops,
+        IReadOnlyList<(DateTime Start, DateTime End)> darkWindows,
+        IspHealthOptions options,
+        double pathSampleSeconds = 0)
+    {
+        var gateway = pathHops.FirstOrDefault(h => h.IsGateway);
+        var pool = pathHops.Where(h => !h.IsGateway).ToList();
+        if (pool.Count == 0) return new List<OutageEvent>();
+
+        var windowSize = TimeSpan.FromSeconds(options.OutagePartialBucketSeconds);
+        var hopBuckets = pool.ToDictionary(h => h, h => BucketTargets(new[] { h.Series }, windowSize));
+        var partialPct = options.OutagePartialLossPct;
+
+        // A bucket qualifies when enough distinct targets across enough distinct ASNs degrade
+        // together: coincident loss across independent destinations is a path event, a lone lossy
+        // target is noise.
+        bool BucketQualifies(DateTime t)
+        {
+            var degraded = pool.Where(h => hopBuckets[h].TryGetValue(t, out var l) && l.Count > 0 && l[0] >= partialPct).ToList();
+            var asns = degraded.Select(NetworkKey).Distinct().Count();
+            return degraded.Count >= options.OutagePartialMinTargets && asns >= options.OutagePartialMinAsns;
+        }
+
+        var qualifying = hopBuckets.Values.SelectMany(d => d.Keys).Distinct()
+            .Where(BucketQualifies)
+            .OrderBy(t => t).ToList();
+        if (qualifying.Count == 0) return new List<OutageEvent>();
+
+        // Contiguous runs (gap of one window ends a run), then coalesce across a short healthy gap.
+        var runs = new List<(DateTime Start, DateTime End)>();
+        for (var i = 0; i < qualifying.Count;)
+        {
+            var j = i;
+            while (j + 1 < qualifying.Count && qualifying[j + 1] - qualifying[j] <= windowSize) j++;
+            runs.Add((qualifying[i], qualifying[j] + windowSize));
+            i = j + 1;
+        }
+        var maxGap = TimeSpan.FromSeconds(options.OutageMaxGapSeconds);
+        var merged = new List<(DateTime Start, DateTime End)>();
+        foreach (var run in runs)
+        {
+            if (merged.Count > 0 && run.Start - merged[^1].End <= maxGap)
+                merged[^1] = (merged[^1].Start, run.End);
+            else merged.Add(run);
+        }
+
+        var events = new List<OutageEvent>();
+        var minDuration = TimeSpan.FromSeconds(options.OutagePartialMinDurationSeconds);
+        foreach (var (start, end) in merged)
+        {
+            if (end - start < minDuration) continue;
+            // A blackout also clears the partial threshold, so a window already flagged as a
+            // blackout would otherwise surface twice - skip any that overlaps one.
+            if (darkWindows.Any(w => start < w.End && w.Start < end)) continue;
+            events.Add(BuildPartialEvent(start, end, pool, hopBuckets, gateway, pathSampleSeconds, options));
+        }
+        return events;
+    }
+
+    /// <summary>
+    /// The network a hop counts as for the partial pass's independence gate, which asks how many
+    /// INDEPENDENT networks degraded together. A row that HAS an <see cref="Hop.AsnLabel"/> is
+    /// already grouped at ASN level by that label, and the label is the corrected one (hand-added
+    /// access hops are mapped onto the access ISP's canonical ASN even when their own address
+    /// resolves elsewhere or not at all) - so the label wins there, and one ISP's hops count once
+    /// however their per-target ASN attribution turned out. Only internet rows lack a label, by
+    /// design, so each destination shows its own name; those key on the real ASN so several
+    /// regional endpoints of one provider, all reached over that provider's network, count once.
+    /// An unattributed destination falls back to its name - its own network, the safe reading.
+    /// </summary>
+    internal static string NetworkKey(Hop h) =>
+        h.AsnLabel ?? (h.AsnNumber > 0 ? $"AS{h.AsnNumber}" : h.Name);
+
+    private static OutageEvent BuildPartialEvent(
+        DateTime start, DateTime end,
+        List<Hop> pool,
+        Dictionary<Hop, Dictionary<DateTime, List<double>>> hopBuckets,
+        Hop? gateway, double pathSampleSeconds,
+        IspHealthOptions options)
+    {
+        var partialPct = options.OutagePartialLossPct;
+        // Degraded duty cycle per hop, mirroring the blackout attribution but at the partial
+        // threshold: the break sits just beyond the deepest hop that stayed clean. touchedDepths
+        // tracks ANY degraded bucket - a hop that spent 40% of the window at 60% loss passes the
+        // duty test yet is no "reachable" anchor, so attribution uses the stricter set.
+        var degradedDepth = new Dictionary<int, bool>();
+        var touchedDepths = new HashSet<int>();
+        var degraded = new List<(Hop Hop, double Peak)>();
+        double eventPeak = 0;
+        foreach (var hop in pool.OrderBy(h => h.Depth))
+        {
+            double peak = 0;
+            int degradedBuckets = 0, totalBuckets = 0;
+            foreach (var (_, losses) in hopBuckets[hop].Where(kv => kv.Key >= start && kv.Key < end))
+            {
+                if (losses.Count == 0) continue;
+                totalBuckets++;
+                peak = Math.Max(peak, losses[0]);
+                if (losses[0] >= partialPct) degradedBuckets++;
+            }
+            if (totalBuckets == 0) continue;
+            degradedDepth[hop.Depth] = (double)degradedBuckets / totalBuckets >= 0.5;
+            if (degradedBuckets > 0)
+            {
+                touchedDepths.Add(hop.Depth);
+                eventPeak = Math.Max(eventPeak, peak);
+                degraded.Add((hop, peak));
+            }
+        }
+
+        // Unlike the blackout waterfall (which groups access hops via GroupAccessTiers), partial-loss
+        // tiers are per-hop, so several hops of one ASN would all read as just the ASN label. Only when
+        // a label repeats in this list, disambiguate it with the specific hop's name/hostname tail.
+        var labelCounts = degraded.GroupBy(d => d.Hop.AsnLabel ?? d.Hop.Name).ToDictionary(g => g.Key, g => g.Count());
+        var tiers = degraded.Select(d =>
+        {
+            var label = d.Hop.AsnLabel ?? d.Hop.Name;
+            return new OutageTierState
+            {
+                Name = DisambiguateTierLabel(label, d.Hop.Name, labelCounts[label] > 1),
+                Depth = d.Hop.Depth,
+                PeakLossPct = d.Peak,
+                WentDark = false,
+                RecoveredAt = null
+            };
+        }).ToList();
+
+        var nearest = pool.Where(h => degradedDepth.ContainsKey(h.Depth)).OrderBy(h => h.Depth).FirstOrDefault();
+        var lastClean = pool.Where(h => degradedDepth.TryGetValue(h.Depth, out var d) && !d).OrderByDescending(h => h.Depth).FirstOrDefault();
+        // Local override, mirroring the blackout builder: on a long window the coarse path series
+        // dilute a LAN outage's 100%-loss samples below the dark threshold, so it lands here as a
+        // partial - but the gateway series stays fine-grained (capped at OutageBucketSeconds), so
+        // the agent failing to reach its own gateway is still visible. When the gateway was dark
+        // for at least half the event's length, nothing recorded upstream says anything about the WAN.
+        var gatewayDark = gateway != null
+            && GatewayDarkCoversEvent(gateway.Series, start.AddSeconds(-pathSampleSeconds), end,
+                end - start, options.OutageDarkLossPct);
+        var scope = gatewayDark
+            ? OutageScope.Local
+            : nearest == null || degradedDepth[nearest.Depth] || lastClean == null
+                ? OutageScope.FullWan
+                : OutageScope.Upstream;
+        // Same split as the blackout builder: any clean WAN row decides the scope, but only a
+        // trace-map-anchored path hop may name where the break sat. Partial-loss cleanliness is
+        // strict (no degraded bucket at all): partials are intermittent by nature, so the duty
+        // test that suits blackouts would let a 60%-peak-loss hop pass as "reachable".
+        var (lastReachableLabel, brokenNetwork) = scope == OutageScope.Upstream
+            ? AttributeBreak(pool,
+                judged: h => degradedDepth.ContainsKey(h.Depth),
+                isClean: h => !touchedDepths.Contains(h.Depth),
+                isBroken: h => degradedDepth[h.Depth])
+            : (null, null);
+
+        var poolSeries = pool.Select(h => (IReadOnlyList<LatencySample>)h.Series).ToList();
+        var onset = FirstDark(poolSeries, start, end, partialPct) ?? start;
+        var recovery = PreciseRecovery(poolSeries, start, end, partialPct) ?? end;
+        var reporting = pool.Count(h => hopBuckets[h].Any(kv => kv.Key >= start && kv.Key < end && kv.Value.Count > 0));
+
+        // A short sharp total outage that straddles the blackout pass's bucket edges dilutes
+        // every bucket mean below the dark threshold there, and lands here instead. When the
+        // loss still reached the blackout dark threshold on (nearly) every reporting hop,
+        // "partial" undersells it - flag it near-total so the UI can say total loss. Scoring
+        // is unchanged: it remains a partial-class event.
+        var nearTotal = reporting > 0
+            && (double)degraded.Count(d => d.Peak >= options.OutageDarkLossPct) / reporting
+                >= options.OutageCoverageFraction;
+
+        return new OutageEvent
+        {
+            Start = onset,
+            End = recovery,
+            IsPartial = true,
+            IsNearTotal = nearTotal,
+            IsBrief = recovery - onset < TimeSpan.FromSeconds(options.OutageBriefMaxSeconds),
+            PeakLossPct = eventPeak,
+            DegradedTargetCount = tiers.Count,
+            PathTargetCount = reporting,
+            Scope = scope,
+            LastReachableHop = lastReachableLabel,
+            BrokenNetwork = brokenNetwork,
+            Tiers = tiers.OrderBy(t => t.Depth).ToList()
+        };
+    }
+
+    /// <summary>
+    /// Break attribution for an Upstream-scoped event. The anchor is the deepest hop that
+    /// <paramref name="isClean"/> AND holds a known trace-map position AND is a path hop AND
+    /// has nothing lossy nearer than it (a clean row deeper than a lossy one is usually a
+    /// sibling transit branch, not proof the break sat beyond it): off-map rows (fabricated
+    /// sort depth) and internet endpoints (destinations, not points on the path) legitimately
+    /// prove the break was upstream, but cannot say WHERE it sat.
+    /// Anchored events prefer the ASN label over the per-target name. With no anchorable hop,
+    /// fall back to naming the network the break surfaced in - the shallowest
+    /// <paramref name="isBroken"/> hop's ASN - but only when every nearer anchorable hop was
+    /// clean; a loss picture that starts at the first hop is path-wide, and blaming one
+    /// network would be a guess. Callers supply the cleanliness tests: blackouts use the
+    /// duty-cycle test (an onset blip must not disqualify the true anchor - validated on a
+    /// real access-ISP outage), partials require a hop untouched in the window (intermittent
+    /// 60%-loss buckets are not "reachable").
+    /// </summary>
+    internal static (string? LastReachableHop, string? BrokenNetwork) AttributeBreak(
+        IEnumerable<Hop> wanHops, Func<Hop, bool> judged, Func<Hop, bool> isClean, Func<Hop, bool> isBroken)
+    {
+        var rows = wanHops.Where(judged).ToList();
+        // "Break upstream of X" claims a contiguous waterfall: everything nearer than X clean,
+        // the loss strictly beyond it. Hops sit on branching paths, so a clean row deeper than
+        // a lossy one is usually a SIBLING branch, not proof the loss sat beyond it - the
+        // anchor only stands when every nearer anchorable hop was also clean.
+        var anchor = rows
+            .Where(h => h.KnownPosition && !h.IsInternet && isClean(h))
+            .OrderByDescending(h => h.Depth)
+            .FirstOrDefault();
+        if (anchor != null && !rows.Any(h =>
+                h.Depth < anchor.Depth && h.KnownPosition && !h.IsInternet && !isClean(h)))
+            return (anchor.AsnLabel ?? anchor.Name, null);
+        var broken = rows
+            .Where(h => isBroken(h) && !string.IsNullOrEmpty(h.AsnLabel))
+            .OrderBy(h => h.Depth)
+            .FirstOrDefault();
+        if (broken == null)
+            return (null, null);
+        var nearerUnclean = rows.Any(h =>
+            h.Depth < broken.Depth && h.KnownPosition && !h.IsInternet && !isClean(h));
+        return nearerUnclean ? (null, null) : (null, broken.AsnLabel);
+    }
+
+    /// <summary>Per bucket, the list of each reporting target's mean loss in that bucket.</summary>
+    private static Dictionary<DateTime, List<double>> BucketTargets(
+        IReadOnlyList<IReadOnlyList<LatencySample>> targets, TimeSpan windowSize)
+    {
+        var perBucket = new Dictionary<DateTime, List<double>>();
+        // Accumulate sum+count per bucket manually rather than GroupBy(...).Average(): the loss
+        // series are coarse relative to the outage bucket, so most buckets hold a single sample and
+        // GroupBy would allocate one IGrouping per bucket per hop. Summation stays in source order,
+        // so the per-bucket mean is bit-identical to the GroupBy version.
+        var sum = new Dictionary<DateTime, double>();
+        var cnt = new Dictionary<DateTime, int>();
+        foreach (var target in targets)
+        {
+            sum.Clear();
+            cnt.Clear();
+            foreach (var s in target)
+            {
+                if (!s.LossPercent.HasValue) continue;
+                var b = CongestionDetector.FloorTime(s.Time, windowSize);
+                sum[b] = (sum.TryGetValue(b, out var sv) ? sv : 0d) + s.LossPercent.Value;
+                cnt[b] = (cnt.TryGetValue(b, out var cv) ? cv : 0) + 1;
+            }
+            foreach (var kv in cnt)
+            {
+                if (!perBucket.TryGetValue(kv.Key, out var list))
+                {
+                    list = new List<double>();
+                    perBucket[kv.Key] = list;
+                }
+                list.Add(sum[kv.Key] / kv.Value);
+            }
+        }
+        return perBucket;
+    }
+
+    private static double DarkFraction(List<double> targetLosses, IspHealthOptions options) =>
+        targetLosses.Count == 0 ? 0 : (double)targetLosses.Count(l => l >= options.OutageDarkLossPct) / targetLosses.Count;
+
+    /// <summary>
+    /// Whether any adequately-reporting trigger bucket falls in [afterInclusive, beforeExclusive).
+    /// Such a bucket reports enough targets to judge reachability yet isn't dark (dark buckets sit
+    /// inside the runs, never in the gap between them), so it is observed reachability - proof the
+    /// internet recovered between two dark runs. Its absence means the gap is a monitoring gap (no
+    /// data), which is missing evidence, not a recovery. <paramref name="reportingBuckets"/> is sorted.
+    /// </summary>
+    private static bool HasReportingBucketBetween(
+        List<DateTime> reportingBuckets, DateTime afterInclusive, DateTime beforeExclusive)
+    {
+        foreach (var t in reportingBuckets)
+        {
+            if (t < afterInclusive) continue;
+            if (t >= beforeExclusive) break;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether the gateway was dark for most of the trigger's dark span within [start, end),
+    /// reached back one coarse trigger interval (a stop-stamped sample's darkness happened up to
+    /// that long before its stamp). Judged on the gateway's raw series - it is queried capped at
+    /// the outage bucket, so its samples already sit at bucket resolution. Duty over the span is
+    /// safe against coalesce padding: a monitoring gap has no gateway samples to dilute it.
+    /// </summary>
+    private static bool GatewayDarkOverTriggerSpan(
+        IReadOnlyList<LatencySample> gatewaySeries,
+        IReadOnlyCollection<DateTime> darkTriggerBuckets,
+        DateTime start, DateTime end,
+        double triggerSampleSeconds, IspHealthOptions options)
+    {
+        DateTime? first = null, last = null;
+        foreach (var b in darkTriggerBuckets)
+        {
+            if (b < start || b >= end) continue;
+            if (first == null || b < first) first = b;
+            if (last == null || b > last) last = b;
+        }
+        if (first == null) return false;
+        return MostlyDark(gatewaySeries,
+            first.Value.AddSeconds(-triggerSampleSeconds),
+            last!.Value.AddSeconds(options.OutageBucketSeconds),
+            options.OutageDarkLossPct);
+    }
+
+    /// <summary>At least half the reporting samples in [from, to) at or above the dark threshold.</summary>
+    private static bool MostlyDark(
+        IReadOnlyList<LatencySample> series, DateTime from, DateTime to, double darkPct)
+    {
+        int dark = 0, total = 0;
+        foreach (var s in series)
+        {
+            if (!s.LossPercent.HasValue || s.Time < from || s.Time >= to) continue;
+            total++;
+            if (s.LossPercent.Value >= darkPct) dark++;
+        }
+        return total > 0 && dark * 2 >= total;
+    }
+
+    /// <summary>
+    /// Whether the gateway's dark time within [from, to) covers at least half of
+    /// <paramref name="duration"/>. Not a duty test on purpose: the stop-stamp reach-back
+    /// necessarily pulls a clean lead into [from, to), which would dilute a duty below the bar
+    /// for exactly the short events this exists to catch. Dark time is measured absolutely -
+    /// dark samples times the series' own median cadence - and compared to the event's length.
+    /// </summary>
+    private static bool GatewayDarkCoversEvent(
+        IReadOnlyList<LatencySample> series, DateTime from, DateTime to,
+        TimeSpan duration, double darkPct)
+    {
+        var times = new List<DateTime>();
+        var dark = 0;
+        foreach (var s in series)
+        {
+            if (!s.LossPercent.HasValue || s.Time < from || s.Time >= to) continue;
+            times.Add(s.Time);
+            if (s.LossPercent.Value >= darkPct) dark++;
+        }
+        if (dark == 0 || times.Count < 2) return false;
+        times.Sort();
+        var gaps = new List<double>(times.Count - 1);
+        for (var i = 1; i < times.Count; i++)
+            gaps.Add((times[i] - times[i - 1]).TotalSeconds);
+        gaps.Sort();
+        return dark * gaps[gaps.Count / 2] >= duration.TotalSeconds * 0.5;
+    }
+
+    private static OutageEvent BuildEvent(
+        DateTime start, DateTime end,
+        IReadOnlyList<IReadOnlyList<LatencySample>> triggerTargets,
+        IReadOnlyList<Hop> hops,
+        Dictionary<Hop, Dictionary<DateTime, List<double>>> hopBuckets,
+        IReadOnlyCollection<DateTime> darkTriggerBuckets,
+        double triggerSampleSeconds,
+        IspHealthOptions options)
+    {
+        var tiers = new List<(Hop Hop, OutageTierState State)>();
+        // A hop on the broken path stays dark for (most of) the outage; a hop that merely
+        // blipped at onset then held - like the OLT, which recovered ~10 min before the
+        // upstream in the validation data - is NOT the break and must read as reachable.
+        // So attribution uses the dark duty cycle, normalized to the buckets where the
+        // TRIGGER tier was actually dark: a merged window can be padded far beyond the real
+        // darkness (run coalescing across healthy blips and monitoring gaps), and duty over
+        // the padded window dilutes below the threshold for every hop at once - an all-dark
+        // outage then read as "everything stayed reachable". Darkness relative to the
+        // trigger's own dark span is padding-proof and keeps the onset-blip case anchored.
+        var onBrokenPath = new Dictionary<int, bool>();
+        foreach (var hop in hops.OrderBy(h => h.Depth))
+        {
+            double peakLoss = 0;
+            int darkBuckets = 0, totalBuckets = 0, darkInTrigger = 0, totalInTrigger = 0;
+            DateTime? lastDarkBucket = null;
+            foreach (var (bucketStart, losses) in hopBuckets[hop]
+                         .Where(kv => kv.Key >= start && kv.Key < end)
+                         .OrderBy(kv => kv.Key))
+            {
+                if (losses.Count == 0) continue;
+                totalBuckets++;
+                var inTrigger = darkTriggerBuckets.Contains(bucketStart);
+                if (inTrigger) totalInTrigger++;
+                var mean = losses.Average();
+                peakLoss = Math.Max(peakLoss, mean);
+                if (mean >= options.OutageDarkLossPct)
+                {
+                    darkBuckets++;
+                    if (inTrigger) darkInTrigger++;
+                    lastDarkBucket = bucketStart;
+                }
+            }
+            // No samples in the outage window means the target didn't exist or wasn't enabled
+            // then - it has nothing to say about this outage, so don't give it a row.
+            if (totalBuckets == 0) continue;
+            // A hop with no samples during the trigger-dark span can't be judged against it -
+            // fall back to window-wide duty for that hop alone.
+            onBrokenPath[hop.Depth] = totalInTrigger > 0
+                ? (double)darkInTrigger / totalInTrigger >= 0.5
+                : (double)darkBuckets / totalBuckets >= 0.5;
+            tiers.Add((hop, new OutageTierState
+            {
+                Name = hop.Name,
+                Depth = hop.Depth,
+                PeakLossPct = peakLoss,
+                WentDark = darkBuckets > 0,
+                // Recovery is anchored to the last *sustained* dark bucket, not the last dark
+                // sample: a hop can twitch dark for a single probe late in the outage (the OLT
+                // blipping as the upstream heals) without that being a real relapse. We then read
+                // the first good sample at/after that bucket, so the time still carries seconds.
+                RecoveredAt = lastDarkBucket.HasValue
+                    ? RecoveryAfter(hop.Series, lastDarkBucket.Value, options.OutageDarkLossPct)
+                    : null
+            }));
+        }
+
+        // The break sits just beyond the deepest hop that stayed reachable through the
+        // outage. If even the nearest hop was dark for most of it, the whole WAN dropped.
+        // Attribution runs on the per-hop (ungrouped) states so it can name the precise hop.
+        // The LAN gateway is excluded from WAN break attribution (FullWan/Upstream) and only decides
+        // the Local override: when the gateway itself stayed dark through the outage, the agent could
+        // not reach its own gateway - a LAN/switch/gateway outage, not the ISP's WAN. With no gateway
+        // hop, wanStates == all states and the FullWan/Upstream logic is byte-for-byte unchanged.
+        var gwTier = tiers.FirstOrDefault(t => t.Hop.IsGateway);
+        // Two gateway-dark tests, either sufficing. The trigger-normalized duty works at fine
+        // resolution; on a long window the coarse, stop-stamped trigger series leave the dark
+        // trigger buckets sparse and shifted up to one aggregate interval after the darkness they
+        // describe, so judging the (fine, capped) gateway series only at those exact instants can
+        // miss a real LAN outage. The second test reads duty over the trigger's whole dark span,
+        // reached back by the trigger interval to cover the stamp shift.
+        var gatewayDark = gwTier.Hop != null
+            && ((onBrokenPath.TryGetValue(gwTier.State.Depth, out var gwd) && gwd)
+                || GatewayDarkOverTriggerSpan(gwTier.Hop.Series, darkTriggerBuckets, start, end,
+                    triggerSampleSeconds, options));
+        var wanStates = tiers.Where(t => !t.Hop.IsGateway).Select(t => t.State).ToList();
+        var nearest = wanStates.OrderBy(s => s.Depth).FirstOrDefault();
+        var lastReachable = wanStates.Where(s => !onBrokenPath[s.Depth]).OrderByDescending(s => s.Depth).FirstOrDefault();
+        var scope = gatewayDark
+            ? OutageScope.Local
+            : nearest == null || onBrokenPath[nearest.Depth] || lastReachable == null
+                ? OutageScope.FullWan
+                : OutageScope.Upstream;
+        // Scope reads reachability from every WAN row (an off-map row answering still proves the
+        // break was upstream); the break's NAME comes only from trace-map-anchored path hops.
+        var (lastReachableLabel, brokenNetwork) = scope == OutageScope.Upstream
+            ? AttributeBreak(tiers.Where(t => !t.Hop.IsGateway).Select(t => t.Hop),
+                judged: h => onBrokenPath.ContainsKey(h.Depth),
+                isClean: h => !onBrokenPath[h.Depth],
+                isBroken: h => onBrokenPath[h.Depth])
+            : (null, null);
+
+        // Bucket edges are minute-aligned; report the real onset and recovery instants from
+        // the pooled trigger stream so the window carries seconds. Fall back to the bucket
+        // edges if the precise edges can't be found (e.g. outage still ongoing at window end).
+        var onset = FirstDark(triggerTargets, start, end, options.OutageDarkLossPct) ?? start;
+        var recovery = PreciseRecovery(triggerTargets, start, end, options.OutageDarkLossPct) ?? end;
+
+        // Breadth/depth over the reporting trigger (internet) targets, so a blackout carries the same
+        // severity = breadth x depth the scorer reads for partials: how many reporting targets went
+        // dark, and the worst loss reached. By the coverage gate breadth is already >= the dark
+        // fraction, but a near-total widespread drop still reads hotter than a borderline one.
+        int reportingTargets = 0, darkTargets = 0;
+        double eventPeakLoss = 0;
+        foreach (var target in triggerTargets)
+        {
+            var inWindow = target.Where(s => s.LossPercent.HasValue && s.Time >= start && s.Time < end).ToList();
+            if (inWindow.Count == 0) continue;
+            reportingTargets++;
+            eventPeakLoss = Math.Max(eventPeakLoss, inWindow.Max(s => s.LossPercent!.Value));
+            if (inWindow.Any(s => s.LossPercent!.Value >= options.OutageDarkLossPct)) darkTargets++;
+        }
+
+        return new OutageEvent
+        {
+            Start = onset,
+            End = recovery,
+            IsBrief = recovery - onset < TimeSpan.FromSeconds(options.OutageBriefMaxSeconds),
+            PeakLossPct = eventPeakLoss,
+            DegradedTargetCount = darkTargets,
+            PathTargetCount = reportingTargets,
+            Scope = scope,
+            LastReachableHop = lastReachableLabel,
+            BrokenNetwork = brokenNetwork,
+            Tiers = GroupAccessTiers(tiers, options)
+        };
+    }
+
+    /// <summary>
+    /// Collapses groupable (access ISP) tiers that share an outage signature - recovery within
+    /// <see cref="IspHealthOptions.OutageAccessGroupToleranceSeconds"/> - into one row, so a handful
+    /// of near-identical access hops don't each take a row, and labels every row by its ASN.
+    /// Access hops that recovered at a distinctly different time (the inside-out heal, e.g. the OLT
+    /// coming back first) stay separate. When one ASN owns several rows they're disambiguated:
+    /// a merged group reads "ASN (N hops)", a lone hop "ASN (hostname tail)"; a unique ASN just
+    /// shows its name. Non-groupable tiers (transit clusters, internet endpoints) always keep their
+    /// own row. Returned nearest-first by depth.
+    /// </summary>
+    private static List<OutageTierState> GroupAccessTiers(
+        List<(Hop Hop, OutageTierState State)> tiers, IspHealthOptions options)
+    {
+        var tol = TimeSpan.FromSeconds(options.OutageAccessGroupToleranceSeconds);
+        var result = new List<OutageTierState>();
+
+        // Transit clusters and internet endpoints keep their own row, labeled by the ASN (transit)
+        // or the endpoint name (internet, AsnLabel null).
+        foreach (var (hop, state) in tiers.Where(t => !t.Hop.Groupable))
+            result.Add(Relabel(state, hop.AsnLabel ?? hop.Name));
+
+        // Access hops: WITHIN each ASN, cluster by outage signature - never merge across ASNs (a
+        // dual-WAN could have two access ISPs recover at the same instant). "Up" and "dark, never
+        // recovered" are each one shared signature; "dark and recovered" clusters by recovery time.
+        var groups = new List<List<(Hop Hop, OutageTierState State)>>();
+        void AddGroup(IEnumerable<(Hop, OutageTierState)> g) { var l = g.ToList(); if (l.Count > 0) groups.Add(l); }
+        foreach (var asnGroup in tiers.Where(t => t.Hop.Groupable).GroupBy(t => t.Hop.AsnLabel ?? t.Hop.Name))
+        {
+            var members = asnGroup.ToList();
+            AddGroup(members.Where(t => !t.State.WentDark));
+            AddGroup(members.Where(t => t.State.WentDark && !t.State.RecoveredAt.HasValue));
+            var cluster = new List<(Hop, OutageTierState)>();
+            foreach (var t in members.Where(t => t.State.WentDark && t.State.RecoveredAt.HasValue).OrderBy(t => t.State.RecoveredAt!.Value))
+            {
+                if (cluster.Count > 0 && t.State.RecoveredAt!.Value - cluster[0].Item2.RecoveredAt!.Value > tol)
+                {
+                    groups.Add(cluster);
+                    cluster = new List<(Hop, OutageTierState)>();
+                }
+                cluster.Add(t);
+            }
+            if (cluster.Count > 0) groups.Add(cluster);
+        }
+
+        // A unique ASN shows just its name; several rows split into "(N hops)" / "(hostname tail)".
+        // Key and lookup use the SAME nearest-hop expression so they never diverge.
+        static string AsnOf(List<(Hop Hop, OutageTierState State)> g)
+        {
+            var n = g.OrderBy(m => m.State.Depth).First().Hop;
+            return n.AsnLabel ?? n.Name;
+        }
+        var rowsPerAsn = groups.GroupBy(AsnOf).ToDictionary(x => x.Key, x => x.Count());
+        foreach (var g in groups)
+        {
+            var nearest = g.OrderBy(m => m.State.Depth).First();
+            var asn = AsnOf(g);
+            var name = rowsPerAsn[asn] == 1 ? asn
+                : g.Count > 1 ? $"{asn} ({g.Count} hops)"
+                : $"{asn} ({HostnameTail(nearest.Hop.Name, asn)})";
+            result.Add(new OutageTierState
+            {
+                Name = name,
+                Depth = nearest.State.Depth,
+                PeakLossPct = g.Max(m => m.State.PeakLossPct),
+                WentDark = g.Any(m => m.State.WentDark),
+                RecoveredAt = g.Where(m => m.State.RecoveredAt.HasValue).Select(m => m.State.RecoveredAt).DefaultIfEmpty(null).Min()
+            });
+        }
+
+        return result.OrderBy(s => s.Depth).ToList();
+    }
+
+    private static OutageTierState Relabel(OutageTierState s, string name) => new()
+    {
+        Name = name,
+        Depth = s.Depth,
+        PeakLossPct = s.PeakLossPct,
+        WentDark = s.WentDark,
+        RecoveredAt = s.RecoveredAt
+    };
+
+    /// <summary>The part of a per-target name after its ASN prefix ("AT&amp;T nokia-olt" -> "nokia-olt").</summary>
+    private static string HostnameTail(string name, string asn) =>
+        name.StartsWith(asn + " ", StringComparison.OrdinalIgnoreCase) ? name[(asn.Length + 1)..] : name;
+
+    /// <summary>
+    /// When a tier label repeats within one event's list (e.g. several hops of one access ISP), make
+    /// it specific: keep the hop's own name if it already extends the label (e.g. a cluster's
+    /// "+N ms hop"), otherwise append the hostname tail as "ASN (tail)" - matching the blackout
+    /// waterfall's style. A unique label is returned unchanged.
+    /// </summary>
+    private static string DisambiguateTierLabel(string label, string hopName, bool repeats)
+    {
+        if (!repeats || string.IsNullOrEmpty(hopName) || string.Equals(hopName, label, StringComparison.OrdinalIgnoreCase))
+            return label;
+        if (hopName.StartsWith(label + " ", StringComparison.OrdinalIgnoreCase))
+            return hopName; // already "label hostname" or "label (+N ms hop)"
+        return $"{label} ({HostnameTail(hopName, label)})";
+    }
+
+    /// <summary>Actual timestamp of the first sample at/above the loss threshold in [start, end).</summary>
+    private static DateTime? FirstDark(
+        IReadOnlyList<IReadOnlyList<LatencySample>> targets,
+        DateTime start, DateTime end, double threshold) =>
+        targets.SelectMany(t => t)
+            .Where(s => s.LossPercent.HasValue && s.Time >= start && s.Time < end
+                && s.LossPercent.Value >= threshold)
+            .OrderBy(s => s.Time)
+            .Select(s => (DateTime?)s.Time)
+            .FirstOrDefault();
+
+    /// <summary>
+    /// First reporting sample below the dark threshold at or after a floor time - the instant
+    /// the series came back (with seconds). Used with the last sustained dark bucket as the
+    /// floor so a late single-probe twitch doesn't push recovery to the end of the outage.
+    /// Null when no good sample follows (never recovered in-window).
+    /// </summary>
+    private static DateTime? RecoveryAfter(
+        IReadOnlyList<LatencySample> series, DateTime floor, double darkPct) =>
+        series
+            .Where(s => s.LossPercent.HasValue && s.Time >= floor && s.LossPercent.Value < darkPct)
+            .OrderBy(s => s.Time)
+            .Select(s => (DateTime?)s.Time)
+            .FirstOrDefault();
+
+    /// <summary>
+    /// When the targets came back: the first reporting sample below the dark threshold that
+    /// follows the last dark sample in [start, end). That is the instant recovery was actually
+    /// observed, with seconds. Null when nothing went dark or it never recovered in-window.
+    /// </summary>
+    private static DateTime? PreciseRecovery(
+        IReadOnlyList<IReadOnlyList<LatencySample>> targets,
+        DateTime start, DateTime end, double dark)
+    {
+        DateTime? lastDark = targets.SelectMany(t => t)
+            .Where(s => s.LossPercent.HasValue && s.Time >= start && s.Time < end
+                && s.LossPercent.Value >= dark)
+            .OrderBy(s => s.Time)
+            .Select(s => (DateTime?)s.Time)
+            .LastOrDefault();
+        if (!lastDark.HasValue) return null;
+
+        return targets.SelectMany(t => t)
+            .Where(s => s.LossPercent.HasValue && s.LossPercent.Value < dark && s.Time > lastDark.Value)
+            .OrderBy(s => s.Time)
+            .Select(s => (DateTime?)s.Time)
+            .FirstOrDefault();
+    }
+}

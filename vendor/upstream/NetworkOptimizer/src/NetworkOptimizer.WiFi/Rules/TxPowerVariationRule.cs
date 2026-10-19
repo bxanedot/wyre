@@ -1,0 +1,51 @@
+using NetworkOptimizer.WiFi.Helpers;
+using NetworkOptimizer.WiFi.Models;
+
+namespace NetworkOptimizer.WiFi.Rules;
+
+/// <summary>
+/// Rule that recommends varied TX power levels in multi-AP deployments.
+/// All APs on high power can cause interference and poor roaming.
+/// </summary>
+public class TxPowerVariationRule : IWiFiOptimizerRule
+{
+    public string RuleId => "WIFI-TX-POWER-VARIATION-001";
+
+    public HealthIssue? Evaluate(WiFiOptimizerContext ctx)
+    {
+        // Only relevant for multi-AP deployments
+        if (ctx.AccessPoints.Count <= 1)
+            return null;
+
+        var powerModes = ctx.AccessPoints
+            .SelectMany(ap => ap.Radios.Where(r => r.Channel.HasValue))
+            .Select(r => r.TxPowerMode?.ToLowerInvariant() ?? "auto")
+            .Distinct()
+            .ToList();
+
+        // Only flag if ALL radios across ALL APs are on high power
+        if (powerModes.Count != 1 || powerModes[0] != "high")
+            return null;
+
+        var issue = new HealthIssue
+        {
+            Severity = HealthIssueSeverity.Info,
+            Dimensions = { HealthDimension.ChannelHealth, HealthDimension.RoamingPerformance },
+            Class = HealthIssueClass.Advisory,
+            Key = HealthIssueKeys.For(RuleId),
+            Title = "Consider Varied TX Power Levels",
+            Description = WiFiAnalysisHelpers.SupportsAutoPowerLeveling
+                ? "All APs are set to high power. In multi-AP deployments, using 'Auto' or varied power levels often improves roaming behavior and reduces co-channel interference."
+                : "All APs are set to high power. In multi-AP deployments, varying power levels (e.g. 'Medium' on some APs) often improves roaming behavior and reduces co-channel interference.",
+            Recommendation = WiFiAnalysisHelpers.SupportsAutoPowerLeveling
+                ? "In UniFi Network: Settings > WiFi > (SSID) > Advanced > TX Power - try 'Auto' to let the controller optimize power levels."
+                : "In UniFi Network: Settings > WiFi > (SSID) > Advanced > TX Power - try 'Medium' on some APs for better coverage balance.",
+            ScoreImpact = -3,
+            ShowOnOverview = false  // Informational, only relevant to Channel/Roaming tabs
+        };
+
+        // Every radio here is on a chosen power mode, so this is a check on a choice.
+        var allFixed = ctx.AccessPoints.SelectMany(ap => ap.Radios.Where(r => r.Channel.HasValue)).All(r => r.TxPowerIsFixed);
+        return allFixed ? RadioIntent.MarkDeliberate(issue, RadioIntent.PowerHint) : issue;
+    }
+}

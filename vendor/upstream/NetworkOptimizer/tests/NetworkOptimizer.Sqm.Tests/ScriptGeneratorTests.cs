@@ -1,0 +1,677 @@
+using System.Diagnostics;
+using System.Globalization;
+using NetworkOptimizer.Sqm.Models;
+using Xunit;
+
+namespace NetworkOptimizer.Sqm.Tests;
+
+public class ScriptGeneratorTests
+{
+    [Fact]
+    public void GenerateAllScripts_WithGermanLocale_UsesDecimalPointNotComma()
+    {
+        // Arrange - save current culture and set to German (uses comma as decimal separator)
+        var originalCulture = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+
+            var config = new SqmConfiguration
+            {
+                ConnectionName = "Test WAN",
+                Interface = "eth0",
+                BaselineLatency = 17.9,
+                LatencyThreshold = 2.5,
+                LatencyDecrease = 0.97,
+                LatencyIncrease = 1.04,
+                OverheadMultiplier = 1.05,
+                BlendingWeightWithin = 0.6,
+                BlendingWeightBelow = 0.8,
+                MaxDownloadSpeed = 100,
+                MinDownloadSpeed = 50,
+                AbsoluteMaxDownloadSpeed = 110,
+                PingHost = "8.8.8.8"
+            };
+
+            var generator = new ScriptGenerator(config);
+            var baseline = new Dictionary<string, string> { ["0_12"] = "95" };
+
+            // Act
+            var scripts = generator.GenerateAllScripts(baseline);
+
+            // Assert - verify scripts use decimal points, not commas
+            var bootScript = scripts.Values.First();
+
+            // Check all double values use decimal point
+            Assert.Contains("BASELINE_LATENCY=17.9", bootScript);
+            Assert.Contains("LATENCY_THRESHOLD=2.5", bootScript);
+            Assert.Contains("LATENCY_DECREASE=0.97", bootScript);
+            Assert.Contains("LATENCY_INCREASE=1.04", bootScript);
+            Assert.Contains("DOWNLOAD_SPEED_MULTIPLIER=\"1.05\"", bootScript);
+
+            // Verify no commas in numeric assignments (would break bc)
+            Assert.DoesNotContain("BASELINE_LATENCY=17,9", bootScript);
+            Assert.DoesNotContain("LATENCY_THRESHOLD=2,5", bootScript);
+            Assert.DoesNotContain("LATENCY_DECREASE=0,97", bootScript);
+            Assert.DoesNotContain("* 1,05", bootScript);
+            Assert.DoesNotContain("* 0,6", bootScript);
+        }
+        finally
+        {
+            // Restore original culture
+            CultureInfo.CurrentCulture = originalCulture;
+        }
+    }
+
+    [Fact]
+    public void GenerateAllScripts_BlendingWeights_NoFloatingPointArtifacts()
+    {
+        // Arrange
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Test WAN",
+            Interface = "eth0",
+            BlendingWeightWithin = 0.7,  // 1.0 - 0.7 can produce 0.30000000000000004
+            BlendingWeightBelow = 0.8,
+            MaxDownloadSpeed = 100,
+            MinDownloadSpeed = 50,
+            AbsoluteMaxDownloadSpeed = 110,
+            PingHost = "8.8.8.8"
+        };
+
+        var generator = new ScriptGenerator(config);
+        var baseline = new Dictionary<string, string> { ["0_12"] = "95" };
+
+        // Act
+        var scripts = generator.GenerateAllScripts(baseline);
+        var bootScript = scripts.Values.First();
+
+        // Assert - should have clean 0.3, not 0.30000000000000004
+        Assert.Contains("* 0.3)", bootScript);
+        Assert.DoesNotContain("0.30000000000000004", bootScript);
+    }
+
+    [Fact]
+    public void GenerateAllScripts_ContainsIfbDeviceCheck_InBothScripts()
+    {
+        // Arrange
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Test WAN",
+            Interface = "eth3",
+            MaxDownloadSpeed = 100,
+            MinDownloadSpeed = 50,
+            AbsoluteMaxDownloadSpeed = 110,
+            PingHost = "8.8.8.8"
+        };
+
+        var generator = new ScriptGenerator(config);
+        var baseline = new Dictionary<string, string> { ["0_12"] = "95" };
+
+        // Act
+        var scripts = generator.GenerateAllScripts(baseline);
+        var bootScript = scripts.Values.First();
+
+        // Extract the speedtest and ping script sections from the heredocs
+        var speedtestSection = ExtractHeredocSection(bootScript, "SPEEDTEST_EOF");
+        var pingSection = ExtractHeredocSection(bootScript, "PING_EOF");
+
+        // Assert - IFB check appears in BOTH embedded scripts independently
+        Assert.Contains("ip link show \"$IFB_DEVICE\"", speedtestSection);
+        Assert.Contains("ip link show \"$IFB_DEVICE\"", pingSection);
+
+        // Both scripts define the correct IFB device name
+        Assert.Contains("IFB_DEVICE=\"ifbeth3\"", speedtestSection);
+        Assert.Contains("IFB_DEVICE=\"ifbeth3\"", pingSection);
+
+        // Both scripts exit with error code 1 on missing IFB
+        Assert.Contains("exit 1", speedtestSection);
+        Assert.Contains("exit 1", pingSection);
+    }
+
+    [Fact]
+    public void GenerateAllScripts_IfbCheck_AppearsBeforeTcCommands()
+    {
+        // Arrange
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Test WAN",
+            Interface = "eth2",
+            MaxDownloadSpeed = 100,
+            MinDownloadSpeed = 50,
+            AbsoluteMaxDownloadSpeed = 110,
+            PingHost = "8.8.8.8"
+        };
+
+        var generator = new ScriptGenerator(config);
+        var baseline = new Dictionary<string, string> { ["0_12"] = "95" };
+
+        // Act
+        var scripts = generator.GenerateAllScripts(baseline);
+        var bootScript = scripts.Values.First();
+
+        var speedtestSection = ExtractHeredocSection(bootScript, "SPEEDTEST_EOF");
+        var pingSection = ExtractHeredocSection(bootScript, "PING_EOF");
+
+        // Assert - IFB check must come BEFORE any tc usage in both scripts
+        var ifbCheckInSpeedtest = speedtestSection.IndexOf("ip link show \"$IFB_DEVICE\"");
+        var firstTcInSpeedtest = speedtestSection.IndexOf("update_all_tc_classes");
+        Assert.True(ifbCheckInSpeedtest >= 0, "IFB check missing from speedtest script");
+        Assert.True(firstTcInSpeedtest >= 0, "tc command missing from speedtest script");
+        Assert.True(ifbCheckInSpeedtest < firstTcInSpeedtest,
+            "IFB check must appear before the first tc command in speedtest script");
+
+        var ifbCheckInPing = pingSection.IndexOf("ip link show \"$IFB_DEVICE\"");
+        var firstTcInPing = pingSection.IndexOf("update_all_tc_classes");
+        Assert.True(ifbCheckInPing >= 0, "IFB check missing from ping script");
+        Assert.True(firstTcInPing >= 0, "tc command missing from ping script");
+        Assert.True(ifbCheckInPing < firstTcInPing,
+            "IFB check must appear before the first tc command in ping script");
+    }
+
+    [Theory]
+    [InlineData("eth0", "ifbeth0")]
+    [InlineData("eth2", "ifbeth2")]
+    [InlineData("eth3", "ifbeth3")]
+    [InlineData("eth4", "ifbeth4")]
+    public void GenerateAllScripts_IfbDeviceName_DerivedFromInterface(string iface, string expectedIfb)
+    {
+        // Arrange
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Test WAN",
+            Interface = iface,
+            MaxDownloadSpeed = 100,
+            MinDownloadSpeed = 50,
+            AbsoluteMaxDownloadSpeed = 110,
+            PingHost = "8.8.8.8"
+        };
+
+        var generator = new ScriptGenerator(config);
+        var baseline = new Dictionary<string, string> { ["0_12"] = "95" };
+
+        // Act
+        var scripts = generator.GenerateAllScripts(baseline);
+        var bootScript = scripts.Values.First();
+
+        // Assert - IFB device name is correctly derived for each interface
+        Assert.Contains($"IFB_DEVICE=\"{expectedIfb}\"", bootScript);
+    }
+
+    [Fact]
+    public void GenerateAllScripts_WhenLinkSpeedSet_EmbedsLinkCeilingClampInBothScripts()
+    {
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Test WAN",
+            Interface = "eth6",
+            MaxDownloadSpeed = 1013,
+            MinDownloadSpeed = 868,
+            AbsoluteMaxDownloadSpeed = 1032,
+            SafetyCapPercent = 0.95,
+            PingHost = "8.8.8.8",
+            WanLinkSpeedMbps = 1000
+        };
+
+        var generator = new ScriptGenerator(config);
+        var baseline = new Dictionary<string, string> { ["0_12"] = "940" };
+        var bootScript = generator.GenerateAllScripts(baseline).Values.First();
+
+        var speedtest = ExtractHeredocSection(bootScript, "SPEEDTEST_EOF");
+        var ping = ExtractHeredocSection(bootScript, "PING_EOF");
+
+        Assert.Contains("WAN_LINK_SPEED_MBPS=\"1000\"", speedtest);
+        Assert.Contains("WAN_LINK_SPEED_MBPS=\"1000\"", ping);
+        Assert.Contains("LINK_SPEED_HEADROOM=\"0.98\"", speedtest);
+        Assert.Contains("LINK_SPEED_HEADROOM=\"0.98\"", ping);
+        Assert.Contains("$WAN_LINK_SPEED_MBPS * $LINK_SPEED_HEADROOM", speedtest);
+        Assert.Contains("$WAN_LINK_SPEED_MBPS * $LINK_SPEED_HEADROOM", ping);
+    }
+
+    [Fact]
+    public void GenerateAllScripts_SpeedtestProbeRate_IsAboveLineRate()
+    {
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Test WAN",
+            Interface = "eth6",
+            MaxDownloadSpeed = 1013,
+            MinDownloadSpeed = 868,
+            AbsoluteMaxDownloadSpeed = 1032,
+            PingHost = "8.8.8.8",
+            WanLinkSpeedMbps = 1000
+        };
+
+        var generator = new ScriptGenerator(config);
+        var bootScript = generator.GenerateAllScripts(new Dictionary<string, string>()).Values.First();
+        var speedtest = ExtractHeredocSection(bootScript, "SPEEDTEST_EOF");
+
+        // Probe rate = MaxDownloadSpeed * 1.03 = 1013 * 1.03 = 1043
+        Assert.Contains("SPEEDTEST_PROBE_RATE=\"1043\"", speedtest);
+        // Initial TC set uses probe rate, not ABSOLUTE_MAX_DOWNLOAD_SPEED
+        Assert.Contains("update_all_tc_classes $IFB_DEVICE $SPEEDTEST_PROBE_RATE", speedtest);
+    }
+
+    [Fact]
+    public void GenerateAllScripts_WhenLinkSpeedUnknown_EmitsZeroAndSkipsClamp()
+    {
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Test WAN",
+            Interface = "eth6",
+            MaxDownloadSpeed = 1013,
+            MinDownloadSpeed = 868,
+            AbsoluteMaxDownloadSpeed = 1032,
+            PingHost = "8.8.8.8",
+            WanLinkSpeedMbps = null
+        };
+
+        var generator = new ScriptGenerator(config);
+        var bootScript = generator.GenerateAllScripts(new Dictionary<string, string>()).Values.First();
+
+        var speedtest = ExtractHeredocSection(bootScript, "SPEEDTEST_EOF");
+        var ping = ExtractHeredocSection(bootScript, "PING_EOF");
+
+        Assert.Contains("WAN_LINK_SPEED_MBPS=\"0\"", speedtest);
+        Assert.Contains("WAN_LINK_SPEED_MBPS=\"0\"", ping);
+        // Guard ensures clamp only runs when link speed is known
+        Assert.Contains("if [ \"$WAN_LINK_SPEED_MBPS\" -gt 0 ]", speedtest);
+        Assert.Contains("if [ \"$WAN_LINK_SPEED_MBPS\" -gt 0 ]", ping);
+    }
+
+    [Fact]
+    public void GenerateAllScripts_OverriddenLinkSpeed_UsesOverrideInScripts()
+    {
+        // Simulates a 2.5G SFP that reports as 1G - user overrides to 2500
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Test WAN",
+            Interface = "eth6",
+            MaxDownloadSpeed = 1013,
+            MinDownloadSpeed = 868,
+            AbsoluteMaxDownloadSpeed = 1032,
+            PingHost = "8.8.8.8",
+            WanLinkSpeedMbps = 2500
+        };
+
+        var generator = new ScriptGenerator(config);
+        var bootScript = generator.GenerateAllScripts(new Dictionary<string, string>()).Values.First();
+
+        var speedtest = ExtractHeredocSection(bootScript, "SPEEDTEST_EOF");
+        var ping = ExtractHeredocSection(bootScript, "PING_EOF");
+
+        Assert.Contains("WAN_LINK_SPEED_MBPS=\"2500\"", speedtest);
+        Assert.Contains("WAN_LINK_SPEED_MBPS=\"2500\"", ping);
+        // Probe rate = MaxDownloadSpeed * 1.03 = 1013 * 1.03 = 1043
+        Assert.Contains("SPEEDTEST_PROBE_RATE=\"1043\"", speedtest);
+    }
+
+    [Fact]
+    public void ApplyProfileSettings_WithLinkSpeedOverride_StoresOverriddenValue()
+    {
+        var config = new SqmConfiguration
+        {
+            ConnectionType = ConnectionType.Gpon,
+            NominalDownloadSpeed = 965,
+            NominalUploadSpeed = 50,
+            Interface = "eth6"
+        };
+
+        // Apply with overridden speed (2500 instead of detected 1000)
+        config.ApplyProfileSettings(wanLinkSpeedMbps: 2500);
+
+        Assert.Equal(2500, config.WanLinkSpeedMbps);
+        // Probe rate = MaxDownloadSpeed * 1.025, just above the shaping ceiling
+        Assert.True(config.SpeedtestProbeRateMbps > config.MaxDownloadSpeed);
+        Assert.True(config.SpeedtestProbeRateMbps <= (int)(config.MaxDownloadSpeed * 1.04));
+    }
+
+    [Fact]
+    public void ApplyProfileSettings_WithNullLinkSpeed_LeavesLinkSpeedNull()
+    {
+        var config = new SqmConfiguration
+        {
+            ConnectionType = ConnectionType.Gpon,
+            NominalDownloadSpeed = 965,
+            NominalUploadSpeed = 50,
+            Interface = "eth6"
+        };
+
+        config.ApplyProfileSettings(wanLinkSpeedMbps: null);
+
+        Assert.Null(config.WanLinkSpeedMbps);
+    }
+
+    [Fact]
+    public void SqmConfiguration_DefaultsToConservativeBurst()
+    {
+        // Guards the property initializer itself: the generator tests below set the flag
+        // explicitly, so a default flipped to true would not show up there.
+        Assert.False(new SqmConfiguration().RateProportionalDownloadBurst);
+    }
+
+    [Fact]
+    public void GenerateAllScripts_ByDefault_SelectsConservativeBurstMode()
+    {
+        var scripts = GenerateWithBurstOptIn(false);
+
+        // Every script that carries the burst machinery must select mode 0.
+        var withMode = scripts.Values.Where(s => s.Contains("DOWNLOAD_BURST_MODE=")).ToList();
+        Assert.NotEmpty(withMode);
+        foreach (var script in withMode)
+        {
+            Assert.Contains("DOWNLOAD_BURST_MODE=0", script);
+            Assert.DoesNotContain("DOWNLOAD_BURST_MODE=1", script);
+        }
+    }
+
+    [Fact]
+    public void GenerateAllScripts_WithBurstOptIn_SelectsRateProportionalMode()
+    {
+        var scripts = GenerateWithBurstOptIn(true);
+
+        var withMode = scripts.Values.Where(s => s.Contains("DOWNLOAD_BURST_MODE=")).ToList();
+        Assert.NotEmpty(withMode);
+        foreach (var script in withMode)
+        {
+            Assert.Contains("DOWNLOAD_BURST_MODE=1", script);
+            Assert.DoesNotContain("DOWNLOAD_BURST_MODE=0", script);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CalcBurst_CarriesBothFormulas_InEveryEmbeddedCopy(bool optIn)
+    {
+        var scripts = GenerateWithBurstOptIn(optIn);
+
+        // calc_burst is embedded into more than one generated script (speedtest + ping).
+        // A copy that carries the definition but not both branches would silently shape
+        // one code path differently from the other.
+        var copies = scripts.Values.Where(s => s.Contains("calc_burst()")).ToList();
+        Assert.NotEmpty(copies);
+        foreach (var script in copies)
+        {
+            Assert.Contains("burst=$((rate_mbps * 5))", script);
+            Assert.Contains("-gt 5000 ] && burst=5000", script);
+            Assert.Contains("burst=$((rate_mbps * 125))", script);
+            Assert.Contains("-gt 131072 ] && burst=131072", script);
+            Assert.Contains("-lt 1500 ] && burst=1500", script);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BurstMode_AppliesToDownloadPathOnly(bool optIn)
+    {
+        var scripts = GenerateWithBurstOptIn(optIn);
+        var all = string.Join("\n", scripts.Values);
+
+        // Egress: the upload calls must not carry a burst mode argument, so they stay on the
+        // conservative sizing regardless of the setting (no upload evidence supports changing it).
+        Assert.Contains("update_all_tc_classes $INTERFACE $UPLOAD_SPEED\n", all + "\n");
+        Assert.DoesNotContain("update_all_tc_classes $INTERFACE $UPLOAD_SPEED $DOWNLOAD_BURST_MODE", all);
+
+        // tune_tc_performance only ever runs on the WAN device and must stay conservative too.
+        Assert.Contains("update_all_tc_classes $device $current_rate\n", all);
+        Assert.DoesNotContain("update_all_tc_classes $device $current_rate $", all);
+
+        // Ingress/IFB: every call passes the mode through.
+        foreach (var line in all.Split('\n').Where(l => l.Contains("update_all_tc_classes $IFB_DEVICE")))
+        {
+            Assert.EndsWith("$DOWNLOAD_BURST_MODE", line.TrimEnd());
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SpeedtestProbe_UsesTheConfiguredBurstMode(bool optIn)
+    {
+        var scripts = GenerateWithBurstOptIn(optIn);
+        var all = string.Join("\n", scripts.Values);
+
+        // The probe rate is applied before measuring. Running it with a different bucket than
+        // normal operation would let a throughput-limited path under-measure itself, and that
+        // number is what the adaptive rate is derived from.
+        Assert.Contains(
+            "update_all_tc_classes $IFB_DEVICE $SPEEDTEST_PROBE_RATE $DOWNLOAD_BURST_MODE",
+            all);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void EveryScriptReferencingBurstMode_AlsoDefinesIt(bool optIn)
+    {
+        var scripts = GenerateWithBurstOptIn(optIn);
+
+        // An undefined $DOWNLOAD_BURST_MODE expands to the empty string, which calc_burst
+        // treats as conservative - the opt-in would silently do nothing instead of failing.
+        // The speedtest and ping scripts are written as separate heredocs into one boot
+        // script, so each heredoc has to carry its own definition; checking the boot script
+        // as a whole would let one heredoc's definition cover for the other's omission.
+        var bootScript = Assert.Single(scripts.Values);
+
+        foreach (var delimiter in new[] { "SPEEDTEST_EOF", "PING_EOF" })
+        {
+            var section = ExtractHeredocSection(bootScript, delimiter);
+            if (!section.Contains("$DOWNLOAD_BURST_MODE"))
+                continue;
+
+            Assert.True(
+                section.Contains("DOWNLOAD_BURST_MODE=0") || section.Contains("DOWNLOAD_BURST_MODE=1"),
+                $"Heredoc '{delimiter}' expands $DOWNLOAD_BURST_MODE without defining it");
+        }
+    }
+
+    private static Dictionary<string, string> GenerateWithBurstOptIn(bool optIn)
+    {
+        var config = new SqmConfiguration
+        {
+            ConnectionName = "Burst WAN",
+            Interface = "eth0",
+            NominalDownloadSpeed = 900,
+            NominalUploadSpeed = 550,
+            PingHost = "1.1.1.1",
+            RateProportionalDownloadBurst = optIn
+        };
+
+        var generator = new ScriptGenerator(config);
+        // SqmDeploymentService normalizes to LF before a script reaches a gateway, so assert against
+        // LF rather than the build host's Environment.NewLine (StringBuilder.AppendLine emits CRLF
+        // on Windows, which made these assertions pass on CI and fail locally).
+        return generator.GenerateAllScripts(new Dictionary<string, string> { ["0_12"] = "880" })
+            .ToDictionary(kv => kv.Key, kv => kv.Value.Replace("\r\n", "\n"));
+    }
+
+    [Fact]
+    public void GenerateBootScript_InstallsPinnedOoklaArchiveAtomically()
+    {
+        var generator = new ScriptGenerator(new SqmConfiguration
+        {
+            ConnectionName = "WAN",
+            Interface = "eth8.201",
+            MaxDownloadSpeed = 1000,
+            MinDownloadSpeed = 100,
+            AbsoluteMaxDownloadSpeed = 1100,
+            PingHost = "1.1.1.1"
+        });
+
+        var script = generator.GenerateBootScript(new Dictionary<string, string>());
+
+        Assert.Contains("SPEEDTEST_RELEASE=\"1.2.0\"", script);
+        Assert.Contains("SPEEDTEST_CLI_VERSION=\"1.2.0.84\"", script);
+        Assert.Contains("https://install.speedtest.net/app/cli/ookla-speedtest-${SPEEDTEST_RELEASE}-linux-${SPEEDTEST_ARCH}.tgz", script);
+        Assert.Contains("SPEEDTEST_ARCHIVE_SHA256", script);
+        Assert.Contains("SPEEDTEST_BINARY_SHA256", script);
+        Assert.Contains("--max-filesize 4194304", script);
+        Assert.Contains("mktemp -d \"${SPEEDTEST_DIR}/.speedtest-install.XXXXXX\"", script);
+        Assert.Contains("mv -f \"${SPEEDTEST_BIN}.new\" \"$SPEEDTEST_BIN\"", script);
+        Assert.Contains(ScriptGenerator.ManagedSpeedtestAarch64ArchiveSha256, script);
+        Assert.Contains(ScriptGenerator.ManagedSpeedtestAarch64BinarySha256, script);
+        Assert.Contains(ScriptGenerator.ManagedSpeedtestArmhfArchiveSha256, script);
+        Assert.Contains(ScriptGenerator.ManagedSpeedtestArmhfBinarySha256, script);
+        Assert.Contains(ScriptGenerator.ManagedSpeedtestX86_64ArchiveSha256, script);
+        Assert.Contains(ScriptGenerator.ManagedSpeedtestX86_64BinarySha256, script);
+    }
+
+    [Fact]
+    public void GenerateBootScript_OoklaInstallFailureDoesNotAbortDeployment()
+    {
+        var generator = new ScriptGenerator(new SqmConfiguration
+        {
+            ConnectionName = "WAN",
+            Interface = "eth8.201",
+            MaxDownloadSpeed = 1000,
+            MinDownloadSpeed = 100,
+            AbsoluteMaxDownloadSpeed = 1100,
+            PingHost = "1.1.1.1"
+        });
+
+        var script = generator.GenerateBootScript(new Dictionary<string, string>());
+
+        Assert.Contains("install_managed_speedtest() (", script);
+        Assert.Contains("if ! install_managed_speedtest; then", script);
+        Assert.Contains("continuing without adaptive calibration", script);
+        Assert.DoesNotContain("fail_boot", script);
+
+        var warningIndex = script.IndexOf("continuing without adaptive calibration", StringComparison.Ordinal);
+        var scriptCreationIndex = script.IndexOf("# Section 2: Create Directories", StringComparison.Ordinal);
+        Assert.True(warningIndex >= 0 && warningIndex < scriptCreationIndex);
+    }
+
+    [Fact]
+    public void GenerateBootScript_DoesNotMutateUniFiSpeedtestPackage()
+    {
+        var generator = new ScriptGenerator(new SqmConfiguration
+        {
+            ConnectionName = "WAN",
+            Interface = "eth8.201",
+            MaxDownloadSpeed = 1000,
+            MinDownloadSpeed = 100,
+            AbsoluteMaxDownloadSpeed = 1100,
+            PingHost = "1.1.1.1"
+        });
+
+        var script = generator.GenerateBootScript(new Dictionary<string, string>());
+
+        Assert.DoesNotContain("script.deb.sh", script);
+        Assert.DoesNotContain("dpkg -i", script);
+        Assert.DoesNotContain("apt-get remove -y speedtest", script);
+        Assert.DoesNotContain("apt-get install -y speedtest", script);
+    }
+
+    [Fact]
+    public void GenerateBootScript_CalibrationUsesOnlyManagedSpeedtest()
+    {
+        var generator = new ScriptGenerator(new SqmConfiguration
+        {
+            ConnectionName = "WAN",
+            Interface = "eth8.201",
+            MaxDownloadSpeed = 1000,
+            MinDownloadSpeed = 100,
+            AbsoluteMaxDownloadSpeed = 1100,
+            PingHost = "1.1.1.1"
+        });
+
+        var script = generator.GenerateBootScript(new Dictionary<string, string>());
+        var speedtest = ExtractHeredocSection(script, "SPEEDTEST_EOF");
+
+        Assert.Contains($"SPEEDTEST_BIN=\"{ScriptGenerator.ManagedSpeedtestPath}\"", speedtest);
+        Assert.Contains("speedtest_output=$(\"$SPEEDTEST_BIN\" --accept-license", speedtest);
+        Assert.DoesNotContain("speedtest_output=$(speedtest ", speedtest);
+    }
+
+    [Fact]
+    public void GenerateBootScript_CalibrationHoldsTheProbeLockSoThePingScriptStandsDown()
+    {
+        var generator = new ScriptGenerator(new SqmConfiguration
+        {
+            ConnectionName = "WAN",
+            Interface = "eth8.201",
+            MaxDownloadSpeed = 1000,
+            MinDownloadSpeed = 100,
+            AbsoluteMaxDownloadSpeed = 1100,
+            PingHost = "1.1.1.1"
+        });
+
+        var script = generator.GenerateBootScript(new Dictionary<string, string>());
+        var speedtest = ExtractHeredocSection(script, "SPEEDTEST_EOF");
+        var ping = ExtractHeredocSection(script, "PING_EOF");
+
+        var wait = speedtest.IndexOf("Wait for a probe", StringComparison.Ordinal);
+        var pingWait = speedtest.IndexOf("pgrep -f -- '[-]ping\\.sh'", StringComparison.Ordinal);
+        var take = speedtest.IndexOf("touch \"$PROBE_LOCK\"", StringComparison.Ordinal);
+        var release = speedtest.IndexOf("trap 'rm -f \"$PROBE_LOCK\"' EXIT", StringComparison.Ordinal);
+        var lift = speedtest.IndexOf("update_all_tc_classes $IFB_DEVICE $SPEEDTEST_PROBE_RATE", StringComparison.Ordinal);
+
+        // Wait out a learning sample, let a running ping finish, take the lock, then lift.
+        Assert.True(wait >= 0 && pingWait > wait, "the hold follows the wait for a learning sample");
+        Assert.True(take > pingWait, "the lock is taken once no ping adjustment is running");
+        Assert.True(release > take, "the lock is released from an EXIT trap");
+        Assert.True(lift > release, "the lock is held before the shaper is lifted");
+
+        // Only the calibration takes the lock; the ping script only reads it.
+        Assert.DoesNotContain("touch \"$PROBE_LOCK\"", ping);
+    }
+
+    [Fact]
+    public void GenerateBootScript_HasValidBashSyntax()
+    {
+        if (OperatingSystem.IsWindows() || !File.Exists("/bin/bash"))
+            return;
+
+        var generator = new ScriptGenerator(new SqmConfiguration
+        {
+            ConnectionName = "WAN",
+            Interface = "eth8.201",
+            MaxDownloadSpeed = 1000,
+            MinDownloadSpeed = 100,
+            AbsoluteMaxDownloadSpeed = 1100,
+            PingHost = "1.1.1.1"
+        });
+        var path = Path.Combine(Path.GetTempPath(), $"networkoptimizer-sqm-{Guid.NewGuid():N}.sh");
+
+        try
+        {
+            File.WriteAllText(path, generator.GenerateBootScript(new Dictionary<string, string>()));
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = "/bin/bash",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                ArgumentList = { "-n", path }
+            });
+
+            Assert.NotNull(process);
+            process!.WaitForExit();
+            Assert.True(process.ExitCode == 0, process.StandardError.ReadToEnd());
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
+    /// Extracts the content between heredoc delimiters (e.g., between 'SPEEDTEST_EOF' markers).
+    /// </summary>
+    private static string ExtractHeredocSection(string script, string delimiter)
+    {
+        var startMarker = $"<< '{delimiter}'";
+        var startIdx = script.IndexOf(startMarker);
+        Assert.True(startIdx >= 0, $"Heredoc start marker '{startMarker}' not found");
+
+        var contentStart = script.IndexOf('\n', startIdx) + 1;
+        var endIdx = script.IndexOf($"\n{delimiter}\n", contentStart);
+        if (endIdx < 0)
+            endIdx = script.IndexOf($"\n{delimiter}", contentStart);
+
+        Assert.True(endIdx >= 0, $"Heredoc end marker '{delimiter}' not found");
+
+        return script[contentStart..endIdx];
+    }
+}

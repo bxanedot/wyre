@@ -1,0 +1,541 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace NetworkOptimizer.UniFi.Models;
+
+/// <summary>
+/// WAN provider capabilities (ISP upload/download speeds).
+/// </summary>
+public class WanProviderCapabilities
+{
+    [JsonPropertyName("upload_kilobits_per_second")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? UploadKilobitsPerSecond { get; set; }
+
+    [JsonPropertyName("download_kilobits_per_second")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? DownloadKilobitsPerSecond { get; set; }
+
+    /// <summary>Upload speed in Mbps</summary>
+    public int? UploadMbps => UploadKilobitsPerSecond / 1000;
+
+    /// <summary>Download speed in Mbps</summary>
+    public int? DownloadMbps => DownloadKilobitsPerSecond / 1000;
+}
+
+/// <summary>
+/// JSON converter that handles bool values that may come as strings ("true"/"false") instead of native booleans.
+/// UniFi OS Server returns some boolean fields as strings.
+/// </summary>
+public class FlexibleBoolConverter : JsonConverter<bool>
+{
+    public override bool Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.True => true,
+            JsonTokenType.False => false,
+            JsonTokenType.String => bool.TryParse(reader.GetString(), out var value) && value,
+            JsonTokenType.Number => reader.GetInt32() != 0,
+            _ => false
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, bool value, JsonSerializerOptions options)
+    {
+        writer.WriteBooleanValue(value);
+    }
+}
+
+/// <summary>
+/// Nullable version of FlexibleBoolConverter for fields that may be absent from the response.
+/// </summary>
+public class FlexibleNullableBoolConverter : JsonConverter<bool?>
+{
+    public override bool? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.True => true,
+            JsonTokenType.False => false,
+            JsonTokenType.String => bool.TryParse(reader.GetString(), out var value) ? value : null,
+            JsonTokenType.Number => reader.GetInt32() != 0,
+            JsonTokenType.Null => null,
+            _ => null
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, bool? value, JsonSerializerOptions options)
+    {
+        if (value.HasValue)
+            writer.WriteBooleanValue(value.Value);
+        else
+            writer.WriteNullValue();
+    }
+}
+
+/// <summary>
+/// JSON converter that handles int values that may come as strings, empty strings, or null.
+/// UniFi API sometimes returns VLAN IDs as strings or empty strings instead of numbers.
+/// </summary>
+public class FlexibleIntConverter : JsonConverter<int?>
+{
+    public override int? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.Number when reader.TryGetInt32(out var i) => i,
+            JsonTokenType.Number => (int)reader.GetDouble(),
+            JsonTokenType.String when int.TryParse(reader.GetString(), out var value) => value,
+            JsonTokenType.String => null, // Empty string or non-numeric string
+            JsonTokenType.Null => null,
+            _ => null
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, int? value, JsonSerializerOptions options)
+    {
+        if (value.HasValue)
+            writer.WriteNumberValue(value.Value);
+        else
+            writer.WriteNullValue();
+    }
+}
+
+/// <summary>
+/// <see cref="FlexibleIntConverter"/> for a non-nullable int: a number, a stringified number, a
+/// float, or nothing. A value that cannot be read is 0, which port and speed readers already
+/// treat as "none".
+/// </summary>
+public class FlexibleNonNullableIntConverter : JsonConverter<int>
+{
+    public override int Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.Number when reader.TryGetInt32(out var i) => i,
+            JsonTokenType.Number => (int)reader.GetDouble(),
+            JsonTokenType.String when int.TryParse(reader.GetString(), out var value) => value,
+            _ => 0,
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, int value, JsonSerializerOptions options)
+        => writer.WriteNumberValue(value);
+}
+
+/// <summary>
+/// Tolerant parser for 64-bit counters (byte and packet totals) that may arrive as a number, a
+/// stringified number, a float, or nothing. Mirrors FlexibleIntConverter; a value that cannot be
+/// read is 0, which the byte-delta readers treat as "no sample" rather than as a reset.
+/// </summary>
+public class FlexibleLongConverter : JsonConverter<long>
+{
+    public override long Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.Number when reader.TryGetInt64(out var l) => l,
+            JsonTokenType.Number => (long)reader.GetDouble(),
+            JsonTokenType.String when long.TryParse(reader.GetString(), out var value) => value,
+            _ => 0,
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, long value, JsonSerializerOptions options)
+        => writer.WriteNumberValue(value);
+}
+
+/// <summary>
+/// Tolerant nullable-double parser for UniFi API fields that may arrive as a number, a
+/// stringified number, or an empty string. Mirrors FlexibleIntConverter but for floating
+/// point. SFP DDM values (rxpower, current, temperature, voltage) are the primary case;
+/// some firmwares stringify them.
+/// </summary>
+public class FlexibleDoubleConverter : JsonConverter<double?>
+{
+    public override double? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.Number => reader.GetDouble(),
+            JsonTokenType.String when double.TryParse(
+                reader.GetString(),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var value) => value,
+            JsonTokenType.String => null, // Empty / non-numeric string
+            JsonTokenType.Null => null,
+            _ => null
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, double? value, JsonSerializerOptions options)
+    {
+        if (value.HasValue)
+            writer.WriteNumberValue(value.Value);
+        else
+            writer.WriteNullValue();
+    }
+}
+
+/// <summary>
+/// Response from GET /api/s/{site}/rest/networkconf
+/// Represents a network/VLAN configuration
+/// </summary>
+public class UniFiNetworkConfig
+{
+    [JsonPropertyName("_id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("site_id")]
+    public string SiteId { get; set; } = string.Empty;
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("purpose")]
+    public string Purpose { get; set; } = string.Empty; // "corporate", "guest", "wan", "vlan-only", "remote-user-vpn"
+
+    [JsonPropertyName("enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool Enabled { get; set; } = true;
+
+    [JsonPropertyName("is_nat")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool IsNat { get; set; }
+
+    [JsonPropertyName("vlan_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool VlanEnabled { get; set; }
+
+    [JsonPropertyName("vlan")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? Vlan { get; set; }
+
+    // IP configuration
+    [JsonPropertyName("dhcpd_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool DhcpdEnabled { get; set; }
+
+    [JsonPropertyName("dhcpd_start")]
+    public string? DhcpdStart { get; set; }
+
+    [JsonPropertyName("dhcpd_stop")]
+    public string? DhcpdStop { get; set; }
+
+    [JsonPropertyName("dhcpd_leasetime")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? DhcpdLeasetime { get; set; }
+
+    [JsonPropertyName("dhcpd_dns_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool DhcpdDnsEnabled { get; set; }
+
+    [JsonPropertyName("dhcpd_dns_1")]
+    public string? DhcpdDns1 { get; set; }
+
+    [JsonPropertyName("dhcpd_dns_2")]
+    public string? DhcpdDns2 { get; set; }
+
+    [JsonPropertyName("dhcpd_dns_3")]
+    public string? DhcpdDns3 { get; set; }
+
+    [JsonPropertyName("dhcpd_dns_4")]
+    public string? DhcpdDns4 { get; set; }
+
+    [JsonPropertyName("dhcpd_gateway_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool DhcpdGatewayEnabled { get; set; }
+
+    [JsonPropertyName("dhcpd_gateway")]
+    public string? DhcpdGateway { get; set; }
+
+    [JsonPropertyName("dhcpd_time_offset_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool DhcpdTimeOffsetEnabled { get; set; }
+
+    [JsonPropertyName("dhcpd_time_offset")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? DhcpdTimeOffset { get; set; }
+
+    [JsonPropertyName("ip_subnet")]
+    public string? IpSubnet { get; set; }
+
+    [JsonPropertyName("ipv6_interface_type")]
+    public string? Ipv6InterfaceType { get; set; }
+
+    /// <summary>
+    /// Static IPv6 prefix in gateway form (e.g., "2001:db8:1::1/64"). Absent for prefix-delegated networks.
+    /// </summary>
+    [JsonPropertyName("ipv6_subnet")]
+    public string? Ipv6Subnet { get; set; }
+
+    [JsonPropertyName("ipv6_pd_interface")]
+    public string? Ipv6PdInterface { get; set; }
+
+    [JsonPropertyName("ipv6_pd_prefixid")]
+    public string? Ipv6PdPrefixid { get; set; }
+
+    [JsonPropertyName("ipv6_pd_start")]
+    public string? Ipv6PdStart { get; set; }
+
+    [JsonPropertyName("ipv6_pd_stop")]
+    public string? Ipv6PdStop { get; set; }
+
+    [JsonPropertyName("ipv6_ra_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool Ipv6RaEnabled { get; set; }
+
+    [JsonPropertyName("ipv6_ra_priority")]
+    public string? Ipv6RaPriority { get; set; }
+
+    [JsonPropertyName("ipv6_ra_valid_lifetime")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? Ipv6RaValidLifetime { get; set; }
+
+    [JsonPropertyName("ipv6_ra_preferred_lifetime")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? Ipv6RaPreferredLifetime { get; set; }
+
+    /// <summary>
+    /// UI "DHCPv6/RDNSS DNS Control": true (or absent) hands out the gateway, false hands out
+    /// <see cref="Dhcpdv6Dns1"/>-<see cref="Dhcpdv6Dns4"/> over both DHCPv6 and RA RDNSS.
+    /// </summary>
+    [JsonPropertyName("dhcpdv6_dns_auto")]
+    [JsonConverter(typeof(FlexibleNullableBoolConverter))]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Dhcpdv6DnsAuto { get; set; }
+
+    [JsonPropertyName("dhcpdv6_dns_1")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Dhcpdv6Dns1 { get; set; }
+
+    [JsonPropertyName("dhcpdv6_dns_2")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Dhcpdv6Dns2 { get; set; }
+
+    [JsonPropertyName("dhcpdv6_dns_3")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Dhcpdv6Dns3 { get; set; }
+
+    [JsonPropertyName("dhcpdv6_dns_4")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Dhcpdv6Dns4 { get; set; }
+
+    // WAN configuration
+    [JsonPropertyName("wan_networkgroup")]
+    public string? WanNetworkgroup { get; set; }
+
+    [JsonPropertyName("wan_type")]
+    public string? WanType { get; set; } // "dhcp", "static", "pppoe"
+
+    /// <summary>
+    /// The interface name for this WAN (e.g., "eth4", "eth0")
+    /// Used for mapping to TC monitor interfaces
+    /// </summary>
+    [JsonPropertyName("wan_ifname")]
+    public string? WanIfname { get; set; }
+
+    /// <summary>
+    /// WAN type version 2 interface name
+    /// </summary>
+    [JsonPropertyName("wan_type_v2")]
+    public string? WanTypeV2 { get; set; }
+
+    /// <summary>
+    /// WAN load balance type ("failover-only" or "weighted")
+    /// </summary>
+    [JsonPropertyName("wan_load_balance_type")]
+    public string? WanLoadBalanceType { get; set; }
+
+    /// <summary>
+    /// WAN load balance weight (for weighted load balancing)
+    /// </summary>
+    [JsonPropertyName("wan_load_balance_weight")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? WanLoadBalanceWeight { get; set; }
+
+    /// <summary>
+    /// WAN failover priority (lower = higher priority). Used to break ties
+    /// among weighted WANs when determining the primary WAN connection.
+    /// </summary>
+    [JsonPropertyName("wan_failover_priority")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? WanFailoverPriority { get; set; }
+
+    [JsonPropertyName("wan_ip")]
+    public string? WanIp { get; set; }
+
+    [JsonPropertyName("wan_netmask")]
+    public string? WanNetmask { get; set; }
+
+    [JsonPropertyName("wan_gateway")]
+    public string? WanGateway { get; set; }
+
+    [JsonPropertyName("wan_dns1")]
+    public string? WanDns1 { get; set; }
+
+    [JsonPropertyName("wan_dns2")]
+    public string? WanDns2 { get; set; }
+
+    /// <summary>
+    /// The WAN's IPv6 connection type ("dhcpv6", "static", ...); "disabled" when the WAN has no IPv6.
+    /// </summary>
+    [JsonPropertyName("wan_type_v6")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WanTypeV6 { get; set; }
+
+    /// <summary>
+    /// "auto" takes the ISP's IPv6 DNS; "manual" uses <see cref="WanIpv6Dns1"/> / <see cref="WanIpv6Dns2"/>.
+    /// </summary>
+    [JsonPropertyName("wan_ipv6_dns_preference")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WanIpv6DnsPreference { get; set; }
+
+    [JsonPropertyName("wan_ipv6_dns1")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WanIpv6Dns1 { get; set; }
+
+    [JsonPropertyName("wan_ipv6_dns2")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WanIpv6Dns2 { get; set; }
+
+    [JsonPropertyName("wan_username")]
+    public string? WanUsername { get; set; }
+
+    [JsonPropertyName("wan_password")]
+    public string? WanPassword { get; set; }
+
+    [JsonPropertyName("wan_egress_qos")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? WanEgressQos { get; set; }
+
+    [JsonPropertyName("wan_smartq_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool WanSmartqEnabled { get; set; }
+
+    [JsonPropertyName("wan_smartq_up_rate")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? WanSmartqUpRate { get; set; }
+
+    [JsonPropertyName("wan_smartq_down_rate")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? WanSmartqDownRate { get; set; }
+
+    /// <summary>
+    /// WAN provider capabilities (upload/download speeds).
+    /// Only present on WAN networks with ISP speed configured.
+    /// </summary>
+    [JsonPropertyName("wan_provider_capabilities")]
+    public WanProviderCapabilities? WanProviderCapabilities { get; set; }
+
+    // VPN configuration
+    [JsonPropertyName("vpn_type")]
+    public string? VpnType { get; set; } // "pptp", "l2tp", "openvpn", "wireguard", "wireguard-client", "openvpn-client"
+
+    /// <summary>WireGuard client id; maps directly to the Linux interface "wgclt{id}".</summary>
+    [JsonPropertyName("wireguard_id")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? WireguardId { get; set; }
+
+    [JsonPropertyName("radiusprofile_id")]
+    public string? RadiusprofileId { get; set; }
+
+    [JsonPropertyName("l2tp_interface")]
+    public string? L2tpInterface { get; set; }
+
+    [JsonPropertyName("l2tp_local_wan_ip")]
+    public string? L2tpLocalWanIp { get; set; }
+
+    [JsonPropertyName("x_l2tp_psk")]
+    public string? XL2tpPsk { get; set; }
+
+    [JsonPropertyName("openvpn_mode")]
+    public string? OpenvpnMode { get; set; }
+
+    [JsonPropertyName("openvpn_remote_host")]
+    public string? OpenvpnRemoteHost { get; set; }
+
+    [JsonPropertyName("openvpn_remote_port")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? OpenvpnRemotePort { get; set; }
+
+    // Domain configuration
+    [JsonPropertyName("domain_name")]
+    public string? DomainName { get; set; }
+
+    [JsonPropertyName("dhcpd_ip_1")]
+    public string? DhcpdIp1 { get; set; }
+
+    [JsonPropertyName("dhcpd_ip_2")]
+    public string? DhcpdIp2 { get; set; }
+
+    [JsonPropertyName("dhcpd_ip_3")]
+    public string? DhcpdIp3 { get; set; }
+
+    // Multicast DNS
+    [JsonPropertyName("mdns_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool MdnsEnabled { get; set; }
+
+    [JsonPropertyName("upnp_lan_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool UpnpLanEnabled { get; set; }
+
+    // IGMP
+    [JsonPropertyName("igmp_snooping")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool IgmpSnooping { get; set; }
+
+    // Network group
+    [JsonPropertyName("networkgroup")]
+    public string? Networkgroup { get; set; }
+
+    // Internet access
+    [JsonPropertyName("internet_access_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool InternetAccessEnabled { get; set; }
+
+    // Auto scaling
+    [JsonPropertyName("dhcpd_unifi_controller")]
+    public string? DhcpdUnifiController { get; set; }
+
+    // Scheduling
+    [JsonPropertyName("schedule")]
+    public List<string>? Schedule { get; set; }
+
+    [JsonPropertyName("schedule_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool ScheduleEnabled { get; set; }
+
+    // Content filtering
+    [JsonPropertyName("contentfilter_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool ContentfilterEnabled { get; set; }
+
+    /// <summary>
+    /// The firewall zone ID for this network.
+    /// Used to identify which firewall zone this network belongs to (e.g., LAN zone vs WAN/External zone).
+    /// </summary>
+    [JsonPropertyName("firewall_zone_id")]
+    public string? FirewallZoneId { get; set; }
+
+    [JsonPropertyName("attr_hidden_id")]
+    public string? AttrHiddenId { get; set; }
+
+    [JsonPropertyName("attr_no_delete")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool AttrNoDelete { get; set; }
+
+    [JsonPropertyName("network_isolation_enabled")]
+    [JsonConverter(typeof(FlexibleBoolConverter))]
+    public bool NetworkIsolationEnabled { get; set; }
+
+    /// <summary>
+    /// Whether this is a system/infrastructure network (e.g., Inter-VLAN routing for L3 switching).
+    /// These should be excluded from audit analysis and network reference lists.
+    /// </summary>
+    [JsonIgnore]
+    public bool IsSystemNetwork => string.Equals(AttrHiddenId, "ROUTE", StringComparison.OrdinalIgnoreCase);
+}

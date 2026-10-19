@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.200'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Build cfspeedtest
+        working-directory: src/cfspeedtest
+        run: go build -trimpath ./...
+
+      - name: Build cfspeedtest (arm64 cross-compile)
+        working-directory: src/cfspeedtest
+        run: GOOS=linux GOARCH=arm64 go build -trimpath ./...
+
+      - name: Build uwnspeedtest
+        working-directory: src/uwnspeedtest
+        run: go build -trimpath ./...
+
+      - name: Build uwnspeedtest (arm64 cross-compile)
+        working-directory: src/uwnspeedtest
+        run: GOOS=linux GOARCH=arm64 go build -trimpath ./...
+
+      - name: Build wansteer
+        working-directory: src/wansteer
+        run: go build -trimpath ./...
+
+      - name: Build wansteer (arm64 cross-compile)
+        working-directory: src/wansteer
+        run: GOOS=linux GOARCH=arm64 go build -trimpath ./...
+
+      - name: Test wansteer
+        working-directory: src/wansteer
+        run: go test ./...
+
+      - name: Test AP Agent
+        working-directory: src/apagent
+        run: go test -race ./...
+
+      - name: Build AP Agent (all AP architectures)
+        working-directory: src/apagent
+        run: make build-ap VERSION=ci
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release --verbosity normal
+        env:
+          FLUENT_ASSERTIONS_LICENSED: ${{ secrets.FLUENT_ASSERTIONS_LICENSED }}

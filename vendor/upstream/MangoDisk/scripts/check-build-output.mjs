@@ -1,0 +1,120 @@
+import { readFile, readdir, stat } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
+
+const assetDirectory = fileURLToPath(new URL('../dist/assets/', import.meta.url));
+const expectedLocaleIds = new Set([
+  'de-de',
+  'en-us',
+  'es-es',
+  'fr-fr',
+  'ja-jp',
+  'ko-kr',
+  'pt-br',
+  'ru-ru',
+  'tr-tr',
+  'zh-cn',
+  'zh-tw',
+]);
+const maximumApplicationChunkBytes = 300 * 1024;
+// Allow a small raw-size margin for localized scan, monitoring and disk-capacity guidance while
+// retaining the 60 KiB gzip limit on transferred locale assets.
+const maximumLocaleChunkBytes = 304 * 1024;
+const maximumLocaleGzipBytes = 60 * 1024;
+// Cyrillic uses two UTF-8 bytes per letter. Keep a measured, locale-specific
+// allowance instead of weakening the budget for every locale chunk.
+// Optional Windows setup adds 32 localized status and action strings. Japanese
+// measures 319,339 raw bytes; Russian measures 67,914 gzip bytes. Keep their
+// measured margins local instead of increasing every locale or application budget.
+// GPU temperature adds six strings; Japanese now measures 320,937 raw bytes.
+// Per-item color rules add 21 net labels: Japanese measures 322,154 raw bytes;
+// Russian measures 389,672 raw / 68,621 gzip bytes. Expand only these local margins.
+// Independent condition dialogs measure 322,964 Japanese / 390,657 Russian raw bytes.
+// Battery metrics and power-direction labels measure 391,458 Russian raw bytes.
+// Reserve one additional KiB locally; keep application and gzip budgets unchanged.
+// Whole-system power adds two labels: Japanese measures 323,767 raw bytes.
+// The component license catalog measures 325,324 Japanese / 393,378 Russian
+// raw bytes. Add one KiB to each local raw margin; retain their gzip budgets.
+// Concise privacy failure guidance measures 326,184 Japanese / 394,554 Russian raw bytes.
+// Japanese gzip measures 61,463 bytes; retain the original Russian gzip budget.
+// Fan display modes add four labels: Japanese measures 326,937 raw bytes and
+// Russian 69,704 gzip bytes. Grant only 512 raw / 128 gzip bytes locally.
+// Disk health, I/O and interface details add localized labels and hints.
+// Japanese measures 329,390 raw bytes; Russian measures 398,077 raw bytes.
+// Extend only the measured locale margins; application budgets remain unchanged.
+// Persisted traffic adds localized accumulation/reset guidance: Japanese measures
+// 330,879 raw / 62,638 gzip bytes; Russian measures 399,778 raw / 70,709 gzip.
+// Add only 512 raw bytes per locale and 256/128 gzip bytes respectively.
+// French, German and Spanish assets measure approximately 318 / 308 / 310 kB
+// raw and 63.2 / 63.8 / 61.7 kB gzip. Keep their measured allowances local;
+// application and existing locale budgets stay fixed.
+const localeChunkLimitOverrides = new Map([
+  ['fr-fr', { bytes: 311 * 1024, gzipBytes: 62 * 1024 }],
+  ['de-de', { bytes: maximumLocaleChunkBytes, gzipBytes: 63 * 1024 }],
+  ['es-es', { bytes: maximumLocaleChunkBytes, gzipBytes: 61 * 1024 }],
+  ['ja-jp', { bytes: 323 * 1024 + 512, gzipBytes: 61 * 1024 + 256 }],
+  ['ru-ru', { bytes: 390 * 1024 + 512, gzipBytes: 69 * 1024 + 128 }],
+]);
+
+function fail(message) {
+  console.error(`[build-output] ${message}`);
+  process.exitCode = 1;
+}
+
+let assetNames;
+try {
+  assetNames = await readdir(assetDirectory);
+} catch (error) {
+  fail(`cannot read ${assetDirectory}: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit();
+}
+
+const javaScriptAssets = assetNames.filter(name => name.endsWith('.js'));
+const localeAssets = javaScriptAssets.filter(name => name.startsWith('locale-'));
+
+for (const localeId of expectedLocaleIds) {
+  const matchingAssets = localeAssets.filter(name => name.startsWith(`locale-${localeId}-`));
+  if (matchingAssets.length !== 1) {
+    fail(`expected one ${localeId} chunk, found ${matchingAssets.length}`);
+  }
+}
+
+const unexpectedLocaleAssets = localeAssets.filter(
+  name => ![...expectedLocaleIds].some(localeId => name.startsWith(`locale-${localeId}-`))
+);
+if (unexpectedLocaleAssets.length > 0) {
+  fail(`unexpected locale chunks: ${unexpectedLocaleAssets.join(', ')}`);
+}
+
+for (const assetName of javaScriptAssets) {
+  const assetPath = `${assetDirectory}/${assetName}`;
+  const assetSize = (await stat(assetPath)).size;
+  const isLocaleAsset = assetName.startsWith('locale-');
+  const localeId = isLocaleAsset
+    ? [...expectedLocaleIds].find(expectedId => assetName.startsWith(`locale-${expectedId}-`))
+    : undefined;
+  const localeLimits = localeId ? localeChunkLimitOverrides.get(localeId) : undefined;
+  const maximumBytes = isLocaleAsset ? (localeLimits?.bytes ?? maximumLocaleChunkBytes) : maximumApplicationChunkBytes;
+  if (assetSize > maximumBytes) {
+    fail(
+      `${assetName} is ${assetSize} bytes, exceeding the ${maximumBytes}-byte ` +
+        `${isLocaleAsset ? 'locale' : 'application'} chunk limit`
+    );
+  }
+  if (isLocaleAsset) {
+    const gzipSize = gzipSync(await readFile(assetPath)).length;
+    const maximumGzipBytes = localeLimits?.gzipBytes ?? maximumLocaleGzipBytes;
+    if (gzipSize > maximumGzipBytes) {
+      fail(`${assetName} is ${gzipSize} bytes gzipped, exceeding the ${maximumGzipBytes}-byte limit`);
+    }
+  }
+}
+
+if (process.exitCode) {
+  process.exit();
+}
+
+console.log(
+  `[build-output] verified ${javaScriptAssets.length} JavaScript chunks and ` +
+    `${localeAssets.length} project-owned locale chunks`
+);

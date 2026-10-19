@@ -1,0 +1,80 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Explicitly require ASP.NET web assets for Blazor (_framework files) in Docker builds -->
+    <RequiresAspNetWebAssets>true</RequiresAspNetWebAssets>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="NetworkOptimizer.Web.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NetworkOptimizer.Core\NetworkOptimizer.Core.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Storage\NetworkOptimizer.Storage.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.UniFi\NetworkOptimizer.UniFi.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Audit\NetworkOptimizer.Audit.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Diagnostics\NetworkOptimizer.Diagnostics.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Sqm\NetworkOptimizer.Sqm.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Monitoring\NetworkOptimizer.Monitoring.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.AgentProtocol\NetworkOptimizer.AgentProtocol.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Reports\NetworkOptimizer.Reports.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.WiFi\NetworkOptimizer.WiFi.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Alerts\NetworkOptimizer.Alerts.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Threats\NetworkOptimizer.Threats.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\PerfTweaks\*.sh" />
+    <EmbeddedResource Include="Resources\PerfTweaks\*.ko" />
+    <!-- Single source of truth for the WAN Steering daemon contract version. The Go binary
+         embeds the same file (src/wansteer/binary-version) so the app and the deployed binary
+         can never disagree. See WanSteerDeploymentService. -->
+    <EmbeddedResource Include="..\wansteer\binary-version">
+      <LogicalName>wansteer.binary-version</LogicalName>
+    </EmbeddedResource>
+    <!-- Same contract for the AP Agent (src/apagent/binary-version), plus the architecture-gating
+         wrapper the server writes onto each access point beside the binary. Both are embedded from
+         the Go module's own files so there is one source of truth. See ApAgentDeploymentService. -->
+    <EmbeddedResource Include="..\apagent\binary-version">
+      <LogicalName>apagent.binary-version</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\apagent\apagent.sh">
+      <LogicalName>apagent.apagent.sh</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Blazor-ApexCharts" Version="6.1.1-ozarkconnect.2" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
+    <PackageReference Include="Castle.Core" Version="5.1.1" />
+    <PackageReference Include="Castle.Core.AsyncInterceptor" Version="2.1.0" />
+    <PackageReference Include="Grpc.AspNetCore" Version="2.80.0" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.80.0" />
+    <PackageReference Include="HtmlAgilityPack" Version="1.12.4" />
+    <PackageReference Include="ITfoxtec.Identity.Saml2" Version="4.20.1" />
+    <PackageReference Include="ITfoxtec.Identity.Saml2.MvcCore" Version="4.20.1" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.7" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.7" />
+    <!-- ITfoxtec's SAML packages raise Microsoft.IdentityModel.Tokens to 8.18.0 while the OpenID
+         Connect handler brings its JWT reader in at 8.0.1. The reader then calls a Base64UrlEncoder
+         overload that 8.18.0 no longer offers, so every id_token fails to parse at runtime with
+         MissingMethodException - a clean build the whole way. Pin the JWT half to match. -->
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.18.0" />
+    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.18.0" />
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.18.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.7" />
+    <PackageReference Include="QRCoder" Version="1.8.0" />
+    <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Protobuf Include="Protos\starlink_device.proto" GrpcServices="Client" />
+  </ItemGroup>
+
+</Project>

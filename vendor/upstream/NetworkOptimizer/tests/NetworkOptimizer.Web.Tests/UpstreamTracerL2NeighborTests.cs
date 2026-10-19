@@ -1,0 +1,240 @@
+using FluentAssertions;
+using NetworkOptimizer.Web.Services.Monitoring;
+using Xunit;
+
+namespace NetworkOptimizer.Web.Tests;
+
+/// <summary>
+/// Pins the WAN L2 neighbor selection so a bridged CPE's LAN-side address can never
+/// again be proposed as an ISP hop. Modeled on a real regression: an ISP gateway in
+/// passthrough listed its private LAN IP (STALE, first line) and its carrier-side
+/// public IP (REACHABLE) under the same MAC, and the parser took the first line.
+/// </summary>
+public class UpstreamTracerL2NeighborTests
+{
+    [Fact]
+    public void Routed_default_gateway_wins_over_higher_scoring_same_subnet_peer()
+    {
+        // Shared WAN subnet (metro Ethernet / two sites on one carrier segment): a peer
+        // host is REACHABLE and public while the true gateway is STALE - the heuristic
+        // scoring would pick the peer, the routed gateway must win.
+        const string output = """
+            203.0.113.7 lladdr aa:bb:cc:dd:ee:01 REACHABLE
+            203.0.113.1 lladdr aa:bb:cc:dd:ee:06 STALE
+            """;
+
+        var selected = UpstreamTracerService.SelectWanNeighbor(output, "203.0.113.5/24", "203.0.113.1");
+
+        selected!.Value.Ip.Should().Be("203.0.113.1");
+        selected.Value.Mac.Should().Be("aa:bb:cc:dd:ee:06");
+    }
+
+    [Fact]
+    public void Falls_back_to_scoring_when_routed_gateway_has_no_neighbor_entry()
+    {
+        const string output = """
+            192.168.1.254 lladdr aa:bb:cc:dd:ee:06 STALE
+            203.0.113.1 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output, null, "198.51.100.99")!
+            .Value.Ip.Should().Be("203.0.113.1");
+    }
+
+    [Fact]
+    public void SelectWanDefaultGateway_finds_the_wan_table_default()
+    {
+        const string routes = """
+            default via 192.168.1.1 dev br0 table 205
+            default via 203.0.113.1 dev eth8 table 201
+            default via 198.51.100.1 dev eth9 table 202
+            """;
+
+        UpstreamTracerService.SelectWanDefaultGateway(routes, "eth8").Should().Be("203.0.113.1");
+        UpstreamTracerService.SelectWanDefaultGateway(routes, "eth9").Should().Be("198.51.100.1");
+    }
+
+    [Fact]
+    public void SelectWanDefaultGateway_matches_whole_iface_name_only()
+    {
+        // "eth8" must not match "eth8.35"'s line and vice versa.
+        const string routes = """
+            default via 203.0.113.1 dev eth8.35 table 201
+            """;
+
+        UpstreamTracerService.SelectWanDefaultGateway(routes, "eth8").Should().BeNull();
+        UpstreamTracerService.SelectWanDefaultGateway(routes, "eth8.35").Should().Be("203.0.113.1");
+    }
+
+    [Fact]
+    public void SelectWanDefaultGateway_ignores_onlink_ppp_default()
+    {
+        // PPPoE default has no "via" - no gateway address (and no MAC) to extract.
+        const string routes = """
+            default dev ppp0 scope link table 201
+            """;
+
+        UpstreamTracerService.SelectWanDefaultGateway(routes, "ppp0").Should().BeNull();
+    }
+
+    [Fact]
+    public void SelectWanDefaultGateway_handles_metric_and_proto_suffixes()
+    {
+        const string routes = "default via 203.0.113.1 dev eth8 proto static metric 220";
+
+        UpstreamTracerService.SelectWanDefaultGateway(routes, "eth8").Should().Be("203.0.113.1");
+    }
+
+    [Fact]
+    public void SelectWanDefaultGateway_returns_null_for_empty_input()
+    {
+        UpstreamTracerService.SelectWanDefaultGateway(null, "eth8").Should().BeNull();
+        UpstreamTracerService.SelectWanDefaultGateway("", "eth8").Should().BeNull();
+    }
+
+    [Fact]
+    public void Prefers_public_reachable_over_private_stale_with_same_mac()
+    {
+        const string output = """
+            1.1.1.1  FAILED
+            192.168.1.254 lladdr aa:bb:cc:dd:ee:06 STALE
+            203.0.113.1 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            fe80::a8bb:ccff:fedd:ee06 lladdr aa:bb:cc:dd:ee:06 router STALE
+            """;
+
+        var selected = UpstreamTracerService.SelectWanNeighbor(output);
+
+        selected.Should().NotBeNull();
+        selected!.Value.Ip.Should().Be("203.0.113.1");
+        selected.Value.Mac.Should().Be("aa:bb:cc:dd:ee:06");
+    }
+
+    [Fact]
+    public void Prefers_public_even_when_stale_over_private_reachable()
+    {
+        const string output = """
+            192.168.1.254 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            203.0.113.1 lladdr aa:bb:cc:dd:ee:06 STALE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output)!.Value.Ip.Should().Be("203.0.113.1");
+    }
+
+    [Fact]
+    public void Prefers_cgnat_over_private()
+    {
+        const string output = """
+            192.168.1.254 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            100.64.12.1 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output)!.Value.Ip.Should().Be("100.64.12.1");
+    }
+
+    [Fact]
+    public void Prefers_reachable_over_stale_within_same_class()
+    {
+        const string output = """
+            203.0.113.7 lladdr aa:bb:cc:dd:ee:01 STALE
+            203.0.113.1 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output)!.Value.Ip.Should().Be("203.0.113.1");
+    }
+
+    [Fact]
+    public void Falls_back_to_private_neighbor_when_nothing_else_exists()
+    {
+        // The MAC still matters for OUI labeling even when the only entry is the
+        // CPE's LAN side; the injection guard keeps it out of the hop proposals
+        const string output = "192.168.1.254 lladdr aa:bb:cc:dd:ee:06 STALE";
+
+        var selected = UpstreamTracerService.SelectWanNeighbor(output);
+
+        selected.Should().NotBeNull();
+        selected!.Value.Ip.Should().Be("192.168.1.254");
+    }
+
+    [Fact]
+    public void Ignores_failed_and_ipv6_only_output()
+    {
+        const string output = """
+            1.1.1.1  FAILED
+            fe80::a8bb:ccff:fedd:ee06 lladdr aa:bb:cc:dd:ee:06 router STALE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output).Should().BeNull();
+    }
+
+    [Fact]
+    public void Empty_output_returns_null()
+    {
+        UpstreamTracerService.SelectWanNeighbor(null).Should().BeNull();
+        UpstreamTracerService.SelectWanNeighbor("").Should().BeNull();
+    }
+
+    [Fact]
+    public void Rejects_unifi_wan_sla_probe_targets_as_the_neighbor()
+    {
+        // UniFi pings 1.1.1.1 / 8.8.8.8 for WAN SLA, leaving neighbor entries that look
+        // like a public on-link next hop. They are DNS resolvers, not the first-mile device.
+        const string output = """
+            1.1.1.1 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            8.8.8.8 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            203.0.113.1 lladdr aa:bb:cc:dd:ee:06 STALE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output)!.Value.Ip.Should().Be("203.0.113.1");
+    }
+
+    [Fact]
+    public void Returns_null_when_only_sla_probe_targets_are_present()
+    {
+        const string output = """
+            1.1.1.1 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            8.8.8.8 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output).Should().BeNull();
+    }
+
+    [Fact]
+    public void Prefers_the_on_link_wan_subnet_gateway_over_another_public_neighbor()
+    {
+        // The real ISP-side gateway shares the WAN subnet; an unrelated public neighbor
+        // (e.g. a stray SLA-style entry) does not and must not win.
+        const string output = """
+            203.0.113.1 lladdr aa:bb:cc:dd:ee:06 REACHABLE
+            198.51.100.9 lladdr aa:bb:cc:dd:ee:07 REACHABLE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output, "203.0.113.5/24")!.Value.Ip
+            .Should().Be("203.0.113.1");
+    }
+
+    [Fact]
+    public void Subnet_preference_beats_freshness_and_class()
+    {
+        // On-link CGNAT gateway should still win over a fresher, public off-subnet neighbor.
+        const string output = """
+            100.64.0.1 lladdr aa:bb:cc:dd:ee:06 STALE
+            198.51.100.9 lladdr aa:bb:cc:dd:ee:07 REACHABLE
+            """;
+
+        UpstreamTracerService.SelectWanNeighbor(output, "100.64.0.5/22")!.Value.Ip
+            .Should().Be("100.64.0.1");
+    }
+
+    [Theory]
+    [InlineData("192.168.1.254", false)]
+    [InlineData("10.0.0.1", false)]
+    [InlineData("172.16.0.1", false)]
+    [InlineData("169.254.1.1", false)]
+    [InlineData("100.64.12.1", true)]
+    [InlineData("203.0.113.1", true)]
+    [InlineData(null, false)]
+    public void Only_carrier_side_addresses_are_injectable_as_access_hops(string? ip, bool expected)
+    {
+        UpstreamTracerService.IsInjectableAccessHopAddress(ip).Should().Be(expected);
+    }
+}

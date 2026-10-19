@@ -1,0 +1,293 @@
+using NetworkOptimizer.Storage.Services;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// Rolls each site's per-client byte counters up into one point per client per hour in the
+/// longterm bucket, so usage over days is a few hundred rows to read rather than millions.
+/// Runs a few minutes past every hour for the hour just finished, and on start fills whatever
+/// the fast bucket still holds behind the newest rolled hour. Idempotent: an hour is written at
+/// its own start, so a re-run overwrites it.
+/// </summary>
+public class ClientUsageRollupService : BackgroundService
+{
+    /// <summary>How far back a first run reaches, matching the longest range Client Performance offers.</summary>
+    private static readonly TimeSpan BackfillHorizon = TimeSpan.FromDays(30);
+
+    /// <summary>Past the hour, so the last write window's points have landed before it is read.</summary>
+    private static readonly TimeSpan SettleDelay = TimeSpan.FromMinutes(3);
+
+    /// <summary>
+    /// A backfill is paced rather than run flat out: a week is hundreds of hour-wide scans, the
+    /// store is serving charts and collectors at the same time, and the box running it is often a
+    /// small NAS where one scan takes seconds. This many hours per pass, a pause between hours,
+    /// and another pass soon after while still behind - a few hours for a month on fast hardware.
+    /// </summary>
+    private const int MaxHoursPerPass = 4;
+    private static readonly TimeSpan PauseBetweenHours = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan CatchUpInterval = TimeSpan.FromMinutes(1);
+
+    private readonly MonitoringInfluxClient _influx;
+    private readonly ILogger<ClientUsageRollupService> _logger;
+    private readonly string _siteSlug;
+
+    public ClientUsageRollupService(
+        MonitoringInfluxRegistry influx,
+        ILogger<ClientUsageRollupService> logger,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
+    {
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _influx = influx.GetFor(_siteSlug);
+        _logger = logger;
+
+        var phase = StablePhaseSeconds(_siteSlug);
+        _sitePhase = TimeSpan.FromSeconds(phase % (int)PhaseSpread.TotalSeconds);
+        _catchUpJitter = TimeSpan.FromSeconds(phase % 20);
+    }
+
+    /// <summary>No-op: the registry owns start and stop.</summary>
+    public override void Dispose() { }
+
+    // Sites start half a minute apart, so a multi-site box does not open with every site's scans at once.
+    private static int _started;
+
+    /// <summary>
+    /// Window the per-site phase spreads over. The startup stagger above only holds for the first
+    /// pass: every site then schedules from the same absolute HourStart, so a multi-site box ran
+    /// every site's scans on one instant every hour for the life of the process. The phase is
+    /// derived from the slug, so it is stable across restarts and needs no coordination.
+    /// </summary>
+    private static readonly TimeSpan PhaseSpread = TimeSpan.FromMinutes(20);
+
+    private readonly TimeSpan _sitePhase;
+    private readonly TimeSpan _catchUpJitter;
+
+    /// <summary>FNV-1a, because string.GetHashCode is randomized per process and a phase that
+    /// moves on every restart cannot keep two sites apart.</summary>
+    private static int StablePhaseSeconds(string slug)
+    {
+        var hash = 2166136261u;
+        foreach (var b in System.Text.Encoding.UTF8.GetBytes(slug))
+        {
+            hash ^= b;
+            hash *= 16777619u;
+        }
+        return (int)(hash % int.MaxValue);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var stagger = TimeSpan.FromSeconds(30 * (Interlocked.Increment(ref _started) - 1));
+        try { await Task.Delay(TimeSpan.FromSeconds(45) + stagger, stoppingToken); }
+        catch (OperationCanceledException) { return; }
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var behind = false;
+            try
+            {
+                behind = await RollupPendingAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Client usage rollup failed for site {Site}", _siteSlug);
+            }
+
+            var now = DateTime.UtcNow;
+            var next = behind
+                ? now + CatchUpInterval + _catchUpJitter
+                : HourStart(now).AddHours(1) + SettleDelay + _sitePhase;
+            try { await Task.Delay(next - now, stoppingToken); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    // Cursors live here, seeded once from the store: an hour with no traffic writes no points, so
+    // the store alone cannot say it was rolled and would hand the same empty hours back every pass.
+    private bool _seeded;
+    private DateTime _next;   // earliest hour not yet rolled going forward
+    private DateTime _oldest; // earliest hour rolled; the backward pass reaches below it
+
+    // client_wan (gateway conntrack) rolls on its OWN cursors and version: bumping the wifi/port
+    // rollup arithmetic must never re-roll conntrack data or vice versa. Forward-only - the feed
+    // starts at the agent's first report, so there is no pre-existing history to backfill, and a
+    // cold seed starts at the earliest covered hour rather than grinding empty ones.
+    private bool _wanSeeded;
+    private DateTime _wanNext;
+
+    // wifi_client_daily rolls whole UTC days on its own cursors: a day-wide scan costs barely more
+    // than an hour-wide one, and slicing it finer would turn a 14-unit backfill into a 336-unit one.
+    // Its horizon follows the width lookback, so moving one moves both.
+    private static readonly TimeSpan DailyBackfillHorizon = ApAgent.ApAgentWidthDemand.Lookback + TimeSpan.FromDays(1);
+
+    /// <summary>
+    /// Days get their own budget, not a share of the hourly one. A day-wide scan measured 1.29 s
+    /// against an hour-wide 75 ms, so four of them in a pass is eight times the query load the
+    /// hourly pacing was built for, on a box already serving charts. One per pass keeps a pass
+    /// bounded and still finishes the backfill in about fifteen minutes.
+    /// </summary>
+    private const int MaxDaysPerPass = 1;
+    private bool _dailySeeded;
+    private DateTime _dailyNext;
+    private DateTime _dailyOldest;
+
+    // Earliest hour a late client_wan batch landed in (spool replay after a tunnel outage) -
+    // hours the cursor already passed hold new points until this is consumed. long.MaxValue =
+    // nothing pending.
+    private long _wanRewindToTicks = long.MaxValue;
+
+    /// <summary>
+    /// Notes a client_wan batch stamped in a past hour, so the WAN rollup rewinds and re-rolls
+    /// from that hour on its next pass. Safe by shape: re-rolls overwrite, and the rollup is a
+    /// pure sum, so rolling again with the replayed points present cannot double-count.
+    /// </summary>
+    public void NoteLateClientWanBatch(DateTime batchUtc)
+    {
+        var hour = HourStart(batchUtc).Ticks;
+        long seen;
+        while (hour < (seen = Interlocked.Read(ref _wanRewindToTicks))
+               && Interlocked.CompareExchange(ref _wanRewindToTicks, hour, seen) != seen) { }
+    }
+
+    /// <summary>
+    /// Rolls the next few pending hours: forward to the last complete hour first, then backward to
+    /// the horizon for a site whose earlier backfill stopped short. True when more remain.
+    /// </summary>
+    private async Task<bool> RollupPendingAsync(CancellationToken ct)
+    {
+        if (!_influx.IsConfigured || string.IsNullOrEmpty(_influx.LongtermBucket)) return false;
+
+        var lastComplete = HourStart(DateTime.UtcNow).AddHours(-1);
+        var horizon = lastComplete - BackfillHorizon;
+        if (!_seeded)
+        {
+            // Only hours built at the current rollup arithmetic count as rolled; hours built an
+            // older way read as not rolled and are rebuilt in place. Always newest first, so a
+            // day reads right within minutes of an upgrade and a month within a few hours, and a
+            // restart resumes from the earliest hour already rebuilt.
+            var last = await _influx.QueryLastUsageRollupHourAsync(MonitoringInfluxClient.RollupVersion, ct);
+            var first = await _influx.QueryFirstUsageRollupHourAsync(MonitoringInfluxClient.RollupVersion, ct);
+            if (last.HasValue && first.HasValue)
+            {
+                _next = last.Value.AddHours(1);
+                _oldest = first.Value;
+            }
+            else
+            {
+                _next = lastComplete.AddHours(1);
+                _oldest = lastComplete.AddHours(1);
+            }
+            if (_next < horizon) _next = horizon;
+            if (_oldest < horizon) _oldest = horizon;
+            _seeded = true;
+        }
+
+        var hours = 0;
+        var wifi = 0;
+        var ports = 0;
+
+        // Days run before hours so the 720-unit hourly backfill cannot starve the 14-unit daily
+        // one and leave the width rule silent for hours on an install that looks healthy.
+        var lastCompleteDay = DayStart(DateTime.UtcNow).AddDays(-1);
+        var dailyHorizon = lastCompleteDay - DailyBackfillHorizon;
+        if (!_dailySeeded)
+        {
+            var lastDay = await _influx.QueryLastWifiClientDailyRollupDayAsync(ct);
+            var firstDay = await _influx.QueryFirstWifiClientDailyRollupDayAsync(ct);
+            if (lastDay.HasValue && firstDay.HasValue)
+            {
+                _dailyNext = lastDay.Value.AddDays(1);
+                _dailyOldest = firstDay.Value;
+            }
+            else
+            {
+                _dailyNext = lastCompleteDay.AddDays(1);
+                _dailyOldest = lastCompleteDay.AddDays(1);
+            }
+            if (_dailyNext < dailyHorizon) _dailyNext = dailyHorizon;
+            if (_dailyOldest < dailyHorizon) _dailyOldest = dailyHorizon;
+            _dailySeeded = true;
+        }
+
+        var daily = 0;
+        var days = 0;
+        async Task RollDayAsync(DateTime day)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (days > 0) await Task.Delay(PauseBetweenHours, ct);
+            daily += await _influx.RollupWifiClientDayAsync(day, ct);
+            days++;
+        }
+
+        for (; _dailyNext <= lastCompleteDay && days < MaxDaysPerPass; _dailyNext = _dailyNext.AddDays(1))
+            await RollDayAsync(_dailyNext);
+        for (; _dailyOldest.AddDays(-1) >= dailyHorizon && days < MaxDaysPerPass; _dailyOldest = _dailyOldest.AddDays(-1))
+            await RollDayAsync(_dailyOldest.AddDays(-1));
+
+        async Task RollAsync(DateTime hour)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (hours + days > 0) await Task.Delay(PauseBetweenHours, ct);
+            wifi += await _influx.RollupWifiClientUsageHourAsync(hour, ct);
+            ports += await _influx.RollupPortUsageHourAsync(hour, ct);
+            hours++;
+        }
+
+        for (; _next <= lastComplete && hours < MaxHoursPerPass; _next = _next.AddHours(1))
+            await RollAsync(_next);
+        for (; _oldest.AddHours(-1) >= horizon && hours < MaxHoursPerPass; _oldest = _oldest.AddHours(-1))
+            await RollAsync(_oldest.AddHours(-1));
+
+        if (!_wanSeeded)
+        {
+            var lastWan = await _influx.QueryLastClientWanRollupHourAsync(ct);
+            if (lastWan.HasValue)
+            {
+                _wanNext = lastWan.Value.AddHours(1);
+            }
+            else
+            {
+                var coverage = await _influx.QueryClientWanCoverageHoursAsync(horizon, lastComplete.AddHours(1), ct: ct);
+                _wanNext = coverage.Count > 0 ? coverage.Keys.Min() : lastComplete.AddHours(1);
+            }
+            if (_wanNext < horizon) _wanNext = horizon;
+            _wanSeeded = true;
+        }
+        // A spool replay landed points behind the cursor: rewind and re-roll forward over them.
+        var rewind = Interlocked.Exchange(ref _wanRewindToTicks, long.MaxValue);
+        if (rewind != long.MaxValue)
+        {
+            var rewindTo = new DateTime(Math.Max(rewind, horizon.Ticks), DateTimeKind.Utc);
+            if (rewindTo < _wanNext) _wanNext = rewindTo;
+        }
+        var wan = 0;
+        for (; _wanNext <= lastComplete && hours < MaxHoursPerPass; _wanNext = _wanNext.AddHours(1))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (hours > 0) await Task.Delay(PauseBetweenHours, ct);
+            wan += await _influx.RollupClientWanUsageHourAsync(_wanNext, ct);
+            hours++;
+        }
+
+        var ahead = _next <= lastComplete ? (int)(lastComplete - _next).TotalHours + 1 : 0;
+        var behind = _oldest > horizon ? (int)(_oldest - horizon).TotalHours : 0;
+        var wanAhead = _wanNext <= lastComplete ? (int)(lastComplete - _wanNext).TotalHours + 1 : 0;
+        var dailyAhead = _dailyNext <= lastCompleteDay ? (int)(lastCompleteDay - _dailyNext).TotalDays + 1 : 0;
+        var dailyBehind = _dailyOldest > dailyHorizon ? (int)(_dailyOldest - dailyHorizon).TotalDays : 0;
+        var remaining = ahead + behind + wanAhead + dailyAhead + dailyBehind;
+        if (hours + days > 0)
+            _logger.LogInformation("Client usage rollup for site {Site}: {Hours} hour(s) and {Days} day(s), rolled {From:u} to {To:u}, {Wifi} wireless, {Ports} port, {Wan} WAN, and {Daily} per-client daily points, {Remaining} unit(s) to go",
+                _siteSlug, hours, days, _oldest, _next.AddHours(-1), wifi, ports, wan, daily, remaining);
+        return remaining > 0;
+    }
+
+    private static DateTime HourStart(DateTime utc) =>
+        new(utc.Year, utc.Month, utc.Day, utc.Hour, 0, 0, DateTimeKind.Utc);
+
+    private static DateTime DayStart(DateTime utc) =>
+        new(utc.Year, utc.Month, utc.Day, 0, 0, 0, DateTimeKind.Utc);
+}

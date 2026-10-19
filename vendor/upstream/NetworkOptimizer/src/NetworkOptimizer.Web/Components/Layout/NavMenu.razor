@@ -1,0 +1,225 @@
+@inject NavigationManager NavigationManager
+@inject NetworkOptimizer.Web.Services.ISiteManagementService SiteManagement
+@inject NetworkOptimizer.Web.Services.Authorization.ISiteAccessFilter SiteAccess
+@inject NetworkOptimizer.Web.Services.Authorization.IEffectiveSiteRoleResolver SiteRoles
+@inject NetworkOptimizer.Web.Services.SiteRegistryChangeNotifier ChangeNotifier
+@inject AuthenticationStateProvider AuthStateProvider
+@implements IDisposable
+
+<nav class="nav-menu">
+    <ul class="nav-list">
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/" Match="NavLinkMatch.All">
+                <img src="/icons/chart-v2.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Dashboard</span>
+            </NavLink>
+        </li>
+        @if (_showSites)
+        {
+            <li class="nav-item" @onclick="HandleNavClick">
+                <NavLink class="nav-link" href="/sites">
+                    <img src="/icons/sites.png" alt="" class="nav-icon-img" />
+                    <span class="nav-text">Sites</span>
+                </NavLink>
+            </li>
+        }
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/monitoring">
+                <img src="/icons/port-scan.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Monitoring</span>
+            </NavLink>
+        </li>
+        <li class="nav-item nav-sub-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/network-tools">
+                <span class="nav-sub-icon">└</span>
+                <span class="nav-text">Network Tools</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick" data-tour="nav-client-performance">
+            <NavLink class="nav-link" href="/client-dashboard">
+                <img src="/icons/client-performance.svg" alt="" class="nav-icon-img" />
+                <span class="nav-text">Client Performance</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/config-optimizer">
+                <img src="/icons/tools.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Config Optimizer</span>
+            </NavLink>
+        </li>
+        <li class="nav-item nav-sub-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/perf-tweaks">
+                <span class="nav-sub-icon">└</span>
+                <span class="nav-text">Performance Tweaks</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick" data-tour="nav-firmware-rollout">
+            <NavLink class="nav-link" href="/firmware-rollout">
+                <img src="/icons/firmware-rollout.svg" alt="" class="nav-icon-img" />
+                <span class="nav-text">Firmware Rollout</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/wifi-optimizer">
+                <img src="/icons/wifi-optimizer.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Wi-Fi Optimizer</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/audit">
+                <img src="/icons/shield-v2.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Security Audit</span>
+            </NavLink>
+        </li>
+        <li class="nav-item nav-sub-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/upnp-inspector">
+                <span class="nav-sub-icon">└</span>
+                <span class="nav-text">UPnP Inspector</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/threats">
+                <img src="/icons/threats.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Threat Intelligence</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/sqm">
+                <img src="/icons/sqm-v3.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Adaptive SQM</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/wan-steering">
+                <img src="/icons/wan-steering.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">WAN Steering</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/wan-speedtest">
+                <img src="/icons/speed-wan.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">WAN Speed Test</span>
+            </NavLink>
+        </li>
+        <li class="nav-item nav-sub-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/client-wan-speedtest">
+                <span class="nav-sub-icon">└</span>
+                <span class="nav-text">Client WAN Test</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/speedtest">
+                <img src="/icons/speed-v4.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">LAN Speed Test</span>
+            </NavLink>
+        </li>
+        <li class="nav-item nav-sub-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/client-speedtest">
+                <span class="nav-sub-icon">└</span>
+                <span class="nav-text">Client Speed Test</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/alerts">
+                <img src="/icons/alerts.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Alerts & Schedule</span>
+            </NavLink>
+        </li>
+        <li class="nav-item" @onclick="HandleNavClick">
+            <NavLink class="nav-link" href="/settings">
+                <img src="/icons/settings-v2.png" alt="" class="nav-icon-img" />
+                <span class="nav-text">Settings</span>
+            </NavLink>
+        </li>
+        @* The top bar runs out of room on a phone, so logout moves in here and the header button
+           hides - see .nav-item-logout. A form post for the same reason as the header's. *@
+        <AuthorizeView>
+            <Authorized>
+                <li class="nav-item nav-item-logout">
+                    <form method="post" action="/api/auth/logout">
+                        <AntiforgeryToken />
+                        <button type="submit" class="nav-link nav-logout-btn">
+                            <span class="nav-logout-icon">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0 0 13.5 3h-6a2.25 2.25 0 0 0-2.25 2.25v13.5A2.25 2.25 0 0 0 7.5 21h6a2.25 2.25 0 0 0 2.25-2.25V15m3 0 3-3m0 0-3-3m3 3H9" />
+                                </svg>
+                            </span>
+                            <span class="nav-text">Logout</span>
+                        </button>
+                    </form>
+                </li>
+            </Authorized>
+        </AuthorizeView>
+    </ul>
+</nav>
+
+@code {
+    [Parameter]
+    public Action? OnNavigate { get; set; }
+
+    private bool _showSites;
+
+    protected override async Task OnInitializedAsync()
+    {
+        ChangeNotifier.SitesChanged += OnSitesChanged;
+        await LoadSitesVisibilityAsync();
+    }
+
+    /// <summary>
+    /// Sites earns its place only when there is a choice to make or something to manage. One site and
+    /// nothing to administer means the page lists the site you are already on and offers nothing, so
+    /// it reads as clutter to exactly the accounts least equipped to make sense of it.
+    ///
+    /// The two carve-outs are what stop this hiding the page from the people who need it most: a
+    /// global Admin sees it at one site because adding the second one happens there, and a Site Admin
+    /// sees it because that is where their own site's configuration and access live.
+    /// </summary>
+    private async Task LoadSitesVisibilityAsync()
+    {
+        if (!await SiteManagement.IsMultiSiteEnabledAsync())
+        {
+            _showSites = false;
+            return;
+        }
+
+        var reachable = await SiteAccess.FilterAsync(
+            (await SiteManagement.GetSitesAsync()).Where(s => s.Enabled), s => s.Slug);
+        if (reachable.Count > 1)
+        {
+            _showSites = true;
+            return;
+        }
+
+        var user = (await AuthStateProvider.GetAuthenticationStateAsync()).User;
+        _showSites = user.IsInRole(NetworkOptimizer.Storage.Models.Identity.Roles.Admin)
+            || await SiteRoles.FirstAdministeredSlugAsync(user) is not null;
+    }
+
+    // Raised from whichever circuit changed the registry (create, rename, enable/disable, remove,
+    // multi-site toggle), same as the site switcher - the nav has to follow the same list it does.
+    private void OnSitesChanged()
+    {
+        _ = InvokeAsync(async () =>
+        {
+            try
+            {
+                await LoadSitesVisibilityAsync();
+                StateHasChanged();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Circuit torn down between the event and the dispatch - nothing to update.
+            }
+        });
+    }
+
+    private void HandleNavClick()
+    {
+        OnNavigate?.Invoke();
+    }
+
+    public void Dispose()
+    {
+        ChangeNotifier.SitesChanged -= OnSitesChanged;
+    }
+}

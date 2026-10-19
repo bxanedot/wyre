@@ -1,0 +1,974 @@
+@using System.Net
+@using Microsoft.EntityFrameworkCore
+@using NetworkOptimizer.Monitoring
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Web.Endpoints
+@using NetworkOptimizer.Core.Enums
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Storage.Services
+@inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject SiteContextService SiteCtx
+@inject UniFiConnectionService ConnectionService
+@inject ICredentialProtectionService CredentialProtection
+@inject ILoggerFactory LoggerFactory
+@inject AgentSnmpQueryService AgentSnmpQuery
+@inject ICustomOidService CustomOids
+@inject IHealthCheckService HealthChecks
+@using NetworkOptimizer.Web.Services.Monitoring.HealthChecks
+
+<div class="card" data-tour="health-checks">
+    <div class="card-header card-header-collapsible" @onclick="ToggleCollapse">
+        <div class="card-title-group">
+            <h2 class="card-title">Devices <span class="card-title-suffix">SNMP, Custom OIDs, and Health Checks</span></h2>
+        </div>
+        <div class="card-header-badges">
+            <span class="status-badge status-active" @onclick:stopPropagation="true">@SummaryLabel()</span>
+            <span class="issue-type-chevron">@(_collapsed ? "▼" : "▲")</span>
+        </div>
+    </div>
+    <div class="expand-wrapper @(!_collapsed ? "expanded" : "")">
+        <div class="expand-content">
+            <div class="card-body">
+                <p class="section-description">
+                    Every adopted device and where it sits in the SNMP polling lifecycle. A device is
+                    only polled when SNMP is enabled on it (a <strong>Location</strong> or
+                    <strong>Contact</strong> is set in UniFi) and it keeps answering. Open a device to
+                    add custom OIDs to poll, or a <strong>Health Check</strong> that runs a command on it
+                    over SSH and can alert, restart a service, kill a process, or reboot it.
+                </p>
+
+                @if (Devices.Count == 0)
+                {
+                    <div class="empty-state">
+                        <p>No devices discovered yet. They'll appear once UniFi reports adopted devices.</p>
+                    </div>
+                }
+                else
+                {
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Device</th>
+                                    <th>SNMP</th>
+                                    <th>Polling status</th>
+                                    <th class="hide-mobile">Last polled</th>
+                                    <th style="width: 2.5rem;"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var d in Devices.OrderBy(d => d.DeviceType).ThenBy(d => d.Name))
+                                {
+                                    var isExpanded = _expandedDeviceMac == d.Mac;
+                                    <tr class="@(isExpanded ? "snmp-row-expanded" : "")" @onclick="() => ToggleDevice(d.Mac)" style="cursor: pointer;">
+                                        <td>
+                                            <span class="snmp-device-name">@d.Name</span>
+                                            <span class="status-badge status-neutral snmp-device-type">@d.DeviceType.ToDisplayName()</span>
+                                        </td>
+                                        <td>
+                                            @if (d.SnmpEnabled)
+                                            {
+                                                <span class="status-indicator status-active"></span>
+                                                <span data-tooltip="An SNMP Location or Contact is set in UniFi, so SNMP is enabled on this device.">On</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="status-indicator status-inactive"></span>
+                                                <span class="text-muted" data-tooltip-wrap data-tooltip="This device either doesn't support SNMP, or it does but just needs a Location or Contact set in UniFi. See the help below.">Check / Unsupported</span>
+                                            }
+                                        </td>
+                                        <td>
+                                            <span class="status-badge @StatusBadgeClass(d.PollState)" data-tooltip-wrap data-tooltip="@StatusTooltip(d)">
+                                                @StatusLabel(d.PollState)
+                                            </span>
+                                        </td>
+                                        <td class="hide-mobile">
+                                            @if (d.LastPolledUtc.HasValue)
+                                            {
+                                                <span>@RelativeTime(d.LastPolledUtc.Value)</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="text-muted">never</span>
+                                            }
+                                        </td>
+                                        <td style="text-align: right;">
+                                            <span class="issue-type-chevron snmp-row-chevron">@(isExpanded ? "▲" : "▼")</span>
+                                        </td>
+                                    </tr>
+                                    @if (isExpanded)
+                                    {
+                                        <tr class="snmp-detail-row">
+                                            <td colspan="5">
+                                                <div class="snmp-detail-panel">
+                                                    <div class="snmp-detail-section">
+                                                        <div class="snmp-detail-header">
+                                                            <h4>Custom OID Polling</h4>
+                                                            @if (!_showAddForm)
+                                                            {
+                                                                @* Adding an OID is Operator: it polls one more value and is undone by
+                                                                   removing it. Removing stays Admin, like the latency targets - a curated
+                                                                   list is expensive to rebuild and nothing recreates it. *@
+                                                                <SiteOperatorOnly>
+                                                                    <button class="btn btn-sm btn-primary" @onclick:stopPropagation="true" @onclick="ShowAddForm">Add OID</button>
+                                                                </SiteOperatorOnly>
+                                                            }
+                                                        </div>
+
+                                                        @if (_customOids.Count > 0)
+                                                        {
+                                                            <div class="table-responsive">
+                                                                <table class="data-table snmp-oid-table">
+                                                                    <thead>
+                                                                        <tr>
+                                                                            <th>OID</th>
+                                                                            <th>Field Name</th>
+                                                                            <th class="hide-mobile">Type</th>
+                                                                            <th class="hide-mobile">Scope</th>
+                                                                            <th style="width: 5rem;"></th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody>
+                                                                        @foreach (var oid in _customOids)
+                                                                        {
+                                                                            <tr>
+                                                                                <td><code class="snmp-oid-code">@oid.Oid</code></td>
+                                                                                <td>@oid.FieldName</td>
+                                                                                <td class="hide-mobile">@oid.ValueType</td>
+                                                                                <td class="hide-mobile">@(oid.Scope == CustomOidScope.DeviceLevel ? "Device" : "Interface")</td>
+                                                                                <td style="text-align: right;">
+                                                                                    <SiteAdminOnly>
+                                                                                        <button class="btn btn-sm btn-danger" @onclick:stopPropagation="true" @onclick="() => DeleteOid(oid.Id)">
+                                                                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                                                                    </button>
+                                                                                    </SiteAdminOnly>
+                                                                                </td>
+                                                                            </tr>
+                                                                        }
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        }
+                                                        else if (!_showAddForm)
+                                                        {
+                                                            <p class="text-muted" style="margin: 0.5rem 0;">No custom OIDs configured. Add one to start polling additional SNMP data.</p>
+                                                        }
+
+                                                        @if (_showAddForm)
+                                                        {
+                                                            <div class="snmp-add-oid-form" @onclick:stopPropagation="true">
+                                                                <div class="form-row">
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">OID</label>
+                                                                        <div class="input-with-button">
+                                                                            <input type="text" class="form-control" @bind="_editOid" placeholder="1.3.6.1.4.1.41112..." />
+                                                                            <button class="btn btn-contrast" @onclick="TestOid" disabled="@_testingOid">@(_testingOid ? "Testing..." : "Test")</button>
+                                                                        </div>
+                                                                        @if (_testResult != null)
+                                                                        {
+                                                                            <div class="snmp-test-result @(_testResult.Success ? "snmp-test-success" : "snmp-test-error")">
+                                                                                @if (_testResult.Success)
+                                                                                {
+                                                                                    <span>Value: <code>@_testResult.Value</code></span>
+                                                                                }
+                                                                                else
+                                                                                {
+                                                                                    <span>@_testResult.ErrorMessage</span>
+                                                                                }
+                                                                            </div>
+                                                                        }
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Field Name</label>
+                                                                        <input type="text" class="form-control" @bind="_editFieldName" placeholder="InfluxDB field name, e.g. fan_speed_rpm" />
+                                                                    </div>
+                                                                </div>
+                                                                <div class="form-row">
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Value Type</label>
+                                                                        <select class="form-control" @bind="_editValueType">
+                                                                            <option value="@CustomOidValueType.Integer">Integer</option>
+                                                                            <option value="@CustomOidValueType.Float">Float</option>
+                                                                            <option value="@CustomOidValueType.String">String</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Scope</label>
+                                                                        <select class="form-control" @bind="_editScope">
+                                                                            <option value="@CustomOidScope.DeviceLevel">Device (scalar)</option>
+                                                                            <option value="@CustomOidScope.InterfaceLevel">Interface (per-port)</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Description</label>
+                                                                        <input type="text" class="form-control" @bind="_editDescription" placeholder="Optional description" />
+                                                                    </div>
+                                                                </div>
+                                                                <div class="action-buttons">
+                                                                    <SiteOperatorOnly>
+                                                                        <button class="btn btn-primary" @onclick="SaveOid" disabled="@_saving">Save</button>
+                                                                    </SiteOperatorOnly>
+                                                                    <button class="btn btn-contrast" @onclick="CancelAdd">Cancel</button>
+                                                                    @if (!string.IsNullOrEmpty(_saveError))
+                                                                    {
+                                                                        <span class="snmp-save-error">@_saveError</span>
+                                                                    }
+                                                                </div>
+                                                            </div>
+                                                        }
+                                                    </div>
+
+                                                    <div class="snmp-detail-section" style="margin-top: 1.25rem;">
+                                                        <div class="snmp-detail-header">
+                                                            <h4>Health Checks</h4>
+                                                            @if (!_showCheckForm)
+                                                            {
+                                                                <SiteAdminOnly>
+                                                                    <button class="btn btn-sm btn-primary" @onclick:stopPropagation="true" @onclick="() => ShowCheckForm(d)">Add Check</button>
+                                                                </SiteAdminOnly>
+                                                            }
+                                                        </div>
+
+                                                        @if (_healthChecks.Count > 0)
+                                                        {
+                                                            <div class="table-responsive">
+                                                                <table class="data-table snmp-oid-table">
+                                                                    <thead>
+                                                                        <tr>
+                                                                            <th>Check</th>
+                                                                            <th class="hide-mobile">Fires when</th>
+                                                                            <th class="hide-mobile">Then</th>
+                                                                            <th>Status</th>
+                                                                            <th style="width: 7rem;"></th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody>
+                                                                        @foreach (var check in _healthChecks)
+                                                                        {
+                                                                            var status = _checkStatus.GetValueOrDefault(check.Id);
+                                                                            <tr>
+                                                                                <td>
+                                                                                    <span class="snmp-device-name">@check.Name</span>
+                                                                                    @if (!check.Enabled)
+                                                                                    {
+                                                                                        <span class="status-badge status-neutral snmp-device-type">Off</span>
+                                                                                    }
+                                                                                </td>
+                                                                                <td class="hide-mobile">@HealthCheckEvaluation.DescribeCondition(check.Operator, check.Threshold)@(check.ConsecutiveSamples > 1 ? $", {check.ConsecutiveSamples} in a row" : "")</td>
+                                                                                <td class="hide-mobile">@ThenLabel(check)</td>
+                                                                                <td>
+                                                                                    <span class="status-badge @StatusClass(status)" data-tooltip-wrap data-tooltip="@StatusTooltip(status)">@StatusText(status)</span>
+                                                                                </td>
+                                                                                <td style="text-align: right; white-space: nowrap;">
+                                                                                    <SiteAdminOnly>
+                                                                                        <button class="btn btn-sm btn-contrast" @onclick:stopPropagation="true" @onclick="() => EditCheck(d, check)">Edit</button>
+                                                                                        <button class="btn btn-sm btn-danger" @onclick:stopPropagation="true" @onclick="() => DeleteCheck(check.Id)">
+                                                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                                                                        </button>
+                                                                                    </SiteAdminOnly>
+                                                                                </td>
+                                                                            </tr>
+                                                                        }
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        }
+                                                        else if (!_showCheckForm)
+                                                        {
+                                                            <p class="text-muted" style="margin: 0.5rem 0;">No health checks on this device. Add one to watch something UniFi doesn't, and act on it.</p>
+                                                        }
+
+                                                        @if (_showCheckForm && _editCheck != null)
+                                                        {
+                                                            <div class="snmp-add-oid-form" @onclick:stopPropagation="true">
+                                                                <div class="form-row">
+                                                                    @if (_editCheck.Id == 0)
+                                                                    {
+                                                                        <div class="form-group">
+                                                                            <label class="form-label">Start from</label>
+                                                                            <select class="form-control" value="@_selectedTemplateId" @onchange="e => ApplyTemplate(d, e.Value?.ToString())">
+                                                                                <option value="">Custom check</option>
+                                                                                @foreach (var t in _templates)
+                                                                                {
+                                                                                    <option value="@t.Id">@t.Name</option>
+                                                                                }
+                                                                            </select>
+                                                                        </div>
+                                                                    }
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Name</label>
+                                                                        <input type="text" class="form-control" @bind="_editCheck.Name" placeholder="What this check watches" />
+                                                                    </div>
+                                                                    @if (_editCheck.Id != 0)
+                                                                    {
+                                                                        <div class="form-group">
+                                                                            <label class="form-label">Enabled</label>
+                                                                            <label class="checkbox-label"><input type="checkbox" @bind="_editCheck.Enabled" /><span>Run this check</span></label>
+                                                                        </div>
+                                                                    }
+                                                                </div>
+
+                                                                @if (_selectedTemplate != null)
+                                                                {
+                                                                    <div class="form-group">
+                                                                        <small class="form-help"><strong>Watches:</strong> @_selectedTemplate.WhatItWatches</small>
+                                                                        <small class="form-help"><strong>Fires:</strong> @_selectedTemplate.WhenItFires</small>
+                                                                        <small class="form-help"><strong>Does:</strong> @_selectedTemplate.WhatItDoes</small>
+                                                                    </div>
+                                                                }
+
+                                                                <div class="form-group">
+                                                                    <label class="form-label">What to run</label>
+                                                                    <textarea class="form-control" rows="3" @bind="_editCheck.Command" placeholder="e.g. df /data | awk 'NR==2 {print $5}'"></textarea>
+                                                                    <small class="form-help">Runs on the device over SSH as the configured SSH user.</small>
+                                                                </div>
+
+                                                                <div class="form-row">
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">What to look for</label>
+                                                                        <select class="form-control" @bind="_editCheck.Parser">
+                                                                            <option value="@HealthCheckParser.FirstNumber">First number on the last line</option>
+                                                                            <option value="@HealthCheckParser.RegexGroup">Number captured by a regex</option>
+                                                                            <option value="@HealthCheckParser.MatchingLineCount">Count of lines matching a regex</option>
+                                                                            <option value="@HealthCheckParser.ExitCode">The exit code</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    @if (_editCheck.Parser is HealthCheckParser.RegexGroup or HealthCheckParser.MatchingLineCount)
+                                                                    {
+                                                                        <div class="form-group">
+                                                                            <label class="form-label">Regular expression</label>
+                                                                            <input type="text" class="form-control" @bind="_editCheck.ParserArg" placeholder="@(_editCheck.Parser == HealthCheckParser.RegexGroup ? "e.g. used=(\\d+)" : "e.g. ^ERROR")" />
+                                                                        </div>
+                                                                    }
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">It's a problem when the value is</label>
+                                                                        <select class="form-control" @bind="_editCheck.Operator">
+                                                                            <option value="@HealthCheckOperator.GreaterOrEqual">at or above</option>
+                                                                            <option value="@HealthCheckOperator.LessOrEqual">at or below</option>
+                                                                            <option value="@HealthCheckOperator.Equal">equal to</option>
+                                                                            <option value="@HealthCheckOperator.NotEqual">anything but</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Threshold</label>
+                                                                        <input type="number" class="form-control" step="any" @bind="_editCheck.Threshold" />
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Samples in a row</label>
+                                                                        <input type="number" class="form-control" min="1" max="60" @bind="_editCheck.ConsecutiveSamples" />
+                                                                    </div>
+                                                                </div>
+
+                                                                <div class="form-row">
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Then</label>
+                                                                        <label class="checkbox-label"><input type="checkbox" @bind="_editCheck.AlertEnabled" /><span>Alert</span></label>
+                                                                    </div>
+                                                                    @if (_editCheck.AlertEnabled)
+                                                                    {
+                                                                        <div class="form-group">
+                                                                            <label class="form-label">Alert severity</label>
+                                                                            <select class="form-control" @bind="_editCheck.AlertSeverity">
+                                                                                <option value="0">Info</option>
+                                                                                <option value="1">Warning</option>
+                                                                                <option value="2">Error</option>
+                                                                                <option value="3">Critical</option>
+                                                                            </select>
+                                                                        </div>
+                                                                    }
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">And on the device</label>
+                                                                        <div class="radio-group">
+                                                                            @foreach (var remedy in AvailableRemedies(d))
+                                                                            {
+                                                                                <label class="radio-label">
+                                                                                    <input type="radio" name="hc-remedy-@d.Mac" checked="@(_editCheck.Remedy == remedy)" @onchange="() => _editCheck.Remedy = remedy" />
+                                                                                    <span>@HealthCheckRemedies.Label(remedy)</span>
+                                                                                </label>
+                                                                            }
+                                                                        </div>
+                                                                    </div>
+                                                                    @if (HealthCheckRemedies.NeedsArgument(_editCheck.Remedy))
+                                                                    {
+                                                                        <div class="form-group">
+                                                                            <label class="form-label">@(_editCheck.Remedy == HealthCheckRemedy.RestartService ? "Service name" : "Process name")</label>
+                                                                            <input type="text" class="form-control" @bind="_editCheck.RemedyArg" placeholder="@(_editCheck.Remedy == HealthCheckRemedy.RestartService ? "e.g. unifi" : "e.g. iperf3")" />
+                                                                        </div>
+                                                                    }
+                                                                </div>
+
+                                                                <div class="form-row">
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Run every (seconds)</label>
+                                                                        <input type="number" class="form-control" min="30" @bind="_editCheck.IntervalSeconds" />
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Command timeout (seconds)</label>
+                                                                        <input type="number" class="form-control" min="5" max="120" @bind="_editCheck.TimeoutSeconds" />
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Wait between actions (seconds)</label>
+                                                                        <input type="number" class="form-control" min="60" @bind="_editCheck.RemedyCooldownSeconds" />
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Most actions per day</label>
+                                                                        <input type="number" class="form-control" min="0" @bind="_editCheck.RemedyMaxPerDay" />
+                                                                        <small class="form-help">0 means no cap.</small>
+                                                                    </div>
+                                                                </div>
+
+                                                                <div class="form-row">
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Not applicable when output matches <span class="tooltip-icon tooltip-icon-sm" data-tooltip="For a check that only makes sense on some devices. Have the command print a marker when there is nothing to check, and put a pattern for that marker here: a run whose output matches records nothing and fires nothing, instead of failing. The JVM template prints NA on a gateway with no local Network application and uses ^NA$. Leave this empty to treat an empty output the same way.">?</span></label>
+                                                                        <input type="text" class="form-control" @bind="_editCheck.NotApplicablePattern" placeholder="Regular expression, e.g. ^NA$" />
+                                                                    </div>
+                                                                    <div class="form-group">
+                                                                        <label class="form-label">Stored as field</label>
+                                                                        <input type="text" class="form-control" @bind="_editCheck.FieldName" placeholder="Derived from the name" />
+                                                                    </div>
+                                                                </div>
+
+                                                                @if (_checkTest != null)
+                                                                {
+                                                                    <div class="form-group">
+                                                                        <div class="snmp-test-result @(TestResultClass(_checkTest))">
+                                                                            <strong>@TestVerdict(_checkTest)</strong>
+                                                                            @if (_checkTest.ExitCode.HasValue)
+                                                                            {
+                                                                                <span> (exit code @_checkTest.ExitCode)</span>
+                                                                            }
+                                                                        </div>
+                                                                        @if (_checkTest.Ran)
+                                                                        {
+                                                                            <pre class="gateway-diag-raw">@(string.IsNullOrWhiteSpace(_checkTest.Output) ? "(no output)" : _checkTest.Output)</pre>
+                                                                        }
+                                                                    </div>
+                                                                }
+
+                                                                <div class="action-buttons">
+                                                                    <SiteAdminOnly>
+                                                                        <button class="btn btn-contrast" @onclick="TestCheck" disabled="@_testingCheck">@(_testingCheck ? "Running..." : "Test")</button>
+                                                                        <button class="btn btn-primary" @onclick="() => SaveCheck(d)" disabled="@_savingCheck">Save</button>
+                                                                    </SiteAdminOnly>
+                                                                    <button class="btn btn-contrast" @onclick="CancelCheck">Cancel</button>
+                                                                    @if (!string.IsNullOrEmpty(_checkError))
+                                                                    {
+                                                                        <span class="snmp-save-error">@_checkError</span>
+                                                                    }
+                                                                </div>
+                                                            </div>
+                                                        }
+                                                    </div>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    }
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    /// <summary>Per-device SNMP polling status, supplied by the parent page.</summary>
+    [Parameter, EditorRequired]
+    public IReadOnlyList<SnmpDeviceStatus> Devices { get; set; } = Array.Empty<SnmpDeviceStatus>();
+
+    private bool _collapsed = true;
+    private string? _expandedDeviceMac;
+    private bool _autoExpandedFirst;
+    private List<CustomOidDto> _customOids = new();
+
+    // Add/edit form state
+    private bool _showAddForm;
+    private string _editOid = string.Empty;
+    private string _editFieldName = string.Empty;
+    private CustomOidValueType _editValueType = CustomOidValueType.Integer;
+    private CustomOidScope _editScope = CustomOidScope.DeviceLevel;
+    private string _editDescription = string.Empty;
+    private bool _saving;
+    private string? _saveError;
+
+    // Test OID state
+    private bool _testingOid;
+    private TestOidResult? _testResult;
+
+    // Health check state
+    private List<HealthCheckDefinition> _healthChecks = new();
+    private Dictionary<int, HealthCheckLiveStatus?> _checkStatus = new();
+    private IReadOnlyList<HealthCheckTemplate> _templates = Array.Empty<HealthCheckTemplate>();
+    private bool _showCheckForm;
+    private HealthCheckDefinition? _editCheck;
+    private string _selectedTemplateId = string.Empty;
+    private HealthCheckTemplate? _selectedTemplate;
+    private bool _savingCheck;
+    private bool _testingCheck;
+    private string? _checkError;
+    private HealthCheckRunResult? _checkTest;
+
+    /// <summary>
+    /// Whether either form is holding work the user would lose. The page checks this before
+    /// adopting a polled status change that would re-render this card away.
+    /// </summary>
+    public bool HasUnsavedEdit =>
+        (_showAddForm && (!string.IsNullOrWhiteSpace(_editOid) || !string.IsNullOrWhiteSpace(_editFieldName)))
+        || (_showCheckForm && _editCheck != null);
+
+    protected override async Task OnParametersSetAsync()
+    {
+        // Nudge users who haven't touched custom OIDs yet: auto-expand the first device so the
+        // Custom OID Polling section (and its "Add OID" action) is visible without a hint. But if
+        // ANY device already has a custom OID configured, the feature is discovered - leave it
+        // collapsed. Runs once, and never overrides a row the user opened themselves.
+        if (_autoExpandedFirst || Devices.Count == 0 || _expandedDeviceMac != null) return;
+        _autoExpandedFirst = true;
+
+        bool anyConfigured;
+        try
+        {
+            await using var db = SiteDb.CreateForSite(SiteCtx.Slug, SiteCtx.IsDefault);
+            anyConfigured = await db.CustomOidConfigurations.AnyAsync() || await db.HealthCheckDefinitions.AnyAsync();
+        }
+        catch
+        {
+            anyConfigured = true; // fail safe: if we can't tell, don't auto-expand
+        }
+        if (anyConfigured) return;
+
+        var first = Devices.OrderBy(d => d.DeviceType).ThenBy(d => d.Name).FirstOrDefault();
+        if (first != null)
+        {
+            _expandedDeviceMac = first.Mac;
+            await LoadCustomOids(first.Mac);
+            await LoadHealthChecks(first.Mac);
+        }
+    }
+
+    private void ToggleCollapse() => _collapsed = !_collapsed;
+
+    /// <summary>Expand the table from outside (e.g. when a banner links here).</summary>
+    public void Expand()
+    {
+        _collapsed = false;
+        StateHasChanged();
+    }
+
+    private async Task ToggleDevice(string mac)
+    {
+        if (_expandedDeviceMac == mac)
+        {
+            _expandedDeviceMac = null;
+            _showAddForm = false;
+            _testResult = null;
+            CancelCheck();
+        }
+        else
+        {
+            _expandedDeviceMac = mac;
+            _showAddForm = false;
+            _testResult = null;
+            CancelCheck();
+            await LoadCustomOids(mac);
+            await LoadHealthChecks(mac);
+        }
+    }
+
+    private async Task LoadHealthChecks(string mac)
+    {
+        try
+        {
+            _healthChecks = await HealthChecks.GetForDeviceAsync(mac);
+            _checkStatus = new Dictionary<int, HealthCheckLiveStatus?>();
+            foreach (var check in _healthChecks)
+                _checkStatus[check.Id] = await HealthChecks.GetStatusAsync(check.Id);
+        }
+        catch
+        {
+            _healthChecks = new();
+            _checkStatus = new();
+        }
+    }
+
+    private async Task ShowCheckForm(SnmpDeviceStatus device)
+    {
+        _templates = await HealthChecks.GetTemplatesAsync(device.Mac, device.DeviceType);
+        _editCheck = new HealthCheckDefinition { DeviceMac = device.Mac };
+        _selectedTemplateId = string.Empty;
+        _selectedTemplate = null;
+        _checkError = null;
+        _checkTest = null;
+        _showCheckForm = true;
+    }
+
+    private async Task EditCheck(SnmpDeviceStatus device, HealthCheckDefinition check)
+    {
+        _templates = await HealthChecks.GetTemplatesAsync(device.Mac, device.DeviceType);
+        // A copy, so Cancel leaves the table's row untouched.
+        _editCheck = new HealthCheckDefinition
+        {
+            Id = check.Id, DeviceMac = check.DeviceMac, Name = check.Name, FieldName = check.FieldName,
+            TemplateId = check.TemplateId, Enabled = check.Enabled, IntervalSeconds = check.IntervalSeconds,
+            Command = check.Command, TimeoutSeconds = check.TimeoutSeconds, Parser = check.Parser,
+            ParserArg = check.ParserArg, Operator = check.Operator, Threshold = check.Threshold,
+            ConsecutiveSamples = check.ConsecutiveSamples, NotApplicablePattern = check.NotApplicablePattern,
+            AlertEnabled = check.AlertEnabled, AlertSeverity = check.AlertSeverity, Remedy = check.Remedy,
+            RemedyArg = check.RemedyArg, RemedyCooldownSeconds = check.RemedyCooldownSeconds,
+            RemedyMaxPerDay = check.RemedyMaxPerDay, Description = check.Description,
+        };
+        _selectedTemplateId = check.TemplateId ?? string.Empty;
+        _selectedTemplate = _templates.FirstOrDefault(t => string.Equals(t.Id, check.TemplateId, StringComparison.OrdinalIgnoreCase));
+        _checkError = null;
+        _checkTest = null;
+        _showCheckForm = true;
+    }
+
+    private void ApplyTemplate(SnmpDeviceStatus device, string? templateId)
+    {
+        _selectedTemplateId = templateId ?? string.Empty;
+        _selectedTemplate = _templates.FirstOrDefault(t => string.Equals(t.Id, templateId, StringComparison.OrdinalIgnoreCase));
+        _editCheck = _selectedTemplate?.ToDefinition(device.Mac) ?? new HealthCheckDefinition { DeviceMac = device.Mac };
+        _checkTest = null;
+        _checkError = null;
+    }
+
+    private void CancelCheck()
+    {
+        _showCheckForm = false;
+        _editCheck = null;
+        _selectedTemplate = null;
+        _selectedTemplateId = string.Empty;
+        _checkError = null;
+        _checkTest = null;
+    }
+
+    private IEnumerable<HealthCheckRemedy> AvailableRemedies(SnmpDeviceStatus device)
+    {
+        foreach (var remedy in new[] { HealthCheckRemedy.None, HealthCheckRemedy.RestartService, HealthCheckRemedy.KillProcess, HealthCheckRemedy.RebootDevice })
+        {
+            if (!HealthCheckRemedies.SupportedOn(remedy, device.DeviceType)) continue;
+            if (_selectedTemplate != null && !_selectedTemplate.Allows(remedy)) continue;
+            yield return remedy;
+        }
+    }
+
+    private async Task TestCheck()
+    {
+        if (_editCheck == null) return;
+        _testingCheck = true;
+        _checkTest = null;
+        _checkError = null;
+        StateHasChanged();
+        try
+        {
+            _checkTest = await HealthChecks.TestRunAsync(_editCheck);
+        }
+        catch (Exception ex)
+        {
+            _checkError = ex.InnerException?.Message ?? ex.Message;
+        }
+        finally
+        {
+            _testingCheck = false;
+        }
+    }
+
+    private async Task SaveCheck(SnmpDeviceStatus device)
+    {
+        if (_editCheck == null) return;
+        _savingCheck = true;
+        _checkError = null;
+        StateHasChanged();
+        try
+        {
+            await HealthChecks.SaveAsync(_editCheck);
+            CancelCheck();
+            await LoadHealthChecks(device.Mac);
+        }
+        catch (Exception ex)
+        {
+            _checkError = ex.InnerException?.Message ?? ex.Message;
+        }
+        finally
+        {
+            _savingCheck = false;
+        }
+    }
+
+    private async Task DeleteCheck(int id)
+    {
+        if (_expandedDeviceMac == null) return;
+        try
+        {
+            await HealthChecks.DeleteAsync(id);
+            await LoadHealthChecks(_expandedDeviceMac);
+        }
+        catch (Exception ex)
+        {
+            _checkError = ex.InnerException?.Message ?? ex.Message;
+        }
+    }
+
+    private static string ThenLabel(HealthCheckDefinition check)
+    {
+        var parts = new List<string>();
+        if (check.AlertEnabled) parts.Add("alert");
+        if (check.Remedy != HealthCheckRemedy.None)
+        {
+            var label = HealthCheckRemedies.Label(check.Remedy).ToLowerInvariant();
+            parts.Add(HealthCheckRemedies.NeedsArgument(check.Remedy) ? $"{label} ({check.RemedyArg})" : label);
+        }
+        return parts.Count == 0 ? "record only" : string.Join(" + ", parts);
+    }
+
+    private static string StatusClass(HealthCheckLiveStatus? status)
+    {
+        if (status?.LastRunAt == null) return "status-inactive";
+        if (status.Tripped) return "status-disconnected";
+        if (status.LastFailing == true) return "status-neutral";
+        return status.LastValue.HasValue ? "status-active" : "status-neutral";
+    }
+
+    private static string StatusText(HealthCheckLiveStatus? status)
+    {
+        if (status?.LastRunAt == null) return "Not run yet";
+        if (status.Tripped) return "Failing";
+        if (status.LastValue.HasValue) return $"{status.LastValue.Value:0.##}";
+        return status.Outcome ?? "Unknown";
+    }
+
+    private static string StatusTooltip(HealthCheckLiveStatus? status)
+    {
+        if (status?.LastRunAt == null) return "Runs shortly after the app starts, then on its own interval.";
+        var when = RelativeTime(status.LastRunAt.Value);
+        var last = status.LastValue.HasValue ? $"Last value {status.LastValue.Value:0.##}, {status.Outcome} ({when})." : $"{status.Outcome} ({when}).";
+        if (status.LastRemedyAt.HasValue)
+            last += $" Last action {RelativeTime(status.LastRemedyAt.Value)}, {status.RemediesToday} today.";
+        return last;
+    }
+
+    private static string TestResultClass(HealthCheckRunResult r) =>
+        !r.Ran ? "snmp-test-error" : r.Failing ? "snmp-test-error" : "snmp-test-success";
+
+    private static string TestVerdict(HealthCheckRunResult r)
+    {
+        if (!r.Ran) return r.Error ?? "Did not run.";
+        if (r.NotApplicable) return "Not applicable on this device (the output matched the not-applicable rule). Nothing would be recorded.";
+        if (r.Value is null) return "Ran, but no value could be read from the output. Check \"What to look for\".";
+        return r.Failing
+            ? $"Read {r.Value.Value:0.##}: this would count as failing."
+            : $"Read {r.Value.Value:0.##}: OK.";
+    }
+
+    private async Task LoadCustomOids(string mac)
+    {
+        try
+        {
+            await using var db = SiteDb.CreateForSite(SiteCtx.Slug, SiteCtx.IsDefault);
+            _customOids = await db.CustomOidConfigurations
+                .Where(c => c.DeviceMac == mac)
+                .OrderBy(c => c.FieldName)
+                .Select(c => new CustomOidDto
+                {
+                    Id = c.Id,
+                    Oid = c.Oid,
+                    FieldName = c.FieldName,
+                    ValueType = c.ValueType,
+                    Scope = c.Scope,
+                    Enabled = c.Enabled,
+                    Description = c.Description
+                })
+                .ToListAsync();
+        }
+        catch
+        {
+            _customOids = new();
+        }
+    }
+
+    private void ShowAddForm()
+    {
+        _showAddForm = true;
+        _editOid = string.Empty;
+        _editFieldName = string.Empty;
+        _editValueType = CustomOidValueType.Integer;
+        _editScope = CustomOidScope.DeviceLevel;
+        _editDescription = string.Empty;
+        _saveError = null;
+        _testResult = null;
+    }
+
+    private void CancelAdd()
+    {
+        _showAddForm = false;
+        _saveError = null;
+        _testResult = null;
+    }
+
+    private async Task TestOid()
+    {
+        if (string.IsNullOrWhiteSpace(_editOid) || _expandedDeviceMac == null) return;
+        _testingOid = true;
+        _testResult = null;
+        StateHasChanged();
+
+        try
+        {
+            // Agent-covered site: the server can't reach the device directly, so run the GET
+            // through the site's agent. Main and any site without an online agent fall through
+            // to the direct poll below (unchanged).
+            if (!SiteCtx.IsDefault && AgentSnmpQuery.HasAgentForSite(SiteCtx.Slug))
+            {
+                var agentIp = await SnmpEndpoints.ResolveDeviceIpAsync(_expandedDeviceMac, ConnectionService);
+                if (agentIp == null)
+                {
+                    _testResult = new TestOidResult { ErrorMessage = "Could not resolve device IP." };
+                    return;
+                }
+                var agentRes = await AgentSnmpQuery.QueryAsync(SiteCtx.Slug, agentIp, _editOid.Trim(), TimeSpan.FromSeconds(10), CancellationToken.None);
+                if (agentRes != null)
+                {
+                    _testResult = agentRes.Success
+                        ? new TestOidResult { Success = true, Value = agentRes.Value }
+                        : new TestOidResult { ErrorMessage = string.IsNullOrEmpty(agentRes.Error) ? "No response." : agentRes.Error };
+                    return;
+                }
+                // agentRes == null: the agent's tunnel dropped between the check and the send;
+                // fall through to a direct attempt rather than failing outright.
+            }
+
+            await using var db = SiteDb.CreateForSite(SiteCtx.Slug, SiteCtx.IsDefault);
+            var settings = await db.MonitoringSettings.FirstOrDefaultAsync();
+            if (settings == null)
+            {
+                _testResult = new TestOidResult { ErrorMessage = "Monitoring not configured." };
+                return;
+            }
+
+            var poller = SnmpEndpoints.BuildPollerFromSettings(settings, CredentialProtection, LoggerFactory);
+            if (poller == null)
+            {
+                _testResult = new TestOidResult { ErrorMessage = "SNMP credentials not configured." };
+                return;
+            }
+
+            var deviceIp = await SnmpEndpoints.ResolveDeviceIpAsync(_expandedDeviceMac, ConnectionService);
+            if (deviceIp == null || !IPAddress.TryParse(deviceIp, out var ip))
+            {
+                _testResult = new TestOidResult { ErrorMessage = "Could not resolve device IP." };
+                return;
+            }
+
+            var value = await poller.GetAsync<string>(ip, _editOid.Trim());
+            _testResult = value != null
+                ? new TestOidResult { Success = true, Value = value }
+                : new TestOidResult { ErrorMessage = "No response (OID may not exist on this device)." };
+        }
+        catch (Exception ex)
+        {
+            _testResult = new TestOidResult { ErrorMessage = $"SNMP error: {ex.Message}" };
+        }
+        finally
+        {
+            _testingOid = false;
+        }
+    }
+
+    private record TestOidResult
+    {
+        public bool Success { get; init; }
+        public string? Value { get; init; }
+        public string? ErrorMessage { get; init; }
+    }
+
+    private async Task SaveOid()
+    {
+        if (string.IsNullOrWhiteSpace(_editOid) || string.IsNullOrWhiteSpace(_editFieldName) || _expandedDeviceMac == null)
+        {
+            _saveError = "OID and Field Name are required.";
+            return;
+        }
+
+        _saving = true;
+        _saveError = null;
+        StateHasChanged();
+
+        try
+        {
+            await CustomOids.AddAsync(_expandedDeviceMac, _editOid, _editFieldName,
+                _editValueType, _editScope, _editDescription);
+
+            _showAddForm = false;
+            await LoadCustomOids(_expandedDeviceMac);
+        }
+        catch (Exception ex)
+        {
+            _saveError = ex.InnerException?.Message ?? ex.Message;
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private async Task DeleteOid(int id)
+    {
+        if (_expandedDeviceMac == null) return;
+
+        try
+        {
+            await CustomOids.DeleteAsync(id);
+            await LoadCustomOids(_expandedDeviceMac);
+        }
+        catch (Exception ex)
+        {
+            _saveError = ex.InnerException?.Message ?? ex.Message;
+        }
+    }
+
+    private string SummaryLabel()
+    {
+        var polling = Devices.Count(d => d.PollState == SnmpPollState.Polling);
+        return $"{polling}/{Devices.Count} polling";
+    }
+
+    private static string StatusBadgeClass(SnmpPollState state) => state switch
+    {
+        SnmpPollState.Polling => "status-active",
+        SnmpPollState.NotYetPolled => "status-inactive",
+        SnmpPollState.Excluded => "status-disconnected",
+        SnmpPollState.SnmpDisabled => "status-neutral",
+        _ => "status-inactive"
+    };
+
+    private static string StatusLabel(SnmpPollState state) => state switch
+    {
+        SnmpPollState.Polling => "Polling",
+        SnmpPollState.NotYetPolled => "Not yet polled",
+        SnmpPollState.Excluded => "Excluded",
+        SnmpPollState.SnmpDisabled => "Not polled",
+        _ => "Unknown"
+    };
+
+    private static string StatusTooltip(SnmpDeviceStatus d) => d.PollState switch
+    {
+        SnmpPollState.Polling => "SNMP is responding; this device is feeding monitoring data.",
+        SnmpPollState.NotYetPolled => "SNMP is enabled but the agent hasn't recorded a successful poll yet this session.",
+        SnmpPollState.Excluded => $"Dropped from polling after {d.FailureCount} consecutive SNMP failures. Retried automatically.",
+        SnmpPollState.SnmpDisabled => "Not polled because SNMP isn't confirmed for this device.",
+        _ => ""
+    };
+
+    private static string RelativeTime(DateTime when)
+    {
+        var delta = DateTime.UtcNow - DateTime.SpecifyKind(when, DateTimeKind.Utc);
+        if (delta < TimeSpan.FromSeconds(15)) return "just now";
+        if (delta < TimeSpan.FromMinutes(1)) return $"{(int)delta.TotalSeconds}s ago";
+        if (delta < TimeSpan.FromHours(1)) return $"{(int)delta.TotalMinutes}m ago";
+        if (delta < TimeSpan.FromDays(1)) return $"{(int)delta.TotalHours}h ago";
+        return $"{(int)delta.TotalDays}d ago";
+    }
+}

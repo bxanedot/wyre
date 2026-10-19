@@ -1,0 +1,363 @@
+using FluentAssertions;
+using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Web.Services;
+using Xunit;
+
+namespace NetworkOptimizer.Storage.Tests;
+
+public class WanDataUsageServiceTests
+{
+    // ========== Billing Cycle Date Calculation ==========
+
+    [Fact]
+    public void GetBillingCycleDates_DayAfterBillingDay_CycleStartsThisMonth()
+    {
+        var refDate = new DateTime(2026, 3, 15, 12, 0, 0, DateTimeKind.Unspecified);
+        var (start, end) = WanDataUsageService.GetBillingCycleDates(1, refDate);
+
+        start.Should().Be(new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Unspecified));
+        end.Should().Be(new DateTime(2026, 3, 31, 0, 0, 0, DateTimeKind.Unspecified));
+    }
+
+    [Fact]
+    public void GetBillingCycleDates_DayBeforeBillingDay_CycleStartsLastMonth()
+    {
+        var refDate = new DateTime(2026, 3, 10, 12, 0, 0, DateTimeKind.Unspecified);
+        var (start, end) = WanDataUsageService.GetBillingCycleDates(15, refDate);
+
+        start.Should().Be(new DateTime(2026, 2, 15, 0, 0, 0, DateTimeKind.Unspecified));
+        end.Should().Be(new DateTime(2026, 3, 14, 0, 0, 0, DateTimeKind.Unspecified));
+    }
+
+    [Fact]
+    public void GetBillingCycleDates_OnBillingDay_CycleStartsToday()
+    {
+        var refDate = new DateTime(2026, 3, 15, 0, 0, 0, DateTimeKind.Unspecified);
+        var (start, end) = WanDataUsageService.GetBillingCycleDates(15, refDate);
+
+        start.Should().Be(new DateTime(2026, 3, 15, 0, 0, 0, DateTimeKind.Unspecified));
+        end.Should().Be(new DateTime(2026, 4, 14, 0, 0, 0, DateTimeKind.Unspecified));
+    }
+
+    [Fact]
+    public void GetBillingCycleDates_Day1_FirstOfMonth()
+    {
+        var refDate = new DateTime(2026, 6, 20, 0, 0, 0, DateTimeKind.Unspecified);
+        var (start, end) = WanDataUsageService.GetBillingCycleDates(1, refDate);
+
+        start.Should().Be(new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Unspecified));
+        end.Should().Be(new DateTime(2026, 6, 30, 0, 0, 0, DateTimeKind.Unspecified));
+    }
+
+    [Fact]
+    public void GetBillingCycleDates_Day28_EndOfMonth()
+    {
+        var refDate = new DateTime(2026, 2, 10, 0, 0, 0, DateTimeKind.Unspecified);
+        var (start, end) = WanDataUsageService.GetBillingCycleDates(28, refDate);
+
+        // Feb 10 is before 28th, so cycle started Jan 28
+        start.Should().Be(new DateTime(2026, 1, 28, 0, 0, 0, DateTimeKind.Unspecified));
+        end.Should().Be(new DateTime(2026, 2, 27, 0, 0, 0, DateTimeKind.Unspecified));
+    }
+
+    [Fact]
+    public void GetBillingCycleDates_ClampsDayAbove28()
+    {
+        var refDate = new DateTime(2026, 3, 15, 0, 0, 0, DateTimeKind.Unspecified);
+        // Day 31 should be clamped to 28
+        var (start, _) = WanDataUsageService.GetBillingCycleDates(31, refDate);
+
+        start.Day.Should().Be(28);
+    }
+
+    [Fact]
+    public void GetBillingCycleDates_YearBoundary()
+    {
+        // January 5 with billing day 15 -> cycle started Dec 15 of previous year
+        var refDate = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Unspecified);
+        var (start, end) = WanDataUsageService.GetBillingCycleDates(15, refDate);
+
+        start.Should().Be(new DateTime(2025, 12, 15, 0, 0, 0, DateTimeKind.Unspecified));
+        end.Should().Be(new DateTime(2026, 1, 14, 0, 0, 0, DateTimeKind.Unspecified));
+    }
+
+    // ========== Cycle Window (reset mode) ==========
+
+    [Fact]
+    public void GetCycleWindow_Monthly_MatchesBillingCycleDates()
+    {
+        var now = new DateTime(2026, 3, 15, 12, 0, 0, DateTimeKind.Utc);
+        var config = new WanDataUsageConfig
+        {
+            ResetMode = DataUsageResetMode.Monthly,
+            BillingCycleDayOfMonth = 1
+        };
+
+        var (start, end) = WanDataUsageService.GetCycleWindow(config, now);
+        var (expectedStart, expectedEnd) = WanDataUsageService.GetBillingCycleDates(1, now);
+
+        start.Should().Be(expectedStart);
+        end.Should().Be(expectedEnd);
+    }
+
+    [Fact]
+    public void GetCycleWindow_ManualNeverReset_StartsAtCreatedAtWithNoEnd()
+    {
+        var created = new DateTime(2026, 1, 10, 8, 0, 0, DateTimeKind.Utc);
+        var now = new DateTime(2026, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+        var config = new WanDataUsageConfig
+        {
+            ResetMode = DataUsageResetMode.Manual,
+            CreatedAt = created,
+            LastResetAt = null
+        };
+
+        var (start, end) = WanDataUsageService.GetCycleWindow(config, now);
+
+        start.Should().Be(created);
+        start.Kind.Should().Be(DateTimeKind.Utc);
+        end.Should().BeNull();
+    }
+
+    [Fact]
+    public void GetCycleWindow_ManualAfterReset_StartsAtLastResetWithNoEnd()
+    {
+        var created = new DateTime(2026, 1, 10, 8, 0, 0, DateTimeKind.Utc);
+        var lastReset = new DateTime(2026, 5, 2, 14, 30, 0, DateTimeKind.Utc);
+        var now = new DateTime(2026, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+        var config = new WanDataUsageConfig
+        {
+            ResetMode = DataUsageResetMode.Manual,
+            CreatedAt = created,
+            LastResetAt = lastReset
+        };
+
+        var (start, end) = WanDataUsageService.GetCycleWindow(config, now);
+
+        start.Should().Be(lastReset);
+        end.Should().BeNull();
+    }
+
+    // ========== Usage Calculation from Snapshots ==========
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_EmptyList_ReturnsZero()
+    {
+        var result = WanDataUsageService.CalculateUsageFromSnapshots([]);
+        result.Should().Be(0);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_SingleSnapshot_ReturnsZero()
+    {
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "wan1", RxBytes = 1000, TxBytes = 500, Timestamp = DateTime.UtcNow }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots);
+        result.Should().Be(0);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_TwoSnapshots_ReturnsDelta()
+    {
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "wan1", RxBytes = 1000, TxBytes = 500, Timestamp = DateTime.UtcNow.AddMinutes(-2) },
+            new() { WanKey = "wan1", RxBytes = 2000, TxBytes = 800, Timestamp = DateTime.UtcNow }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots);
+        // RxDelta = 1000, TxDelta = 300 => 1300
+        result.Should().Be(1300);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_MultipleSnapshots_SumsDeltas()
+    {
+        var now = DateTime.UtcNow;
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "wan1", RxBytes = 1000, TxBytes = 500, Timestamp = now.AddMinutes(-6) },
+            new() { WanKey = "wan1", RxBytes = 2000, TxBytes = 1000, Timestamp = now.AddMinutes(-4) },
+            new() { WanKey = "wan1", RxBytes = 3500, TxBytes = 1500, Timestamp = now.AddMinutes(-2) },
+            new() { WanKey = "wan1", RxBytes = 4000, TxBytes = 2000, Timestamp = now }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots);
+        // Total Rx delta = 3000, Total Tx delta = 1500 => 4500
+        result.Should().Be(4500);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_CounterReset_SkipsResetDelta()
+    {
+        var now = DateTime.UtcNow;
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "wan1", RxBytes = 10000, TxBytes = 5000, Timestamp = now.AddMinutes(-6) },
+            new() { WanKey = "wan1", RxBytes = 15000, TxBytes = 7000, Timestamp = now.AddMinutes(-4) },
+            // Counter reset (gateway reboot) - values drop
+            new() { WanKey = "wan1", RxBytes = 100, TxBytes = 50, IsCounterReset = true, Timestamp = now.AddMinutes(-2) },
+            new() { WanKey = "wan1", RxBytes = 2000, TxBytes = 1000, Timestamp = now }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots);
+        // Snapshot 1->2: Rx=5000, Tx=2000 = 7000
+        // Snapshot 2->3: SKIPPED (counter reset)
+        // Snapshot 3->4: Rx=1900, Tx=950 = 2850
+        // Total = 9850
+        result.Should().Be(9850);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_CounterResetAtStart_SkipsFirstDelta()
+    {
+        var now = DateTime.UtcNow;
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "wan1", RxBytes = 50000, TxBytes = 20000, Timestamp = now.AddMinutes(-4) },
+            // Reset detected
+            new() { WanKey = "wan1", RxBytes = 500, TxBytes = 200, IsCounterReset = true, Timestamp = now.AddMinutes(-2) },
+            new() { WanKey = "wan1", RxBytes = 1500, TxBytes = 700, Timestamp = now }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots);
+        // Snapshot 0->1: SKIPPED (reset)
+        // Snapshot 1->2: Rx=1000, Tx=500 = 1500
+        result.Should().Be(1500);
+    }
+
+    // ========== Large Values (multi-GB) ==========
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_LargeValues_HandlesCorrectly()
+    {
+        var now = DateTime.UtcNow;
+        var oneGb = 1024L * 1024 * 1024;
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "wan1", RxBytes = oneGb, TxBytes = oneGb / 2, Timestamp = now.AddMinutes(-2) },
+            new() { WanKey = "wan1", RxBytes = oneGb * 3, TxBytes = oneGb, Timestamp = now }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots);
+        // Rx delta = 2GB, Tx delta = 0.5GB
+        result.Should().Be(oneGb * 2 + oneGb / 2);
+    }
+
+    // ========== Baseline from Gateway Uptime ==========
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_BaselineWithBootTime_IncludesRawBytes()
+    {
+        var oneGb = 1024L * 1024 * 1024;
+        var cycleStart = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+        var bootTime = new DateTime(2026, 3, 5, 0, 0, 0, DateTimeKind.Utc); // Booted after cycle start
+
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "WAN3", RxBytes = oneGb * 2, TxBytes = oneGb, GatewayBootTime = bootTime, IsBaseline = true, Timestamp = DateTime.UtcNow.AddMinutes(-4) },
+            new() { WanKey = "WAN3", RxBytes = oneGb * 2 + 1000, TxBytes = oneGb + 500, GatewayBootTime = bootTime, Timestamp = DateTime.UtcNow }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots, cycleStart);
+        // Baseline: 2GB + 1GB = 3GB, plus delta: 1000 + 500 = 1500
+        result.Should().Be(oneGb * 3 + 1500);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_BaselineSingleSnapshot_ReturnsRawBytes()
+    {
+        var oneGb = 1024L * 1024 * 1024;
+        var cycleStart = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+        var bootTime = new DateTime(2026, 3, 5, 0, 0, 0, DateTimeKind.Utc);
+
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "WAN3", RxBytes = oneGb * 2, TxBytes = oneGb, GatewayBootTime = bootTime, IsBaseline = true, Timestamp = DateTime.UtcNow }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots, cycleStart);
+        // Just the baseline bytes: 2GB + 1GB = 3GB
+        result.Should().Be(oneGb * 3);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_NonBaselineSingleSnapshot_ReturnsZero()
+    {
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "WAN3", RxBytes = 5000, TxBytes = 3000, Timestamp = DateTime.UtcNow }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots);
+        result.Should().Be(0);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_BootBeforeCycleStart_NoBaseline()
+    {
+        // Gateway booted BEFORE the cycle start - should NOT count as baseline
+        var oneGb = 1024L * 1024 * 1024;
+        var cycleStart = new DateTime(2026, 3, 28, 0, 0, 0, DateTimeKind.Utc);
+        var bootTime = new DateTime(2026, 3, 27, 23, 0, 0, DateTimeKind.Utc); // Before cycle
+
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "WAN", RxBytes = oneGb * 30, TxBytes = oneGb, GatewayBootTime = bootTime, IsBaseline = true, Timestamp = DateTime.UtcNow.AddMinutes(-4) },
+            new() { WanKey = "WAN", RxBytes = oneGb * 30 + 5000, TxBytes = oneGb + 2000, GatewayBootTime = bootTime, Timestamp = DateTime.UtcNow }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots, cycleStart);
+        // Despite IsBaseline=true, boot time is before cycle start so only deltas count
+        result.Should().Be(7000);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_OldSnapshotWithoutBootTime_FallsBackToIsBaseline()
+    {
+        // Old snapshots without GatewayBootTime should fall back to IsBaseline flag
+        var oneGb = 1024L * 1024 * 1024;
+        var cycleStart = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "WAN3", RxBytes = oneGb * 2, TxBytes = oneGb, GatewayBootTime = null, IsBaseline = true, Timestamp = DateTime.UtcNow.AddMinutes(-4) },
+            new() { WanKey = "WAN3", RxBytes = oneGb * 2 + 1000, TxBytes = oneGb + 500, GatewayBootTime = null, Timestamp = DateTime.UtcNow }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots, cycleStart);
+        // Falls back to IsBaseline=true: 3GB + 1500 delta
+        result.Should().Be(oneGb * 3 + 1500);
+    }
+
+    [Fact]
+    public void CalculateUsageFromSnapshots_NoCycleStart_FallsBackToIsBaseline()
+    {
+        // When cycleStart is not provided, fall back to IsBaseline flag
+        var oneGb = 1024L * 1024 * 1024;
+
+        var snapshots = new List<WanDataUsageSnapshot>
+        {
+            new() { WanKey = "WAN3", RxBytes = oneGb * 2, TxBytes = oneGb, IsBaseline = true, Timestamp = DateTime.UtcNow }
+        };
+
+        var result = WanDataUsageService.CalculateUsageFromSnapshots(snapshots);
+        result.Should().Be(oneGb * 3);
+    }
+
+    // ========== WAN Key to Network Group Mapping ==========
+
+    [Theory]
+    [InlineData("wan1", "WAN")]
+    [InlineData("wan2", "WAN2")]
+    [InlineData("wan3", "WAN3")]
+    [InlineData("wan", "WAN")]
+    public void WanKeyToNetworkGroup_MapsCorrectly(string wanKey, string expectedGroup)
+    {
+        var result = WanDataUsageService.WanKeyToNetworkGroup(wanKey);
+        result.Should().Be(expectedGroup);
+    }
+}

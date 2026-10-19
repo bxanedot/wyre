@@ -1,0 +1,246 @@
+using FluentAssertions;
+using NetworkOptimizer.Web.Services.Monitoring.IspHealth;
+using Xunit;
+
+namespace NetworkOptimizer.Web.Tests.IspHealth;
+
+public class LoadClassifierTests
+{
+    private static readonly IspHealthOptions Options = new();
+
+    [Fact]
+    public void Classifies_download_load_at_seventy_percent_of_expected()
+    {
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 700_000_000, 5_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        windows.Should().HaveCount(1);
+        var w = windows.Values.Single();
+        w.IsLoadedDown.Should().BeTrue();
+        w.IsLoadedUp.Should().BeFalse();
+        w.IsIdle.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Classifies_idle_when_both_directions_quiet()
+    {
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 200_000_000, 20_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        windows.Should().HaveCount(1);
+        var w = windows.Values.Single();
+        w.IsIdle.Should().BeTrue();
+        w.IsLoadedDown.Should().BeFalse();
+        w.IsLoadedUp.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Moderate_load_is_neither_idle_nor_loaded()
+    {
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 400_000_000, 20_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        windows.Should().HaveCount(1);
+        var w = windows.Values.Single();
+        w.IsIdle.Should().BeFalse();
+        w.IsLoadedDown.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Both_directions_can_be_loaded_at_once()
+    {
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 800_000_000, 90_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        windows.Should().HaveCount(1);
+        var w = windows.Values.Single();
+        w.IsLoadedDown.Should().BeTrue();
+        w.IsLoadedUp.Should().BeTrue();
+    }
+
+    [Fact]
+    public void No_expected_speeds_yields_no_classification()
+    {
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 800_000_000, 90_000_000)
+        };
+
+        LoadClassifier.Classify(rates, null, null, Options).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Uses_peak_rate_within_load_window()
+    {
+        // Both samples within one LoadWindowSeconds span so they group into one bucket
+        var ws = Options.LoadWindowSeconds;
+        var baseTime = CongestionDetector.FloorTime(TestSeries.Start, TimeSpan.FromSeconds(ws));
+        var rates = new List<ThroughputSample>
+        {
+            new(baseTime, 100_000_000, 1_000_000),
+            new(baseTime.AddSeconds(ws - 1), 750_000_000, 1_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        windows.Should().HaveCount(1);
+        windows.Values.Single().IsLoadedDown.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Demotion_clears_the_live_flag_but_never_the_classified_one()
+    {
+        // Dilation's opposite-direction barrier reads the classified pair, so a demoted phase still
+        // stops the surviving phase from dilating into it.
+        var ws = Options.LoadWindowSeconds;
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 10_000_000, 1_000_000),
+            new(TestSeries.Start.AddSeconds(ws), 900_000_000, 2_000_000),
+            new(TestSeries.Start.AddSeconds(ws * 2), 10_000_000, 1_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        var demoted = windows[windows.Keys.OrderBy(k => k).ToList()[1]];
+        demoted.IsLoadedDown.Should().BeFalse();
+        demoted.ClassifiedLoadedDown.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Lone_loaded_window_between_idle_ones_does_not_count_as_load()
+    {
+        // This used to register as loaded. It no longer does, because it is indistinguishable from a
+        // counter artifact - a rate delta spanning a counter reset at a link flap - and magnitude
+        // cannot separate the two: bursty access media legitimately read well above plan. One such
+        // sample, beside an outage, defined an entire month's Loaded Loss on a real site.
+        var ws = Options.LoadWindowSeconds;
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 10_000_000, 1_000_000),
+            new(TestSeries.Start.AddSeconds(ws), 900_000_000, 2_000_000),
+            new(TestSeries.Start.AddSeconds(ws * 2), 10_000_000, 1_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        windows.Should().HaveCount(3);
+        var keys = windows.Keys.OrderBy(k => k).ToList();
+        windows[keys[1]].IsLoadedDown.Should().BeFalse();
+        windows[keys[0]].IsIdle.Should().BeTrue();
+        windows[keys[2]].IsIdle.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Lone_loaded_window_during_a_recorded_speed_test_still_counts()
+    {
+        // A speed test phase lasts about ten seconds, so at a 7 s rate aggregate it often fills one
+        // bucket. The recorded test proves the load was real, so the artifact guard stands aside.
+        // The test is stamped at its end, after the phase.
+        var ws = Options.LoadWindowSeconds;
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 10_000_000, 1_000_000),
+            new(TestSeries.Start.AddSeconds(ws), 900_000_000, 2_000_000),
+            new(TestSeries.Start.AddSeconds(ws * 2), 10_000_000, 1_000_000)
+        };
+        var testEnd = TestSeries.Start.AddSeconds(ws + 20);
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options,
+            speedTestTimes: new[] { testEnd });
+
+        windows[windows.Keys.OrderBy(k => k).ToList()[1]].IsLoadedDown.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Lone_loaded_window_far_from_any_speed_test_is_still_demoted()
+    {
+        var ws = Options.LoadWindowSeconds;
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 10_000_000, 1_000_000),
+            new(TestSeries.Start.AddSeconds(ws), 900_000_000, 2_000_000),
+            new(TestSeries.Start.AddSeconds(ws * 2), 10_000_000, 1_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options,
+            speedTestTimes: new[] { TestSeries.Start.AddHours(1) });
+
+        windows[windows.Keys.OrderBy(k => k).ToList()[1]].IsLoadedDown.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Sustained_load_across_consecutive_samples_still_counts()
+    {
+        // The other side of the same rule: real saturation holds across samples, so it survives.
+        // A gig line under full load sawtooths roughly 0.8x to 1.4x of plan, and even its troughs
+        // clear the loaded threshold - so the run requirement never costs a genuine transfer.
+        var ws = Options.LoadWindowSeconds;
+        var rates = new List<ThroughputSample>
+        {
+            new(TestSeries.Start, 10_000_000, 1_000_000),
+            new(TestSeries.Start.AddSeconds(ws), 1_400_000_000, 2_000_000),
+            new(TestSeries.Start.AddSeconds(ws * 2), 800_000_000, 2_000_000),
+            new(TestSeries.Start.AddSeconds(ws * 3), 1_300_000_000, 2_000_000),
+            new(TestSeries.Start.AddSeconds(ws * 4), 10_000_000, 1_000_000)
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        var keys = windows.Keys.OrderBy(k => k).ToList();
+        windows[keys[1]].IsLoadedDown.Should().BeTrue();
+        windows[keys[2]].IsLoadedDown.Should().BeTrue();
+        windows[keys[3]].IsLoadedDown.Should().BeTrue();
+    }
+
+    [Fact]
+    public void A_single_sample_series_is_not_demoted()
+    {
+        // Nothing to compare against. Absence of a neighbor is not evidence of a spike, and demoting
+        // here would discard the only load a short window ever saw.
+        var rates = new List<ThroughputSample> { new(TestSeries.Start, 900_000_000, 2_000_000) };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options);
+
+        windows.Values.Single().IsLoadedDown.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Exclusion_window_forces_non_loaded()
+    {
+        var ws = Options.LoadWindowSeconds;
+        var baseTime = CongestionDetector.FloorTime(TestSeries.Start, TimeSpan.FromSeconds(ws));
+        var rates = new List<ThroughputSample>
+        {
+            new(baseTime, 900_000_000, 90_000_000)
+        };
+        var exclusions = new List<(DateTime Start, DateTime End)>
+        {
+            (baseTime, baseTime.AddSeconds(20))
+        };
+
+        var windows = LoadClassifier.Classify(rates, expectedDownloadMbps: 1000, expectedUploadMbps: 100, Options, exclusions);
+
+        windows.Should().HaveCount(1);
+        var w = windows.Values.Single();
+        w.IsLoadedDown.Should().BeFalse();
+        w.IsLoadedUp.Should().BeFalse();
+        w.IsIdle.Should().BeFalse();
+    }
+}

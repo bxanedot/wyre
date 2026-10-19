@@ -1,0 +1,276 @@
+namespace NetworkOptimizer.Audit.Models;
+
+/// <summary>
+/// Network classification types based on purpose.
+/// Note: Corporate is the default (value 0), matching UniFi's API behavior.
+/// </summary>
+public enum NetworkPurpose
+{
+    /// <summary>
+    /// Corporate/business network for general use (default)
+    /// </summary>
+    Corporate,
+
+    /// <summary>
+    /// Home/primary residential network
+    /// </summary>
+    Home,
+
+    /// <summary>
+    /// IoT devices (smart home, automation, etc.)
+    /// </summary>
+    IoT,
+
+    /// <summary>
+    /// Security cameras and surveillance equipment
+    /// </summary>
+    Security,
+
+    /// <summary>
+    /// Guest network for visitors
+    /// </summary>
+    Guest,
+
+    /// <summary>
+    /// Management/admin network for infrastructure
+    /// </summary>
+    Management,
+
+    /// <summary>
+    /// Printer/scanner network
+    /// </summary>
+    Printer,
+
+    /// <summary>
+    /// DMZ (demilitarized zone) network - isolated with internet access but restricted LAN access
+    /// </summary>
+    Dmz,
+
+    /// <summary>
+    /// Server/compute network for hypervisors, containers, and datacenter workloads
+    /// </summary>
+    Server,
+
+    /// <summary>
+    /// Media/entertainment network (streaming devices, Apple TV, A/V receivers)
+    /// </summary>
+    Media,
+
+    /// <summary>
+    /// Gaming network (consoles, PCs) - same trust level as Home
+    /// </summary>
+    Gaming,
+
+    /// <summary>
+    /// Unknown or unclassified network
+    /// </summary>
+    Unknown
+}
+
+/// <summary>
+/// Extension methods for NetworkPurpose
+/// </summary>
+public static class NetworkPurposeExtensions
+{
+    /// <summary>
+    /// Get a human-friendly display name for the purpose
+    /// </summary>
+    public static string ToDisplayString(this NetworkPurpose purpose) => purpose switch
+    {
+        NetworkPurpose.Corporate => "Corporate",
+        NetworkPurpose.Home => "Home",
+        NetworkPurpose.IoT => "IoT",
+        NetworkPurpose.Security => "Security",
+        NetworkPurpose.Guest => "Guest",
+        NetworkPurpose.Management => "Management",
+        NetworkPurpose.Printer => "Printer",
+        NetworkPurpose.Dmz => "DMZ",
+        NetworkPurpose.Server => "Server",
+        NetworkPurpose.Media => "Media",
+        NetworkPurpose.Gaming => "Gaming",
+        NetworkPurpose.Unknown => "Unclassified",
+        _ => purpose.ToString()
+    };
+}
+
+/// <summary>
+/// Represents a network/VLAN configuration
+/// </summary>
+public class NetworkInfo
+{
+    /// <summary>
+    /// Network ID (from UniFi)
+    /// </summary>
+    public required string Id { get; init; }
+
+    /// <summary>
+    /// Network name
+    /// </summary>
+    public required string Name { get; init; }
+
+    /// <summary>
+    /// VLAN ID (1 for native/untagged)
+    /// </summary>
+    public required int VlanId { get; init; }
+
+    /// <summary>
+    /// Purpose/classification of the network
+    /// </summary>
+    public NetworkPurpose Purpose { get; init; }
+
+    /// <summary>
+    /// IP subnet (e.g., "192.168.1.0/24")
+    /// </summary>
+    public string? Subnet { get; init; }
+
+    /// <summary>
+    /// Gateway IP address
+    /// </summary>
+    public string? Gateway { get; init; }
+
+    /// <summary>
+    /// DNS servers for this network
+    /// </summary>
+    public List<string>? DnsServers { get; init; }
+
+    /// <summary>
+    /// Whether this is the native/default VLAN
+    /// </summary>
+    public bool IsNative => VlanId == 1;
+
+    /// <summary>
+    /// Whether inter-VLAN routing is enabled
+    /// </summary>
+    public bool AllowsRouting { get; init; }
+
+    /// <summary>
+    /// Whether DHCP server is enabled on this network
+    /// </summary>
+    public bool DhcpEnabled { get; init; }
+
+    /// <summary>
+    /// Whether network isolation is enabled (blocks inter-VLAN traffic by default)
+    /// </summary>
+    public bool NetworkIsolationEnabled { get; init; }
+
+    /// <summary>
+    /// Whether internet access is enabled for this network
+    /// </summary>
+    public bool InternetAccessEnabled { get; init; }
+
+    /// <summary>
+    /// Whether this is an official UniFi Guest network (purpose="guest" in API).
+    /// These networks have implicit isolation at the switch/AP level that doesn't
+    /// appear in firewall rules, so we skip firewall isolation checks for them.
+    /// </summary>
+    public bool IsUniFiGuestNetwork { get; init; }
+
+    /// <summary>
+    /// Firewall zone ID for this network (from UniFi).
+    /// LAN networks share one zone ID, WAN networks have a different zone ID.
+    /// Used to detect firewall rules that block internet access.
+    /// </summary>
+    public string? FirewallZoneId { get; init; }
+
+    /// <summary>
+    /// Network group (LAN, WAN, WAN2, etc.).
+    /// Used to identify whether this is an internal or external network.
+    /// </summary>
+    public string? NetworkGroup { get; init; }
+
+    /// <summary>
+    /// Whether UPnP is enabled for this specific network.
+    /// When true, devices on this network can use UPnP to open ports on the firewall.
+    /// </summary>
+    public bool UpnpLanEnabled { get; init; }
+
+    /// <summary>
+    /// Whether this network is enabled/active.
+    /// Disabled networks are configured but not active on the gateway.
+    /// </summary>
+    public bool Enabled { get; init; } = true;
+
+    /// <summary>
+    /// Whether the user has explicitly overridden this network's purpose classification.
+    /// When true, native VLAN exemptions are bypassed so audit rules apply based on the overridden purpose.
+    /// </summary>
+    public bool HasPurposeOverride { get; init; }
+
+    /// <summary>
+    /// Whether IPv6 is enabled on this network (ipv6_interface_type set and not "none").
+    /// </summary>
+    public bool HasIpv6 { get; init; }
+
+    /// <summary>
+    /// The network's IPv6 prefixes in CIDR form (e.g., "2001:db8:1::/64"). A static network carries
+    /// its configured prefix; a prefix-delegated one carries it only when read from the gateway.
+    /// </summary>
+    public List<string>? Ipv6Subnets { get; init; }
+
+    /// <summary>
+    /// The gateway's own IPv6 addresses on this network: the host part of ipv6_subnet / ipv6_subnets
+    /// ("2001:db8:1::1/64" gives "2001:db8:1::1"). <see cref="Ipv6Subnets"/> drops it by normalizing.
+    /// </summary>
+    public List<string>? Ipv6GatewayAddresses { get; init; }
+
+    /// <summary>
+    /// Custom IPv6 DNS servers handed out over DHCPv6 and RA RDNSS (dhcpdv6_dns_1..4 with
+    /// dhcpdv6_dns_auto false). Null when IPv6 is off or the network hands out the gateway.
+    /// </summary>
+    public List<string>? Ipv6DnsServers { get; init; }
+
+    /// <summary>
+    /// Whether IPv6 traffic from or to this network can be evaluated. Requires a known prefix, since
+    /// address-based rules cannot be matched to the network without one.
+    /// </summary>
+    /// <remarks>
+    /// Deliberate: without a prefix the audit makes no IPv6 claim for the network, in either
+    /// direction. Do not report it as a gap. rest/networkconf never carries a delegated prefix
+    /// (only the gateway network_table does), so this is expected for PD networks read from there.
+    /// </remarks>
+    public bool IsIpv6Evaluable => HasIpv6 && Ipv6Subnets is { Count: > 0 };
+
+    /// <summary>
+    /// The address families whose traffic this network carries and the audit can evaluate.
+    /// Always IPv4; IPv6 when <see cref="IsIpv6Evaluable"/>.
+    /// </summary>
+    public IEnumerable<IpFamily> EvaluableFamilies => IsIpv6Evaluable
+        ? [IpFamily.IPv4, IpFamily.IPv6]
+        : [IpFamily.IPv4];
+
+    /// <summary>
+    /// The subnets that address-based rules are matched against for the given family.
+    /// </summary>
+    public IReadOnlyList<string> SubnetsFor(IpFamily family) => family == IpFamily.IPv6
+        ? Ipv6Subnets ?? []
+        : string.IsNullOrEmpty(Subnet) ? [] : [Subnet];
+
+    /// <summary>
+    /// Copy of this network with a different purpose. Keeps every other field, so callers that
+    /// reclassify a network cannot drop one.
+    /// </summary>
+    public NetworkInfo WithPurpose(NetworkPurpose purpose, bool hasPurposeOverride) => new()
+    {
+        Id = Id,
+        Name = Name,
+        VlanId = VlanId,
+        Purpose = purpose,
+        Subnet = Subnet,
+        Gateway = Gateway,
+        DnsServers = DnsServers,
+        AllowsRouting = AllowsRouting,
+        DhcpEnabled = DhcpEnabled,
+        NetworkIsolationEnabled = NetworkIsolationEnabled,
+        InternetAccessEnabled = InternetAccessEnabled,
+        IsUniFiGuestNetwork = IsUniFiGuestNetwork,
+        FirewallZoneId = FirewallZoneId,
+        NetworkGroup = NetworkGroup,
+        UpnpLanEnabled = UpnpLanEnabled,
+        Enabled = Enabled,
+        HasPurposeOverride = hasPurposeOverride,
+        HasIpv6 = HasIpv6,
+        Ipv6Subnets = Ipv6Subnets,
+        Ipv6GatewayAddresses = Ipv6GatewayAddresses,
+        Ipv6DnsServers = Ipv6DnsServers
+    };
+}
