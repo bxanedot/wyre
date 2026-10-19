@@ -10,9 +10,6 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    env:
-      WIN_CSC_LINK: ${{ secrets.WYRE_WINDOWS_PFX }}
-      WIN_CSC_KEY_PASSWORD: ${{ secrets.WYRE_WINDOWS_PFX_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,12 +17,18 @@ jobs:
           node-version: 24
           cache: npm
       - name: Require the bxane signing certificate
+        env:
+          WYRE_WINDOWS_PFX: ${{ secrets.WYRE_WINDOWS_PFX }}
+          WYRE_WINDOWS_PFX_PASSWORD: ${{ secrets.WYRE_WINDOWS_PFX_PASSWORD }}
         shell: pwsh
         run: |
-          if (-not $env:WIN_CSC_LINK -or -not $env:WIN_CSC_KEY_PASSWORD) { throw 'Set WYRE_WINDOWS_PFX and WYRE_WINDOWS_PFX_PASSWORD in repository Actions secrets.' }
+          if (-not $env:WYRE_WINDOWS_PFX -or -not $env:WYRE_WINDOWS_PFX_PASSWORD) { throw 'Set WYRE_WINDOWS_PFX and WYRE_WINDOWS_PFX_PASSWORD in repository Actions secrets.' }
       - run: npm ci
       - run: npm run dist:win
       - name: Sign and verify installer files
+        env:
+          WIN_CSC_LINK: ${{ secrets.WYRE_WINDOWS_PFX }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WYRE_WINDOWS_PFX_PASSWORD }}
         shell: pwsh
         run: |
           $pfxPath = Join-Path $env:RUNNER_TEMP 'wyre-signing.pfx'
@@ -57,9 +60,6 @@ jobs:
 
   linux:
     runs-on: ubuntu-latest
-    env:
-      WYRE_WINDOWS_PFX: ${{ secrets.WYRE_WINDOWS_PFX }}
-      WYRE_WINDOWS_PFX_PASSWORD: ${{ secrets.WYRE_WINDOWS_PFX_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -67,10 +67,16 @@ jobs:
           node-version: 24
           cache: npm
       - name: Require the bxane signing certificate
+        env:
+          WYRE_WINDOWS_PFX: ${{ secrets.WYRE_WINDOWS_PFX }}
+          WYRE_WINDOWS_PFX_PASSWORD: ${{ secrets.WYRE_WINDOWS_PFX_PASSWORD }}
         run: test -n "$WYRE_WINDOWS_PFX" && test -n "$WYRE_WINDOWS_PFX_PASSWORD"
       - run: npm ci
       - run: npm run dist:linux
       - name: Sign packages and checksums
+        env:
+          WYRE_WINDOWS_PFX: ${{ secrets.WYRE_WINDOWS_PFX }}
+          WYRE_WINDOWS_PFX_PASSWORD: ${{ secrets.WYRE_WINDOWS_PFX_PASSWORD }}
         shell: bash
         run: |
           printf '%s' "$WYRE_WINDOWS_PFX" | base64 --decode > "$RUNNER_TEMP/wyre-signing.pfx"
