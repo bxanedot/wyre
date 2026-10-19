@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "Rede",
     "networkDescription": "Meça sob demanda a latência, o jitter e as velocidades de download e upload.",
+    "networkTestTitle": "Teste de velocidade da internet",
+    "networkReadyTitle": "Pronto para medir a velocidade",
+    "networkReadyDescription": "Inicie um teste para ver a latência, o jitter e as velocidades de download e upload.",
+    "networkCurrentConnection": "Conexão atual",
+    "networkErrorTitle": "Não foi possível concluir o teste",
+    "networkErrorDescription": "Verifique sua conexão com a internet e tente novamente.",
     "networkRun": "Testar velocidade",
     "networkMeasuring": "Medindo…",
     "latency": "Latência",

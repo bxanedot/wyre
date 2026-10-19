@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "Ağ",
     "networkDescription": "İsteğe bağlı olarak gecikme, titreşim ve indirme/yükleme hızını ölçün.",
+    "networkTestTitle": "İnternet hız testi",
+    "networkReadyTitle": "Hız testi hazır",
+    "networkReadyDescription": "Gecikme, titreşim ve indirme/yükleme hızlarını görmek için testi başlatın.",
+    "networkCurrentConnection": "Mevcut bağlantı",
+    "networkErrorTitle": "Hız testi tamamlanamadı",
+    "networkErrorDescription": "İnternet bağlantınızı kontrol edip yeniden deneyin.",
     "networkRun": "Hız testi yap",
     "networkMeasuring": "Ölçülüyor…",
     "latency": "Gecikme",

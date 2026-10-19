@@ -1,9 +1,10 @@
 # Changelog
 
-## 0.4.0 — 2026-10-19
+## 1.0.0 — 2026-10-20
 
 - Replaced the standalone Electron shell with the full MangoDisk Vue/Tauri application as Wyre's base.
 - Added on-demand network latency, jitter, download, and upload measurement.
+- Added live network interface status, local IPv4 details, and current traffic rates to the Network page.
 - Added native Windows and GNOME pointer speed and acceleration controls with review and one-step undo.
 - Rebranded the desktop app, package metadata, icons, and release workflow as Wyre.
 - Added Windows NSIS, Linux AppImage and Debian installers, SHA-256 checksums, optional signatures, and this changelog to GitHub Releases.

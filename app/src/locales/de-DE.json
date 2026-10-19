@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "Netzwerk",
     "networkDescription": "Latenz, Jitter sowie Download- und Uploadgeschwindigkeit bei Bedarf messen.",
+    "networkTestTitle": "Internet-Geschwindigkeitstest",
+    "networkReadyTitle": "Bereit für den Geschwindigkeitstest",
+    "networkReadyDescription": "Starten Sie einen Test, um Latenz, Jitter sowie Download- und Uploadgeschwindigkeit zu sehen.",
+    "networkCurrentConnection": "Aktuelle Verbindung",
+    "networkErrorTitle": "Geschwindigkeitstest nicht abgeschlossen",
+    "networkErrorDescription": "Prüfen Sie Ihre Internetverbindung und versuchen Sie es erneut.",
     "networkRun": "Geschwindigkeit messen",
     "networkMeasuring": "Wird gemessen…",
     "latency": "Latenz",

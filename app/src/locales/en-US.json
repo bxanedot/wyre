@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "Network",
     "networkDescription": "Run an on-demand check of latency, jitter, download, and upload speed.",
+    "networkTestTitle": "Internet speed test",
+    "networkReadyTitle": "Ready for a speed check",
+    "networkReadyDescription": "Start a test to see latency, jitter, download speed, and upload speed.",
+    "networkCurrentConnection": "Current connection",
+    "networkErrorTitle": "Speed check could not finish",
+    "networkErrorDescription": "Check your internet connection and try again.",
     "networkRun": "Run speed check",
     "networkMeasuring": "Measuring…",
     "latency": "Latency",

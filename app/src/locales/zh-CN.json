@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "网络",
     "networkDescription": "按需测量延迟、抖动、下载速度和上传速度。",
+    "networkTestTitle": "网络测速",
+    "networkReadyTitle": "可以开始测速",
+    "networkReadyDescription": "开始测试以查看延迟、抖动以及下载和上传速度。",
+    "networkCurrentConnection": "当前连接",
+    "networkErrorTitle": "未能完成速度测试",
+    "networkErrorDescription": "请检查互联网连接后重试。",
     "networkRun": "测速",
     "networkMeasuring": "测量中…",
     "latency": "延迟",

@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "Réseau",
     "networkDescription": "Mesurez à la demande la latence, la gigue et les débits descendant et montant.",
+    "networkTestTitle": "Test de débit Internet",
+    "networkReadyTitle": "Prêt à mesurer le débit",
+    "networkReadyDescription": "Lancez un test pour voir la latence, la gigue et les débits descendant et montant.",
+    "networkCurrentConnection": "Connexion actuelle",
+    "networkErrorTitle": "Le test de débit n’a pas abouti",
+    "networkErrorDescription": "Vérifiez votre connexion Internet et réessayez.",
     "networkRun": "Tester le débit",
     "networkMeasuring": "Mesure en cours…",
     "latency": "Latence",

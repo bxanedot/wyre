@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "ネットワーク",
     "networkDescription": "必要なときに遅延、ジッター、ダウンロード速度、アップロード速度を測定します。",
+    "networkTestTitle": "インターネット速度測定",
+    "networkReadyTitle": "速度測定の準備ができました",
+    "networkReadyDescription": "測定を開始すると、遅延、ジッター、ダウンロード速度、アップロード速度を確認できます。",
+    "networkCurrentConnection": "現在の接続",
+    "networkErrorTitle": "速度測定を完了できませんでした",
+    "networkErrorDescription": "インターネット接続を確認して、もう一度お試しください。",
     "networkRun": "速度を測定",
     "networkMeasuring": "測定中…",
     "latency": "遅延",

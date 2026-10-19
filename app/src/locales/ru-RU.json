@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "Сеть",
     "networkDescription": "По запросу измеряет задержку, джиттер, скорость загрузки и отправки.",
+    "networkTestTitle": "Проверка скорости интернета",
+    "networkReadyTitle": "Готово к проверке скорости",
+    "networkReadyDescription": "Запустите проверку, чтобы увидеть задержку, джиттер и скорость загрузки и отправки.",
+    "networkCurrentConnection": "Текущее подключение",
+    "networkErrorTitle": "Не удалось завершить проверку скорости",
+    "networkErrorDescription": "Проверьте подключение к интернету и повторите попытку.",
     "networkRun": "Проверить скорость",
     "networkMeasuring": "Измерение…",
     "latency": "Задержка",

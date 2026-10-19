@@ -4369,6 +4369,12 @@
   "wyre": {
     "networkTitle": "네트워크",
     "networkDescription": "필요할 때 지연 시간, 지터, 다운로드 및 업로드 속도를 측정합니다.",
+    "networkTestTitle": "인터넷 속도 측정",
+    "networkReadyTitle": "속도 측정 준비 완료",
+    "networkReadyDescription": "측정을 시작하면 지연 시간, 지터, 다운로드 및 업로드 속도를 확인할 수 있습니다.",
+    "networkCurrentConnection": "현재 연결",
+    "networkErrorTitle": "속도 측정을 완료할 수 없습니다",
+    "networkErrorDescription": "인터넷 연결을 확인하고 다시 시도하세요.",
     "networkRun": "속도 측정",
     "networkMeasuring": "측정 중…",
     "latency": "지연 시간",
