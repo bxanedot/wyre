@@ -1,6 +1,6 @@
 {
   "name": "wyre",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A practical PC, network, and mouse control panel for Windows and Linux.",
   "main": "src/main.cjs",
   "author": "bxane",

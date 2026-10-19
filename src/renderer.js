@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const pages = ['overview', 'network', 'mouse'];
+const pages = ['overview', 'network', 'storage', 'mouse'];
 let state;
 let acceleration = true;
 let pendingChange = null;
@@ -30,6 +30,18 @@ function paintState(value) {
   $('power-button').disabled = !value.power.supported;
   $('power-button').innerHTML = /performance/i.test(value.power.current) ? 'SET BALANCED <span>↗</span>' : 'PERFORMANCE MODE <span>↗</span>';
   $('power-note').textContent = value.power.supported ? 'Changes apply only when selected' : value.power.current;
+  $('network-facts').replaceChildren();
+  if (value.network.length) {
+    for (const item of value.network) {
+      const row = document.createElement('div');
+      const name = document.createElement('b');
+      const address = document.createElement('span');
+      name.textContent = item.name;
+      address.textContent = item.address;
+      row.append(name, address);
+      $('network-facts').append(row);
+    }
+  } else $('network-facts').textContent = 'No active IPv4 interface found.';
   if (value.mouse.supported) {
     $('mouse-speed').value = Math.max(1, Math.min(20, value.mouse.speed));
     $('mouse-speed-output').value = $('mouse-speed').value;
@@ -178,6 +190,57 @@ $('power-undo').addEventListener('click', async () => {
   } catch (error) { setNotice('power-notice', error.message, 'error'); }
   finally { $('power-undo').disabled = false; }
 });
+$('storage-scan').addEventListener('click', async () => {
+  const button = $('storage-scan');
+  button.disabled = true;
+  $('storage-status').textContent = 'Choose a folder. Wyre is scanning its files…';
+  $('storage-summary').hidden = true;
+  try {
+    const result = await window.wyre.scanStorage();
+    if (result.canceled) {
+      $('storage-status').textContent = 'Scan canceled.';
+      return;
+    }
+    $('storage-root').textContent = result.root;
+    $('storage-status').textContent = `Scanned ${result.scannedFiles.toLocaleString()} files${result.skipped ? ` · skipped ${result.skipped.toLocaleString()} inaccessible items` : ''}${result.limited ? ' · scan reached its safety limit' : ''}.`;
+    $('storage-summary').textContent = `${formatBytes(result.scannedBytes)} in scanned files`;
+    $('storage-summary').hidden = false;
+    const list = $('storage-list');
+    list.replaceChildren();
+    if (!result.largest.length) {
+      const empty = document.createElement('li');
+      empty.className = 'empty-result';
+      empty.textContent = 'No files were found in this folder.';
+      list.append(empty);
+    }
+    for (const file of result.largest) {
+      const row = document.createElement('li');
+      const info = document.createElement('div');
+      const name = document.createElement('b');
+      const filePath = document.createElement('small');
+      const size = document.createElement('span');
+      name.textContent = file.path.split(/[\\/]/).pop();
+      filePath.textContent = file.path;
+      size.textContent = formatBytes(file.size);
+      info.append(name, filePath);
+      row.append(info, size);
+      list.append(row);
+    }
+  } catch (error) {
+    $('storage-status').textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = -1;
+  do { value /= 1024; unit++; } while (value >= 1024 && unit < units.length - 1);
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
 
 function updateClock() { $('clock').textContent = new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit' }).format(new Date()); }
 updateClock();

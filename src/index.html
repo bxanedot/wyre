@@ -20,11 +20,12 @@
       <nav aria-label="Main navigation">
         <button class="nav-item active" data-page="overview"><span class="nav-icon">◫</span>Overview</button>
         <button class="nav-item" data-page="network"><span class="nav-icon">⌁</span>Network<span class="nav-live"><i></i>LIVE</span></button>
+        <button class="nav-item" data-page="storage"><span class="nav-icon">▤</span>Storage</button>
         <button class="nav-item" data-page="mouse"><span class="nav-icon">⌖</span>Mouse</button>
       </nav>
       <div class="sidebar-foot">
         <div class="device-indicator"><i></i><span>LOCAL DEVICE</span><b>CONNECTED</b></div>
-        <div class="version">WYRE DESKTOP <span>0.1.0</span></div>
+        <div class="version">WYRE DESKTOP <span>0.2.0</span></div>
       </div>
     </aside>
 
@@ -73,7 +74,7 @@
             <div class="quick-copy"><div class="eyebrow">CONTROL WITHOUT CLUTTER</div><h2>Small adjustments.<br><em>Smoother sessions.</em></h2><span>Pick one setting. See what changes.</span></div>
           </article>
         </div>
-        <footer class="page-foot"><span>WYRE / SYSTEM OVERVIEW</span><span>BUILT FOR FOCUS <i>·</i> VERSION 0.1.0</span></footer>
+        <footer class="page-foot"><span>WYRE / SYSTEM OVERVIEW</span><span>BUILT FOR FOCUS <i>·</i> VERSION 0.2.0</span></footer>
       </section>
 
       <section class="page" id="page-network">
@@ -92,12 +93,22 @@
             <article class="result-card"><span>FAILED CHECKS</span><div><b id="loss">—</b><small>%</small></div><small>HTTP probes that did not complete</small></article>
           </div>
           <article class="card insight-card"><div class="insight-mark">✳</div><div><div class="eyebrow">CONNECTION READOUT</div><h2 id="insight-title">A useful baseline.</h2><p id="insight-copy">Run a check to see what your current network is doing. Results depend on your router, ISP, and the route to the test server.</p></div><span class="insight-tag">LOCAL READOUT</span></article>
+          <article class="card network-facts-card"><div class="eyebrow">LOCAL INTERFACE</div><h2>Connected network</h2><div id="network-facts" class="network-facts"><span>Looking for an active IPv4 interface…</span></div></article>
         </div>
         <footer class="page-foot"><span>WYRE / NETWORK</span><span>TEST PROVIDER: CLOUDFLARE <i>·</i> 16 MB DATA</span></footer>
       </section>
 
+      <section class="page" id="page-storage">
+        <div class="intro-row compact-intro"><div><div class="eyebrow"><span class="eyebrow-line"></span>PC / 03</div><h1>Know what fills <em>your drive.</em></h1><p class="intro-copy">Scan a folder and find its largest files. Wyre only reads; nothing is removed.</p></div><div class="local-badge"><span class="local-glyph">▤</span><span><b>LOCAL SCAN</b><small>Runs only when started</small></span></div></div>
+        <div class="storage-layout">
+          <article class="card storage-card"><div class="card-head"><div><div class="eyebrow">STORAGE ANALYSIS</div><h2>Find the space hogs.</h2></div><span class="card-index">READ ONLY</span></div><p class="storage-copy">Choose a folder to calculate its file sizes and list the 25 largest files. The scan stops at 25,000 files, 5,000 folders, or 10 levels; inaccessible files may be skipped.</p><button class="button" id="storage-scan">CHOOSE FOLDER TO SCAN <span>↗</span></button><div class="notice" id="storage-status" aria-live="polite">No scan has been run.</div><div class="storage-summary" id="storage-summary" hidden></div></article>
+          <article class="card storage-results"><div class="card-head"><div><div class="eyebrow">LARGEST FILES</div><h2 id="storage-root">Your scan results</h2></div></div><ol id="storage-list" class="largest-list"><li class="empty-result">Choose a folder to see its largest files.</li></ol></article>
+        </div>
+        <footer class="page-foot"><span>WYRE / STORAGE</span><span>READ ONLY <i>·</i> NO DELETES OR BACKGROUND SCANS</span></footer>
+      </section>
+
       <section class="page" id="page-mouse">
-        <div class="intro-row compact-intro"><div><div class="eyebrow"><span class="eyebrow-line"></span>INPUT / 02</div><h1>Find your <em>feel.</em></h1><p class="intro-copy">Set pointer speed and acceleration for this device.</p></div><div class="local-badge"><span class="local-glyph">⌖</span><span><b>OS SETTINGS</b><small>Applied to this device</small></span></div></div>
+        <div class="intro-row compact-intro"><div><div class="eyebrow"><span class="eyebrow-line"></span>INPUT / 04</div><h1>Find your <em>feel.</em></h1><p class="intro-copy">Set pointer speed and acceleration for this device.</p></div><div class="local-badge"><span class="local-glyph">⌖</span><span><b>OS SETTINGS</b><small>Applied to this device</small></span></div></div>
         <div class="mouse-layout">
           <article class="card mouse-control-card">
             <div class="card-head"><div><div class="eyebrow">POINTER CONTROL</div><h2>Make it yours.</h2></div><span class="card-index">01—02</span></div>

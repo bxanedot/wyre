@@ -1,6 +1,7 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const os = require('node:os');
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const { execFile, execFileSync } = require('node:child_process');
 const https = require('node:https');
 
@@ -112,8 +113,51 @@ function systemState() {
     cores: os.cpus().length,
     memory: { used: used, total: total, percent: Math.round(used / total * 100) },
     mouse,
-    power
+    power,
+    network: Object.entries(os.networkInterfaces()).flatMap(([name, addresses]) => (addresses || [])
+      .filter(address => !address.internal && (address.family === 'IPv4' || address.family === 4))
+      .map(address => ({ name, address: address.address })))
   }));
+}
+
+async function scanStorage() {
+  const choice = await dialog.showOpenDialog({ properties: ['openDirectory'] });
+  if (choice.canceled || !choice.filePaths[0]) return { canceled: true };
+  const root = path.resolve(choice.filePaths[0]);
+  const pending = [{ directory: root, depth: 0 }];
+  const largest = [];
+  let scannedDirectories = 0;
+  let scannedFiles = 0;
+  let scannedBytes = 0;
+  let skipped = 0;
+  let hitLimit = false;
+  // shortcut: scans at most 5000 directories, 25000 files, and depth 10; increase for a full-disk index.
+  while (pending.length && scannedFiles < 25000 && scannedDirectories < 5000) {
+    const { directory, depth } = pending.pop();
+    scannedDirectories++;
+    let entries;
+    try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+    catch { skipped++; continue; }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const itemPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < 10 && pending.length < 5000) pending.push({ directory: itemPath, depth: depth + 1 });
+        else hitLimit = true;
+      } else if (entry.isFile()) {
+        try {
+          const info = await fs.lstat(itemPath);
+          scannedFiles++;
+          scannedBytes += info.size;
+          largest.push({ path: itemPath, size: info.size });
+          largest.sort((a, b) => b.size - a.size);
+          if (largest.length > 25) largest.pop();
+        } catch { skipped++; }
+        if (scannedFiles >= 25000) { hitLimit = true; break; }
+      }
+    }
+  }
+  return { canceled: false, root, scannedDirectories, scannedFiles, scannedBytes, skipped, limited: hitLimit || pending.length > 0 || scannedDirectories >= 5000, largest };
 }
 
 function requestBytes(url, method = 'GET', body) {
@@ -159,6 +203,7 @@ ipcMain.handle('system:state', systemState);
 ipcMain.handle('mouse:apply', (_event, settings) => applyMouse(settings));
 ipcMain.handle('power:set', (_event, profile) => setPowerProfile(profile));
 ipcMain.handle('network:test', networkTest);
+ipcMain.handle('storage:scan', scanStorage);
 
 function createWindow() {
   const win = new BrowserWindow({

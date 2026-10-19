@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-19
 
+- Added an opt-in local storage scan that lists the largest files in a chosen folder without deleting anything.
+- Added active IPv4 interface and address details to the network page.
 - Added review-before-apply dialogs and one-step undo for power profile and pointer changes.
 - Added failed HTTP probe percentage to the on-demand network readout.
+- Documented the scope and decisions for the requested reference projects.
 - Improved mobile layout, focus visibility, and dialog styling.
 
 ## 0.1.0 — 2026-10-19

@@ -5,11 +5,16 @@ Wyre is a small desktop control panel for Windows and Linux. It brings together 
 ## Features
 
 - Live CPU load and RAM use, sampled locally.
+- Reviewable power profile changes with a one-step undo.
+- On-demand storage analysis of a folder you choose, including its 25 largest files. It is read-only and bounded to 25,000 files, 5,000 directories, and 10 folder levels.
+- Active local IPv4 interface addresses, plus an on-demand internet connection check.
 - On-demand latency, jitter, download, upload, and failed HTTP timing probe measurements using Cloudflare's public speed test endpoint. Each check transfers about 16 MB; no test runs in the background. Failed HTTP probes are not ICMP packet loss or packet capture.
+- Local IPv4 addresses for active network interfaces.
 - Pointer speed and acceleration controls for Windows and GNOME Linux. Other Linux desktops can run Wyre, but their pointer settings are not yet supported.
 - Windows and Linux power profile controls with a review step and one-step undo.
 - Pointer changes have a review step and one-step undo.
 - No accounts, telemetry, background services, or bundled source from the archives in `SOURCE_REVIEW.md`.
+- Reference project decisions are documented in `REFERENCES.md`.
 
 ## Run from source
 
@@ -31,7 +36,7 @@ The Windows build creates an NSIS installer. Linux builds create an AppImage and
 
 ## Signing releases
 
-Tag a version such as `v0.1.0` to start `.github/workflows/release.yml`. The workflow refuses to publish unless its signing secrets are present.
+Tag a version such as `v0.2.0` to start `.github/workflows/release.yml`. The workflow refuses to publish unless its signing secrets are present.
 
 - `WYRE_WINDOWS_PFX`: base64 encoded Authenticode PFX whose subject identifies `bxane`.
 - `WYRE_WINDOWS_PFX_PASSWORD`: PFX password.
