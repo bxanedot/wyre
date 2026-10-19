@@ -7,7 +7,7 @@
 - Added live network interface status, local IPv4 details, and current traffic rates to the Network page.
 - Added native Windows and GNOME pointer speed and acceleration controls with review and one-step undo.
 - Rebranded the desktop app, package metadata, icons, and release workflow as Wyre.
-- Added Windows NSIS, Linux AppImage and Debian installers, SHA-256 checksums, optional signatures, and this changelog to GitHub Releases.
+- Added Windows NSIS, Linux AppImage and Debian installers, SHA-256 checksums, bxane signing, and this changelog to GitHub Releases.
 - Switched the combined source to GPL-3.0-only and preserved the MangoDisk attribution and license.
 
 ## 0.3.0 — 2026-10-19

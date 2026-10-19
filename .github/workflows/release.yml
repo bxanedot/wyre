@@ -21,6 +21,8 @@ jobs:
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
       - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          rust-src-dir: app
       - name: Install bxane's signing certificate
         id: windows-signing
         env:
@@ -100,6 +102,8 @@ jobs:
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
       - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          rust-src-dir: app
       - name: Install frontend dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
