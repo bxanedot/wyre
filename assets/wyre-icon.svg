@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Wyre application icon</title>
+  <defs>
+    <linearGradient id="signal" x1="38" y1="35" x2="215" y2="224" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#c8f38c"/>
+      <stop offset="1" stop-color="#59d9c5"/>
+    </linearGradient>
+    <linearGradient id="surface" x1="28" y1="16" x2="224" y2="244" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#182523"/>
+      <stop offset="1" stop-color="#0e1415"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="url(#surface)"/>
+  <rect x="9" y="9" width="238" height="238" rx="57" stroke="#344440" stroke-width="2"/>
+  <path d="M48 66 79 188l49-81 49 81 31-122" fill="none" stroke="url(#signal)" stroke-linecap="round" stroke-linejoin="round" stroke-width="18"/>
+  <circle cx="209" cy="66" r="9" fill="#eef5ed"/>
+</svg>
