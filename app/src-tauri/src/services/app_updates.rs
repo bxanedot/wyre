@@ -206,13 +206,14 @@ async fn discover(
     app: &tauri::AppHandle,
 ) -> tauri_plugin_updater::Result<Option<tauri_plugin_updater::Update>> {
     let locale = super::native_labels::NativeLabels::load(app).locale;
-    let mut builder = app
+    let builder = app
         .updater_builder()
         .timeout(TIMEOUT)
         .header("Accept-Language", &locale)?;
     builder.build()?.check().await
 }
 
+#[cfg(test)]
 fn valid_system_locale(locale: String) -> Option<String> {
     let locale = locale.trim();
     (locale.len() <= 32

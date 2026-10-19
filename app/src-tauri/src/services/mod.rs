@@ -1,6 +1,7 @@
 pub(crate) mod ai_runtime;
 #[cfg(target_os = "windows")]
 pub(crate) mod app_update_native_arch;
+#[allow(dead_code)]
 pub(crate) mod app_update_os_version;
 pub(crate) mod app_updates;
 pub(crate) mod application_icon;
