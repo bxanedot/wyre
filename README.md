@@ -5,9 +5,10 @@ Wyre is a small desktop control panel for Windows and Linux. It brings together 
 ## Features
 
 - Live CPU load and RAM use, sampled locally.
-- On-demand latency, jitter, download, and upload measurements using Cloudflare's public speed test endpoint. Each check transfers about 16 MB; no test runs in the background.
+- On-demand latency, jitter, download, upload, and failed HTTP timing probe measurements using Cloudflare's public speed test endpoint. Each check transfers about 16 MB; no test runs in the background. Failed HTTP probes are not ICMP packet loss or packet capture.
 - Pointer speed and acceleration controls for Windows and GNOME Linux. Other Linux desktops can run Wyre, but their pointer settings are not yet supported.
-- Windows and Linux power profile controls. Changes happen only after clicking the control.
+- Windows and Linux power profile controls with a review step and one-step undo.
+- Pointer changes have a review step and one-step undo.
 - No accounts, telemetry, background services, or bundled source from the archives in `SOURCE_REVIEW.md`.
 
 ## Run from source
@@ -44,4 +45,3 @@ Windows uses the current user's Windows pointer settings. Linux currently suppor
 ## License
 
 Wyre is provided under the MIT License. See [LICENSE](LICENSE).
-

@@ -48,7 +48,7 @@
             </div>
             <div class="card-rule"></div>
             <div class="power-row"><div class="power-icon">ϟ</div><div class="power-info"><span>POWER PROFILE</span><b id="power-current">Checking…</b><small id="power-note">May use more power and create more heat</small></div><button class="button button-small" id="power-button">PERFORMANCE MODE <span>↗</span></button></div>
-            <div class="notice" id="power-notice" aria-live="polite"></div>
+            <div class="notice" id="power-notice" aria-live="polite"></div><button class="undo-button" id="power-undo" hidden>Undo power change</button>
           </article>
 
           <article class="card network-card">
@@ -89,6 +89,7 @@
             <article class="result-card"><span>JITTER</span><div><b id="jitter">—</b><small>ms</small></div><small>Response variation</small></article>
             <article class="result-card"><span>DOWNLOAD</span><div><b id="download">—</b><small>Mbps</small></div><small>Receiving data</small></article>
             <article class="result-card"><span>UPLOAD</span><div><b id="upload">—</b><small>Mbps</small></div><small>Sending data</small></article>
+            <article class="result-card"><span>FAILED CHECKS</span><div><b id="loss">—</b><small>%</small></div><small>HTTP probes that did not complete</small></article>
           </div>
           <article class="card insight-card"><div class="insight-mark">✳</div><div><div class="eyebrow">CONNECTION READOUT</div><h2 id="insight-title">A useful baseline.</h2><p id="insight-copy">Run a check to see what your current network is doing. Results depend on your router, ISP, and the route to the test server.</p></div><span class="insight-tag">LOCAL READOUT</span></article>
         </div>
@@ -102,7 +103,7 @@
             <div class="card-head"><div><div class="eyebrow">POINTER CONTROL</div><h2>Make it yours.</h2></div><span class="card-index">01—02</span></div>
             <div class="setting-block"><div class="setting-title"><div><b>Pointer speed</b><span>Adjust how far the cursor moves.</span></div><output id="mouse-speed-output">10</output></div><div class="range-labels"><span>SLOW</span><span>FAST</span></div><input type="range" id="mouse-speed" min="1" max="20" value="10" aria-label="Pointer speed"><div class="range-ticks"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div>
             <div class="setting-block accel-block"><div class="setting-title"><div><b>Pointer acceleration</b><span>Let the cursor travel farther with faster movement.</span></div><button id="accel-toggle" class="toggle" type="button" role="switch" aria-checked="true" aria-label="Pointer acceleration"><i></i></button></div><div class="accel-explainer"><span class="accel-icon">↗</span><span id="accel-description">Adaptive acceleration is enabled.</span></div></div>
-            <div class="mouse-actions"><span id="mouse-capability">Reading system settings…</span><button class="button" id="mouse-apply">APPLY SETTINGS <span>↗</span></button></div><div class="notice" id="mouse-notice" aria-live="polite"></div>
+            <div class="mouse-actions"><span id="mouse-capability">Reading system settings…</span><button class="button" id="mouse-apply">REVIEW SETTINGS <span>↗</span></button></div><div class="notice" id="mouse-notice" aria-live="polite"></div><button class="undo-button" id="mouse-undo" hidden>Undo pointer change</button>
           </article>
           <article class="card pointer-card"><div class="eyebrow">POINTER / PREVIEW</div><div class="pointer-stage"><div class="stage-grid"></div><div class="pointer-target"><span></span><i></i></div><div class="pointer-trail"></div><span class="stage-label">INPUT RESPONSE</span><span class="stage-coordinate">X 042 &nbsp; Y 018</span></div><div class="pointer-bottom"><span>CONNECTED DEVICE</span><b>DEFAULT POINTER</b><small id="platform-settings">System-level controls are read from your desktop.</small></div></article>
         </div>
@@ -110,6 +111,11 @@
       </section>
     </main>
   </div>
+  <dialog id="change-review" class="review-dialog" aria-labelledby="review-title">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="Cancel">×</button></form>
+    <div class="eyebrow">REVIEW CHANGE</div><h2 id="review-title">Apply this setting?</h2><p id="review-copy"></p>
+    <div class="review-actions"><button class="button button-secondary" id="review-cancel" type="button">KEEP CURRENT</button><button class="button" id="review-apply" type="button">APPLY CHANGE</button></div>
+  </dialog>
   <script src="renderer.js"></script>
 </body>
 </html>
