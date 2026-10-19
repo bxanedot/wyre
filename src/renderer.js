@@ -75,7 +75,7 @@ $('review-apply').addEventListener('click', async () => {
 });
 
 function recommendation(result) {
-  if (result.loss) return ['Some requests did not arrive.', 'Check Wi-Fi signal or router placement, then run the check again.'];
+  if (result.loss) return ['Some timing probes did not complete.', 'Check Wi-Fi signal or router placement, then rerun the HTTP check.'];
   if (result.latency > 100 || result.jitter > 25) return ['The route is responding slowly.', 'Try Ethernet or move closer to your router. This result includes your ISP and route to the test server.'];
   if (result.download < 25) return ['Download speed is below 25 Mbps.', 'Compare another device on the same network to narrow down whether the router or this device is limiting the connection.'];
   return ['Your connection looks steady.', 'The result is a snapshot of the current route. Network conditions can change throughout the day.'];

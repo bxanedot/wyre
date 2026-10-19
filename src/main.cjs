@@ -58,14 +58,16 @@ async function applyMouse({ speed, acceleration }) {
   }
   const value = speed;
   const accel = acceleration;
-  if (isWindows) return JSON.parse(await run('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', windowsMouseScript('set', value, accel)]));
-  if (linux && process.env.XDG_CURRENT_DESKTOP?.toLowerCase().includes('gnome')) {
+  let applied;
+  if (isWindows) applied = JSON.parse(await run('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', windowsMouseScript('set', value, accel)]));
+  else if (linux && process.env.XDG_CURRENT_DESKTOP?.toLowerCase().includes('gnome')) {
     const gnomeSpeed = ((value - 10) / 10).toFixed(2);
     await run('gsettings', ['set', 'org.gnome.desktop.peripherals.mouse', 'speed', gnomeSpeed]);
     await run('gsettings', ['set', 'org.gnome.desktop.peripherals.mouse', 'accel-profile', accel ? 'adaptive' : 'flat']);
-    return { supported: true, speed: value, acceleration: accel };
-  }
-  throw new Error('Wyre mouse controls currently support Windows and GNOME desktops.');
+    applied = { supported: true, speed: value, acceleration: accel };
+  } else throw new Error('Wyre mouse controls currently support Windows and GNOME desktops.');
+  if (cachedStatic) cachedStatic = { ...cachedStatic, at: Date.now(), mouse: applied };
+  return applied;
 }
 
 async function powerState() {
@@ -88,7 +90,9 @@ async function setPowerProfile(profile) {
   if (isWindows) await run('powercfg.exe', ['/setactive', profile === 'performance' ? 'SCHEME_MIN' : 'SCHEME_BALANCED']);
   else if (linux) await run('powerprofilesctl', ['set', profile]);
   else throw new Error('Power profile controls are unavailable on this platform.');
-  return powerState();
+  const current = await powerState();
+  if (cachedStatic) cachedStatic = { ...cachedStatic, at: Date.now(), power: current };
+  return current;
 }
 
 function systemState() {
