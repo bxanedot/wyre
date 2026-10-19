@@ -121,6 +121,7 @@ $('mouse-apply').addEventListener('click', () => reviewChange(
   try {
     const previous = { speed: Number(state.mouse.speed), acceleration: state.mouse.acceleration };
     const result = await window.wyre.applyMouse({ speed: Number($('mouse-speed').value), acceleration });
+    state.mouse = result;
     undoMouse = previous;
     $('mouse-undo').hidden = false;
     setNotice('mouse-notice', 'Pointer settings applied.', 'success');
