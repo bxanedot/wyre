@@ -81,7 +81,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5OUUxQkI2MTVFQTQ4MUEKUldRYVNPb1Z0aHVlZWZDM0VyMTU2NEN0SUpSOEhiQjJSaURDYjYvd2xqcGVLLytFZGdLTnVzdXQK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY4MTRFQzNFOTM3ODkwQjAKUldTd2tIaVRQdXdVK0NRbW1lUlQvTTFtTEEvMzNhZ004Q2NCMWJlek9PSWJOOGl4S0UzaUtqVU8K",
       "endpoints": [
         "https://github.com/bxanedot/wyre/releases/latest/download/latest.json"
       ],

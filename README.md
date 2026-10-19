@@ -25,7 +25,7 @@ Build the installer on its target OS:
 corepack pnpm tauri:build
 ```
 
-Tag a version such as `v0.4.0` to build and publish signed Windows and Linux installers with `CHANGELOG.md` as the release notes. The workflow always creates SHA-256 checksums. Configure `WYRE_WINDOWS_PFX` (base64-encoded PFX) and `WYRE_WINDOWS_PFX_PASSWORD` Actions secrets for bxane Authenticode signing, and `WYRE_GPG_PRIVATE_KEY` (ASCII-armored private key), `WYRE_GPG_PASSPHRASE`, and `WYRE_GPG_KEY_ID` for bxane GPG signatures on Linux packages. Publishing stops if a platform signing key is missing.
+Tag a version such as `v1.0.0` to build and publish signed Windows and Linux installers with `CHANGELOG.md` as the release notes. The workflow creates SHA-256 checksums and a signed updater manifest. Repository Actions secrets hold the Windows PFX and password, Tauri updater key and password, and GPG key, passphrase, and fingerprint. The Windows certificate is self-signed; Windows will show an untrusted-publisher warning unless users choose to trust the included public certificate.
 
 ## Source and license
 

@@ -21,9 +21,9 @@ The main app builds its Vue assets and Windows privileged helper before packagin
 
 ## GitHub releases
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`. It builds native installers on Windows and Linux runners, attaches SHA-256 checksums, signing certificates, and this changelog, then publishes the GitHub Release. Set `WYRE_WINDOWS_PFX` to a base64-encoded PFX and provide `WYRE_WINDOWS_PFX_PASSWORD` for bxane Authenticode signing. Set `WYRE_GPG_PRIVATE_KEY` to an ASCII-armored private key and provide `WYRE_GPG_PASSPHRASE` plus `WYRE_GPG_KEY_ID` for bxane detached signatures on Linux packages. The release stops if either platform's signing secret is missing.
+Pushing a `v*` tag runs `.github/workflows/release.yml`. It builds native installers on Windows and Linux runners, attaches SHA-256 checksums, signing certificates, updater signatures, and this changelog, then publishes the GitHub Release. Repository Actions secrets provide the Windows PFX and password, Tauri updater private key and password, and GPG private key, passphrase, and fingerprint.
 
-The current release workflow publishes Authenticode-signed Windows installers and GPG-signed Linux packages. Install updates from the repository's Releases page; Wyre does not publish Tauri updater metadata yet.
+The Windows certificate for v1.0.0 is self-signed as `CN=bxane`; Windows will show an untrusted-publisher warning unless users choose to trust the included public certificate. Wyre publishes `latest.json` for its opt-in in-app updater; users remain in control of installing updates.
 
 ## AI providers
 
