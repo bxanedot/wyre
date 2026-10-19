@@ -52,7 +52,7 @@ jobs:
           Remove-Item $pfxPath
       - name: Create checksums
         shell: pwsh
-        run: Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } | Set-Content dist/SHA256SUMS.txt
+        run: Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } | Set-Content dist/SHA256SUMS-Windows.txt
       - uses: actions/upload-artifact@v4
         with:
           name: wyre-windows
@@ -85,8 +85,8 @@ jobs:
           openssl x509 -in "$RUNNER_TEMP/wyre-cert.pem" -out dist/Wyre-signing-cert.pem
           openssl x509 -in "$RUNNER_TEMP/wyre-cert.pem" -noout -subject -fingerprint -sha256
           cd dist
-          sha256sum * > SHA256SUMS.txt
-          for file in *.AppImage *.deb SHA256SUMS.txt; do
+          sha256sum * > SHA256SUMS-Linux.txt
+          for file in *.AppImage *.deb SHA256SUMS-Linux.txt; do
             if [ -f "$file" ]; then
               openssl cms -sign -binary -in "$file" -signer "$RUNNER_TEMP/wyre-cert.pem" -inkey "$RUNNER_TEMP/wyre-key.pem" -outform DER -out "$file.p7s" -nosmimecap -md sha256
               openssl cms -verify -binary -inform DER -in "$file.p7s" -content "$file" -noverify -out /dev/null
