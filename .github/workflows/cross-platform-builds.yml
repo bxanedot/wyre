@@ -35,7 +35,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rust-src-dir: app
-          cache-workspaces: app -> app/target
+          cache-workspaces: app -> target
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -43,6 +43,32 @@ jobs:
           sudo apt-get install --yes build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
       - name: Install dependencies
         run: pnpm --dir app install --frozen-lockfile
+      - name: Create temporary signing certificate for CI validation
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $certificate = New-SelfSignedCertificate -Subject 'CN=bxane CI' -Type CodeSigningCert -CertStoreLocation Cert:\CurrentUser\My
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'wyre-ci-signing.cer'
+          Export-Certificate -Cert $certificate -FilePath $certificatePath -Force | Out-Null
+          Import-Certificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          Remove-Item $certificatePath
+          "WYRE_WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
+          'WYRE_PRIVILEGED_SIGN_COMMAND=["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File","scripts/sign-windows-file.ps1","{file}"]' >> $env:GITHUB_ENV
+      - name: Generate temporary updater key for Windows CI validation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $keyPath = Join-Path $env:RUNNER_TEMP 'wyre-ci-updater.key'
+          pnpm --dir app exec tauri signer generate --ci --write-keys $keyPath
+          if ($LASTEXITCODE -ne 0) { throw 'Could not generate the CI-only updater key.' }
+          "TAURI_SIGNING_PRIVATE_KEY=$keyPath" >> $env:GITHUB_ENV
+          "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> $env:GITHUB_ENV
+      - name: Generate temporary updater key for Linux CI validation
+        if: runner.os == 'Linux'
+        run: |
+          pnpm --dir app exec tauri signer generate --ci --write-keys "$RUNNER_TEMP/wyre-ci-updater.key"
+          printf 'TAURI_SIGNING_PRIVATE_KEY=%s\n' "$RUNNER_TEMP/wyre-ci-updater.key" >> "$GITHUB_ENV"
+          printf 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\n' >> "$GITHUB_ENV"
       - name: Build Windows installer
         if: runner.os == 'Windows'
         run: npm run dist:win
@@ -53,7 +79,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: wyre-installers-${{ runner.os }}-${{ runner.arch }}
+          name: wyre-ci-test-installers-${{ runner.os }}-${{ runner.arch }}
           path: app/target/release/bundle/nsis/*.exe
           retention-days: 7
           if-no-files-found: error
@@ -61,7 +87,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: wyre-installers-${{ runner.os }}-${{ runner.arch }}
+          name: wyre-ci-test-installers-${{ runner.os }}-${{ runner.arch }}
           path: |
             app/target/release/bundle/appimage/*.AppImage
             app/target/release/bundle/deb/*.deb
