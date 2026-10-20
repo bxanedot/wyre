@@ -1,6 +1,6 @@
 {
   "name": "wyre",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Wyre Windows and Linux desktop application, based on MangoDisk.",
   "license": "GPL-3.0-only",
