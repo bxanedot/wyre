@@ -51,7 +51,7 @@ if (process.platform === 'win32') {
       $signature = Get-AuthenticodeSignature -LiteralPath $env:MANGODISK_PRIVILEGED_VERIFY_PATH
       $signerMatches = ($null -ne $signature.SignerCertificate) -and ($signature.SignerCertificate.Thumbprint -eq $env:WYRE_WINDOWS_CERTIFICATE_THUMBPRINT)
       if ($env:WYRE_CI_EPHEMERAL_SIGNING -eq 'true') {
-        if (($signature.Status.ToString() -notin @('Valid', 'NotTrusted')) -or -not $signerMatches) {
+        if (($signature.Status.ToString() -notin @('Valid', 'NotTrusted', 'UnknownError')) -or -not $signerMatches) {
           Write-Error 'The CI helper must carry the temporary signing certificate signature.'
           exit 1
         }

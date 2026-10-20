@@ -20,7 +20,9 @@ Set-AuthenticodeSignature @signingParameters | Out-Null
 $signature = Get-AuthenticodeSignature -LiteralPath $Path
 $signerMatches = ($null -ne $signature.SignerCertificate) -and ($signature.SignerCertificate.Thumbprint -eq $thumbprint)
 if ($env:WYRE_CI_EPHEMERAL_SIGNING -eq 'true') {
-  if (($signature.Status.ToString() -notin @('Valid', 'NotTrusted')) -or -not $signerMatches) {
+  Write-Output "CI Authenticode status: $($signature.Status) ($($signature.StatusMessage)); signer: $($signature.SignerCertificate.Thumbprint)"
+  # The ephemeral CI certificate is not installed in a trust store.
+  if (($signature.Status.ToString() -notin @('Valid', 'NotTrusted', 'UnknownError')) -or -not $signerMatches) {
     throw "Wyre CI file signature failed: $($signature.Status)"
   }
 } elseif ($signature.Status -ne 'Valid' -or -not $signerMatches) {
