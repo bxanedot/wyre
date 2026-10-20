@@ -62,7 +62,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $certificatePath = Join-Path $env:RUNNER_TEMP 'wyre-ci-signing.cer'
-          Import-Certificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          certutil.exe -user -f -addstore Root $certificatePath
+          if ($LASTEXITCODE -ne 0) { throw 'Could not trust the temporary CI certificate.' }
           Remove-Item $certificatePath
           Write-Output 'Trusted the temporary CI certificate for this runner.'
       - name: Generate temporary updater key for Windows CI validation
