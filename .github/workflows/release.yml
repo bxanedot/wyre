@@ -23,6 +23,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rust-src-dir: app
+          cache-workspaces: app -> app/target
       - name: Install bxane's signing certificate
         id: windows-signing
         env:
@@ -104,6 +105,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rust-src-dir: app
+          cache-workspaces: app -> app/target
       - name: Install frontend dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
