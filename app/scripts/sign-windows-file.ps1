@@ -8,8 +8,21 @@ $certificate = Get-Item "Cert:\CurrentUser\My\$thumbprint"
 if (-not $certificate.HasPrivateKey -or $certificate.Subject -notmatch 'CN=bxane') {
   throw 'The Wyre signing certificate must have a private key and identify bxane.'
 }
-Set-AuthenticodeSignature -LiteralPath $Path -Certificate $certificate -TimestampServer 'http://timestamp.digicert.com' -HashAlgorithm SHA256 | Out-Null
+$signingParameters = @{
+  LiteralPath = $Path
+  Certificate = $certificate
+  HashAlgorithm = 'SHA256'
+}
+if ($env:WYRE_CI_EPHEMERAL_SIGNING -ne 'true') {
+  $signingParameters.TimestampServer = 'http://timestamp.digicert.com'
+}
+Set-AuthenticodeSignature @signingParameters | Out-Null
 $signature = Get-AuthenticodeSignature -LiteralPath $Path
-if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $thumbprint) {
+$signerMatches = ($null -ne $signature.SignerCertificate) -and ($signature.SignerCertificate.Thumbprint -eq $thumbprint)
+if ($env:WYRE_CI_EPHEMERAL_SIGNING -eq 'true') {
+  if (($signature.Status.ToString() -notin @('Valid', 'NotTrusted')) -or -not $signerMatches) {
+    throw "Wyre CI file signature failed: $($signature.Status)"
+  }
+} elseif ($signature.Status -ne 'Valid' -or -not $signerMatches) {
   throw "Wyre file signing failed: $($signature.Status)"
 }

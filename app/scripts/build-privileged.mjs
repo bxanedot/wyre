@@ -47,14 +47,22 @@ if (process.platform === 'win32') {
     // build inherits PowerShell 7's incompatible module search path.
     const verificationEnvironment = { ...process.env, MANGODISK_PRIVILEGED_VERIFY_PATH: helper };
     delete verificationEnvironment.PSModulePath;
+    const verificationCommand = `
+      $signature = Get-AuthenticodeSignature -LiteralPath $env:MANGODISK_PRIVILEGED_VERIFY_PATH
+      $signerMatches = ($null -ne $signature.SignerCertificate) -and ($signature.SignerCertificate.Thumbprint -eq $env:WYRE_WINDOWS_CERTIFICATE_THUMBPRINT)
+      if ($env:WYRE_CI_EPHEMERAL_SIGNING -eq 'true') {
+        if (($signature.Status.ToString() -notin @('Valid', 'NotTrusted')) -or -not $signerMatches) {
+          Write-Error 'The CI helper must carry the temporary signing certificate signature.'
+          exit 1
+        }
+      } elseif (($signature.Status -ne 'Valid') -or -not $signerMatches) {
+        Write-Error 'The release privileged helper requires valid Authenticode signing before packaging.'
+        exit 1
+      }
+    `;
     const verified = spawnSync(
       'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        '$signature = Get-AuthenticodeSignature -LiteralPath $env:MANGODISK_PRIVILEGED_VERIFY_PATH; if ($signature.Status -ne "Valid") { Write-Error "The release privileged helper requires valid Authenticode signing before packaging"; exit 1 }',
-      ],
+      ['-NoProfile', '-NonInteractive', '-Command', verificationCommand],
       { stdio: 'inherit', env: verificationEnvironment }
     );
     if (verified.status !== 0) process.exit(verified.status ?? 1);
