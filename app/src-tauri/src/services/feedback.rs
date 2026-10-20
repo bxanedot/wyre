@@ -225,6 +225,18 @@ struct FeedbackMetadata<'a> {
     locale: &'a str,
 }
 
+fn feedback_architecture() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        super::app_update_native_arch::telemetry_native_arch()
+            .unwrap_or_else(tauri_plugin_os::arch)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        tauri_plugin_os::arch()
+    }
+}
+
 #[derive(Deserialize)]
 struct FeedbackApiResponse {
     success: bool,
@@ -296,7 +308,7 @@ impl FeedbackSubmissionService {
                         .map(str::trim)
                         .filter(|value| !value.is_empty()),
                     platform: tauri_plugin_os::platform(),
-                    architecture: tauri_plugin_os::arch(),
+                    architecture: feedback_architecture(),
                     app_version,
                     os_version: tauri_plugin_os::version().to_string(),
                     locale: &request.locale,
@@ -806,3 +818,4 @@ mod tests {
         assert!(loopback_feedback_endpoint("http://localhost:3000@evil.example/api").is_none());
     }
 }
+
