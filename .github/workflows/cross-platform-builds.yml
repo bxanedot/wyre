@@ -45,15 +45,26 @@ jobs:
         run: pnpm --dir app install --frozen-lockfile
       - name: Create temporary signing certificate for CI validation
         if: runner.os == 'Windows'
-        shell: powershell
+        timeout-minutes: 2
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $certificate = New-SelfSignedCertificate -Subject 'CN=bxane CI' -Type CodeSigningCert -CertStoreLocation Cert:\CurrentUser\My
           $certificatePath = Join-Path $env:RUNNER_TEMP 'wyre-ci-signing.cer'
           Export-Certificate -Cert $certificate -FilePath $certificatePath -Force | Out-Null
-          Import-Certificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
-          Remove-Item $certificatePath
           "WYRE_WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
           'WYRE_PRIVILEGED_SIGN_COMMAND=["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File","scripts/sign-windows-file.ps1","{file}"]' >> $env:GITHUB_ENV
+          Write-Output "Created temporary certificate $($certificate.Thumbprint)"
+      - name: Trust temporary signing certificate for CI validation
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'wyre-ci-signing.cer'
+          Import-Certificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          Remove-Item $certificatePath
+          Write-Output 'Trusted the temporary CI certificate for this runner.'
       - name: Generate temporary updater key for Windows CI validation
         if: runner.os == 'Windows'
         shell: pwsh
