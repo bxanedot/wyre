@@ -19,7 +19,7 @@ Pushing a `v*` tag runs the root release workflow for Windows and Linux installe
 
 ## AI providers
 
-Configure your own provider endpoint and credentials. Hosted AI remains unavailable unless the build explicitly configures a Wyre service. See [AI configuration](src-tauri/crates/wyre-core/src/ai/README.md).
+Configure your own provider endpoint and credentials. Hosted AI remains unavailable unless the build explicitly configures a Wyre service.
 
 ## Source and license
 
