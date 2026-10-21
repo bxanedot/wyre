@@ -1,36 +1,28 @@
 # Wyre desktop application
 
-This directory contains the full Tauri desktop app copied from MangoDisk 1.1.9 and adapted for Wyre. It retains MangoDisk's Vue interface and Rust product core. Wyre adds a user-started network speed measurement and Windows/GNOME pointer controls with review and one-step undo.
+Wyre combines a Vue interface with a Rust core for storage analysis, reviewed cleanup, privacy, startup management, applications, and system maintenance. It also includes user-started network measurements and Windows/GNOME pointer controls.
 
 ## Development
 
-Requirements: Node.js 22+, pnpm 11.13.1, Rust stable, and the operating-system Tauri build dependencies.
+Requirements: Node.js 22+, pnpm 11.13.1, Rust 1.99.0, and the native Tauri dependencies for your operating system.
 
 ```sh
 corepack pnpm install --frozen-lockfile
 corepack pnpm tauri:dev
 ```
 
-Create a Windows NSIS installer on Windows, or AppImage and Debian installers on Linux:
-
-```sh
-corepack pnpm tauri:build
-```
-
-The main app builds its Vue assets and Windows privileged helper before packaging. It does not run the upstream test suite as part of the packaging command.
+Run `corepack pnpm check` for source gates, frontend coverage, asset compilation, Rust formatting, Clippy, compilation, and native tests. Build installers on their target OS with `corepack pnpm tauri:build`. Packaging builds frontend assets and the Windows privileged helper; use the complete check before preparing a release.
 
 ## GitHub releases
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`. It builds native installers on Windows and Linux runners, attaches SHA-256 checksums, signing certificates, updater signatures, and this changelog, then publishes the GitHub Release. Repository Actions secrets provide the Windows PFX and password, Tauri updater private key and password, and GPG private key, passphrase, and fingerprint.
-
-The Windows certificate for v1.0.0 is self-signed as `CN=bxane`; Windows will show an untrusted-publisher warning unless users choose to trust the included public certificate. Wyre publishes `latest.json` for its opt-in in-app updater; users remain in control of installing updates.
+Pushing a `v*` tag runs the root release workflow for Windows and Linux installers, checksums, signatures, and updater metadata. [Wyre releases](https://github.com/bxanedot/wyre/releases) contain published artifacts. Portable builds open the matching release page for manual downloads. The Windows certificate is currently self-signed as `CN=bxane`.
 
 ## AI providers
 
-AI provider configuration and local-model details are documented in [`src-tauri/crates/mangodisk-core/src/ai/README.md`](src-tauri/crates/mangodisk-core/src/ai/README.md). Wyre's custom-provider mode uses the endpoint and credentials that you configure there; the upstream MangoDisk hosted AI service is not a Wyre service.
+Configure your own provider endpoint and credentials. Hosted AI remains unavailable unless the build explicitly configures a Wyre service. See [AI configuration](src-tauri/crates/wyre-core/src/ai/README.md).
 
-## Upstream source and attribution
+## Source and license
 
-Wyre is derived from MangoDisk 1.1.9, commit `f7d8bc73b68ec2170ac4ba451c6723b11329380c`, by harry0703 and contributors. The unmodified working-tree snapshot is preserved at `../vendor/upstream/MangoDisk/`; its GPL-3.0-only license is included here as [`LICENSE`](LICENSE). The Wyre changes and combined desktop app are distributed under GPL-3.0-only. Keep third-party notices under `src/components/` and the upstream snapshot intact.
+All Wyre-specific features, fixes, and source code changes are by bxane. Wyre is distributed under [GPL-3.0-only](../LICENSE). The desktop source incorporates work by harry0703 and contributors, based on version 1.1.9 at commit `f7d8bc73b68ec2170ac4ba451c6723b11329380c`, with Wyre changes by bxane. Original author credit and third-party license notices are retained. See [UPSTREAMS.md](../UPSTREAMS.md) for source provenance.
 
-Wyre is not affiliated with the MangoDisk project. Its network speed check is user-started and transfers about 16 MB to Cloudflare. Mouse changes are supported on Windows and GNOME Linux and can be undone once.
+The network check transfers about 16 MB to Cloudflare when started. Mouse changes require review and can be undone once.

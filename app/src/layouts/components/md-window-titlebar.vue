@@ -4,7 +4,7 @@ import { onBeforeUnmount, onMounted, ref } from 'vue';
 
 import MdIconAction from '@/components/custom/md-icon-action.vue';
 import MdIcon from '@/components/icons/md-icon.vue';
-import MdIconMangodisk from '@/components/icons/md-icon-mangodisk.vue';
+import MdIconWyre from '@/components/icons/md-icon-wyre.vue';
 import { APP_NAME } from '@/lib/models/shell/application-shell';
 import { ICON_NAMES } from '@/lib/models/presentation/ui';
 import { ApplicationWindowService } from '@/lib/services/shell/application-window-service';
@@ -60,7 +60,7 @@ function close() {
       :class="{ 'window-title--expanded': sidebarExpanded }"
     >
       <span data-tauri-drag-region class="window-title-icon">
-        <MdIconMangodisk :size="28" />
+        <MdIconWyre :size="28" />
       </span>
       <strong data-tauri-drag-region :aria-hidden="!sidebarExpanded">{{ APP_NAME }}</strong>
     </div>
@@ -73,7 +73,7 @@ function close() {
         :show-tooltip="false"
         @click="minimize"
       >
-        <MdIcon :name="ICON_NAMES.minus" :size="18" :stroke-width="1.7" />
+        <MdIcon :name="ICON_NAMES.minus" :size="20" :stroke-width="1.7" />
       </MdIconAction>
       <MdIconAction
         appearance="unstyled"
@@ -84,7 +84,7 @@ function close() {
       >
         <MdIcon
           :name="maximized ? ICON_NAMES.windowRestore : ICON_NAMES.windowMaximize"
-          :size="15"
+          :size="17"
           :stroke-width="1.6"
         />
       </MdIconAction>
@@ -95,7 +95,7 @@ function close() {
         :show-tooltip="false"
         @click="close"
       >
-        <MdIcon :name="ICON_NAMES.close" :size="18" :stroke-width="1.7" />
+        <MdIcon :name="ICON_NAMES.close" :size="20" :stroke-width="1.7" />
       </MdIconAction>
     </div>
 
@@ -269,5 +269,12 @@ function close() {
 
 .window-controls :deep(.window-control--close:hover::before) {
   @apply bg-destructive;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .window-controls :deep(.window-control),
+  .window-controls :deep(.window-control::before) {
+    transition: none;
+  }
 }
 </style>

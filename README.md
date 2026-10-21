@@ -1,17 +1,17 @@
 # Wyre
 
-Wyre is the complete MangoDisk Tauri desktop application, rebranded for bxane and extended with on-demand network measurement plus reviewed Windows and GNOME mouse controls. The full Vue frontend and Rust application source lives in [`app/`](app/); the unmodified MangoDisk snapshot remains in [`vendor/upstream/MangoDisk/`](vendor/upstream/MangoDisk/) for attribution and comparison.
+Wyre is a Windows and Linux desktop toolkit for storage analysis, reviewed cleanup, system maintenance, network measurements, and mouse controls. Its Vue interface and Rust core live in [app/](app/).
 
 ## Included tools
 
-- MangoDisk's full storage analysis, cleanup, privacy, startup, application management, system optimization, maintenance, and history workflows.
-- An on-demand latency, jitter, download, and upload check through Cloudflare. Each run transfers about 16 MB; Cloudflare can see your public IP address. Nothing runs in the background.
-- Windows pointer speed and acceleration controls, plus GNOME Linux controls. Changes require review and can be undone once.
-- Windows NSIS and Linux AppImage and Debian installers from the GitHub Release workflow.
+- Storage analysis, cleanup previews, privacy tools, startup management, application management, system settings, maintenance, and history.
+- On-demand latency, jitter, download, and upload measurements through Cloudflare. Each run transfers about 16 MB; Cloudflare can see your public IP address.
+- Windows and GNOME pointer speed and acceleration controls, with review and one-step undo.
+- Windows NSIS and Linux AppImage and Debian installers from GitHub Releases.
 
 ## Run and build
 
-Use Node.js 22+, pnpm 11.13.1, Rust stable, and the native Tauri prerequisites for your OS.
+Use Node.js 22+, pnpm 11.13.1, Rust 1.99.0, and the native Tauri prerequisites for your OS.
 
 ```sh
 cd app
@@ -19,14 +19,12 @@ corepack pnpm install --frozen-lockfile
 corepack pnpm tauri:dev
 ```
 
-Build the installer on its target OS:
+Build on the target operating system with `corepack pnpm tauri:build`. Run `corepack pnpm check` for the complete validation suite.
 
-```sh
-corepack pnpm tauri:build
-```
+## Releases
 
-Tag a version such as `v1.0.0` to build and publish signed Windows and Linux installers with `CHANGELOG.md` as the release notes. The workflow creates SHA-256 checksums and a signed updater manifest. Repository Actions secrets hold the Windows PFX and password, Tauri updater key and password, and GPG key, passphrase, and fingerprint. The Windows certificate is self-signed; Windows will show an untrusted-publisher warning unless users choose to trust the included public certificate.
+Tag a version such as `v1.0.0` to build Windows and Linux installers, SHA-256 checksums, and a signed updater manifest. Repository Actions secrets provide the signing keys. The current Windows certificate is self-signed as `CN=bxane`; Windows reports an untrusted publisher unless users choose to trust that certificate.
 
-## Source and license
+## License and authors
 
-Wyre is a GPL-3.0-only derivative of MangoDisk 1.1.9, pinned at commit `f7d8bc73b68ec2170ac4ba451c6723b11329380c`. MangoDisk copyright and license notices remain in the copied app and the upstream snapshot. Other preserved upstream snapshots retain their own licenses; see [`UPSTREAMS.md`](UPSTREAMS.md).
+All Wyre-specific features, fixes, and source code changes are by bxane. Wyre is distributed under [GPL-3.0-only](LICENSE). The desktop source incorporates work by harry0703 and contributors, based on version 1.1.9 at commit `f7d8bc73b68ec2170ac4ba451c6723b11329380c`, with Wyre changes by bxane. Original author credit and third-party license notices are retained. See [UPSTREAMS.md](UPSTREAMS.md) for source provenance.
