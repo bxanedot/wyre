@@ -366,7 +366,10 @@ cargo test --manifest-path src-tauri/Cargo.toml -p mangodisk-core
 ### 建置桌面安裝程式
 
 ```sh
+# Windows 安裝程式
 pnpm tauri:build
+# Linux 安裝程式
+pnpm tauri:build:linux
 ```
 
 ### 建置 CLI

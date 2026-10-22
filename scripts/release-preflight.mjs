@@ -2,14 +2,14 @@ import { appendFileSync, readFileSync } from 'node:fs';
 
 const SEMVER = '(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?';
 
-export function validateReleaseVersion({ tag, rootVersion, packageVersion, tauriVersion, changelog }) {
+export function validateReleaseVersion({ tag, rootVersion, packageVersion, tauriVersion, cargoVersion, changelog }) {
   const match = new RegExp(`^v(${SEMVER})$`).exec(tag ?? '');
   if (!match) throw new Error('Expected a v semantic-version tag.');
 
   const version = match[1];
-  if (rootVersion !== version || packageVersion !== version || tauriVersion !== version) {
+  if (rootVersion !== version || packageVersion !== version || tauriVersion !== version || cargoVersion !== version) {
     throw new Error(
-      `Release tag ${version} must match root, app, and Tauri versions (${rootVersion}, ${packageVersion}, ${tauriVersion}).`
+      `Release tag ${version} must match root, app, Tauri, and Cargo workspace versions (${rootVersion}, ${packageVersion}, ${tauriVersion}, ${cargoVersion}).`
     );
   }
 
@@ -32,8 +32,11 @@ function main() {
   const rootVersion = JSON.parse(readFileSync('package.json', 'utf8')).version;
   const packageVersion = JSON.parse(readFileSync('app/package.json', 'utf8')).version;
   const tauriVersion = JSON.parse(readFileSync('app/src-tauri/tauri.conf.json', 'utf8')).version;
+  const cargoManifest = readFileSync('app/Cargo.toml', 'utf8');
+  const workspacePackage = cargoManifest.split(/^\[workspace\.package\]\s*$/m)[1]?.split(/^\[/m, 1)[0] ?? '';
+  const cargoVersion = /^\s*version\s*=\s*"([^"]+)"/m.exec(workspacePackage)?.[1];
   const changelog = readFileSync('CHANGELOG.md', 'utf8');
-  const version = validateReleaseVersion({ tag, rootVersion, packageVersion, tauriVersion, changelog });
+  const version = validateReleaseVersion({ tag, rootVersion, packageVersion, tauriVersion, cargoVersion, changelog });
   const releaseTag = `v${version}`;
 
   if (process.env.GITHUB_OUTPUT) {

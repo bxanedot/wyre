@@ -11,7 +11,7 @@ corepack pnpm install --frozen-lockfile
 corepack pnpm tauri:dev
 ```
 
-Run `corepack pnpm check` for source gates, frontend coverage, asset compilation, Rust formatting, Clippy, compilation, and native tests. Build installers on their target OS with `corepack pnpm tauri:build`. Packaging builds frontend assets and the Windows privileged helper; use the complete check before preparing a release.
+Run `corepack pnpm check` for source gates, frontend coverage, asset compilation, Rust formatting, Clippy, compilation, and native tests. Build the Windows installer with `corepack pnpm tauri:build` or the Linux installers with `corepack pnpm tauri:build:linux`. Packaging builds frontend assets and the Windows privileged helper; use the complete check before preparing a release.
 
 ## GitHub releases
 

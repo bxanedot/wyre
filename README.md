@@ -19,7 +19,7 @@ corepack pnpm install --frozen-lockfile
 corepack pnpm tauri:dev
 ```
 
-Build on the target operating system with `corepack pnpm tauri:build`. Run `corepack pnpm check` for the complete validation suite.
+Build the Windows installer with `corepack pnpm tauri:build` or the Linux installers with `corepack pnpm tauri:build:linux`. Run `corepack pnpm check` for the complete validation suite.
 
 ## Releases
 

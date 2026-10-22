@@ -8,4 +8,4 @@ The Windows installer uses a self-signed `CN=bxane` Code Signing certificate. Th
 
 Linux release files use the repository secrets `WYRE_GPG_PRIVATE_KEY`, `WYRE_GPG_PASSPHRASE`, and `WYRE_GPG_KEY_ID`. Never add private keys or passwords to the repository.
 
-Push a `vX.Y.Z` tag matching both `app/package.json` and `app/src-tauri/tauri.conf.json`. The workflow includes the changelog and publishes installers, signatures, checksums, and the updater manifest on the GitHub release.
+Push a `vX.Y.Z` tag matching `package.json`, `app/package.json`, `app/src-tauri/tauri.conf.json`, and the Cargo workspace version in `app/Cargo.toml`. The workflow includes the changelog and publishes installers, signatures, checksums, and the updater manifest on the GitHub release.

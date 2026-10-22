@@ -8,7 +8,7 @@
     "start": "pnpm --dir app tauri:dev",
     "build": "pnpm --dir app tauri:build",
     "dist:win": "pnpm --dir app tauri:build",
-    "dist:linux": "pnpm --dir app tauri:build"
+    "dist:linux": "pnpm --dir app tauri:build:linux"
   },
   "packageManager": "pnpm@11.13.1"
 }

@@ -366,7 +366,10 @@ cargo test --manifest-path src-tauri/Cargo.toml -p mangodisk-core
 ### Сборка установщика настольного приложения
 
 ```sh
+# Для Windows
 pnpm tauri:build
+# Для Linux
+pnpm tauri:build:linux
 ```
 
 ### Сборка CLI

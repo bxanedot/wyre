@@ -38,6 +38,9 @@
   },
   "bundle": {
     "active": true,
+    "android": {
+      "versionCode": 1
+    },
     "publisher": "bxane",
     "homepage": "https://github.com/bxanedot/wyre",
     "copyright": "Copyright © 2026 bxane and MangoDisk contributors",

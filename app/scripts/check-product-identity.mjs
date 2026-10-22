@@ -39,6 +39,7 @@ function assertExists(relativePath) {
 
 const packageJson = readJson('package.json');
 const tauriConfig = readJson('src-tauri/tauri.conf.json');
+const linuxTauriConfig = readJson('src-tauri/tauri.linux.conf.json');
 const tauriManifest = readText('src-tauri/Cargo.toml');
 const cliManifest = readText('src-tauri/crates/mangodisk-cli/Cargo.toml');
 const readme = readText('README.md');
@@ -58,6 +59,7 @@ assertContains(
 );
 assertEqual(tauriConfig.mainBinaryName, 'Wyre', 'Tauri binary name');
 assertEqual(tauriConfig.app?.windows?.[0]?.title, 'Wyre', 'main window title');
+assertEqual(linuxTauriConfig.app?.windows?.[0]?.title, 'Wyre', 'Linux main window title');
 
 assertContains(tauriManifest, 'name = "mangodisk"', 'Tauri package manifest');
 assertContains(tauriManifest, 'name = "mangodisk_lib"', 'Tauri library manifest');
