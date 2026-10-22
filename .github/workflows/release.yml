@@ -37,6 +37,7 @@ jobs:
         with:
           rust-src-dir: app
           cache-workspaces: app -> target
+          cache-key: windows-latest
       - name: Install bxane's signing certificate
         id: windows-signing
         timeout-minutes: 5
@@ -57,7 +58,9 @@ jobs:
           $certificatePath = Join-Path $env:RUNNER_TEMP 'wyre-signing.cer'
           Export-Certificate -Cert $certificate -FilePath $certificatePath -Force | Out-Null
           Write-Output 'Trusting Windows signing certificate for signature verification.'
-          Import-Certificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\Root -Confirm:$false -ErrorAction Stop | Out-Null
+          certutil.exe -f -addstore Root $certificatePath | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not add the signing certificate to the root store.' }
+          Write-Output 'Windows signing certificate trust import complete.'
           "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
       - name: Install frontend dependencies
         working-directory: app
@@ -124,6 +127,7 @@ jobs:
         with:
           rust-src-dir: app
           cache-workspaces: app -> target
+          cache-key: ubuntu-22.04
       - name: Install frontend dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile

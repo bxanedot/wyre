@@ -36,6 +36,7 @@ jobs:
         with:
           rust-src-dir: app
           cache-workspaces: app -> target
+          cache-key: ${{ matrix.os }}
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
