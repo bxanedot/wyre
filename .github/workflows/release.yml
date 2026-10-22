@@ -39,6 +39,7 @@ jobs:
           cache-workspaces: app -> target
       - name: Install bxane's signing certificate
         id: windows-signing
+        timeout-minutes: 5
         env:
           WYRE_WINDOWS_PFX: ${{ secrets.WYRE_WINDOWS_PFX }}
           WYRE_WINDOWS_PFX_PASSWORD: ${{ secrets.WYRE_WINDOWS_PFX_PASSWORD }}
@@ -46,14 +47,17 @@ jobs:
         run: |
           if (-not $env:WYRE_WINDOWS_PFX -or -not $env:WYRE_WINDOWS_PFX_PASSWORD) { throw 'Set WYRE_WINDOWS_PFX and WYRE_WINDOWS_PFX_PASSWORD in repository Actions secrets.' }
           $pfxPath = Join-Path $env:RUNNER_TEMP 'wyre-signing.pfx'
+          Write-Output 'Decoding Windows signing certificate.'
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WYRE_WINDOWS_PFX))
           $password = ConvertTo-SecureString $env:WYRE_WINDOWS_PFX_PASSWORD -AsPlainText -Force
-          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Write-Output 'Importing Windows signing certificate and private key.'
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password -Confirm:$false -ErrorAction Stop
           Remove-Item $pfxPath
           if (-not $certificate -or $certificate.Subject -notmatch 'CN=bxane') { throw 'The configured Windows certificate must identify bxane.' }
           $certificatePath = Join-Path $env:RUNNER_TEMP 'wyre-signing.cer'
           Export-Certificate -Cert $certificate -FilePath $certificatePath -Force | Out-Null
-          Import-Certificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          Write-Output 'Trusting Windows signing certificate for signature verification.'
+          Import-Certificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\Root -Confirm:$false -ErrorAction Stop | Out-Null
           "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
       - name: Install frontend dependencies
         working-directory: app
@@ -101,7 +105,7 @@ jobs:
 
   linux:
     needs: [preflight]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Tauri system dependencies
