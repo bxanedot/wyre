@@ -11,13 +11,13 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.99.0"
 authors = ["harry0703 <harry0703@hotmail.com>"]
 license = "GPL-3.0-only"
 repository = "https://github.com/harry0703/MangoDisk"
-homepage = "https://mangodisk.app"
+homepage = "https://github.com/bxanedot/wyre"
 
 # Filesystem traversal and content hashing are exercised directly from the desktop development
 # build. Optimizing only these performance-critical packages keeps UI iteration responsive while
