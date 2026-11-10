@@ -9,9 +9,9 @@ use super::{configuration_file, AiError};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AiServiceMode {
-    Free,
-    // Missing fields belong to schema 1 custom configurations, never opt users into a new recipient.
+    // Wyre has no hosted AI service. Files saved in MangoDisk's former "free" mode load as custom.
     #[default]
+    #[serde(alias = "free")]
     Custom,
 }
 
@@ -37,8 +37,8 @@ pub struct AiConfiguration {
     pub schema_version: u8,
     #[serde(default)]
     pub mode: AiServiceMode,
-    // Retained for schema 2 compatibility; explanation requests no longer require this flag.
-    #[serde(default)]
+    // Read from older schema 2 files so they still parse; never written.
+    #[serde(default, skip_serializing)]
     pub free_consent: bool,
     pub endpoint: String,
     pub model: String,
@@ -57,7 +57,6 @@ pub struct AiConfiguration {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AiConfigurationUpdate {
     pub mode: AiServiceMode,
-    pub free_consent: bool,
     pub endpoint: String,
     pub model: String,
     /// None retains the stored key; the editor sends the complete custom configuration.
@@ -76,8 +75,6 @@ pub struct AiConfigurationUpdate {
 pub struct AiSettings {
     pub schema_version: u8,
     pub mode: AiServiceMode,
-    pub free_consent: bool,
-    pub free_available: bool,
     pub endpoint: String,
     pub model: String,
     pub has_key: bool,
@@ -90,7 +87,7 @@ impl AiConfiguration {
     pub fn initial() -> Self {
         Self {
             schema_version: 2,
-            mode: AiServiceMode::Free,
+            mode: AiServiceMode::Custom,
             free_consent: false,
             endpoint: String::new(),
             model: String::new(),
@@ -107,41 +104,37 @@ impl AiConfiguration {
             .map(|raw| {
                 let mut value: Self =
                     serde_json::from_str(&raw).map_err(|_| AiError::InvalidConfiguration)?;
+                // A former free-mode file with no saved provider means "not configured yet".
+                if value.endpoint.is_empty() && value.model.is_empty() {
+                    return Ok(None);
+                }
                 value.validate()?;
                 value.schema_version = 2;
-                Ok(value)
+                Ok(Some(value))
             })
             .transpose()
+            .map(Option::flatten)
     }
 
     pub fn save(update: AiConfigurationUpdate) -> Result<AiSettings, AiError> {
-        let value = if update.mode == AiServiceMode::Free {
-            // Switching to free mode must not validate or persist an unfinished
-            // custom draft. Preserve the last saved settings, or initial defaults.
-            let mut stored = Self::load()?.unwrap_or_else(Self::initial);
-            stored.mode = AiServiceMode::Free;
-            stored.free_consent = update.free_consent;
-            stored
+        let previous = if update.api_key.is_none() || update.custom_headers.is_none() {
+            Self::load()?.unwrap_or_else(Self::initial)
         } else {
-            let previous = if update.api_key.is_none() || update.custom_headers.is_none() {
-                Self::load()?.unwrap_or_else(Self::initial)
-            } else {
-                Self::initial()
-            };
-            Self {
-                schema_version: 2,
-                mode: update.mode,
-                free_consent: update.free_consent,
-                endpoint: normalize_endpoint(&update.endpoint)?,
-                model: update.model.trim().to_owned(),
-                api_key: update
-                    .api_key
-                    .map_or(previous.api_key, |key| key.trim().to_owned()),
-                reasoning: update.reasoning,
-                temperature: update.temperature,
-                max_tokens: update.max_tokens,
-                custom_headers: update.custom_headers.unwrap_or(previous.custom_headers),
-            }
+            Self::initial()
+        };
+        let value = Self {
+            schema_version: 2,
+            mode: update.mode,
+            free_consent: false,
+            endpoint: normalize_endpoint(&update.endpoint)?,
+            model: update.model.trim().to_owned(),
+            api_key: update
+                .api_key
+                .map_or(previous.api_key, |key| key.trim().to_owned()),
+            reasoning: update.reasoning,
+            temperature: update.temperature,
+            max_tokens: update.max_tokens,
+            custom_headers: update.custom_headers.unwrap_or(previous.custom_headers),
         };
         value.validate()?;
         let raw =
@@ -159,8 +152,6 @@ impl AiConfiguration {
         AiSettings {
             schema_version: 2,
             mode: self.mode,
-            free_consent: self.free_consent,
-            free_available: super::official::available(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
             has_key: !self.api_key.is_empty(),
@@ -187,9 +178,6 @@ impl AiConfiguration {
             || (!self.endpoint.is_empty() && normalize_endpoint(&self.endpoint)? != self.endpoint)
         {
             return Err(AiError::InvalidConfiguration);
-        }
-        if self.mode == AiServiceMode::Free {
-            return Ok(());
         }
         if self.model.is_empty() || self.endpoint.is_empty() {
             return Err(AiError::InvalidConfiguration);
@@ -275,6 +263,9 @@ mod tests {
     #[test]
     fn advanced_controls_are_optional_and_validated() {
         let mut config = AiConfiguration::initial();
+        config.endpoint = "https://example.com/v1".into();
+        config.model = "fixture-model".into();
+        config.api_key = "synthetic-key".into();
         for temperature in [-0.1, 2.1, f64::NAN, f64::INFINITY] {
             config.temperature = Some(temperature);
             assert!(config.validate().is_err());
@@ -395,7 +386,6 @@ mod tests {
         let _cleanup = Cleanup;
         let update = |endpoint: &str, key: Option<&str>| AiConfigurationUpdate {
             mode: AiServiceMode::Custom,
-            free_consent: false,
             endpoint: endpoint.into(),
             model: "fixture-model".into(),
             api_key: key.map(str::to_owned),
@@ -450,43 +440,25 @@ mod tests {
         assert_eq!(maximum.custom_headers.len(), 8);
         assert_eq!(maximum.custom_headers[0].value.len(), 1024);
         assert!(configuration_file::read().unwrap().unwrap().len() > 16 * 1024);
-        let mut unfinished = update("not a URL", Some("unfinished-key"));
-        unfinished.mode = AiServiceMode::Free;
-        unfinished.model = "unfinished-model".into();
-        unfinished.temperature = Some(3.0);
-        unfinished.max_tokens = Some(0);
-        unfinished.custom_headers = Some(vec![AiCustomHeader {
-            name: String::new(),
-            value: String::new(),
-        }]);
-        AiConfiguration::save(unfinished).unwrap();
-        let free = AiConfiguration::load().unwrap().unwrap();
-        assert_eq!(free.mode, AiServiceMode::Free);
-        assert_eq!(free.endpoint, maximum.endpoint);
-        assert_eq!(free.model, maximum.model);
-        assert_eq!(free.api_key, maximum.api_key);
-        assert_eq!(free.temperature, maximum.temperature);
-        assert_eq!(free.max_tokens, maximum.max_tokens);
-        assert!(matches!(free.reasoning, ReasoningMode::Disabled));
-        assert!(free.custom_headers == maximum.custom_headers);
         // Schema 1 retains its custom provider and defaults the legacy flag to false.
         configuration_file::write(r#"{"schemaVersion":1,"endpoint":"https://example.com/v1","model":"fixture-model","apiKey":"synthetic-key","reasoning":"default"}"#).unwrap();
         let migrated = AiConfiguration::load().unwrap().unwrap();
         assert_eq!(migrated.schema_version, 2);
         assert_eq!(migrated.mode, AiServiceMode::Custom);
-        assert!(!migrated.free_consent);
         assert_eq!(migrated.temperature, None);
         assert_eq!(migrated.max_tokens, None);
         assert!(migrated.custom_headers.is_empty());
-        let mut free = update("https://example.com/v1", None);
-        free.mode = AiServiceMode::Free;
-        free.free_consent = true;
-        AiConfiguration::save(free).unwrap();
-        let free = AiConfiguration::load().unwrap().unwrap();
-        assert_eq!(free.mode, AiServiceMode::Free);
-        assert_eq!(free.api_key, "synthetic-key");
-        assert!(free.free_consent);
-        AiConfiguration::save(update("https://example.com/v1", None)).unwrap();
+        // MangoDisk's former free mode loads as custom, or as unconfigured when nothing was saved.
+        configuration_file::write(r#"{"schemaVersion":2,"mode":"free","freeConsent":true,"endpoint":"https://example.com/v1","model":"fixture-model","apiKey":"synthetic-key","reasoning":"default"}"#).unwrap();
+        let legacy = AiConfiguration::load().unwrap().unwrap();
+        assert_eq!(legacy.mode, AiServiceMode::Custom);
+        assert_eq!(legacy.api_key, "synthetic-key");
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("freeConsent"));
+        configuration_file::write(r#"{"schemaVersion":2,"mode":"free","freeConsent":false,"endpoint":"","model":"","apiKey":"","reasoning":"default"}"#).unwrap();
+        assert!(AiConfiguration::load().unwrap().is_none());
+        AiConfiguration::save(update("https://example.com/v1", Some("synthetic-key"))).unwrap();
         assert_eq!(
             AiConfiguration::load().unwrap().unwrap().mode,
             AiServiceMode::Custom
@@ -503,19 +475,6 @@ mod tests {
         AiConfiguration::save(update("https://example.com/v1", Some("replacement"))).unwrap();
         AiConfiguration::delete().unwrap();
         assert!(AiConfiguration::load().unwrap().is_none());
-        let mut first_free = update("unfinished", None);
-        first_free.mode = AiServiceMode::Free;
-        first_free.custom_headers = Some(vec![AiCustomHeader {
-            name: String::new(),
-            value: String::new(),
-        }]);
-        AiConfiguration::save(first_free).unwrap();
-        let initial = AiConfiguration::load().unwrap().unwrap();
-        assert_eq!(initial.mode, AiServiceMode::Free);
-        assert!(initial.endpoint.is_empty());
-        assert!(initial.api_key.is_empty());
-        assert!(initial.custom_headers.is_empty());
-        assert_eq!(AiConfiguration::initial().mode, AiServiceMode::Free);
-        assert!(!AiConfiguration::initial().free_consent);
+        assert_eq!(AiConfiguration::initial().mode, AiServiceMode::Custom);
     }
 }

@@ -12,7 +12,6 @@ import {
 import { LOG_DOMAINS, LOG_EVENTS } from '@/lib/models/diagnostics/telemetry';
 import { AppDistributionService } from '@/lib/services/updates/app-distribution-service';
 import { AppUpdateService } from '@/lib/services/updates/app-update-service';
-import { InstallationIdentityService } from '@/lib/services/http/installation-identity-service';
 import { LinkService } from '@/lib/services/shell/link-service';
 import { LoggerService } from '@/lib/services/diagnostics/logger-service';
 import { normalizeError } from '@/lib/utils/diagnostics/error';
@@ -55,16 +54,6 @@ export const useAppUpdateStore = defineStore('app-update', {
   actions: {
     async initialize() {
       if (!this.currentVersion) {
-        // Keep installation identity creation in its existing owner. Native
-        // discovery reads the shared store and does not race a second writer.
-        try {
-          await InstallationIdentityService.getOrCreateInstallId();
-        } catch (error) {
-          LoggerService.warn(LOG_DOMAINS.appUpdate, LOG_EVENTS.updateMetadataUnavailable, {
-            source: 'installation_identity',
-            diagnostic: normalizeError(error),
-          });
-        }
         try {
           this.currentVersion = await AppUpdateService.currentVersion();
         } catch (error) {

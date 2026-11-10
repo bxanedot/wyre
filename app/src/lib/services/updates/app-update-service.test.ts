@@ -31,7 +31,7 @@ const metadata = {
   version: '1.1.0',
   body: 'Release notes',
   date: '2026-07-31T00:00:00Z',
-  rawJson: { url: 'https://mangodisk.app/api/updates/1.1.0/windows/x86_64/download?distribution=portable' },
+  rawJson: {},
 };
 
 describe('AppUpdateService', () => {
@@ -110,23 +110,12 @@ describe('AppUpdateService', () => {
     await expect(AppUpdateService.installDownloaded()).resolves.toBeUndefined();
   });
 
-  it('returns a trusted portable URL without retaining an install resource', async () => {
+  it('sends portable builds to the GitHub release page without retaining an install resource', async () => {
     await expect(AppUpdateService.check(APP_DISTRIBUTION_IDS.portable, false)).resolves.toMatchObject({
       action: 'manualDownload',
-      manualDownloadUrl: metadata.rawJson.url,
+      manualDownloadUrl: 'https://github.com/bxanedot/wyre/releases/tag/v1.1.0',
     });
     expect(native.close).toHaveBeenCalledOnce();
     await expect(AppUpdateService.download(() => undefined)).rejects.toThrow('No checked update');
-  });
-
-  it('rejects an untrusted portable URL and releases its resource', async () => {
-    native.invoke.mockResolvedValueOnce({
-      schemaVersion: 1,
-      update: { ...metadata, rawJson: { url: 'https://example.com/app.exe' } },
-    });
-    await expect(AppUpdateService.check(APP_DISTRIBUTION_IDS.portable, false)).rejects.toThrow(
-      'unsupported download URL'
-    );
-    expect(native.close).toHaveBeenCalledOnce();
   });
 });

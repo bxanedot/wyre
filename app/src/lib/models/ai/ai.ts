@@ -15,7 +15,7 @@ import type {
 } from '@/lib/models/applications/application';
 
 export type AiReasoningMode = 'default' | 'disabled';
-export type AiServiceMode = 'free' | 'custom';
+export type AiServiceMode = 'custom';
 
 export interface AiCustomHeader {
   name: string;
@@ -25,30 +25,6 @@ export interface AiCustomHeader {
 export interface AiPreferences {
   schemaVersion: 1;
   enabled: boolean;
-}
-
-export interface AiClientMetadata {
-  installId: string;
-  appVersion: string;
-  locale: string;
-  distribution: string;
-  osVersion: string;
-  timezone: string;
-}
-
-export interface AiQuota {
-  available: boolean;
-  unavailableReason: string | null;
-  dailyLimit: number;
-  remaining: number;
-  cooldownSeconds: number;
-  nextAllowedAt: string;
-  resetAt: string;
-  serverTime: string;
-  activeRequests: number;
-  maxConcurrentRequests: number;
-  policyVersion: string;
-  promptVersion: string;
 }
 
 export type LocalModelProvider = 'ollama' | 'openAiCompatible';
@@ -62,15 +38,6 @@ export interface InstalledLocalModel {
 
 export const AI_ERROR_LABELS = {
   disabled: 'ai.errors.disabled',
-  freeUnavailable: 'ai.errors.freeUnavailable',
-  freeDailyLimit: 'ai.errors.freeDailyLimit',
-  freeRateLimited: 'ai.errors.freeRateLimited',
-  freeConcurrent: 'ai.errors.freeConcurrent',
-  freeClockSkew: 'ai.errors.freeClockSkew',
-  freeSignatureInvalid: 'ai.errors.freeSignatureInvalid',
-  freeRequestExists: 'ai.errors.freeRequestExists',
-  freeArchiveUnavailable: 'ai.errors.freeArchiveUnavailable',
-  feedbackExpired: 'ai.feedback.expired',
   invalidConfiguration: 'ai.errors.invalidConfiguration',
   invalidContext: 'ai.errors.invalidContext',
   notConfigured: 'ai.errors.notConfigured',
@@ -93,9 +60,6 @@ export const AI_ERROR_LABELS = {
 export interface AiSettings {
   schemaVersion: 2;
   mode: AiServiceMode;
-  /** Legacy schema 2 field; free requests no longer require explicit consent. */
-  freeConsent: boolean;
-  freeAvailable: boolean;
   endpoint: string;
   model: string;
   hasKey: boolean;
@@ -106,7 +70,6 @@ export interface AiSettings {
 
 export interface AiConfigurationUpdate {
   mode: AiServiceMode;
-  freeConsent: boolean;
   endpoint: string;
   model: string;
   apiKey: string | null;
@@ -126,7 +89,6 @@ export interface AiConfiguration extends AiConfigurationUpdate {
 /** One fresh editor read; this secret-bearing snapshot must not be cached. */
 export interface AiEditorState {
   configuration: AiConfiguration | null;
-  freeAvailable: boolean;
 }
 
 /** Descriptive metadata, including original startup locations; never executable actions. */
@@ -257,38 +219,13 @@ export type AiSubject =
 /** Provider output channels remain distinct through streaming and caching. */
 export type AiDelta = { kind: 'text' | 'reasoning'; text: string };
 
-export type AiFeedbackRating = 'positive' | 'negative';
-export interface AiFeedbackTarget {
-  schemaVersion: 1;
-  requestId: string;
-}
-export interface AiFeedback extends AiFeedbackTarget {
-  rating: AiFeedbackRating | null;
-  updatedAt: number | null;
-}
-export interface AiFeedbackState extends AiFeedbackTarget {
-  rating: AiFeedbackRating | null;
-  busy: boolean;
-  error: 'failed' | 'expired' | null;
-}
-
 export interface AiUsage {
-  feedback?: AiFeedbackTarget;
   promptTokens: number | null;
   completionTokens: number | null;
 }
 
 export const AI_ERROR_CODES = [
   'disabled',
-  'freeUnavailable',
-  'freeDailyLimit',
-  'freeRateLimited',
-  'freeConcurrent',
-  'freeClockSkew',
-  'freeSignatureInvalid',
-  'freeRequestExists',
-  'freeArchiveUnavailable',
-  'feedbackExpired',
   'invalidConfiguration',
   'invalidContext',
   'notConfigured',

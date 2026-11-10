@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## 2.0.0 — 2026-11-10
+
+Wyre 2.0 gets an Apple-style look and drops every service it inherited from MangoDisk. Wyre now talks only to servers you choose.
+
+- Restyled the interface after Apple's design language, with SF Symbols icons from GlyphStudio.
+- Removed the hosted MangoDisk AI service, its quota display, reply ratings, installation ID and request headers. AI explanations now use only the provider you configure. Saved free-service settings load as unconfigured.
+- Portable builds now open Wyre's GitHub release page for updates instead of a MangoDisk download link.
 - Keep the desktop window's native minimize animation and enlarge custom window-control glyphs.
 - Generate resident tray icons from the vector Wyre mark and document the correct vector source for packaged icons.
 - Validate release tags against all app versions and the matching changelog before starting platform builds.

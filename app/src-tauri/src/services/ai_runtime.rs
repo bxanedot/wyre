@@ -19,8 +19,6 @@ pub(crate) struct AiRuntime(Arc<Mutex<AiRuntimeState>>);
 struct AiRuntimeState {
     preferences: Option<AiPreferences>,
     active: HashMap<String, ActiveRequest>,
-    // Each disable invalidates existing quota reads even after a quick re-enable.
-    disabled_revision: watch::Sender<u64>,
 }
 
 impl AiRuntimeState {
@@ -35,8 +33,6 @@ impl AiRuntimeState {
     fn apply_preferences(&mut self, preferences: AiPreferences) {
         self.preferences = Some(preferences);
         if !preferences.enabled {
-            self.disabled_revision
-                .send_modify(|revision| *revision += 1);
             for request in self.active.values() {
                 request.cancel.send_replace(true);
             }
@@ -70,12 +66,6 @@ impl AiRuntime {
         state.apply_preferences(preferences);
         log::info!("ai_feature_preference_saved enabled={enabled} active_count={active_count}");
         Ok(preferences)
-    }
-
-    pub(crate) fn quota_permit(&self) -> Result<watch::Receiver<u64>, AiError> {
-        let state = self.0.lock().map_err(|_| AiError::Busy)?;
-        state.require_enabled()?;
-        Ok(state.disabled_revision.subscribe())
     }
 
     pub(crate) fn reserve_request(&self) -> Result<String, AiError> {
@@ -166,7 +156,6 @@ mod tests {
     fn unloaded_and_disabled_preferences_block_all_network_admission() {
         let runtime = AiRuntime::default();
         assert!(matches!(runtime.reserve_request(), Err(AiError::Disabled)));
-        assert!(matches!(runtime.quota_permit(), Err(AiError::Disabled)));
         runtime.0.lock().unwrap().apply_preferences(AiPreferences {
             enabled: false,
             ..AiPreferences::default()
@@ -176,22 +165,19 @@ mod tests {
             runtime.start_reserved_request("unknown"),
             Err(AiError::Disabled)
         ));
-        assert!(matches!(runtime.quota_permit(), Err(AiError::Disabled)));
     }
 
     #[test]
-    fn disabling_cancels_every_stream_reservation_and_quota_without_reviving_them() {
+    fn disabling_cancels_every_stream_reservation_without_reviving_them() {
         let runtime = enabled_runtime();
         let reserved = runtime.reserve_request().unwrap();
         let running = runtime.reserve_request().unwrap();
         let cancellation = runtime.start_reserved_request(&running).unwrap();
-        let quota = runtime.quota_permit().unwrap();
         runtime.0.lock().unwrap().apply_preferences(AiPreferences {
             enabled: false,
             ..AiPreferences::default()
         });
         assert!(*cancellation.borrow());
-        assert!(quota.has_changed().unwrap());
         assert!(matches!(runtime.reserve_request(), Err(AiError::Disabled)));
         runtime
             .0
@@ -199,7 +185,6 @@ mod tests {
             .unwrap()
             .apply_preferences(AiPreferences::default());
         assert!(*cancellation.borrow());
-        assert!(quota.has_changed().unwrap());
         assert!(matches!(
             runtime.start_reserved_request(&reserved),
             Err(AiError::Cancelled)
@@ -207,7 +192,6 @@ mod tests {
         runtime.complete_request(&running);
         let fresh = runtime.reserve_request().unwrap();
         assert!(!*runtime.start_reserved_request(&fresh).unwrap().borrow());
-        assert!(!runtime.quota_permit().unwrap().has_changed().unwrap());
     }
 
     #[test]

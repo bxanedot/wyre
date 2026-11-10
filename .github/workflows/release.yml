@@ -220,10 +220,14 @@ jobs:
           node-version: 24
       - name: Create signed updater manifest
         run: node scripts/create-updater-manifest.mjs
+      - name: Write one checksum file for every release asset
+        # Hash files only, by the base name they get on the release page.
+        run: |
+          cp CHANGELOG.md release/
+          cd release && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum | sed -E 's#^([0-9a-f]+ [ *])\./(.*/)?#\1#' > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           name: Wyre ${{ github.ref_name }}
           files: |
             release/**
-            CHANGELOG.md
           body_path: CHANGELOG.md

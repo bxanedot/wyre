@@ -28,8 +28,6 @@ vi.mock('@/lib/services/ai/ai-service', () => ({
     settings: async () => ({
       schemaVersion: 2,
       mode: 'custom',
-      freeConsent: false,
-      freeAvailable: false,
       endpoint: 'http://localhost/v1',
       model: 'test',
       hasKey: false,
@@ -116,134 +114,6 @@ it.each([true, false])(
   }
 );
 
-it.each(['zh-CN', 'zh-TW', 'en-US', 'ja-JP', 'ko-KR', 'tr-TR', 'pt-BR'] as const)(
-  'keeps free quota in the footer without a countdown in %s',
-  async locale => {
-    streams.clear();
-    const previousLocale = i18n.global.locale.value;
-    i18n.global.locale.value = locale;
-    const pinia = createPinia();
-    const wrapper = mount(TooltipProvider, {
-      slots: { default: () => h(MdAiWorkspace, { module: 'startup' }) },
-      global: { plugins: [pinia, i18n], stubs: { MdAiSettingsDialog: true } },
-    });
-    const store = useAiStore(pinia);
-    store.$patch({ enabled: true, preferencesLoaded: true });
-    const context = (fixtures as AiContext[]).find(item => item.subject.module === 'startup')!;
-    const request = store.show(context, locale);
-    try {
-      await flushPromises();
-      streams.get('startup')!.fail('connectionFailed');
-      await request;
-      Object.assign(store.workspaces.startup.settings!, {
-        mode: 'free',
-        freeConsent: true,
-        freeAvailable: true,
-      });
-      store.quotaReadAt = performance.now();
-      store.quota = {
-        available: true,
-        unavailableReason: null,
-        dailyLimit: 20,
-        remaining: 13,
-        cooldownSeconds: 60,
-        nextAllowedAt: '2026-09-07T00:01:00Z',
-        resetAt: '2026-09-08T00:00:00Z',
-        serverTime: '2026-09-07T00:00:00Z',
-        activeRequests: 0,
-        maxConcurrentRequests: 2,
-        policyVersion: 'test',
-        promptVersion: 'test',
-      };
-      await flushPromises();
-      const quotaText = i18n.global.t('ai.freeRemaining', { remaining: 13, limit: 20 });
-      const footer = wrapper.get('footer');
-      expect(footer.text()).toContain(quotaText);
-      expect(wrapper.get('.overflow-y-auto').text()).not.toContain(quotaText);
-      expect(footer.text()).toBe(i18n.global.t('ai.disclaimer') + quotaText + i18n.global.t('ai.retry'));
-      // Removing the countdown must not remove the request interval guard.
-      expect(footer.get('button').attributes('disabled')).toBeDefined();
-      store.quota.nextAllowedAt = store.quota.serverTime;
-      await flushPromises();
-      expect(footer.get('button').attributes('disabled')).toBeUndefined();
-      store.workspaces.startup.settings!.mode = 'custom';
-      await flushPromises();
-      expect(footer.text()).not.toContain(quotaText);
-    } finally {
-      streams.get('startup')?.finish();
-      await request;
-      wrapper.unmount();
-      i18n.global.locale.value = previousLocale;
-    }
-  }
-);
-
-it('shows the first free explanation without an acceptance step', () => {
-  const pinia = createPinia();
-  const store = useAiStore(pinia);
-  store.$patch({ enabled: true, preferencesLoaded: true });
-  Object.assign(store.workspaces.startup, {
-    open: true,
-    context: (fixtures as AiContext[]).find(item => item.subject.module === 'startup')!,
-    settings: {
-      schemaVersion: 2,
-      mode: 'free',
-      freeConsent: false,
-      freeAvailable: true,
-      endpoint: '',
-      model: '',
-      hasKey: false,
-      reasoning: 'default',
-    },
-    status: 'generating',
-  });
-  const wrapper = mount(TooltipProvider, {
-    slots: { default: () => h(MdAiWorkspace, { module: 'startup' }) },
-    global: { plugins: [pinia, i18n], stubs: { MdAiSettingsDialog: true } },
-  });
-  try {
-    const body = wrapper.get('.overflow-y-auto');
-    expect(body.text()).toContain(i18n.global.t('ai.waiting'));
-    expect(body.find('button').exists()).toBe(false);
-  } finally {
-    wrapper.unmount();
-  }
-});
-
-it('keeps an existing answer and offers settings when the free service is disabled', async () => {
-  streams.clear();
-  const pinia = createPinia();
-  const wrapper = mount(TooltipProvider, {
-    slots: { default: () => h(MdAiWorkspace, { module: 'startup' }) },
-    global: { plugins: [pinia, i18n], stubs: { MdAiSettingsDialog: true } },
-  });
-  const store = useAiStore(pinia);
-  store.$patch({ enabled: true, preferencesLoaded: true });
-  const context = (fixtures as AiContext[]).find(item => item.subject.module === 'startup')!;
-  const request = store.show(context, 'en-US');
-  try {
-    await flushPromises();
-    streams.get('startup')!.delta({ kind: 'text', text: 'Existing useful answer' });
-    streams.get('startup')!.finish();
-    await request;
-    Object.assign(store.workspaces.startup.settings!, { mode: 'free', freeConsent: true, freeAvailable: true });
-    store.workspaces.startup.error = 'freeUnavailable';
-    await flushPromises();
-    const body = wrapper.get('.overflow-y-auto');
-    expect(body.text()).toContain('Existing useful answer');
-    expect(body.text()).toContain(i18n.global.t('ai.freeTemporarilyUnavailable'));
-    expect(body.text()).toContain(i18n.global.t('ai.freeUseCustom'));
-    expect(body.find('[role="alert"]').exists()).toBe(false);
-    expect(body.get('button').text()).toBe(i18n.global.t('ai.configure'));
-    await body.get('button').trigger('click');
-    expect(wrapper.get('md-ai-settings-dialog-stub').attributes('open')).toBe('true');
-  } finally {
-    streams.get('startup')?.finish();
-    await request;
-    wrapper.unmount();
-  }
-});
-
 it.each(['completed', 'cancelled', 'failed'] as const)(
   'keeps answer progress in the footer and removes it when %s',
   async outcome => {
@@ -294,10 +164,6 @@ it.each(['completed', 'cancelled', 'failed'] as const)(
       expect(body.get('.ai-response').text()).toContain('Docker Desktop');
       if (outcome === 'cancelled') {
         expect(body.text()).toContain(i18n.global.t('ai.stopped'));
-        store.workspaces.startup.settings!.mode = 'free';
-        await flushPromises();
-        expect(body.text()).toContain(i18n.global.t('ai.freeStopped'));
-        expect(body.text()).not.toContain(i18n.global.t('ai.stopped'));
       }
     } finally {
       streams.get('startup')?.finish();

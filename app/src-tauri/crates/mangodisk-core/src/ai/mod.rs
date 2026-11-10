@@ -5,10 +5,7 @@ mod context;
 mod discovery;
 #[cfg(test)]
 mod evaluation;
-mod feedback;
 mod language;
-mod official;
-mod official_protocol;
 mod preferences;
 mod prompt;
 mod prompt_schema;
@@ -22,8 +19,6 @@ pub use configuration::{
 };
 pub use context::{AiContext, AiPlatform, AiSubject};
 pub use discovery::{discover_local_models, InstalledLocalModel, LocalModelProvider};
-pub use feedback::{official_feedback, AiFeedback, AiFeedbackRating, AiFeedbackTarget};
-pub use official::{official_explain, official_quota, AiClientMetadata, AiQuota};
 pub use preferences::AiPreferences;
 pub use transport::{explain, AiDelta, AiRequest, AiUsage};
 
@@ -48,13 +43,4 @@ pub enum AiError {
     OutputLimit,
     EmptyResponse,
     ResponseTooLarge,
-    FreeUnavailable,
-    FreeDailyLimit,
-    FreeRateLimited,
-    FreeConcurrent,
-    FreeClockSkew,
-    FreeSignatureInvalid,
-    FreeRequestExists,
-    FreeArchiveUnavailable,
-    FeedbackExpired,
 }

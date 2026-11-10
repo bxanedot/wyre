@@ -5,20 +5,14 @@ import { i18n } from '@/i18n';
 import MdAiSettingsDialog from './md-ai-settings-dialog.vue';
 import MdSpinner from './md-spinner.vue';
 import MdTooltip from './md-tooltip.vue';
-import type { AiQuota } from '@/lib/models/ai/ai';
-import { formatAiQuotaResetAt } from '@/lib/utils/ai/ai-quota';
 
 const mocks = vi.hoisted(() => {
   const reads = {
-    settings: vi.fn().mockResolvedValue({ freeAvailable: false }),
     configuration: vi.fn().mockResolvedValue(null),
   };
   return {
     ...reads,
-    editorState: vi.fn(async () => ({
-      configuration: await reads.configuration(),
-      freeAvailable: (await reads.settings()).freeAvailable,
-    })),
+    editorState: vi.fn(async () => ({ configuration: await reads.configuration() })),
     save: vi.fn(),
     delete: vi.fn(),
     run: vi.fn(),
@@ -37,16 +31,13 @@ vi.mock('@/lib/services/ai/ai-service', () => ({
     async cancel() {}
   },
 }));
-function modeRadio(value: 'free' | 'custom'): HTMLInputElement {
-  return document.querySelector(`input[name="ai-service-mode"][value="${value}"]`)!;
-}
 afterEach(() => {
   document.body.innerHTML = '';
   vi.clearAllMocks();
 });
 
 describe('AI configuration dialog', () => {
-  it('opens help without selecting custom mode, saving, closing or losing unsaved fields', async () => {
+  it('opens help without saving, closing or losing unsaved fields', async () => {
     const wrapper = mount(MdAiSettingsDialog, {
       props: { open: true },
       attachTo: document.body,
@@ -58,16 +49,12 @@ describe('AI configuration dialog', () => {
       expect(link.closest('label')).toBeNull();
       link.click();
       await flushPromises();
-      expect(modeRadio('free').checked).toBe(true);
       expect(mocks.openLink).toHaveBeenLastCalledWith(link.href);
-      modeRadio('custom').click();
-      await flushPromises();
       const input = document.querySelector('#ai-model') as HTMLInputElement;
       input.value = 'unsaved-model';
       input.dispatchEvent(new Event('input', { bubbles: true }));
       link.click();
       await flushPromises();
-      expect(modeRadio('custom').checked).toBe(true);
       expect(input.value).toBe('unsaved-model');
       expect(mocks.save).not.toHaveBeenCalled();
       expect(mocks.run).not.toHaveBeenCalled();
@@ -78,85 +65,6 @@ describe('AI configuration dialog', () => {
       expect(mocks.error).toHaveBeenCalledWith(i18n.global.t('ai.guideOpenFailed'), { id: expect.any(String) });
       expect(input.value).toBe('unsaved-model');
       expect(document.querySelector('[role="alert"]')).toBeNull();
-    } finally {
-      wrapper.unmount();
-    }
-  });
-
-  it('renders quota independently of opening and only requests updates for the selected free service', async () => {
-    mocks.settings.mockResolvedValueOnce({ freeAvailable: true });
-    const wrapper = mount(MdAiSettingsDialog, {
-      props: { open: true },
-      attachTo: document.body,
-      global: { plugins: [i18n] },
-    });
-    try {
-      await flushPromises();
-      const dialog = () => document.querySelector('[role="dialog"]')!;
-      expect(dialog()).not.toBeNull();
-      expect(dialog().textContent).toContain(i18n.global.t('ai.freeDailyAllowance'));
-      expect(wrapper.findComponent(MdSpinner).exists()).toBe(false);
-      expect(wrapper.emitted('refreshQuota')).toEqual([[i18n.global.locale.value, false]]);
-      const quota: AiQuota = {
-        available: true,
-        unavailableReason: null,
-        remaining: 13,
-        dailyLimit: 20,
-        cooldownSeconds: 60,
-        nextAllowedAt: '2026-09-07T00:01:00Z',
-        resetAt: '2026-09-08T00:00:00Z',
-        serverTime: '2026-09-07T00:00:00Z',
-        activeRequests: 0,
-        maxConcurrentRequests: 2,
-        policyVersion: 'test',
-        promptVersion: 'test',
-      };
-      await wrapper.setProps({ quota });
-      const remaining = i18n.global.t('ai.freeRemaining', { remaining: 13, limit: 20 });
-      expect(dialog().textContent).toContain(remaining);
-      expect(dialog().textContent).not.toContain(i18n.global.t('ai.freeDailyAllowance'));
-      await wrapper.setProps({ quota: { ...quota, remaining: 3, dailyLimit: 10, cooldownSeconds: 120 } });
-      expect(dialog().textContent).toContain(i18n.global.t('ai.freeRemaining', { remaining: 3, limit: 10 }));
-      expect(dialog().textContent).not.toContain(remaining);
-      expect(dialog().querySelector('[role="status"]')?.parentElement?.children).toHaveLength(1);
-      await wrapper.setProps({ quota });
-      modeRadio('custom').click();
-      await flushPromises();
-      window.dispatchEvent(new Event('focus'));
-      await flushPromises();
-      expect(wrapper.emitted('refreshQuota')).toHaveLength(1);
-      expect(dialog().textContent).not.toContain(remaining);
-      modeRadio('free').click();
-      await flushPromises();
-      expect(wrapper.emitted('refreshQuota')).toHaveLength(2);
-      expect(dialog().textContent).toContain(remaining);
-      // The owner retains the last successful snapshot when a refresh fails.
-      window.dispatchEvent(new Event('focus'));
-      await flushPromises();
-      expect(wrapper.emitted('refreshQuota')?.at(-1)).toEqual([i18n.global.locale.value, true]);
-      expect(dialog().textContent).toContain(remaining);
-      await wrapper.setProps({ quota: { ...quota, remaining: 0 } });
-      expect(dialog().textContent).toContain(
-        i18n.global.t('ai.freeResetsAt', {
-          time: formatAiQuotaResetAt(
-            quota.resetAt,
-            i18n.global.locale.value,
-            Intl.DateTimeFormat().resolvedOptions().timeZone
-          ),
-        })
-      );
-      await wrapper.setProps({ quota: { ...quota, unavailableReason: 'AI_SERVICE_DISABLED' } });
-      expect(dialog().textContent).toContain(i18n.global.t('ai.freeTemporarilyUnavailable'));
-      expect(dialog().textContent).toContain(i18n.global.t('ai.freeUseCustom'));
-      expect(dialog().textContent).not.toContain(remaining);
-      await wrapper.setProps({ quota: { ...quota, unavailableReason: 'AI_RATE_LIMITED' } });
-      expect(dialog().textContent).not.toContain(i18n.global.t('ai.freeTemporarilyUnavailable'));
-      await wrapper.setProps({ quota: { ...quota, remaining: 20 } });
-      expect(dialog().textContent).toContain(i18n.global.t('ai.freeRemaining', { remaining: 20, limit: 20 }));
-      await wrapper.setProps({ open: false });
-      window.dispatchEvent(new Event('focus'));
-      await flushPromises();
-      expect(wrapper.emitted('refreshQuota')).toHaveLength(3);
     } finally {
       wrapper.unmount();
     }
@@ -220,59 +128,6 @@ describe('AI configuration dialog', () => {
     wrapper.unmount();
   });
 
-  it('keeps free mode simple and retains custom fields when switching back', async () => {
-    mocks.settings.mockResolvedValueOnce({ freeAvailable: true });
-    mocks.configuration.mockResolvedValueOnce({
-      schemaVersion: 2,
-      mode: 'custom',
-      freeConsent: false,
-      endpoint: 'https://example.com/v1',
-      model: 'fixture',
-      apiKey: 'synthetic-key',
-      reasoning: 'default',
-    });
-    const wrapper = mount(MdAiSettingsDialog, {
-      props: { open: true },
-      attachTo: document.body,
-      global: { plugins: [i18n] },
-    });
-    await flushPromises();
-    const button = (label: string) =>
-      [...document.querySelectorAll('button')].find(item => item.textContent?.trim() === i18n.global.t(label))!;
-    expect(modeRadio('custom').checked).toBe(true);
-    expect(document.querySelector('[role="dialog"]')?.textContent).not.toContain(
-      i18n.global.t('ai.freeDailyAllowance')
-    );
-    modeRadio('free').click();
-    await flushPromises();
-    expect(mocks.editorState).toHaveBeenCalledTimes(1);
-    expect(modeRadio('free').checked).toBe(true);
-    expect(modeRadio('custom').checked).toBe(false);
-    expect(mocks.save).not.toHaveBeenCalled();
-    expect(document.querySelector('#ai-key')).toBeNull();
-    expect(button('ai.saveAndTest')).toBeUndefined();
-    for (const label of ['ai.freeNoKey', 'ai.freeDailyAllowance']) {
-      expect(i18n.global.te(label)).toBe(true);
-    }
-    for (const label of ['ai.freeNoKey', 'ai.freeDailyAllowance']) {
-      expect(document.querySelector('[role="dialog"]')?.textContent).toContain(i18n.global.t(label));
-    }
-    expect(document.querySelector('[role="dialog"]')?.textContent).not.toContain(
-      i18n.global.t('ai.freeBuildUnavailable')
-    );
-    button('ai.save').click();
-    await flushPromises();
-    expect(mocks.run).not.toHaveBeenCalled();
-    expect(mocks.save).toHaveBeenCalledWith(
-      expect.objectContaining({ mode: 'free', freeConsent: false, apiKey: null })
-    );
-    modeRadio('custom').click();
-    await flushPromises();
-    expect((document.querySelector('#ai-key') as HTMLInputElement).value).toBe('synthetic-key');
-    expect(document.querySelector('#ai-key')?.getAttribute('type')).toBe('password');
-    wrapper.unmount();
-  });
-
   it('opens, masks the key and saves the entered configuration', async () => {
     const wrapper = mount(MdAiSettingsDialog, {
       props: { open: false },
@@ -283,13 +138,10 @@ describe('AI configuration dialog', () => {
     await flushPromises();
     const dialog = document.querySelector('[role="dialog"]');
     expect(dialog).not.toBeNull();
-    modeRadio('custom').click();
-    await flushPromises();
     expect(document.querySelector('#ai-key')?.getAttribute('type')).toBe('password');
     expect(mocks.configuration).toHaveBeenCalledTimes(1);
     const configuration = {
       mode: 'custom',
-      freeConsent: false,
       endpoint: 'https://api.example.com/v1',
       model: 'example-model',
       apiKey: 'synthetic-test-key',
@@ -345,7 +197,6 @@ describe('AI configuration dialog', () => {
     mocks.configuration.mockResolvedValueOnce({
       schemaVersion: 2,
       mode: 'custom',
-      freeConsent: false,
       endpoint: 'https://first.example/v1',
       model: 'fixture',
       apiKey: 'synthetic-key',
@@ -402,48 +253,6 @@ describe('AI configuration dialog', () => {
     }
   });
 
-  it('saves free mode without sending or validating the unfinished custom draft', async () => {
-    const wrapper = mount(MdAiSettingsDialog, {
-      props: { open: true },
-      attachTo: document.body,
-      global: { plugins: [i18n] },
-    });
-    try {
-      await flushPromises();
-      modeRadio('custom').click();
-      await flushPromises();
-      (document.querySelector('[aria-controls="ai-advanced-settings"]') as HTMLButtonElement).click();
-      await flushPromises();
-      [...document.querySelectorAll('button')]
-        .find(button => button.textContent?.trim() === i18n.global.t('ai.addHeader'))!
-        .click();
-      await flushPromises();
-      const save = [...document.querySelectorAll('button')].find(
-        button => button.textContent?.trim() === i18n.global.t('ai.save')
-      )!;
-      expect(save.disabled).toBe(true);
-      modeRadio('free').click();
-      await flushPromises();
-      expect(save.disabled).toBe(false);
-      save.click();
-      await flushPromises();
-      expect(mocks.save).toHaveBeenLastCalledWith({
-        mode: 'free',
-        freeConsent: false,
-        endpoint: '',
-        model: '',
-        apiKey: null,
-        reasoning: 'default',
-      });
-      modeRadio('custom').click();
-      await flushPromises();
-      expect(document.querySelectorAll('[id^="ai-header-value-"]')).toHaveLength(1);
-      expect(save.disabled).toBe(true);
-    } finally {
-      wrapper.unmount();
-    }
-  });
-
   it.each(['en-US', 'zh-CN', 'zh-TW', 'ja-JP', 'ko-KR', 'tr-TR', 'pt-BR', 'ru-RU'] as const)(
     'shows concise header and temperature help on hover in %s',
     async locale => {
@@ -455,8 +264,6 @@ describe('AI configuration dialog', () => {
         global: { plugins: [i18n] },
       });
       try {
-        await flushPromises();
-        modeRadio('custom').click();
         await flushPromises();
         (document.querySelector('[aria-controls="ai-advanced-settings"]') as HTMLButtonElement).click();
         await flushPromises();
@@ -492,8 +299,6 @@ describe('AI configuration dialog', () => {
     mocks.configuration.mockResolvedValueOnce({
       schemaVersion: 2,
       mode: 'custom',
-      freeConsent: false,
-      freeAvailable: false,
       endpoint: 'http://example.com/v1',
       model: 'fixture',
       apiKey: 'synthetic-key',
@@ -534,7 +339,7 @@ describe('AI configuration dialog', () => {
       expect(mocks.success).toHaveBeenLastCalledWith(i18n.global.t('ai.deleted'), { id: expect.any(String) });
       expect(document.querySelector('[role="alert"]')).toBeNull();
       expect(document.getElementById('ai-reasoning')).toBeNull();
-      expect(modeRadio('free').checked).toBe(true);
+      expect((document.querySelector('#ai-endpoint') as HTMLInputElement).value).toBe('');
     } finally {
       wrapper.unmount();
       expect(mocks.dismiss).toHaveBeenCalledWith(mocks.success.mock.lastCall?.[1]?.id);
@@ -547,8 +352,6 @@ describe('AI configuration dialog', () => {
       mocks.configuration.mockResolvedValueOnce({
         schemaVersion: 2,
         mode: 'custom',
-        freeConsent: false,
-        freeAvailable: false,
         endpoint: 'http://example.com/v1',
         model: 'fixture',
         apiKey: 'synthetic-key',
@@ -602,8 +405,6 @@ describe('AI configuration dialog', () => {
     resolve({
       schemaVersion: 2,
       mode: 'custom',
-      freeConsent: false,
-      freeAvailable: false,
       endpoint: 'http://example.com/v1',
       model: 'fixture',
       apiKey: 'late-secret',
@@ -640,7 +441,6 @@ it.each(['save', 'test'])('suppresses late %s notifications and automatic resume
   mocks.configuration.mockResolvedValueOnce({
     schemaVersion: 2,
     mode: 'custom',
-    freeConsent: false,
     endpoint: 'http://localhost/v1',
     model: 'fixture',
     apiKey: '',
