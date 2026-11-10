@@ -29,7 +29,10 @@ const lines = Object.entries(manifest).map(([key, appleName]) => {
   }
   const width = source.match(/viewportWidth = ([\d.]+)f/)[1];
   const height = source.match(/viewportHeight = ([\d.]+)f/)[1];
-  const paths = [...source.matchAll(/addSfPath\("([^"]+)"/g)].map(match => match[1]);
+  // Two decimals is under 1/100 px at icon sizes and keeps the table small enough for the main bundle.
+  const paths = [...source.matchAll(/addSfPath\("([^"]+)"/g)].map(match =>
+    match[1].replace(/\d*\.\d+/g, n => String(Number(Number(n).toFixed(2))).replace(/^0\./, '.'))
+  );
   return `  ${JSON.stringify(key)}: [${width}, ${height}, ${paths.map(d => JSON.stringify(d)).join(', ')}],`;
 });
 
