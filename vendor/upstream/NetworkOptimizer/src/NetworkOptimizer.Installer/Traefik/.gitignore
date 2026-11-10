@@ -1,5 +1,0 @@
-# Downloaded Traefik binary (fetched during build)
-traefik.exe
-
-# Config templates (downloaded from NetworkOptimizer-Proxy repo during build)
-templates/

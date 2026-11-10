@@ -1,8 +1,0 @@
-## Build results
-bin/
-obj/
-
-## Database files
-*.db
-*.db-shm
-*.db-wal
