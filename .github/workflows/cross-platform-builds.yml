@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04]
+        os: [windows-latest, ubuntu-22.04, macos-latest]
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -44,6 +44,10 @@ jobs:
           sudo apt-get install --yes build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
       - name: Install dependencies
         run: pnpm --dir app install --frozen-lockfile
+      - name: Run frontend tests
+        run: pnpm --dir app test
+      - name: Run Rust tests
+        run: pnpm --dir app rust:test
       - name: Create temporary signing certificate for CI validation
         if: runner.os == 'Windows'
         timeout-minutes: 2
@@ -64,11 +68,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not generate the CI-only updater key.' }
           "TAURI_SIGNING_PRIVATE_KEY=$keyPath" >> $env:GITHUB_ENV
           "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> $env:GITHUB_ENV
-      - name: Generate temporary updater key for Linux CI validation
-        if: runner.os == 'Linux'
+      - name: Generate temporary updater key for Linux and macOS CI validation
+        if: runner.os != 'Windows'
         run: |
           pnpm --dir app exec tauri signer generate --ci --write-keys "$RUNNER_TEMP/wyre-ci-updater.key"
-          printf 'TAURI_SIGNING_PRIVATE_KEY=%s\n' "$RUNNER_TEMP/wyre-ci-updater.key" >> "$GITHUB_ENV"
+          # Tauri reads this variable as the key itself on Linux and macOS, not as a path to it.
+          printf 'TAURI_SIGNING_PRIVATE_KEY=%s\n' "$(cat "$RUNNER_TEMP/wyre-ci-updater.key")" >> "$GITHUB_ENV"
           printf 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\n' >> "$GITHUB_ENV"
       - name: Build Windows installer
         if: runner.os == 'Windows'
@@ -76,6 +81,9 @@ jobs:
       - name: Build Linux installers
         if: runner.os == 'Linux'
         run: npm run dist:linux
+      - name: Build macOS disk image
+        if: runner.os == 'macOS'
+        run: npm run dist:mac
       - name: Retain installer artifacts for manual runs
         if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
         uses: actions/upload-artifact@v4

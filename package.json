@@ -2,13 +2,14 @@
   "name": "wyre",
   "version": "1.0.0",
   "private": true,
-  "description": "Wyre Windows and Linux desktop application, based on MangoDisk.",
+  "description": "Wyre desktop application for Windows, macOS and Linux, based on MangoDisk.",
   "license": "GPL-3.0-only",
   "scripts": {
     "start": "pnpm --dir app tauri:dev",
     "build": "pnpm --dir app tauri:build",
     "dist:win": "pnpm --dir app tauri:build",
-    "dist:linux": "pnpm --dir app tauri:build:linux"
+    "dist:linux": "pnpm --dir app tauri:build:linux",
+    "dist:mac": "pnpm --dir app tauri:build:mac"
   },
   "packageManager": "pnpm@11.13.1"
 }

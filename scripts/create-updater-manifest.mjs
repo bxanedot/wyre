@@ -35,6 +35,7 @@ const manifest = {
   platforms: {
     'windows-x86_64': platform('release/windows', '.exe'),
     'linux-x86_64': platform('release/linux', '.AppImage'),
+    'darwin-aarch64': platform('release/macos', '.app.tar.gz'),
   },
 };
 
