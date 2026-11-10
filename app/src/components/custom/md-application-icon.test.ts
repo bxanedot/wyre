@@ -31,7 +31,7 @@ describe('MdApplicationIcon', () => {
     await flushPromises();
     expect(wrapper.find('img').exists()).toBe(false);
     expect(wrapper.classes()).toContain('linux-icon');
-    expect(wrapper.get('.process-icon').attributes('style')).toContain('width: 24px');
+    expect(wrapper.get('.fallback-icon svg').attributes('width')).toBe('24');
     expect(fallback.resolve).toHaveBeenCalledExactlyOnceWith('linuxPackage');
   });
 

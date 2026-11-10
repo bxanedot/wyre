@@ -15,7 +15,8 @@ const sourceExtensions = new Set(['.ts', '.vue']);
 const forbiddenDependencies = [
   { pattern: /from\s+['"]vue-i18n['"]/u, reason: 'localization belongs in a project-owned wrapper' },
   {
-    pattern: /from\s+['"]@\/components\/(?:custom|icons)(?:\/|['"])/u,
+    // Generated primitives may draw SF Symbols (pure icon data) in place of an icon package.
+    pattern: /from\s+['"]@\/components\/(?:custom|icons)(?:\/(?!md-sf-symbols['"])|['"])/u,
     reason: 'project components must wrap generated UI instead of being imported by it',
   },
   {

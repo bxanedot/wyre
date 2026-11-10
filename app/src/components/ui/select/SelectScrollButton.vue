@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronDown, ChevronUp } from '@lucide/vue';
+import { ChevronDown, ChevronUp } from '@/components/icons/md-sf-symbols';
 import { SelectScrollDownButton, SelectScrollUpButton } from 'reka-ui';
 
 defineProps<{ direction: 'up' | 'down' }>();

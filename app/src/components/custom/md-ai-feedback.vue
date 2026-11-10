@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useI18n } from 'vue-i18n';
-import { ThumbsUp, ThumbsDown } from '@lucide/vue';
+import { ThumbsUp, ThumbsDown } from '@/components/icons/md-sf-symbols';
 import { Button } from '@/components/ui/button';
 import type { AiFeedbackState, AiFeedbackRating } from '@/lib/models/ai/ai';
 const { t } = useI18n({ useScope: 'global' });

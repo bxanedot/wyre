@@ -7,7 +7,7 @@ defineProps<{
 
 <template>
   <!--
-    Simple Icons use filled silhouettes while the application's Lucide and Tabler icons use strokes.
+    Simple Icons brand marks are filled silhouettes like the SF Symbols used for the interface.
     The expanded viewBox adds consistent optical padding so brand marks do not dominate list rows.
   -->
   <svg

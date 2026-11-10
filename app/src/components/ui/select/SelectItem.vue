@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { reactiveOmit } from '@vueuse/core';
-import { Check } from '@lucide/vue';
+import { Check } from '@/components/icons/md-sf-symbols';
 import type { SelectItemProps } from 'reka-ui';
 import { SelectItem, SelectItemIndicator, SelectItemText, useForwardProps } from 'reka-ui';
 import type { HTMLAttributes } from 'vue';

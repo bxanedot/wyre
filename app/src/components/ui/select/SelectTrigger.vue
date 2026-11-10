@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { reactiveOmit } from '@vueuse/core';
-import { ChevronDown } from '@lucide/vue';
+import { ChevronDown } from '@/components/icons/md-sf-symbols';
 import type { SelectTriggerProps } from 'reka-ui';
 import { SelectIcon, SelectTrigger, useForwardProps } from 'reka-ui';
 import type { HTMLAttributes } from 'vue';
