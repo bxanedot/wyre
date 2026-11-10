@@ -2,14 +2,10 @@
 import { computed, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { Button } from '@/components/ui/button';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { Dialog, DialogDescription, DialogTitle } from '@/components/ui/dialog';
+import MdDialogContent from '@/components/custom/md-dialog-content.vue';
+import MdDialogFooter from '@/components/custom/md-dialog-footer.vue';
+import MdDialogHeader from '@/components/custom/md-dialog-header.vue';
 import MdPageShell from '@/components/custom/md-page-shell.vue';
 import { LoggerService } from '@/lib/services/diagnostics/logger-service';
 import { WyreMouseService, type WyreMouseSettings } from '@/lib/services/system-settings/wyre-mouse-service';
@@ -104,7 +100,9 @@ onMounted(() => void load());
             <h2 class="m-0 text-base font-medium text-foreground">{{ t('wyre.pointerSpeed') }}</h2>
             <p class="mt-1 mb-0 text-sm text-muted-foreground">{{ t('wyre.pointerSpeedDescription') }}</p>
           </div>
-          <output class="rounded-md border px-3 py-1.5 font-mono text-sm text-foreground" for="pointer-speed">{{ speed }}/20</output>
+          <output class="rounded-md border px-3 py-1.5 font-mono text-sm text-foreground" for="pointer-speed"
+            >{{ speed }}/20</output
+          >
         </div>
         <input
           id="pointer-speed"
@@ -116,10 +114,12 @@ onMounted(() => void load());
           step="1"
           :disabled="!supported || busy"
           :aria-label="t('wyre.pointerSpeed')"
-        >
+        />
         <div class="mt-6 flex items-center justify-between gap-6 border-t pt-5">
           <div>
-            <label for="pointer-acceleration" class="text-sm font-medium text-foreground">{{ t('wyre.pointerAcceleration') }}</label>
+            <label for="pointer-acceleration" class="text-sm font-medium text-foreground">{{
+              t('wyre.pointerAcceleration')
+            }}</label>
             <p class="mt-1 mb-0 text-sm text-muted-foreground">{{ t('wyre.pointerAccelerationDescription') }}</p>
           </div>
           <input
@@ -129,11 +129,13 @@ onMounted(() => void load());
             role="switch"
             class="size-5 accent-primary"
             :disabled="!supported || busy"
-          >
+          />
         </div>
         <div class="mt-6 flex flex-wrap items-center gap-3">
           <Button :disabled="!changed || busy" @click="pending = true">{{ t('wyre.reviewMouseChanges') }}</Button>
-          <Button v-if="undo" variant="outline" :disabled="busy" @click="restore">{{ t('wyre.undoMouseChanges') }}</Button>
+          <Button v-if="undo" variant="outline" :disabled="busy" @click="restore">{{
+            t('wyre.undoMouseChanges')
+          }}</Button>
         </div>
         <p v-if="notice" class="mb-0 mt-4 text-sm text-primary-text" role="status">{{ notice }}</p>
         <p v-if="error" class="mb-0 mt-4 text-sm text-destructive-text" role="alert">{{ error }}</p>
@@ -141,24 +143,29 @@ onMounted(() => void load());
       <aside class="rounded-xl border bg-card p-5 sm:p-7">
         <h2 class="mt-0 text-base font-medium text-foreground">{{ t('wyre.mouseAvailabilityTitle') }}</h2>
         <p class="mb-0 text-sm leading-relaxed text-muted-foreground">
-          {{ supported ? t('wyre.mouseAvailability') : current?.reason ?? t('wyre.mouseLoading') }}
+          {{ supported ? t('wyre.mouseAvailability') : (current?.reason ?? t('wyre.mouseLoading')) }}
         </p>
         <Button class="mt-5" variant="outline" :disabled="busy" @click="load">{{ t('common.retry') }}</Button>
       </aside>
     </div>
     <Dialog v-model:open="pending">
-      <DialogContent>
-        <DialogHeader>
+      <MdDialogContent size="compact">
+        <MdDialogHeader>
           <DialogTitle>{{ t('wyre.mouseReviewTitle') }}</DialogTitle>
           <DialogDescription>
-            {{ t('wyre.mouseReviewDescription', { speed, acceleration: acceleration ? t('wyre.accelerationEnabled') : t('wyre.accelerationDisabled') }) }}
+            {{
+              t('wyre.mouseReviewDescription', {
+                speed,
+                acceleration: acceleration ? t('wyre.accelerationEnabled') : t('wyre.accelerationDisabled'),
+              })
+            }}
           </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
+        </MdDialogHeader>
+        <MdDialogFooter>
           <Button variant="outline" :disabled="busy" @click="pending = false">{{ t('common.cancel') }}</Button>
           <Button :disabled="busy" @click="apply">{{ t('wyre.confirmMouseChanges') }}</Button>
-        </DialogFooter>
-      </DialogContent>
+        </MdDialogFooter>
+      </MdDialogContent>
     </Dialog>
   </MdPageShell>
 </template>

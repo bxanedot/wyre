@@ -2492,7 +2492,7 @@
     },
     "colorThemeTitle": "Theme color",
     "colorThemeDescription": "Choose a color palette independently of light or dark mode",
-    "colorThemeTurquoise": "Turquoise",
+    "colorThemeBlue": "Blue",
     "colorThemeWarmGray": "Warm Gray",
     "themeTitle": "Theme",
     "themeDescription": "Use a light, dark, or system theme",
