@@ -327,8 +327,6 @@ describe('identity preparation cancellation', () => {
       vi.spyOn(AiService, 'settings').mockResolvedValue({
         schemaVersion: 2,
         mode: 'custom',
-        freeConsent: false,
-        freeAvailable: false,
         endpoint: 'https://example.invalid/v1',
         model: 'example',
         hasKey: true,

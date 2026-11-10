@@ -4,7 +4,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { APP_DISTRIBUTION_IDS, APP_UPDATE_ACTION_IDS, APP_UPDATE_STATUS_IDS } from '@/lib/models/updates/app-update';
 import { AppDistributionService } from '@/lib/services/updates/app-distribution-service';
 import { AppUpdateService } from '@/lib/services/updates/app-update-service';
-import { InstallationIdentityService } from '@/lib/services/http/installation-identity-service';
 import { LinkService } from '@/lib/services/shell/link-service';
 import { LoggerService } from '@/lib/services/diagnostics/logger-service';
 
@@ -14,9 +13,6 @@ describe('app update store', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.restoreAllMocks();
-    vi.spyOn(InstallationIdentityService, 'getOrCreateInstallId').mockResolvedValue(
-      '019c0b3d-a9ef-7d11-89a3-d5ea10df4001'
-    );
     vi.spyOn(LoggerService, 'info').mockImplementation(() => undefined);
     vi.spyOn(LoggerService, 'warn').mockImplementation(() => undefined);
     vi.spyOn(LoggerService, 'error').mockImplementation(() => undefined);
@@ -32,14 +28,6 @@ describe('app update store', () => {
     expect(store.dialogOpen).toBe(true);
     await store.check(true);
     expect(check).toHaveBeenLastCalledWith(APP_DISTRIBUTION_IDS.installed, true);
-  });
-
-  it('continues checking when optional installation metadata is unavailable', async () => {
-    vi.spyOn(InstallationIdentityService, 'getOrCreateInstallId').mockRejectedValue(new Error('store unavailable'));
-    vi.spyOn(AppUpdateService, 'check').mockResolvedValue(null);
-    const store = useAppUpdateStore();
-    await store.check(true);
-    expect(store.status).toBe(APP_UPDATE_STATUS_IDS.upToDate);
   });
 
   it('marks automatic update results as unread without interrupting the current task', async () => {
@@ -316,7 +304,7 @@ describe('app update store', () => {
       version: '1.1.0',
       notes: 'Improvements',
       action: APP_UPDATE_ACTION_IDS.manualDownload,
-      manualDownloadUrl: 'https://mangodisk.app/api/updates/1.1.0/windows/x86_64/download?distribution=portable',
+      manualDownloadUrl: 'https://github.com/bxanedot/wyre/releases/tag/v1.1.0',
     });
     const automaticDownload = vi.spyOn(AppUpdateService, 'download');
     const open = vi.spyOn(LinkService, 'open').mockResolvedValue();
@@ -328,9 +316,7 @@ describe('app update store', () => {
 
     expect(store.distribution).toBe(APP_DISTRIBUTION_IDS.portable);
     expect(automaticDownload).not.toHaveBeenCalled();
-    expect(open).toHaveBeenCalledWith(
-      'https://mangodisk.app/api/updates/1.1.0/windows/x86_64/download?distribution=portable'
-    );
+    expect(open).toHaveBeenCalledWith('https://github.com/bxanedot/wyre/releases/tag/v1.1.0');
     expect(store.status).toBe(APP_UPDATE_STATUS_IDS.available);
   });
 });

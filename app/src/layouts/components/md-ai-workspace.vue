@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { Button } from '@/components/ui/button';
 import MdFloatingPanel from '@/components/custom/md-floating-panel.vue';
@@ -9,9 +9,6 @@ import MdAiReasoning from '@/components/custom/md-ai-reasoning.vue';
 import MdSafeRichText from '@/components/custom/md-safe-rich-text.vue';
 import MdCopyButton from '@/components/custom/md-copy-button.vue';
 import MdSpinner from '@/components/custom/md-spinner.vue';
-import MdAiFeedback from '@/components/custom/md-ai-feedback.vue';
-import MdAiQuotaStatus from '@/components/custom/md-ai-quota-status.vue';
-import { aiQuotaCooldownSeconds, isAiServiceUnavailable } from '@/lib/utils/ai/ai-quota';
 import MdIcon from '@/components/icons/md-icon.vue';
 import { ICON_NAMES } from '@/lib/models/presentation/ui';
 import { useAiStore } from '@/stores/ai-store';
@@ -31,37 +28,6 @@ watch(
 const scroller = ref<HTMLElement | null>(null);
 const follow = ref(true);
 const generating = computed(() => store.value.status === 'generating');
-const freeMode = computed(() => store.value.settings?.mode === 'free');
-const freeUnavailable = computed(
-  () =>
-    freeMode.value &&
-    !generating.value &&
-    (isAiServiceUnavailable(aiStore.quota) || store.value.error === 'freeUnavailable')
-);
-const freeReady = computed(() => !freeMode.value || store.value.settings?.freeAvailable);
-const now = ref(performance.now());
-let quotaTimer: ReturnType<typeof setInterval> | undefined;
-const cooldown = computed(() => aiQuotaCooldownSeconds(aiStore.quota, aiStore.quotaReadAt, now.value));
-watch(
-  () => aiStore.enabled && store.value.open && freeMode.value,
-  active => {
-    clearInterval(quotaTimer);
-    if (active)
-      quotaTimer = setInterval(() => {
-        now.value = performance.now();
-      }, 1000);
-  },
-  { immediate: true }
-);
-function refreshAfterFocus() {
-  if (aiStore.enabled && store.value.open && freeMode.value && store.value.settings?.freeAvailable)
-    void aiStore.refreshQuota(store.value.language, true);
-}
-onMounted(() => window.addEventListener('focus', refreshAfterFocus));
-onBeforeUnmount(() => {
-  clearInterval(quotaTimer);
-  window.removeEventListener('focus', refreshAfterFocus);
-});
 const statusLabel = computed(() =>
   generating.value
     ? store.value.reasoning && !store.value.text
@@ -119,15 +85,6 @@ function scroll() {
       <div v-if="store.loadingSettings" role="status" class="flex items-center gap-2 text-sm text-muted-foreground">
         <MdSpinner />{{ t('ai.loadingSettings') }}
       </div>
-      <div v-else-if="freeUnavailable" role="status" class="grid gap-2 py-3 text-sm text-muted-foreground">
-        <p class="font-medium text-foreground">{{ t('ai.freeTemporarilyUnavailable') }}</p>
-        <p>{{ t('ai.freeUseCustom') }}</p>
-        <Button variant="outline" size="sm" class="w-fit" @click="settingsOpen = true">{{ t('ai.configure') }}</Button>
-      </div>
-      <div v-else-if="freeMode && !freeReady && !store.text" class="grid gap-4 py-3 text-sm text-muted-foreground">
-        <p>{{ t('ai.freeBuildUnavailable') }}</p>
-        <Button class="w-fit" @click="settingsOpen = true">{{ t('ai.configure') }}</Button>
-      </div>
       <div v-else-if="!store.settings && !store.text" class="grid gap-4 py-3 text-sm text-muted-foreground">
         <p>{{ t('ai.notConfigured') }}</p>
         <p class="leading-relaxed">{{ t('ai.disclosure') }}</p>
@@ -149,12 +106,6 @@ function scroll() {
         variant="answer"
         :allow-links="false"
       />
-      <MdAiFeedback
-        v-if="freeMode && store.status === 'completed' && store.text && store.feedback"
-        :feedback="store.feedback"
-        :disabled="store.loadingSettings || aiStore.changingConfiguration || aiStore.preferencesBusy"
-        @rate="aiStore.rate(module, $event)"
-      />
       <div
         v-if="generating && !store.reasoning && !store.text"
         role="status"
@@ -163,9 +114,9 @@ function scroll() {
         <MdSpinner />{{ t('ai.waiting') }}
       </div>
       <p v-if="store.status === 'cancelled'" role="status" class="mt-3 text-sm text-muted-foreground">
-        {{ t(freeMode ? 'ai.freeStopped' : 'ai.stopped') }}
+        {{ t('ai.stopped') }}
       </p>
-      <p v-else-if="store.error && !freeUnavailable" role="alert" class="mt-3 text-sm text-destructive-text">
+      <p v-else-if="store.error" role="alert" class="mt-3 text-sm text-destructive-text">
         {{ t(AI_ERROR_LABELS[store.error]) }}
       </p>
     </div>
@@ -177,15 +128,14 @@ function scroll() {
           <MdSpinner />{{ t('ai.generating') }}
         </p>
         <p v-else>{{ t('ai.disclaimer') }}</p>
-        <MdAiQuotaStatus v-if="freeMode && freeReady && aiStore.quota && !freeUnavailable" :quota="aiStore.quota" />
       </div>
       <div class="flex min-h-8 flex-none items-center gap-2">
         <Button v-if="generating" variant="outline" size="sm" @click="aiStore.stop(module)">{{ t('ai.stop') }}</Button>
         <Button
-          v-else-if="store.settings && freeReady && (store.status === 'failed' || store.status === 'cancelled')"
+          v-else-if="store.settings && (store.status === 'failed' || store.status === 'cancelled')"
           variant="outline"
           size="sm"
-          :disabled="store.loadingSettings || aiStore.changingConfiguration || (freeMode && cooldown > 0)"
+          :disabled="store.loadingSettings || aiStore.changingConfiguration"
           @click="aiStore.generate(module)"
           >{{ t('ai.retry') }}</Button
         >
@@ -196,8 +146,6 @@ function scroll() {
   <MdAiSettingsDialog
     v-if="aiStore.enabled"
     v-model:open="settingsOpen"
-    :quota="aiStore.quota"
-    @refresh-quota="aiStore.refreshQuota"
     @configured="aiStore.configurationChanged($event, module)"
   />
 </template>

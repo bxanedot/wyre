@@ -314,7 +314,6 @@ fn configuration_io_diagnostics_identify_stage_without_paths() {
     std::fs::create_dir_all(&config_path).unwrap();
     let update = || AiConfigurationUpdate {
         mode: mangodisk_core::ai::AiServiceMode::Custom,
-        free_consent: false,
         endpoint: "https://example.com/v1".into(),
         model: "fixture".into(),
         api_key: Some("synthetic-secret".into()),

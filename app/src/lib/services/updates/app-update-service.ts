@@ -11,6 +11,7 @@ import {
   type AppUpdateInfo,
 } from '@/lib/models/updates/app-update';
 import { LoggerService } from '@/lib/services/diagnostics/logger-service';
+import { PROJECT_LINKS } from '@/lib/models/shell/application-shell';
 
 type AcquiredUpdate = {
   schemaVersion: 1;
@@ -119,22 +120,8 @@ export class AppUpdateService {
     };
   }
 
+  // Portable builds update by hand from the matching GitHub release page; the version comes from the signed manifest.
   private static resolvePortableDownloadUrl(update: Update): string {
-    const rawUrl = update.rawJson.url;
-    if (typeof rawUrl !== 'string') throw new Error('The portable update response is missing its download URL.');
-
-    const url = new URL(rawUrl);
-    const expectedPath = `/api/updates/${encodeURIComponent(update.version)}/windows/x86_64/download`;
-    if (
-      url.origin !== 'https://mangodisk.app' ||
-      url.pathname !== expectedPath ||
-      url.searchParams.size !== 1 ||
-      url.searchParams.get('distribution') !== APP_DISTRIBUTION_IDS.portable ||
-      url.hash
-    ) {
-      throw new Error('The portable update response contains an unsupported download URL.');
-    }
-
-    return url.href;
+    return `${PROJECT_LINKS.repository}/releases/tag/v${encodeURIComponent(update.version)}`;
   }
 }

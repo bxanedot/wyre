@@ -6,18 +6,11 @@ import type {
   AiContext,
   AiSettings,
   AiUsage,
-  AiFeedback,
-  AiFeedbackRating,
   AiServiceMode,
-  AiClientMetadata,
-  AiQuota,
   AiEditorState,
   AiPreferences,
   InstalledLocalModel,
 } from '@/lib/models/ai/ai';
-import { getVersion } from '@tauri-apps/api/app';
-import { ClientRequestMetadataService } from '@/lib/services/http/client-request-metadata-service';
-import { AppDistributionService } from '@/lib/services/updates/app-distribution-service';
 import { LoggerService } from '@/lib/services/diagnostics/logger-service';
 
 /** One owned IPC session; closing a dialog cancels its request, not another module's work. */
@@ -34,8 +27,6 @@ export class AiSession {
     this.id = await invoke<string>('ai_begin');
     try {
       if (this.cancelled) throw 'cancelled';
-      const metadata = mode === 'free' ? await AiService.metadata(language) : null;
-      if (this.cancelled) throw 'cancelled';
       const onDeltaChannel = new Channel<AiDelta>();
       onDeltaChannel.onmessage = text => {
         if (!this.cancelled) onDelta(text);
@@ -43,7 +34,6 @@ export class AiSession {
       const result = await invoke<AiUsage>('ai_explain', {
         id: this.id,
         request: { context, language },
-        metadata,
         expectedMode: mode,
         onDelta: onDeltaChannel,
       });
@@ -70,42 +60,6 @@ export class AiService {
   }
   static setEnabled(enabled: boolean): Promise<AiPreferences> {
     return invoke('ai_set_enabled', { enabled });
-  }
-  static async metadata(language: string): Promise<AiClientMetadata> {
-    const distribution = await AppDistributionService.current();
-    const metadata = await ClientRequestMetadataService.collect(language, distribution, source => {
-      LoggerService.warn('ai', 'request_metadata_unavailable', { source });
-    });
-    const installId = metadata.installId;
-    if (!installId) throw 'configurationUnavailable';
-    return {
-      installId,
-      appVersion: await getVersion(),
-      locale: metadata.locale,
-      distribution: metadata.distribution,
-      osVersion: metadata.osVersion || 'unknown',
-      timezone: metadata.timezone || 'UTC',
-    };
-  }
-  static async quota(language: string, isCurrent: () => boolean): Promise<AiQuota> {
-    const metadata = await this.metadata(language);
-    // Metadata collection can span a disable/re-enable cycle. The caller owns
-    // that lifecycle; reject stale work before IPC admits a new network request.
-    if (!isCurrent()) {
-      LoggerService.info('ai', 'quota_request_cancelled_before_dispatch');
-      throw 'cancelled';
-    }
-    return invoke('ai_get_quota', { metadata });
-  }
-  static async feedback(
-    requestId: string,
-    rating: AiFeedbackRating | null,
-    language: string,
-    isCurrent: () => boolean
-  ): Promise<AiFeedback> {
-    const metadata = await this.metadata(language);
-    if (!isCurrent()) throw 'cancelled';
-    return invoke('ai_set_feedback', { requestId, rating, metadata });
   }
   static editorState(): Promise<AiEditorState> {
     return invoke('ai_get_configuration');

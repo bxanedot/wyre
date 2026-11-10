@@ -33,8 +33,6 @@ pub enum AiDelta {
 pub struct AiUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub feedback: Option<super::AiFeedbackTarget>,
 }
 
 fn payload(config: &AiConfiguration, request: &AiRequest) -> Result<serde_json::Value, AiError> {
@@ -102,7 +100,7 @@ pub async fn explain(
     );
     let client = client(180)?;
     let builder = custom_request(&client, &config, &body, operation_id)?;
-    stream_request(builder, operation_id, cancel, emit, false).await
+    stream_request(builder, operation_id, cancel, emit).await
 }
 
 fn custom_request(
@@ -191,13 +189,12 @@ pub(super) fn client(timeout_seconds: u64) -> Result<reqwest::Client, AiError> {
         .map_err(network_error)
 }
 
-/// Both service modes share cancellation, wire limits, parser and output diagnostics.
+/// Shared cancellation, wire limits, parser and output diagnostics for provider streams.
 pub(super) async fn stream_request(
     builder: reqwest::RequestBuilder,
     operation_id: &str,
     mut cancel: watch::Receiver<bool>,
     mut emit: impl FnMut(AiDelta) -> bool,
-    official: bool,
 ) -> Result<AiUsage, AiError> {
     if *cancel.borrow() {
         return Err(AiError::Cancelled);
@@ -210,36 +207,12 @@ pub(super) async fn stream_request(
     let run = async {
         let mut response = builder.send().await.map_err(network_error)?;
         let status = response.status().as_u16();
-        let feedback = official
-            .then(|| super::feedback::target(response.headers()))
-            .flatten();
-        if official {
-            // Only a bounded UUID is accepted into logs. This joins desktop
-            // operation diagnostics to the server ledger without logging context.
-            if let Some(request_id) = response
-                .headers()
-                .get("X-Request-ID")
-                .and_then(|value| value.to_str().ok())
-                .filter(|value| value.len() == 36)
-                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-            {
-                log::info!(
-                    "ai_official_request operation_id={operation_id} request_id={request_id}"
-                );
-            }
-        }
         log::info!(
             "ai_response operation_id={operation_id} status={status} headers_ms={}",
             started.elapsed().as_millis()
         );
         if status != 200 {
-            let official_error = official
-                .then(|| super::official_protocol::response_error(response.headers()))
-                .flatten();
             stream.provider_error = Some(super::provider_error::read(&mut response).await);
-            if let Some(error) = official_error {
-                return Err(error);
-            }
             return Err(match status {
                 401 | 403 => AiError::Unauthorized,
                 402 | 429 => AiError::QuotaExceeded,
@@ -280,22 +253,12 @@ pub(super) async fn stream_request(
         }
         .await;
         result?;
-        let mut usage = stream.finish()?;
-        usage.feedback = feedback;
-        Ok(usage)
+        stream.finish()
     };
-    let mut result = tokio::select! {
+    let result = tokio::select! {
         result = run => result,
         _ = cancel.changed() => Err(AiError::Cancelled),
     };
-    if official && matches!(result, Err(AiError::ProviderRejected)) {
-        if let Some(error) = stream
-            .provider_error
-            .and_then(|diagnostic| diagnostic.official_error)
-        {
-            result = Err(error);
-        }
-    }
     let outcome = match &result {
         Ok(_) => "completed",
         Err(AiError::Cancelled) => "cancelled",

@@ -47,7 +47,6 @@ export const LOG_EVENTS = {
   updateInstallStarted: 'update_install_started',
   updateInstallFailed: 'update_install_failed',
   updateRestartFailed: 'update_restart_failed',
-  updateMetadataUnavailable: 'update_metadata_unavailable',
   updateManualDownloadFailed: 'update_manual_download_failed',
   updateManualDownloadOpened: 'update_manual_download_opened',
   updateNotAvailable: 'update_not_available',

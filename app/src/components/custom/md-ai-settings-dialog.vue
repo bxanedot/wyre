@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import MdTooltip from '@/components/custom/md-tooltip.vue';
-import { computed, ref, watch, onMounted, onBeforeUnmount, useId } from 'vue';
+import { computed, ref, watch, onBeforeUnmount, useId } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { toast } from 'vue-sonner';
 import { Button } from '@/components/ui/button';
@@ -12,8 +12,6 @@ import MdDialogHeader from '@/components/custom/md-dialog-header.vue';
 import MdDialogFooter from '@/components/custom/md-dialog-footer.vue';
 import MdSpinner from '@/components/custom/md-spinner.vue';
 import MdNumberField from '@/components/custom/md-number-field.vue';
-import MdAiQuotaStatus from '@/components/custom/md-ai-quota-status.vue';
-import { isAiServiceUnavailable } from '@/lib/utils/ai/ai-quota';
 import MdIcon from '@/components/icons/md-icon.vue';
 import { ICON_NAMES } from '@/lib/models/presentation/ui';
 import { AiService, AiSession } from '@/lib/services/ai/ai-service';
@@ -21,14 +19,13 @@ import { LoggerService } from '@/lib/services/diagnostics/logger-service';
 import { LinkService } from '@/lib/services/shell/link-service';
 import { projectWebsiteUrl } from '@/lib/utils/shell/project-website';
 import { aiErrorCode } from '@/lib/utils/ai/ai-error';
-import type { AiCustomHeader, AiErrorCode, AiReasoningMode, AiServiceMode, AiQuota } from '@/lib/models/ai/ai';
+import type { AiCustomHeader, AiErrorCode, AiReasoningMode } from '@/lib/models/ai/ai';
 import { AI_ERROR_LABELS } from '@/lib/models/ai/ai';
 
-const props = defineProps<{ open: boolean; quota?: AiQuota | null }>();
+const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{
   'update:open': [value: boolean];
   configured: [testError: AiErrorCode | null];
-  refreshQuota: [language: string, force: boolean];
 }>();
 const { t, locale } = useI18n({ useScope: 'global' });
 // Each editor owns one notification so disabling AI can remove already-visible
@@ -47,9 +44,6 @@ async function openGuide() {
   }
 }
 const configured = ref(false);
-const mode = ref<AiServiceMode>('free');
-const freeAvailable = ref(false);
-const freeConsent = ref(false);
 const endpoint = ref('');
 const model = ref('');
 const apiKey = ref('');
@@ -64,16 +58,6 @@ const advanced = ref(false);
 const busy = ref(false);
 const loading = ref(false);
 const loaded = ref(false);
-const showFreeQuota = computed(() => props.open && loaded.value && mode.value === 'free' && freeAvailable.value);
-// Quota reads are independent of editor initialization: neither a slow network
-// nor a failed refresh may delay the entrance animation or resize the form.
-watch(showFreeQuota, active => {
-  if (active) emit('refreshQuota', locale.value, false);
-});
-function refreshQuotaAfterFocus() {
-  if (showFreeQuota.value) emit('refreshQuota', locale.value, true);
-}
-onMounted(() => window.addEventListener('focus', refreshQuotaAfterFocus));
 const testing = ref(false);
 const error = ref<AiErrorCode | null>(null);
 let testSession: AiSession | null = null;
@@ -82,19 +66,18 @@ const canSave = computed(
   () =>
     loaded.value &&
     !loading.value &&
-    (mode.value === 'free' ||
-      ((temperature.value === null ||
-        (Number.isFinite(Number(temperature.value)) &&
-          Number(temperature.value) >= 0 &&
-          Number(temperature.value) <= 2)) &&
-        (maxTokens.value === null ||
-          (Number.isSafeInteger(Number(maxTokens.value)) &&
-            Number(maxTokens.value) > 0 &&
-            Number(maxTokens.value) <= 4294967295)) &&
-        customHeaders.value.length <= 8 &&
-        customHeaders.value.every(header => header.name.trim().length > 0 && header.value.length > 0) &&
-        Boolean(endpoint.value.trim()) &&
-        Boolean(model.value.trim())))
+    (temperature.value === null ||
+      (Number.isFinite(Number(temperature.value)) &&
+        Number(temperature.value) >= 0 &&
+        Number(temperature.value) <= 2)) &&
+    (maxTokens.value === null ||
+      (Number.isSafeInteger(Number(maxTokens.value)) &&
+        Number(maxTokens.value) > 0 &&
+        Number(maxTokens.value) <= 4294967295)) &&
+    customHeaders.value.length <= 8 &&
+    customHeaders.value.every(header => header.name.trim().length > 0 && header.value.length > 0) &&
+    Boolean(endpoint.value.trim()) &&
+    Boolean(model.value.trim())
 );
 
 function addHeader() {
@@ -122,13 +105,10 @@ watch(
     error.value = null;
     const started = performance.now();
     try {
-      const { configuration: settings, freeAvailable: available } = await AiService.editorState();
+      const { configuration: settings } = await AiService.editorState();
       // Closing during IPC must not repopulate a hidden editor with a secret.
       if (revision !== loadRevision || !props.open) return;
       configured.value = settings !== null;
-      mode.value = settings?.mode ?? 'free';
-      freeConsent.value = settings?.freeConsent ?? false;
-      freeAvailable.value = available;
       endpoint.value = settings?.endpoint ?? '';
       model.value = settings?.model ?? '';
       apiKey.value = settings?.apiKey ?? '';
@@ -153,35 +133,21 @@ async function save(test: boolean) {
   error.value = null;
   let saved = false;
   try {
-    // Free mode changes only the mode in Core. Keep the unsaved custom draft
-    // in this editor, and never send it as a replacement for persisted settings.
-    await AiService.save(
-      mode.value === 'free'
-        ? {
-            mode: 'free',
-            freeConsent: freeConsent.value,
-            endpoint: '',
-            model: '',
-            apiKey: null,
-            reasoning: 'default',
-          }
-        : {
-            mode: 'custom',
-            freeConsent: freeConsent.value,
-            endpoint: endpoint.value,
-            model: model.value,
-            apiKey: apiKey.value,
-            reasoning: reasoning.value,
-            temperature: temperature.value,
-            maxTokens: maxTokens.value,
-            customHeaders: customHeaders.value.map(header => ({ ...header })),
-          }
-    );
+    await AiService.save({
+      mode: 'custom',
+      endpoint: endpoint.value,
+      model: model.value,
+      apiKey: apiKey.value,
+      reasoning: reasoning.value,
+      temperature: temperature.value,
+      maxTokens: maxTokens.value,
+      customHeaders: customHeaders.value.map(header => ({ ...header })),
+    });
     if (disposed) return;
     configured.value = true;
     showKey.value = false;
     saved = true;
-    if (test && mode.value === 'custom') {
+    if (test) {
       testing.value = true;
       testSession = new AiSession();
       await testSession.run(null, locale.value, () => undefined);
@@ -209,8 +175,6 @@ async function remove() {
     if (disposed) return;
     configured.value = false;
     loaded.value = true;
-    mode.value = 'free';
-    freeConsent.value = false;
     emit('configured', null);
     apiKey.value = '';
     customHeaders.value = [];
@@ -244,7 +208,6 @@ async function cancelTest() {
 onBeforeUnmount(() => {
   disposed = true;
   toast.dismiss(notificationId);
-  window.removeEventListener('focus', refreshQuotaAfterFocus);
   ++loadRevision;
   void cancelTest();
   apiKey.value = '';
@@ -268,93 +231,27 @@ onBeforeUnmount(() => {
         <DialogDescription>{{ t('ai.settingsDescription') }}</DialogDescription>
       </MdDialogHeader>
       <div class="grid min-h-0 gap-4 overflow-y-auto p-5">
-        <!-- Native radios communicate a persistent choice and provide arrow-key
-             navigation. Selection edits the draft; only Save changes the service. -->
-        <fieldset v-if="loaded" class="grid min-w-0 gap-3" :disabled="busy">
-          <legend class="sr-only">{{ t('ai.serviceMode') }}</legend>
-          <div
-            class="min-w-0 rounded-xl border transition-colors"
-            :class="mode === 'free' ? 'border-primary/30' : 'border-border/70'"
-          >
-            <label
-              class="flex cursor-pointer items-start gap-3 rounded-t-xl p-4 transition-colors"
-              :class="{ 'cursor-default': busy, 'bg-accent/15': mode === 'free' }"
-            >
-              <input
-                v-model="mode"
-                type="radio"
-                name="ai-service-mode"
-                value="free"
-                class="peer sr-only"
-                aria-labelledby="ai-mode-free-title"
-              />
-              <!-- WebKit can clip the native radio artwork inside a fixed-size
-                   input. Keep native semantics and draw only the visible circle. -->
-              <span
-                aria-hidden="true"
-                class="mt-0.5 grid size-4 shrink-0 place-items-center rounded-full border border-muted-foreground/60 bg-background peer-checked:border-primary peer-checked:bg-primary peer-focus-visible:ring-2 peer-focus-visible:ring-ring/35 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50"
-              >
-                <span
-                  class="size-1.5 rounded-full bg-primary-foreground"
-                  :class="mode === 'free' ? 'opacity-100' : 'opacity-0'"
-                />
+        <div v-if="loaded" class="grid min-w-0 gap-3">
+          <div class="min-w-0 rounded-xl border border-border/70">
+            <div class="flex items-start justify-between gap-3 p-4">
+              <span class="grid min-w-0 flex-1 gap-1">
+                <span class="text-sm font-medium">{{ t('ai.customService') }}</span>
+                <span class="text-sm leading-relaxed text-muted-foreground">{{ t('ai.customDescription') }}</span>
               </span>
-              <span class="grid min-w-0 gap-1">
-                <span id="ai-mode-free-title" class="text-sm font-medium">{{ t('ai.freeService') }}</span>
-                <span class="text-sm leading-relaxed text-muted-foreground">{{ t('ai.freeNoKey') }}</span>
-              </span>
-            </label>
-            <div
-              v-if="mode === 'free'"
-              class="grid gap-2 border-t border-border/70 p-4 text-sm leading-relaxed text-muted-foreground"
-            >
-              <MdAiQuotaStatus :quota="freeAvailable ? quota : null" />
-              <p v-if="freeAvailable && isAiServiceUnavailable(quota)">{{ t('ai.freeUseCustom') }}</p>
-              <p v-if="!freeAvailable" class="text-xs">{{ t('ai.freeBuildUnavailable') }}</p>
-            </div>
-          </div>
-          <div
-            class="min-w-0 rounded-xl border transition-colors"
-            :class="mode === 'custom' ? 'border-primary/30' : 'border-border/70'"
-          >
-            <!-- Keep the help link outside the radio label so opening help never changes the draft mode. -->
-            <div class="relative rounded-t-xl transition-colors" :class="{ 'bg-accent/15': mode === 'custom' }">
-              <label class="flex cursor-pointer items-start gap-3 p-4" :class="{ 'cursor-default': busy }">
-                <input
-                  v-model="mode"
-                  type="radio"
-                  name="ai-service-mode"
-                  value="custom"
-                  class="peer sr-only"
-                  aria-labelledby="ai-mode-custom-title"
-                />
-                <span
-                  aria-hidden="true"
-                  class="mt-0.5 grid size-4 shrink-0 place-items-center rounded-full border border-muted-foreground/60 bg-background peer-checked:border-primary peer-checked:bg-primary peer-focus-visible:ring-2 peer-focus-visible:ring-ring/35 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50"
-                >
-                  <span
-                    class="size-1.5 rounded-full bg-primary-foreground"
-                    :class="mode === 'custom' ? 'opacity-100' : 'opacity-0'"
-                  />
-                </span>
-                <span class="grid min-w-0 flex-1 gap-1">
-                  <span id="ai-mode-custom-title" class="pr-32 text-sm font-medium">{{ t('ai.customService') }}</span>
-                  <span class="text-sm leading-relaxed text-muted-foreground">{{ t('ai.customDescription') }}</span>
-                </span>
-              </label>
               <MdTooltip :text="t('ai.guideOpenInBrowser')"
                 ><a
                   :href="guideUrl"
                   target="_blank"
                   rel="noopener noreferrer"
-                  class="absolute top-4 right-4 inline-flex items-center gap-1 rounded-sm text-xs leading-5 text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35"
+                  class="inline-flex shrink-0 items-center gap-1 rounded-sm text-xs leading-5 text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35"
                   @click.prevent="openGuide"
                 >
                   {{ t('ai.configurationGuide') }}
                   <MdIcon :name="ICON_NAMES.external" :size="13" aria-hidden="true" /> </a
               ></MdTooltip>
             </div>
-            <div v-if="mode === 'custom'" class="grid min-w-0 gap-4 border-t border-border/70 p-4">
+            <fieldset class="grid min-w-0 gap-4 border-t border-border/70 p-4" :disabled="busy">
+              <legend class="sr-only">{{ t('ai.customService') }}</legend>
               <div class="grid gap-2">
                 <label for="ai-endpoint" class="text-sm font-medium">{{ t('ai.endpoint') }}</label>
                 <Input
@@ -527,9 +424,9 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
-            </div>
+            </fieldset>
           </div>
-        </fieldset>
+        </div>
         <p v-if="error" role="alert" class="text-sm text-destructive-text">{{ t(AI_ERROR_LABELS[error]) }}</p>
       </div>
       <MdDialogFooter class="flex-wrap" align="between">
@@ -541,9 +438,7 @@ onBeforeUnmount(() => {
           <!-- Local saves need no flashing spinner; reserve the same space for
                the slower connection test so its indicator never shifts actions. -->
           <span class="grid size-4 place-items-center"><MdSpinner v-if="testing" /></span>
-          <Button v-if="mode === 'custom'" variant="outline" :disabled="busy || !canSave" @click="save(true)">{{
-            t('ai.saveAndTest')
-          }}</Button>
+          <Button variant="outline" :disabled="busy || !canSave" @click="save(true)">{{ t('ai.saveAndTest') }}</Button>
           <Button :disabled="busy || !canSave" @click="save(false)">{{ t('ai.save') }}</Button>
         </div>
       </MdDialogFooter>

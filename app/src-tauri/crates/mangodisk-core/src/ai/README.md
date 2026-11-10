@@ -25,8 +25,8 @@ authorize cleanup. Existing native preflight and confirmation remain authoritati
   (schema 1). A missing file preserves the previous enabled behavior; unreadable,
   invalid, and unsupported documents fail closed without being rewritten.
   Provider configuration deletion never changes this preference. Tauri serializes
-  preference writes with request admission and cancels streams, reservations, and
-  quota reads when disabling. The frontend loads the preference before mounting,
+  preference writes with request admission and cancels streams and reservations
+  when disabling. The frontend loads the preference before mounting,
   hides all explanation UI except the settings toggle, and discards late callbacks.
   Re-enabling preserves provider configuration but never resumes old requests.
 - Tauri owns request reservation, cancellation, IPC channels, and diagnostic logs.
@@ -46,9 +46,9 @@ authorize cleanup. Existing native preflight and confirmation remain authoritati
   only the initiating panel may restart, never hidden panels automatically.
 - Each page owns a pure metadata projection. Version 2 of the transient context
   uses a tagged subject with domain-specific facts; older preview contexts are
-  rejected. Configuration schema 2 adds the service mode and retains the old
-  `freeConsent` field for compatibility. It no longer gates requests. Schema 1
-  remains custom; saving migrates atomically.
+  rejected. Configuration schema 2 adds the service mode. Files saved by the removed hosted
+  service load as custom, or as unconfigured when empty. Schema 1 remains custom;
+  saving migrates atomically.
   Startup explanations include original software names, descriptions, publishers,
   versions, signature status, executable paths and registration paths without
   redaction. Cleanup includes original source paths, source-level block reasons,
@@ -87,8 +87,7 @@ authorize cleanup. Existing native preflight and confirmation remain authoritati
   Custom-provider message text omits the IPC schema version and absent descriptive
   strings, diagnostics and modification times. It preserves false/zero values,
   empty source/process inventories, protection policies, paths and null pending
-  drafts. The frontend IPC and signed official-service context retain the complete
-  versioned schema; compact provider text is not a replacement protocol document.
+  drafts. The frontend IPC retains the complete versioned schema; compact provider text is not a replacement protocol document.
 - Core combines common explanation boundaries with a subject-specific prompt.
   The requested UI language tag explicitly controls the answer language,
   regardless of the language used in item metadata. Rust contains no language
@@ -131,52 +130,19 @@ source diagnostics. Do not use unsupported template markers (`{{...}}`) in other
 Sources are embedded with `include_str!` and parsed once per process. Runtime does
 not read files or split Markdown headings. [prompt.rs](prompt.rs) selects applicable
 fields using typed domain facts. Keep these conditions intact when editing text;
-unrelated instructions must not be sent. Custom and free providers use the same
-assembled prompt. File count does not determine token usage: only selected text
+unrelated instructions must not be sent. File count does not determine token usage: only selected text
 enters the request, not TOML syntax, field names or maintenance comments.
 
 ## Provider contract
 
-New installations default to the official free service. Existing custom settings
-retain their provider and credentials. Clicking an item starts the official
-request directly; selected context and replies are retained for 30 days.
-Switching modes preserves custom credentials but never sends them to MangoDisk.
-The official adapter signs requests in Rust and uses the same stream decoder as
-custom providers.
-The signed official request includes `context` and the Core-generated
-`systemPrompt`, identical to the custom-provider instructions. The website uses
-its fallback only when that optional prompt is absent, null, empty or whitespace.
-The entire body, including the prompt, remains subject to the 128 KiB limit.
-Free quota is enforced by the server (initial policy: 20 daily,
-60 seconds between new requests), not by the client countdown. Cached answers do
-not consume quota. No account or automatic provider fallback is used.
-Settings and explanation footers share an installation-scoped quota snapshot.
-Concurrent forced refreshes share one newer read rather than fan out. A generation
-completed after that read started still requires a subsequent snapshot.
-Saving provider settings does not discard it. Reset timestamps are displayed in
-the user's local timezone. Service-wide rejection reasons are distinct from
-daily limits, cooldown and concurrent-request limits. A temporary outage keeps
-existing answers readable and offers settings without switching providers.
-Quota reads log request IDs, elapsed time, HTTP status and typed failure stages,
-never installation identifiers, credentials or response bodies.
-
-Official builds inject `MANGODISK_AI_KEY_ID` (for example `20260907`) and
-`MANGODISK_AI_SIGNING_KEY` (32 random bytes encoded as Base64) at Rust compile time.
-They must never be committed or bundled as frontend environment variables.
-Missing keys disable only the free service; open-source custom-provider builds
-remain functional. A compiled shared key is an abuse hurdle, not proof of an
-untampered client. Server quotas, replay protection and a global kill switch remain
-necessary. Debug builds alone may set `MANGODISK_AI_LOCAL_ORIGIN` to a loopback
-HTTP origin for local website integration; release builds always use HTTPS on
-`mangodisk.app`. Tests use synthetic keys and deterministic cross-language vectors.
+Wyre has no hosted AI service. Explanations use the provider you configure.
 
 Configure a base URL ending at the API prefix (commonly `/v1`), a model, and a key.
 Requests use `POST /chat/completions` with `stream: true`. Both HTTP and HTTPS
 are accepted; HTTP does not encrypt the API key or request. Local loopback services
 may omit a key. Redirects and automatic retries are disabled. The editor saves
 the visible custom configuration as a whole; editing the endpoint preserves the
-entered key and headers. Saving free mode retains the last persisted custom
-configuration and ignores unfinished custom drafts.
+entered key and headers.
 
 All AI requests use the shared
 `MangoDisk/<version> (<OS> <OS version>; <architecture>)` user agent. Custom services
@@ -213,8 +179,7 @@ Existing saved reasoning preferences are preserved; disabling reasoning is opt-i
 Advanced custom-provider settings accept optional temperature (0–2) and positive
 integer `max_tokens`. Blank values omit these fields, leaving the provider's
 defaults unchanged, including connection tests. `max_completion_tokens` is not
-sent. Schema 1/2 files without these additive fields retain provider defaults;
-switching to the official service preserves but does not send custom overrides.
+sent. Schema 1/2 files without these additive fields retain provider defaults.
 Length-limited output is a distinct error, never silently accepted or retried.
 Wire traffic is bounded at 4 MiB to accommodate repeated per-token gateway
 metadata. Visible text remains bounded at 32 KiB and individual SSE records at
@@ -276,15 +241,10 @@ response bodies, or private scan data.
 
 ## Validation
 
-Language tags are protocol inputs, not the desktop UI locale list. Both request
-paths and the website accept a maximum of 32 ASCII bytes: a 2–8 letter primary
+Language tags are protocol inputs, not the desktop UI locale list. Requests accept a maximum of 32 ASCII bytes: a 2–8 letter primary
 subtag followed by optional 1–8 alphanumeric subtags separated by hyphens. This
-bounded syntax check is not a full BCP 47 registry lookup. Preserve the original
-tag when signing; new UI languages must not require a Rust or server allowlist
-release. Shared signature vectors include a language absent from the UI catalog.
-Official error mapping lives in `official_protocol`, without dependencies on
-request construction or network IO. The frontend collects typed client metadata;
-only the update adapter projects it into HTTP headers.
+bounded syntax check is not a full BCP 47 registry lookup. New UI languages must not
+require a Rust allowlist release.
 
 `tests/fixtures/ai-context-v2.json` contains eight synthetic module contexts shared
 by frontend projection tests and Rust deserialization, prompt, and transport tests.
@@ -332,20 +292,3 @@ overwritten, so completed evaluation evidence survives a later failure.
 Configuration-file tests use isolated temporary directories and synthetic keys.
 The frontend tests cover automatic generation, minimized streaming, cancellation,
 rapid selection changes, retries, and cache reuse.
-
-## Free-service reply feedback
-
-Completed official replies may include an optional `feedback` target (schema 1)
-in the usage result. The desktop only accepts the `x-mangodisk-ai-feedback: v1`
-capability with a valid server `X-Request-ID`; older servers and custom providers
-never expose rating controls. Feedback targets and confirmed ratings share the
-memory-only answer cache. Configuration changes discard their attribution.
-
-`ai_set_feedback` sends a separately signed `PUT` to
-`/api/v1/ai/explanations/{serverRequestId}/feedback` with
-`{"rating":"positive"}`, `{"rating":"negative"}`, or `{"rating":null}`
-to retract. Each operation uses a fresh request ID and nonce and a 15-second
-transport timeout. It sends no prompt, answer, paths, or provider credentials.
-Failed submissions retain the confirmed rating and can be retried. Expired
-or inaccessible replies disable further rating until another reply is generated.
-Feedback never changes AI usage, cooldowns, scan results, or cleanup selection.
