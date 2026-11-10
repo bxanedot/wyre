@@ -64,6 +64,9 @@
 }
 
 @theme inline {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
   --color-background: var(--background);
   --color-workspace: var(--workspace);
   --color-foreground: var(--foreground);
@@ -130,7 +133,7 @@
    */
   --layout-sidebar-collapsed-width: 68px;
   --layout-sidebar-expanded-width: 240px;
-  --layout-sidebar-item-height: 40px;
+  --layout-sidebar-item-height: 32px;
   --layout-page-padding-inline: 20px;
   --layout-page-padding-top: 14px;
   --layout-scrollbar-width: 10px;

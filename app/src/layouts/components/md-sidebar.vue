@@ -221,7 +221,6 @@ watch(
   font-size: 11px;
   font-weight: 600;
   line-height: 20px;
-  letter-spacing: 0.04em;
   white-space: nowrap;
   visibility: hidden;
   transform: translateY(-3px);
@@ -245,7 +244,7 @@ watch(
   background: transparent;
   color: inherit;
   font: inherit;
-  font-size: 14px;
+  font-size: 13px;
   cursor: pointer;
   transition:
     background-color 0.16s ease,
@@ -287,16 +286,6 @@ watch(
 }
 .nav-item.active {
   @apply bg-sidebar-accent text-sidebar-accent-foreground;
-  font-weight: 600;
-}
-.nav-item.active::before {
-  position: absolute;
-  left: 0;
-  width: 3px;
-  height: 24px;
-  border-radius: 999px;
-  @apply bg-primary;
-  content: '';
 }
 .nav-item:focus-visible {
   outline: none;
@@ -310,7 +299,7 @@ watch(
   height: 24px;
   flex: none;
   place-items: center;
-  color: currentColor;
+  color: var(--primary-text);
   font-size: 22px;
   line-height: 1;
 }

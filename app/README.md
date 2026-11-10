@@ -15,7 +15,7 @@ Run `corepack pnpm check` for source gates, frontend coverage, asset compilation
 
 ## GitHub releases
 
-Pushing a `v*` tag runs the root release workflow for Windows and Linux installers, checksums, signatures, and updater metadata. [Wyre releases](https://github.com/bxanedot/wyre/releases) contain published artifacts. Portable builds open the matching release page for manual downloads. The Windows certificate is currently self-signed as `CN=bxane`.
+Pushing a `v*` tag runs the root release workflow for Windows, macOS and Linux installers, checksums, signatures, and updater metadata. [Wyre releases](https://github.com/bxanedot/wyre/releases) contain published artifacts. Portable builds open the matching release page for manual downloads. The Windows certificate is currently self-signed as `CN=bxane`.
 
 ## AI providers
 

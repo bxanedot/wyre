@@ -1,13 +1,14 @@
 # Wyre
 
-Wyre is a Windows and Linux desktop toolkit for storage analysis, reviewed cleanup, system maintenance, network measurements, and mouse controls. Its Vue interface and Rust core live in [app/](app/).
+Wyre is a Windows, macOS and Linux desktop toolkit for storage analysis, reviewed cleanup, system maintenance, network measurements, and mouse controls. Its Vue interface and Rust core live in [app/](app/).
 
 ## Included tools
 
 - Storage analysis, cleanup previews, privacy tools, startup management, application management, system settings, maintenance, and history.
 - On-demand latency, jitter, download, and upload measurements through Cloudflare. Each run transfers about 16 MB; Cloudflare can see your public IP address.
 - Windows and GNOME pointer speed and acceleration controls, with review and one-step undo.
-- Windows NSIS and Linux AppImage and Debian installers from GitHub Releases.
+- A macOS-style interface with SF Symbols from [GlyphStudio](https://github.com/bxanedot/GlyphStudio), in light and dark.
+- Windows NSIS, macOS disk image, and Linux AppImage and Debian installers from GitHub Releases.
 
 ## Run and build
 
@@ -19,11 +20,11 @@ corepack pnpm install --frozen-lockfile
 corepack pnpm tauri:dev
 ```
 
-Build the Windows installer with `corepack pnpm tauri:build` or the Linux installers with `corepack pnpm tauri:build:linux`. Run `corepack pnpm check` for the complete validation suite.
+Build the Windows installer with `corepack pnpm tauri:build` the Linux installers with `corepack pnpm tauri:build:linux`, or the macOS disk image with `corepack pnpm tauri:build:mac`. After changing `src/components/icons/glyph-names.json`, regenerate the icons with `node scripts/sync-glyphs.mjs <GlyphStudio checkout> src/components/icons/glyph-names.json src/components/icons/glyphs.ts`. Run `corepack pnpm check` for the complete validation suite.
 
 ## Releases
 
-Tag a version such as `v1.0.0` to build Windows and Linux installers, SHA-256 checksums, and a signed updater manifest. Repository Actions secrets provide the signing keys. The current Windows certificate is self-signed as `CN=bxane`; Windows reports an untrusted publisher unless users choose to trust that certificate.
+Tag a version such as `v1.0.0` to build Windows, macOS and Linux installers, SHA-256 checksums, and a signed updater manifest. Repository Actions secrets provide the signing keys. The current Windows certificate is self-signed as `CN=bxane`; Windows reports an untrusted publisher unless users choose to trust that certificate. The macOS app is not notarized, so macOS asks users to approve it on first launch.
 
 ## License and authors
 

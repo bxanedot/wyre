@@ -4,8 +4,9 @@ import { flushPromises, mount } from '@vue/test-utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { i18n } from '@/i18n';
-import { ClipboardService } from '@/lib/services/shell/clipboard-service';
+import { PROJECT_LINKS } from '@/lib/models/shell/application-shell';
 import { FeedbackService } from '@/lib/services/feedback/feedback-service';
+import { LinkService } from '@/lib/services/shell/link-service';
 import { NativeDragDropService } from '@/lib/services/shell/native-drag-drop-service';
 
 import MdFeedbackDialog from './md-feedback-dialog.vue';
@@ -142,7 +143,8 @@ describe('feedback dialog component', () => {
     wrapper.unmount();
   });
 
-  it('submits the visible form state and renders the terminal success state', async () => {
+  it('opens a prefilled GitHub issue draft with the visible form state', async () => {
+    vi.spyOn(LinkService, 'open').mockResolvedValue();
     const wrapper = mountDialog();
     await selectFiles(wrapper, [textFile('context.txt')]);
     await wrapper.get('textarea').setValue('The cleanup dialog failed after selecting a directory.');
@@ -150,32 +152,11 @@ describe('feedback dialog component', () => {
     await wrapper.get('.feedback-primary-actions button:last-child').trigger('click');
     await flushPromises();
 
-    expect(FeedbackService.submit).toHaveBeenCalledWith(
-      expect.objectContaining({
-        category: 'issue',
-        content: 'The cleanup dialog failed after selecting a directory.',
-        includeLogs: true,
-        attachmentTokens: ['token-context.txt'],
-      })
-    );
-    expect(wrapper.find('.feedback-success').exists()).toBe(true);
-    expect(wrapper.text()).toContain('feedback-1');
-    const header = wrapper.get('.feedback-success-heading');
-    expect(header.text()).toBe(i18n.global.t('settings.feedbackDialog.successTitle'));
-    expect(header.find('[data-tauri-drag-region][aria-hidden="true"]').exists()).toBe(true);
-    expect(header.find('.feedback-success-icon').exists()).toBe(false);
-    expect(header.find('.feedback-reference').exists()).toBe(false);
-    expect(wrapper.get('.feedback-success-description').text()).toBe(
-      i18n.global.t('settings.feedbackDialog.successDescription')
-    );
-    expect(wrapper.get('.feedback-success').text()).not.toContain(
-      i18n.global.t('settings.feedbackDialog.successTitle')
-    );
-    expect(wrapper.get('.dialog-content-stub').attributes('data-dialog-size')).toBe('standard');
-    vi.spyOn(ClipboardService, 'writeText').mockResolvedValue();
-    await wrapper.get('.feedback-reference button').trigger('click');
-    await flushPromises();
-    expect(ClipboardService.writeText).toHaveBeenCalledWith('feedback-1');
+    const draft = new URL(vi.mocked(LinkService.open).mock.lastCall![0]);
+    expect(`${draft.origin}${draft.pathname}`).toBe(`${PROJECT_LINKS.issues}/new`);
+    expect(draft.searchParams.get('title')).toContain('The cleanup dialog failed after selecting a directory.');
+    expect(draft.searchParams.get('body')).toContain('context.txt');
+    expect(wrapper.find('.feedback-submit-error').exists()).toBe(false);
     wrapper.unmount();
   });
 });

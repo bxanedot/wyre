@@ -12,7 +12,7 @@ describe('project website links', () => {
     ['tr-TR', ''],
     ['pt-BR', ''],
     ['unknown', ''],
-  ])('maps %s to Wyre pages without query parameters', (locale) => {
+  ])('maps %s to Wyre pages without query parameters', locale => {
     expect(projectWebsiteUrl(locale)).toBe('https://github.com/bxanedot/wyre');
     expect(projectWebsiteUrl(locale, '/docs/ai#custom-service')).toBe(
       'https://github.com/bxanedot/wyre/blob/main/app/README.md#ai-providers'

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 const SPEED_TEST_BASE: &str = "https://speed.cloudflare.com";
@@ -173,7 +172,10 @@ pub fn mouse_apply_settings(
         return gnome_mouse_settings();
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    Err("Mouse controls are unavailable on this platform.".into())
+    {
+        let _ = (acceleration, acceleration_profile);
+        Err("Mouse controls are unavailable on this platform.".into())
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -234,8 +236,9 @@ fn unavailable(reason: String) -> MouseSettings {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
+    let output = std::process::Command::new(program)
         .args(args)
         .output()
         .map_err(|error| format!("Could not run {program}: {error}"))?;

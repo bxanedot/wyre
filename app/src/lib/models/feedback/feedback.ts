@@ -1,4 +1,3 @@
-export const FEEDBACK_SCHEMA_VERSION = 1 as const;
 export const FEEDBACK_LIMITS = {
   contentMinLength: 10,
   contentMaxLength: 5000,

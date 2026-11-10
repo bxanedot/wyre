@@ -60,11 +60,10 @@ if (process.platform === 'win32') {
         exit 1
       }
     `;
-    const verified = spawnSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', verificationCommand],
-      { stdio: 'inherit', env: verificationEnvironment }
-    );
+    const verified = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', verificationCommand], {
+      stdio: 'inherit',
+      env: verificationEnvironment,
+    });
     if (verified.status !== 0) process.exit(verified.status ?? 1);
   }
 }

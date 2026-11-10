@@ -839,10 +839,10 @@ mod tests {
     }
 
     #[test]
-    fn mangodisk_operational_caches_are_never_candidates() {
+    fn own_operational_caches_are_never_candidates() {
         assert!(OWN_CACHE_DIRECTORIES
             .iter()
-            .any(|name| name.eq_ignore_ascii_case("app.mangodisk.desktop")));
+            .any(|name| name.eq_ignore_ascii_case("dev.bxane.wyre")));
     }
 
     #[test]

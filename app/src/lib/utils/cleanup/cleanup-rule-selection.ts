@@ -1,10 +1,5 @@
 import { sameMembers } from '@/lib/utils/collections/set-membership';
-import type {
-  CleanupSourceDetail,
-  CleanupSourceSelection,
-  RiskLevel,
-  ScanRuleResult,
-} from '@/lib/models/cleanup/cleanup';
+import type { CleanupSourceDetail, CleanupSourceSelection, ScanRuleResult } from '@/lib/models/cleanup/cleanup';
 
 /** Project writers require confirmation and an execution-time guard, not a disabled selection. */
 export function sourceSelectable(rule: ScanRuleResult, source: CleanupSourceDetail): boolean {
@@ -65,9 +60,6 @@ export function selectionMode(
   if (matches(recommendedRuleIds(rules))) return 'smart';
   if (matches(selectable)) return 'all';
   return 'manual';
-}
-export function selectableByRisk(rules: readonly ScanRuleResult[], risk: RiskLevel): ScanRuleResult[] {
-  return rules.filter(rule => rule.risk === risk && rule.selectable);
 }
 export function selectedRules<Rule extends ScanRuleResult>(
   rules: readonly Rule[],

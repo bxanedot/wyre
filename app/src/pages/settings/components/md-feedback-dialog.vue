@@ -331,174 +331,170 @@ onMounted(() => {
       size="wide"
       @interact-outside="preventOutsideDismiss"
     >
-        <MdDialogHeader class="feedback-header">
-          <DialogTitle>{{ t('settings.feedbackDialog.title') }}</DialogTitle>
-          <DialogDescription
-            :class="{ 'feedback-submit-error': submissionErrorKey }"
-            :role="submissionErrorKey ? 'alert' : undefined"
-            aria-live="polite"
-          >
-            {{ t(submissionErrorKey ?? 'settings.feedbackDialog.description') }}
-          </DialogDescription>
-        </MdDialogHeader>
+      <MdDialogHeader class="feedback-header">
+        <DialogTitle>{{ t('settings.feedbackDialog.title') }}</DialogTitle>
+        <DialogDescription
+          :class="{ 'feedback-submit-error': submissionErrorKey }"
+          :role="submissionErrorKey ? 'alert' : undefined"
+          aria-live="polite"
+        >
+          {{ t(submissionErrorKey ?? 'settings.feedbackDialog.description') }}
+        </DialogDescription>
+      </MdDialogHeader>
 
-        <div class="feedback-body scrollbar-stable">
+      <div class="feedback-body scrollbar-stable">
+        <label class="field-label">
+          <span class="field-heading">
+            <span>{{ t('settings.feedbackDialog.contentLabel') }}</span>
+            <MdTooltip v-if="contentErrorKey" :text="t(contentErrorKey)"
+              ><small class="field-error" role="alert">
+                {{ t(contentErrorKey) }}
+              </small></MdTooltip
+            >
+            <small class="field-count">{{ contentLength }} / {{ FEEDBACK_LIMITS.contentMaxLength }}</small>
+          </span>
+          <textarea
+            v-model="content"
+            class="feedback-textarea"
+            :class="{ invalid: contentErrorKey }"
+            :aria-invalid="Boolean(contentErrorKey)"
+            :disabled="submitting"
+            :maxlength="FEEDBACK_LIMITS.contentMaxLength"
+            :placeholder="t('settings.feedbackDialog.contentPlaceholder')"
+            @paste="onPaste"
+          />
+        </label>
+
+        <div class="feedback-meta-grid">
           <label class="field-label">
-            <span class="field-heading">
-              <span>{{ t('settings.feedbackDialog.contentLabel') }}</span>
-              <MdTooltip v-if="contentErrorKey" :text="t(contentErrorKey)"
-                ><small class="field-error" role="alert">
-                  {{ t(contentErrorKey) }}
-                </small></MdTooltip
+            <span>{{ t('settings.feedbackDialog.categoryLabel') }}</span>
+            <Select :model-value="category" :disabled="submitting" @update:model-value="setCategory">
+              <SelectTrigger class="w-full font-normal"
+                ><SelectValue>{{ categoryLabel }}</SelectValue></SelectTrigger
               >
-              <small class="field-count">{{ contentLength }} / {{ FEEDBACK_LIMITS.contentMaxLength }}</small>
-            </span>
-            <textarea
-              v-model="content"
-              class="feedback-textarea"
-              :class="{ invalid: contentErrorKey }"
-              :aria-invalid="Boolean(contentErrorKey)"
-              :disabled="submitting"
-              :maxlength="FEEDBACK_LIMITS.contentMaxLength"
-              :placeholder="t('settings.feedbackDialog.contentPlaceholder')"
-              @paste="onPaste"
-            />
+              <SelectContent>
+                <SelectItem v-for="value in FEEDBACK_CATEGORY_IDS" :key="value" :value="value">
+                  {{ t(CATEGORY_LABEL_KEYS[value]) }}
+                </SelectItem>
+              </SelectContent>
+            </Select>
           </label>
 
-          <div class="feedback-meta-grid">
-            <label class="field-label">
-              <span>{{ t('settings.feedbackDialog.categoryLabel') }}</span>
-              <Select :model-value="category" :disabled="submitting" @update:model-value="setCategory">
-                <SelectTrigger class="w-full font-normal"
-                  ><SelectValue>{{ categoryLabel }}</SelectValue></SelectTrigger
-                >
-                <SelectContent>
-                  <SelectItem v-for="value in FEEDBACK_CATEGORY_IDS" :key="value" :value="value">
-                    {{ t(CATEGORY_LABEL_KEYS[value]) }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </label>
-
-            <label class="field-label">
-              <span class="field-heading">
-                <span>{{ t('settings.feedbackDialog.emailLabel') }}</span>
-                <MdTooltip v-if="emailErrorKey" :text="t(emailErrorKey)"
-                  ><small class="field-error" role="alert">
-                    {{ t(emailErrorKey) }}
-                  </small></MdTooltip
-                >
-              </span>
-              <Input
-                v-model="email"
-                class="feedback-email h-10 font-normal"
-                :class="{ invalid: emailErrorKey }"
-                type="email"
-                autocomplete="email"
-                :aria-invalid="Boolean(emailErrorKey)"
-                :disabled="submitting"
-                :maxlength="FEEDBACK_LIMITS.emailMaxLength"
-                :placeholder="t('settings.feedbackDialog.emailPlaceholder')"
-              />
-            </label>
-          </div>
-
-          <section class="attachment-section">
-            <div class="attachment-heading">
-              <span class="attachment-copy">
-                <strong>{{ t('settings.feedbackDialog.attachmentsLabel') }}</strong>
-                <MdTooltip :text="attachmentErrorKey ? t(attachmentErrorKey) : undefined"
-                  ><small
-                    :class="{ 'field-error': attachmentErrorKey }"
-                    :role="attachmentErrorKey ? 'alert' : undefined"
-                  >
-                    {{
-                      attachmentErrorKey
-                        ? t(attachmentErrorKey)
-                        : t('settings.feedbackDialog.attachmentHint', { count: FEEDBACK_LIMITS.attachmentCount })
-                    }}
-                  </small></MdTooltip
-                >
-              </span>
-              <Button
-                v-if="attachments.length > 0"
-                class="attachment-picker-button"
-                variant="ghost"
-                size="sm"
-                type="button"
-                :disabled="submitting || addingAttachments || remainingAttachmentCount === 0"
-                @click="fileInput?.click()"
+          <label class="field-label">
+            <span class="field-heading">
+              <span>{{ t('settings.feedbackDialog.emailLabel') }}</span>
+              <MdTooltip v-if="emailErrorKey" :text="t(emailErrorKey)"
+                ><small class="field-error" role="alert">
+                  {{ t(emailErrorKey) }}
+                </small></MdTooltip
               >
-                <MdIcon :name="ICON_NAMES.paperclip" :size="15" />
-                {{ t('settings.feedbackDialog.chooseAttachments') }}
-              </Button>
-            </div>
-            <input
-              ref="fileInput"
-              class="sr-only"
-              type="file"
-              multiple
-              :accept="FEEDBACK_ATTACHMENT_ACCEPT"
-              @change="onFileInput"
+            </span>
+            <Input
+              v-model="email"
+              class="feedback-email h-10 font-normal"
+              :class="{ invalid: emailErrorKey }"
+              type="email"
+              autocomplete="email"
+              :aria-invalid="Boolean(emailErrorKey)"
+              :disabled="submitting"
+              :maxlength="FEEDBACK_LIMITS.emailMaxLength"
+              :placeholder="t('settings.feedbackDialog.emailPlaceholder')"
             />
-            <div
-              class="attachment-dropzone"
-              :class="{
-                empty: attachments.length === 0,
-                'attachment-dropzone-active': nativeDropActive,
-                invalid: attachmentErrorKey,
-              }"
-              :aria-invalid="Boolean(attachmentErrorKey)"
-              @dragover.prevent
-              @dragenter.prevent
-              @drop="onDrop"
-            >
-              <button
-                v-if="attachments.length === 0"
-                class="attachment-dropzone-action"
-                type="button"
-                :disabled="submitting || addingAttachments || remainingAttachmentCount === 0"
-                @click="fileInput?.click()"
-              >
-                <MdIcon :name="ICON_NAMES.paperclip" :size="18" />
-                <strong>{{ t('settings.feedbackDialog.addAttachments') }}</strong>
-              </button>
-              <ul v-else class="attachment-list" :class="{ 'scrollbar-stable-end': attachments.length > 3 }">
-                <li v-for="item in attachments" :key="item.token">
-                  <img v-if="item.previewUrl" :src="item.previewUrl" alt="" />
-                  <span v-else class="attachment-file-icon"><MdIcon :name="ICON_NAMES.file" :size="20" /></span>
-                  <span class="attachment-name">{{ item.displayName }}</span>
-                  <button
-                    type="button"
-                    :aria-label="t('settings.feedbackDialog.removeAttachment', { name: item.displayName })"
-                    :disabled="submitting"
-                    @click="removeAttachment(item)"
-                  >
-                    <MdIcon :name="ICON_NAMES.close" :size="16" />
-                  </button>
-                </li>
-              </ul>
-            </div>
-          </section>
-
+          </label>
         </div>
 
-        <MdDialogFooter class="feedback-footer" align="between">
-          <div class="feedback-primary-actions">
+        <section class="attachment-section">
+          <div class="attachment-heading">
+            <span class="attachment-copy">
+              <strong>{{ t('settings.feedbackDialog.attachmentsLabel') }}</strong>
+              <MdTooltip :text="attachmentErrorKey ? t(attachmentErrorKey) : undefined"
+                ><small :class="{ 'field-error': attachmentErrorKey }" :role="attachmentErrorKey ? 'alert' : undefined">
+                  {{
+                    attachmentErrorKey
+                      ? t(attachmentErrorKey)
+                      : t('settings.feedbackDialog.attachmentHint', { count: FEEDBACK_LIMITS.attachmentCount })
+                  }}
+                </small></MdTooltip
+              >
+            </span>
             <Button
-              variant="outline"
+              v-if="attachments.length > 0"
+              class="attachment-picker-button"
+              variant="ghost"
+              size="sm"
               type="button"
-              :disabled="submitting || addingAttachments"
-              @click="updateOpen(false)"
+              :disabled="submitting || addingAttachments || remainingAttachmentCount === 0"
+              @click="fileInput?.click()"
             >
-              {{ t('common.cancel') }}
-            </Button>
-            <Button type="button" :disabled="submitting || addingAttachments" @click="submit">
-              <MdSpinner v-if="submitting" size="small" />
-              {{ t('settings.feedbackDialog.githubAction') }}
+              <MdIcon :name="ICON_NAMES.paperclip" :size="15" />
+              {{ t('settings.feedbackDialog.chooseAttachments') }}
             </Button>
           </div>
-        </MdDialogFooter>
+          <input
+            ref="fileInput"
+            class="sr-only"
+            type="file"
+            multiple
+            :accept="FEEDBACK_ATTACHMENT_ACCEPT"
+            @change="onFileInput"
+          />
+          <div
+            class="attachment-dropzone"
+            :class="{
+              empty: attachments.length === 0,
+              'attachment-dropzone-active': nativeDropActive,
+              invalid: attachmentErrorKey,
+            }"
+            :aria-invalid="Boolean(attachmentErrorKey)"
+            @dragover.prevent
+            @dragenter.prevent
+            @drop="onDrop"
+          >
+            <button
+              v-if="attachments.length === 0"
+              class="attachment-dropzone-action"
+              type="button"
+              :disabled="submitting || addingAttachments || remainingAttachmentCount === 0"
+              @click="fileInput?.click()"
+            >
+              <MdIcon :name="ICON_NAMES.paperclip" :size="18" />
+              <strong>{{ t('settings.feedbackDialog.addAttachments') }}</strong>
+            </button>
+            <ul v-else class="attachment-list" :class="{ 'scrollbar-stable-end': attachments.length > 3 }">
+              <li v-for="item in attachments" :key="item.token">
+                <img v-if="item.previewUrl" :src="item.previewUrl" alt="" />
+                <span v-else class="attachment-file-icon"><MdIcon :name="ICON_NAMES.file" :size="20" /></span>
+                <span class="attachment-name">{{ item.displayName }}</span>
+                <button
+                  type="button"
+                  :aria-label="t('settings.feedbackDialog.removeAttachment', { name: item.displayName })"
+                  :disabled="submitting"
+                  @click="removeAttachment(item)"
+                >
+                  <MdIcon :name="ICON_NAMES.close" :size="16" />
+                </button>
+              </li>
+            </ul>
+          </div>
+        </section>
+      </div>
+
+      <MdDialogFooter class="feedback-footer" align="between">
+        <div class="feedback-primary-actions">
+          <Button
+            variant="outline"
+            type="button"
+            :disabled="submitting || addingAttachments"
+            @click="updateOpen(false)"
+          >
+            {{ t('common.cancel') }}
+          </Button>
+          <Button type="button" :disabled="submitting || addingAttachments" @click="submit">
+            <MdSpinner v-if="submitting" size="small" />
+            {{ t('settings.feedbackDialog.githubAction') }}
+          </Button>
+        </div>
+      </MdDialogFooter>
     </MdDialogContent>
   </Dialog>
 </template>

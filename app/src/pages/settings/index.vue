@@ -85,7 +85,7 @@ const themeLabel = computed(() => {
   return t('settings.themeSystem');
 });
 const colorThemeLabel = computed(() =>
-  t(form.colorTheme === COLOR_THEME_IDS.warmGray ? 'settings.colorThemeWarmGray' : 'settings.colorThemeTurquoise')
+  t(form.colorTheme === COLOR_THEME_IDS.warmGray ? 'settings.colorThemeWarmGray' : 'settings.colorThemeBlue')
 );
 const hasPermissionObservation = computed(
   () => permissionObservation.value.applicationDataStatus !== MACOS_ACCESS_STATUS_IDS.notChecked
@@ -232,7 +232,7 @@ function updateTheme(value: unknown) {
             <SelectValue>{{ colorThemeLabel }}</SelectValue>
           </SelectTrigger>
           <SelectContent>
-            <SelectItem :value="COLOR_THEME_IDS.mango">{{ t('settings.colorThemeTurquoise') }}</SelectItem>
+            <SelectItem :value="COLOR_THEME_IDS.mango">{{ t('settings.colorThemeBlue') }}</SelectItem>
             <SelectItem :value="COLOR_THEME_IDS.warmGray">{{ t('settings.colorThemeWarmGray') }}</SelectItem>
           </SelectContent>
         </Select>
